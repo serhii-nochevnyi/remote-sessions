@@ -1,8 +1,8 @@
 # ADR-13 — Local desktop creation and terminal ergonomics
 
-- **Status:** proposed
+- **Status:** accepted
 - **Date:** 2026-11-21
-- **Decision owner:** user; recommendation prepared from verified INV-001 research
+- **Decision owner:** user; explicitly accepted recommended SQLite ADR-13 on 2026-11-21
 - **Scope:** Wave 1 local Mac workflow, planned as vertical MVP slices
 - **Supersedes:** none; preserves ADR-12 Rust selection and original Session/Runtime/View boundaries
 - **Related:** INV-001-local-desktop-workflow; docs/planning/ARCHITECTURE.md; docs/planning/UI-SPEC.md

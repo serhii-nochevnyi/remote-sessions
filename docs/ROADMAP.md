@@ -74,9 +74,9 @@ Relevant existing acceptance IDs: A01, A02, A04 (local ownership subset), A06 (a
 
 ## Wave 1 planning status
 
-All four Wave 1 research lines completed against baseline `91d9695`; durable receipts and materialized artifact digests were verified. The proposed [ADR-13](decisions/ADR-13-local-desktop-workflow.md) recommends SQLite-backed operation identity, a restricted native launch path and in-place owner resize. The storage/recovery choice awaits the user; no accepted W1 ADR, executable ticket set or validated dependency graph is claimed yet.
+All four Wave 1 research lines completed against baseline `91d9695`; durable receipts and materialized artifact digests were verified. The user accepted [ADR-13](decisions/ADR-13-local-desktop-workflow.md) on 2026-11-21, selecting SQLite-backed operation identity, a restricted native launch path and in-place owner resize. Gate 1 passed. Formal MVP decomposition is in progress; no executable ticket set or validated dependency graph is claimed yet.
 
-After acceptance: typed MVP researcher/planner/checker → graph validation → reviewed task set → GitHub Issues. Detailed internal planning artifacts and receipts remain local. Published architecture and acceptance documents remain reviewable here.
+Next: typed MVP researcher/planner/checker → graph validation → reviewed task set → GitHub Issues. Detailed internal planning artifacts and receipts remain local. Published architecture and acceptance documents remain reviewable here.
 
 The private [repository](https://github.com/serhii-nochevnyi/remote-sessions), seven [wave milestones](https://github.com/serhii-nochevnyi/remote-sessions/milestones), branches and PR workflow are user-authorized. Jira is not this project's tracker. No feature implementation or automatic merge permission follows from this planning PR.
 
