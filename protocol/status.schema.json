@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ScaffoldStatusV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocolVersion", "appVersion", "stage", "capabilities"],
+  "properties": {
+    "protocolVersion": { "const": 1 },
+    "appVersion": { "type": "string", "minLength": 1 },
+    "stage": { "const": "scaffold" },
+    "capabilities": { "type": "array", "maxItems": 0 }
+  }
+}

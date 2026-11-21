@@ -1,0 +1,35 @@
+{
+  "platform": "darwin",
+  "tmux": "tmux 3.8",
+  "checks": [
+    "private IPC, single-agent lock and bounded/unknown-request rejection",
+    "real process created through agent; duplicate create rejected",
+    "two ordinary read-only PTY attachments render live output without input/resize authority",
+    "normal detach and SIGKILL client loss preserve process identity and progress",
+    "SIGTERM agent shutdown and launchd restart preserve tmux/runtime identity",
+    "forced launchctl kickstart -k recovers stale IPC and inventory without respawning runtime",
+    "fresh PTY reattachment after service restart displays current output",
+    "stop precondition rejects stale target; explicit stop leaves unrelated runtime alive",
+    "natural CLI exit is retained as exited and never resurrected",
+    "missing tmux service fails closed; agent never starts its own replacement"
+  ],
+  "identity": {
+    "session_id": "5c703c51-1ea0-47c1-b5b7-cbcc378ccae3",
+    "runtime_id": "542fbb51-2213-4313-a628-dc1aa0b9a504",
+    "pane_id": "%0",
+    "pane_pid": 64670,
+    "process_started": "Sat Nov 21 19:16:44 2026",
+    "instance": "be29d277fab645ac8ce6b5307c6ebd90",
+    "tmux_pid": 64596
+  },
+  "agent_pids": [
+    64599,
+    64747,
+    64760
+  ],
+  "progress": {
+    "before": 0,
+    "after": 11
+  },
+  "cleanup": "Both temporary launchd jobs unloaded; private test directory removed."
+}

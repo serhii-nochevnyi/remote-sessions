@@ -1,0 +1,99 @@
+{
+  "test": "real CLI TUI compatibility",
+  "model_prompts_submitted": 0,
+  "tools": {
+    "claude": {
+      "version": "2.1.330 (Claude Code)",
+      "runtime_id": "c08d2e1f-585a-45c4-8682-f5029eb779d5",
+      "session_id": "321ed516-5fef-4ad6-9463-40c23f22f91b",
+      "pane_pid": 15551,
+      "process_started": "Sat Nov 21 18:22:29 2026",
+      "sizes": [
+        {
+          "cols": 120,
+          "rows": 32,
+          "xterm_buffer": "alternate",
+          "bytes": 3642,
+          "unicode_draft_visible": true
+        },
+        {
+          "cols": 40,
+          "rows": 18,
+          "xterm_buffer": "alternate",
+          "bytes": 2504,
+          "unicode_draft_visible": true
+        },
+        {
+          "cols": 100,
+          "rows": 30,
+          "xterm_buffer": "alternate",
+          "bytes": 3378,
+          "unicode_draft_visible": true
+        }
+      ],
+      "application_alternate_screen": false,
+      "reattached": {
+        "cols": 100,
+        "rows": 30,
+        "xterm_buffer": "alternate",
+        "bytes": 3566,
+        "unicode_draft_visible": true
+      }
+    },
+    "codex": {
+      "version": "codex-cli 0.171.0",
+      "runtime_id": "4644976b-df7a-4e8b-a53e-9aa437dfd35f",
+      "session_id": "e69ece7d-4b6c-4b84-b48b-a1eea9783fe5",
+      "pane_pid": 15849,
+      "process_started": "Sat Nov 21 18:22:36 2026",
+      "sizes": [
+        {
+          "cols": 120,
+          "rows": 32,
+          "xterm_buffer": "alternate",
+          "bytes": 1102,
+          "unicode_draft_visible": true
+        },
+        {
+          "cols": 40,
+          "rows": 18,
+          "xterm_buffer": "alternate",
+          "bytes": 2667,
+          "unicode_draft_visible": true
+        },
+        {
+          "cols": 100,
+          "rows": 30,
+          "xterm_buffer": "alternate",
+          "bytes": 2720,
+          "unicode_draft_visible": true
+        }
+      ],
+      "application_alternate_screen": true,
+      "reattached": {
+        "cols": 100,
+        "rows": 30,
+        "xterm_buffer": "alternate",
+        "bytes": 2720,
+        "unicode_draft_visible": true
+      }
+    }
+  },
+  "checks": [
+    "claude: Unicode draft rendered by xterm at 120x32, 40x18 and 100x30; process identity preserved",
+    "codex: Unicode draft rendered by xterm at 120x32, 40x18 and 100x30; process identity preserved",
+    "claude: fresh attachment after agent restart restores draft; CLI accepts further unsubmitted input",
+    "codex: fresh attachment after agent restart restores draft; CLI accepts further unsubmitted input"
+  ],
+  "agent_pids": [
+    15532,
+    16216
+  ],
+  "cleanup": "Temporary launchd jobs and actual CLI runtimes stopped; disposable workspaces removed.",
+  "limits": [
+    "No model response/tool execution tested.",
+    "Resize/input are privileged local test-driver operations, not implemented product ownership APIs.",
+    "Raw captures contain local CLI account/status UI and remain in ignored .cache only.",
+    "No iPhone or remote/E2EE test."
+  ]
+}

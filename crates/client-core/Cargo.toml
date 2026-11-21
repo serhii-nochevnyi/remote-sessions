@@ -1,0 +1,8 @@
+[package]
+name = "remote-sessions-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+remote-sessions-protocol = { path = "../protocol" }

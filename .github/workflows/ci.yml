@@ -1,0 +1,31 @@
+name: Scaffold checks
+on: [push, pull_request]
+permissions:
+  contents: read
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy
+      - run: npm ci
+      - run: make check
+  native:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: npm ci
+      - run: npm run build
+      - run: make check-native
+# launchd lifecycle proof is run locally in an actual logged-in macOS GUI domain.
+# A hosted runner without that domain cannot substitute for the device evidence.

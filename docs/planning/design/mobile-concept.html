@@ -1,0 +1,93 @@
+<div id="remote-mobile-concept" class="viz-dotted-background">
+  <div class="rm-stage">
+    <nav class="rm-scenarios" aria-label="Екрани концепції">
+      <button type="button" data-screen="sessions" aria-pressed="true">Сесії</button>
+      <button type="button" data-screen="terminal" aria-pressed="false">Термінал</button>
+      <button type="button" data-screen="chat" aria-pressed="false">Чат · згодом</button>
+    </nav>
+    <div class="rm-phone" aria-label="Концепція мобільного застосунку">
+      <div class="rm-status"><span>9:41</span><span>Демо інтерфейсу</span><i data-lucide="battery-full" aria-hidden="true"></i></div>
+      <section data-page="sessions">
+        <header class="rm-heading"><div><span class="rm-eyebrow">МОЯ РОБОТА</span><h2>Сесії</h2></div><span class="rm-monogram">S</span></header>
+        <div class="rm-host"><i data-lucide="laptop" aria-hidden="true"></i><div><strong>Робочий MacBook</strong><small>Підключено · захищений канал</small></div><span class="rm-dot"></span></div>
+        <div class="rm-section-label">API-SERVICE <span>2 сесії</span></div>
+        <button type="button" class="rm-session" data-open="Claude Code"><span class="rm-app-icon">✳</span><span><strong>Claude Code</strong><small>Авторизація користувачів</small><span class="rm-state">Термінальна сесія · запущена</span></span><i data-lucide="chevron-right" aria-hidden="true"></i></button>
+        <button type="button" class="rm-session" data-open="Shell"><span class="rm-app-icon">›_</span><span><strong>Shell</strong><small>Сервер розробки</small><span class="rm-state">Термінальна сесія · запущена</span></span><i data-lucide="chevron-right" aria-hidden="true"></i></button>
+        <div class="rm-section-label">WEB-APP <span>1 сесія</span></div>
+        <button type="button" class="rm-session" data-open="Codex"><span class="rm-app-icon">›</span><span><strong>Codex</strong><small>Тести інтерфейсу</small><span class="rm-state">Термінальна сесія · запущена</span></span><i data-lucide="chevron-right" aria-hidden="true"></i></button>
+        <div class="rm-bottom"><button type="button" class="rm-primary rm-full" data-action="new"><i data-lucide="plus" aria-hidden="true"></i> Нова сесія</button></div>
+      </section>
+      <section data-page="terminal" hidden>
+        <header class="rm-session-header"><button type="button" class="rm-icon-button" data-screen="sessions" aria-label="До списку сесій"><i data-lucide="chevron-left" aria-hidden="true"></i></button><div><strong class="rm-agent-title">Claude Code</strong><small>api-service · Робочий MacBook</small></div><span class="rm-tag">CLI</span></header>
+        <div class="rm-control"><span id="rm-owner">Керування на Mac</span><button type="button" data-action="control">Взяти керування</button></div>
+        <div class="rm-terminal" aria-label="Приклад термінального виведення"><div class="rm-terminal-muted">~/projects/api-service</div><div class="rm-terminal-command">❯ claude</div><br><div>❯ Додай тести авторизації</div><br><div>✳ Перевіряю наявні тести…</div><br><div class="rm-terminal-muted">Read  src/auth/session.ts<br>Read  tests/auth.test.ts</div><br><div>Знайдено 3 сценарії:<br>• чинний токен<br>• прострочений токен<br>• відсутній токен</div><br><div id="rm-terminal-last">Готую зміни… <span class="rm-caret">▌</span></div></div>
+        <div class="rm-terminal-footer"><div class="rm-keys" aria-label="Додаткові клавіші"><button type="button" data-key="Esc">Esc</button><button type="button" data-key="Tab">Tab</button><button type="button" data-key="↑" aria-label="Стрілка вгору">↑</button><button type="button" data-key="↓" aria-label="Стрілка вниз">↓</button><button type="button" data-key="Ctrl+C">Ctrl+C</button></div><form id="rm-terminal-form"><input id="rm-input" aria-label="Введення в термінал" placeholder="Спочатку візьми керування" disabled autocomplete="off"><button type="submit" class="rm-primary" aria-label="Надіслати введення" disabled>↵</button></form><div class="rm-caption" id="rm-terminal-caption" aria-live="polite">Перегляд тієї самої сесії, що й на Mac</div></div>
+      </section>
+      <section data-page="chat" hidden>
+        <header class="rm-session-header"><button type="button" class="rm-icon-button" data-screen="sessions" aria-label="До списку сесій"><i data-lucide="chevron-left" aria-hidden="true"></i></button><div><strong>Codex</strong><small>web-app · Робочий MacBook</small></div><span class="rm-tag">Чат</span></header>
+        <div class="rm-future">Наступний етап · структурована інтеграція</div>
+        <div class="rm-chat-content"><div class="rm-user-message">Додай тести для форми входу.</div><div class="rm-agent-message"><strong>Codex</strong><p>Додав перевірки порожніх полів і помилкового пароля. Залишилося запустити тести.</p></div><div class="rm-file"><i data-lucide="file-code" aria-hidden="true"></i><span>login.test.ts</span><span>+42</span></div><div class="rm-approval"><span class="rm-eyebrow">ПОТРІБНЕ ПІДТВЕРДЖЕННЯ</span><h3>Запустити тести?</h3><code>npm test -- login.test.ts</code><div class="rm-approval-actions"><button type="button" data-answer="Відхилено">Відхилити</button><button type="button" class="rm-primary" data-answer="Дозволено · тести запущено">Дозволити</button></div><div id="rm-approval-result" aria-live="polite" hidden></div></div></div>
+        <div class="rm-bottom"><form id="rm-chat-form"><input id="rm-chat-input" aria-label="Повідомлення агенту" placeholder="Повідомлення агенту…" autocomplete="off"><button type="submit" class="rm-primary" aria-label="Надіслати повідомлення">↑</button></form><div class="rm-caption" id="rm-chat-caption" aria-live="polite">Виконується на твоєму Mac</div></div>
+      </section>
+      <section data-page="new" hidden>
+        <header class="rm-session-header"><button type="button" class="rm-icon-button" data-screen="sessions" aria-label="До списку сесій"><i data-lucide="chevron-left" aria-hidden="true"></i></button><strong>Нова сесія</strong></header>
+        <form id="rm-new-form" class="rm-new-form"><label>Комп’ютер<select aria-label="Комп’ютер"><option>Робочий MacBook</option></select></label><label>Проєкт<select aria-label="Проєкт"><option>api-service</option><option>web-app</option></select></label><label>Програма<select id="rm-new-agent"><option>Claude Code</option><option>Codex</option><option>Shell</option></select></label><div class="rm-caption">Відкриється нова термінальна сесія на Mac.</div><button type="submit" class="rm-primary rm-full">Створити демосесію</button></form>
+      </section>
+      <div class="rm-home-indicator"></div>
+    </div>
+  </div>
+</div>
+<style>
+#remote-mobile-concept{--rm-bg:light-dark(#fff,#15191f);--rm-text:light-dark(#19232c,#e7edf2);--rm-muted:light-dark(#65717e,#a2aeba);--rm-line:light-dark(#e4e8eb,#303943);--rm-soft:light-dark(#f3f6f7,#202831);--rm-accent:light-dark(#126c60,#8ce0c5);--rm-on-accent:light-dark(#fff,#102e26);--rm-terminal:light-dark(#172029,#10171e);--rm-terminal-text:#dce9e4;color:var(--rm-text);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+#remote-mobile-concept *{box-sizing:border-box}#remote-mobile-concept [hidden]{display:none!important}
+#remote-mobile-concept .rm-stage{padding:14px 8px 20px;display:grid;justify-items:center;gap:18px}
+#remote-mobile-concept button,#remote-mobile-concept input,#remote-mobile-concept select{font:inherit}#remote-mobile-concept button{cursor:pointer;border:1px solid var(--rm-line);background:var(--rm-bg);color:var(--rm-text);border-radius:10px;min-height:44px;padding:8px 12px;display:inline-flex;align-items:center;justify-content:center;gap:6px}#remote-mobile-concept button:disabled{opacity:.5;cursor:default}
+#remote-mobile-concept .rm-scenarios{display:flex;gap:6px;flex-wrap:wrap;justify-content:center}#remote-mobile-concept .rm-scenarios [aria-pressed=true]{background:var(--rm-text);color:var(--rm-bg);border-color:var(--rm-text)}
+#remote-mobile-concept .rm-phone{width:min(380px,100%);background:var(--rm-bg);border:1px solid var(--rm-line);border-radius:30px;overflow:hidden;box-shadow:0 12px 35px #00000012}
+#remote-mobile-concept .rm-status{display:flex;justify-content:space-between;align-items:center;padding:15px 22px 6px;font-size:12px;font-weight:500}#remote-mobile-concept .rm-status span:nth-child(2){font-size:11px;color:var(--rm-muted)}
+#remote-mobile-concept [data-page]{min-height:552px;display:flex;flex-direction:column}#remote-mobile-concept h2{font-size:27px;line-height:1.2;margin:4px 0 0;font-weight:500}#remote-mobile-concept h3{font-size:17px;font-weight:500;margin:8px 0}#remote-mobile-concept strong{font-weight:500}#remote-mobile-concept small{display:block;color:var(--rm-muted);font-size:12px;margin-top:2px}
+#remote-mobile-concept .rm-heading{padding:20px;display:flex;justify-content:space-between;align-items:center}#remote-mobile-concept .rm-eyebrow{font-size:10px;letter-spacing:1.2px;color:var(--rm-muted);font-weight:500}#remote-mobile-concept .rm-monogram{border-radius:50%;padding:8px 14px;background:var(--rm-soft)}
+#remote-mobile-concept .rm-host{display:flex;align-items:center;gap:12px;margin:0 18px 18px;padding:12px;background:var(--rm-soft);border-radius:14px}#remote-mobile-concept .rm-dot{width:7px;height:7px;border-radius:50%;background:var(--rm-accent);margin-left:auto}
+#remote-mobile-concept .rm-section-label{margin:2px 20px 4px;font-size:11px;font-weight:500;letter-spacing:.7px;display:flex;justify-content:space-between;color:var(--rm-muted)}#remote-mobile-concept .rm-section-label span{letter-spacing:0;font-weight:400}
+#remote-mobile-concept .rm-session{margin:0 18px;padding:13px 0;border:0;border-bottom:1px solid var(--rm-line);border-radius:0;text-align:left;justify-content:flex-start;gap:12px}#remote-mobile-concept .rm-session>span:nth-child(2){flex:1;min-width:0}#remote-mobile-concept .rm-state{font-size:11px;color:var(--rm-muted);display:block;margin-top:6px}#remote-mobile-concept .rm-app-icon{width:36px;height:36px;background:var(--rm-soft);border-radius:11px;display:grid;place-items:center;font-size:21px;flex:none}
+#remote-mobile-concept .rm-bottom{padding:18px;margin-top:auto}#remote-mobile-concept .rm-primary{background:var(--rm-accent);color:var(--rm-on-accent);border-color:var(--rm-accent)}#remote-mobile-concept .rm-full{width:100%}
+#remote-mobile-concept .rm-session-header{padding:16px 14px;display:flex;align-items:center;gap:9px;border-bottom:1px solid var(--rm-line)}#remote-mobile-concept .rm-icon-button{border:0;padding:6px;min-width:32px}#remote-mobile-concept .rm-tag{margin-left:auto;font-size:11px;padding:3px 7px;background:var(--rm-soft);border-radius:6px}
+#remote-mobile-concept .rm-control{display:flex;align-items:center;justify-content:space-between;gap:6px;padding:8px 14px;background:var(--rm-soft);font-size:11px}#remote-mobile-concept .rm-control button{font-size:11px;padding:5px 8px;min-height:36px}
+#remote-mobile-concept .rm-terminal{background:var(--rm-terminal);color:var(--rm-terminal-text);padding:16px 14px;font:12px/1.65 ui-monospace,SFMono-Regular,Consolas,monospace;flex:1;overflow-wrap:anywhere;min-height:300px}#remote-mobile-concept .rm-terminal-muted{color:#9caebc}#remote-mobile-concept .rm-terminal-command,#remote-mobile-concept .rm-caret{color:#8ce0c5}
+#remote-mobile-concept .rm-terminal-footer{padding:10px 12px 0}#remote-mobile-concept .rm-keys{display:flex;gap:5px;margin-bottom:8px}#remote-mobile-concept .rm-keys button{flex:1;padding:5px;min-width:0;background:var(--rm-soft);font-size:12px}
+#remote-mobile-concept form:not(.rm-new-form){display:flex;gap:8px}#remote-mobile-concept input{width:0;flex:1;min-width:0;padding:10px;border:1px solid var(--rm-line);border-radius:10px;background:var(--rm-soft);color:var(--rm-text);font-size:16px}#remote-mobile-concept input::placeholder{color:var(--rm-muted);font-size:12px}#remote-mobile-concept .rm-caption{color:var(--rm-muted);text-align:center;font-size:11px;margin-top:9px}
+#remote-mobile-concept .rm-future{text-align:center;font-size:11px;background:var(--rm-soft);padding:8px;color:var(--rm-muted)}#remote-mobile-concept .rm-chat-content{padding:18px;display:grid;gap:20px}#remote-mobile-concept .rm-user-message{padding:11px 13px;border-radius:14px 14px 3px 14px;background:var(--rm-soft);margin-left:30px}#remote-mobile-concept .rm-agent-message p{margin:5px 0 0}#remote-mobile-concept .rm-file{display:flex;gap:9px;align-items:center;font-size:12px}#remote-mobile-concept .rm-file span:last-child{margin-left:auto;color:var(--rm-accent)}#remote-mobile-concept .rm-approval{border:1px solid var(--rm-line);padding:14px;border-radius:14px}#remote-mobile-concept .rm-approval code{font-size:11px;overflow-wrap:anywhere}#remote-mobile-concept .rm-approval-actions{display:flex;gap:8px;margin-top:15px}#remote-mobile-concept .rm-approval-actions button{flex:1}#remote-mobile-concept #rm-approval-result{color:var(--rm-accent);margin-top:12px;font-size:12px}
+#remote-mobile-concept .rm-new-form{padding:22px;display:grid;gap:20px}#remote-mobile-concept .rm-new-form label{display:grid;gap:6px;font-size:12px;color:var(--rm-muted)}#remote-mobile-concept select{width:100%;padding:12px;background:var(--rm-soft);color:var(--rm-text);border:1px solid var(--rm-line);border-radius:10px;font-size:16px}#remote-mobile-concept .rm-home-indicator{width:105px;height:4px;border-radius:4px;background:var(--rm-text);margin:14px auto 9px;opacity:.7}
+</style>
+<script>
+(()=>{
+const root=document.getElementById('remote-mobile-concept');
+const state={screen:'sessions',control:false,agent:'Claude Code'};
+const saved=window.openai?.widgetState?.modelContent;
+if(saved&&['sessions','terminal','chat','new'].includes(saved.screen))Object.assign(state,{screen:saved.screen,control:!!saved.control,agent:['Claude Code','Codex','Shell'].includes(saved.agent)?saved.agent:'Claude Code'});
+function render(){
+root.querySelectorAll('[data-page]').forEach(el=>el.hidden=el.dataset.page!==state.screen);
+root.querySelectorAll('.rm-scenarios [data-screen]').forEach(el=>el.setAttribute('aria-pressed',String(el.dataset.screen===state.screen)));
+root.querySelector('.rm-agent-title').textContent=state.agent;
+root.querySelector('#rm-owner').textContent=state.control?'Керуєш із телефона':'Керування на Mac';
+root.querySelector('[data-action="control"]').textContent=state.control?'Віддати керування':'Взяти керування';
+const input=root.querySelector('#rm-input');input.disabled=!state.control;input.placeholder=state.control?'Введення в термінал…':'Спочатку візьми керування';
+root.querySelector('#rm-terminal-form button').disabled=!state.control;
+root.querySelectorAll('[data-key]').forEach(el=>el.disabled=!state.control);
+}
+function save(){if(window.openai?.setWidgetState)window.openai.setWidgetState({modelContent:{...state},privateContent:null}).catch(()=>{});}
+root.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;
+if(b.dataset.screen){state.screen=b.dataset.screen;render();save();}
+if(b.dataset.open){state.agent=b.dataset.open;state.screen='terminal';root.querySelector('.rm-terminal-command').textContent='❯ '+(state.agent==='Claude Code'?'claude':state.agent==='Codex'?'codex':'zsh');render();save();}
+if(b.dataset.action==='new'){state.screen='new';render();save();}
+if(b.dataset.action==='control'){state.control=!state.control;render();save();}
+if(b.dataset.key)root.querySelector('#rm-terminal-caption').textContent='Демо: натиснуто '+b.dataset.key;
+if(b.dataset.answer){const result=root.querySelector('#rm-approval-result');result.hidden=false;result.textContent='Демо: '+b.dataset.answer;root.querySelectorAll('[data-answer]').forEach(x=>x.disabled=true);}
+});
+root.querySelector('#rm-terminal-form').addEventListener('submit',e=>{e.preventDefault();const input=root.querySelector('#rm-input');if(!input.value.trim())return;root.querySelector('#rm-terminal-last').textContent='❯ '+input.value;root.querySelector('#rm-terminal-caption').textContent='Демонстраційне введення · нічого не виконується';input.value='';});
+root.querySelector('#rm-chat-form').addEventListener('submit',e=>{e.preventDefault();const input=root.querySelector('#rm-chat-input');if(!input.value.trim())return;root.querySelector('#rm-chat-caption').textContent='Демо: повідомлення додано';root.querySelector('.rm-user-message').textContent=input.value;input.value='';});
+root.querySelector('#rm-new-form').addEventListener('submit',e=>{e.preventDefault();state.agent=root.querySelector('#rm-new-agent').value;state.screen='terminal';state.control=true;root.querySelector('.rm-terminal-command').textContent='❯ '+(state.agent==='Claude Code'?'claude':state.agent==='Codex'?'codex':'zsh');root.querySelector('#rm-terminal-caption').textContent='Демосесія · процес на Mac не запускався';render();save();});
+window.addEventListener('openai:set_globals',e=>{const s=e.detail?.globals?.widgetState?.modelContent;if(s&&['sessions','terminal','chat','new'].includes(s.screen)){state.screen=s.screen;state.control=!!s.control;if(['Claude Code','Codex','Shell'].includes(s.agent))state.agent=s.agent;render();}});
+render();
+})();
+</script>

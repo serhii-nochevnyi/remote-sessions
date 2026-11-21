@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="uk">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P0 · Реальні CLI через tmux</title>
+<style>
+body { background:#111820; color:#dce7ee; margin:24px; font:14px system-ui }
+h1 { font-size:22px } p { color:#adbac5 } select { padding:8px;background:#23303c;color:inherit;border:1px solid #465564;border-radius:6px }
+main { display:flex;flex-wrap:wrap;gap:20px } article { padding:14px;background:#18232e;border:1px solid #344451;border-radius:10px;overflow:auto }
+h2 { font-size:16px;margin:0 0 12px } .terminal { width:max-content }
+</style>
+<h1>P0 · Claude Code і Codex через tmux</h1>
+<p>Відтворення записаного PTY-потоку у xterm.js. Це докази тесту, не активні підключення.</p>
+<label>Етап <select id="stage"><option value="wide">120 × 32</option><option value="narrow">40 × 18</option><option value="restored">100 × 30</option><option value="reattached">Після перезапуску агента</option></select></label>
+<p id="status"></p><main></main>
+<script type="module">
+import { Terminal } from '@xterm/xterm';
+import '@xterm/xterm/css/xterm.css';
+let terminals=[];
+async function render() {
+ for(const term of terminals)term.dispose();terminals=[];
+ document.querySelector('main').replaceChildren();
+ const stage=document.querySelector('select').value;
+ for(const name of ['claude','codex']) {
+  const data=await fetch(`./captures/${name}-${stage}.json`).then(r=>{if(!r.ok)throw Error('Run the CLI test first');return r.json()});
+  const article=document.createElement('article'),heading=document.createElement('h2'),element=document.createElement('div');
+  heading.textContent=`${name==='claude'?'Claude Code':'Codex'} · ${data.cols} × ${data.rows}`;
+  article.append(heading,element);document.querySelector('main').append(article);
+  const term=new Terminal({cols:data.cols,rows:data.rows,fontSize:12,lineHeight:1.2,disableStdin:true,theme:{background:'#18232e'},allowProposedApi:true});
+  terminals.push(term);term.open(element);
+  await new Promise(resolve=>term.write(Uint8Array.from(atob(data.base64),c=>c.charCodeAt(0)),resolve));
+ }
+ document.querySelector('#status').textContent='Справжні записи · чернетка не надсилалася моделі';
+}
+document.querySelector('select').addEventListener('change',()=>render().catch(e=>document.querySelector('#status').textContent=e.message));
+render().catch(e=>document.querySelector('#status').textContent=e.message);
+</script>
+</html>

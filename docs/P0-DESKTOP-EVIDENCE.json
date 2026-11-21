@@ -1,0 +1,76 @@
+{
+  "date": "2026-11-21",
+  "before": {
+    "pid": 41648,
+    "instance": "237d4a3f20634db09bdf576a09eda4e5",
+    "sequence": 1211
+  },
+  "after": {
+    "pid": 41648,
+    "instance": "237d4a3f20634db09bdf576a09eda4e5",
+    "sequence": 1363
+  },
+  "health_after_restart": {
+    "result": "health",
+    "agent_pid": 46863,
+    "remote_execution_enabled": false
+  },
+  "runtimes_after": [
+    {
+      "session_id": "13d07897-4abb-4fc0-b7e8-3f2b1f7bc29f",
+      "runtime_id": "e2e64abb-6981-4b94-95b8-7f30df18dfc1",
+      "tmux_name": "rs_13d078974abb4fc0b7e83f2b1f7bc29f_e2e64abb69814b9495b87f30df18dfc1",
+      "pane_id": "%0",
+      "command": "Python",
+      "pane_pid": 41648,
+      "exited": false,
+      "width": 100,
+      "height": 30
+    },
+    {
+      "session_id": "d57f6de1-0baf-4bb1-a573-50b7ca41394d",
+      "runtime_id": "d6dfad9c-c23c-4ec0-b552-d51379e79b70",
+      "tmux_name": "rs_d57f6de10baf4bb1a57350b7ca41394d_d6dfad9cc23c4ec0b552d51379e79b70",
+      "pane_id": "%2",
+      "command": "codex",
+      "pane_pid": 41664,
+      "exited": false,
+      "width": 100,
+      "height": 30
+    },
+    {
+      "session_id": "d686062a-d5e3-410c-a90b-9cac0a550c03",
+      "runtime_id": "5eb0d405-612d-4432-91d7-1ac01245270b",
+      "tmux_name": "rs_d686062ad5e3410ca90b9cac0a550c03_5eb0d405612d443291d71ac01245270b",
+      "pane_id": "%1",
+      "command": "claude",
+      "pane_pid": 41655,
+      "exited": false,
+      "width": 100,
+      "height": 30
+    }
+  ],
+  "checks": [
+    "native GUI real PTY output",
+    "tab close/reopen same runtime and PID",
+    "manual reconnect",
+    "agent launchctl forced restart with advancing output",
+    "Rust bridge 3 attach/read/detach cycles"
+  ],
+  "interactive_input": {
+    "agent_pid_before": 70018,
+    "agent_pid_after": 72182,
+    "all_runtime_pids_unchanged": true,
+    "gui_checks": [
+      "exact Unicode paste plus Enter received by actual process, no negotiation/paste markers",
+      "Claude Code Down/Up selection changed and restored without accepting trust",
+      "Codex Unicode draft persisted across forced agent restart",
+      "typed additional character after reconnect",
+      "Ctrl-U cleared unsent test draft"
+    ],
+    "provider_prompts_submitted": 0,
+    "app_left_open": true,
+    "lab_left_running": true
+  },
+  "automated_input": "PASS make check-desktop: exclusive/expired/stale tokens, input sequencing, exact bytes and native bridge"
+}

@@ -1,0 +1,15 @@
+[package]
+name = "remote-sessions-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum = "0.8"
+tokio.workspace = true
+remote-sessions-protocol = { path = "../protocol" }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+serde_json.workspace = true
