@@ -28,4 +28,4 @@ Toolchain: Go 1.26.1, Node 24.21.0, npm 11.19.0, Rust 1.97.1. An isolated Rust t
 
 Native type checking is not an app launch, signed release build or physical-device test. The client only displays static samples and exposes build metadata. The server only provides loopback liveness. CI is a local template and has not run on a remote provider. No remote, commit, user service or deployment was created.
 
-Remaining P0 gates: tmux/service-lifetime proof, physical iPhone usability and lifecycle, and Go/Rust encryption/key-store interoperability. See [current state](../.planning/STATE.md).
+Remaining P0 gates: tmux/service-lifetime proof, physical iPhone usability and lifecycle, and Go/Rust encryption/key-store interoperability. See [current roadmap](ROADMAP.md).
