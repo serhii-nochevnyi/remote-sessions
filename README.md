@@ -10,7 +10,7 @@ P0 scaffold plus a **local desktop terminal and tmux runtime spike**. The Rust C
 
 The native React/Tauri app discovers real local sessions, opens tabs, streams terminal output and reconnects. Active views acquire exclusive, expiring host input leases for text, paste, Enter and arrow keys. Closing a view releases control and leaves the process alive. Pairing, relay and E2EE are not implemented. The server exposes only loopback liveness and advertises no remote capabilities.
 
-See [current progress](.planning/STATE.md), [runtime lab](docs/RUNTIME-LAB.md), [development setup](docs/DEVELOPMENT.md), and the [Rust decision](.planning/architecture/ADR-12-rust-runtime.md).
+See [development waves](docs/ROADMAP.md), [runtime lab](docs/RUNTIME-LAB.md), [development setup](docs/DEVELOPMENT.md), and the [Rust decision](docs/STACK.md).
 
 ## Stack
 
@@ -79,4 +79,4 @@ docs/planning/           Historical v0.2 architecture/plan/UI/mockups
 
 `docs/planning` remains the unchanged v0.2 snapshot. ADR-12 supersedes its Go stack and Go/Rust cryptographic interoperability requirement. The remaining session/ownership/encryption invariants still apply. Mockup HTML files are Codex visualization fragments, not standalone applications.
 
-Local Git remains on `main`, with no remote and no commits. Product name and `dev.remotesessions.app` remain development placeholders; choose a company-owned identifier before signing/pairing rollout.
+The private repository is [serhii-nochevnyi/remote-sessions](https://github.com/serhii-nochevnyi/remote-sessions). Development uses GitHub milestones/issues, feature branches and pull requests. Internal `.planning/` artifacts remain local; the reviewed roadmap is published in `docs/ROADMAP.md`. Product name and `dev.remotesessions.app` remain development placeholders; choose a company-owned identifier before signing/pairing rollout.
