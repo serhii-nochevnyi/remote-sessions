@@ -74,7 +74,21 @@ Relevant existing acceptance IDs: A01, A02, A04 (local ownership subset), A06 (a
 
 ## Wave 1 planning status
 
-The user selected vertical MVP slices (--mvp). Formal research is in progress against source baseline 91d9695. Technical decisions and executable tasks will be published after research and plan validation. GitHub Issues track accepted tasks; feature branches and PRs carry implementation changes. Private local workflow artifacts and receipts are not release source.
+All four Wave 1 research lines completed against baseline `91d9695`; durable receipts and materialized artifact digests were verified. The proposed [ADR-13](decisions/ADR-13-local-desktop-workflow.md) recommends SQLite-backed operation identity, a restricted native launch path and in-place owner resize. The storage/recovery choice awaits the user; no accepted W1 ADR, executable ticket set or validated dependency graph is claimed yet.
+
+After acceptance: typed MVP researcher/planner/checker → graph validation → reviewed task set → GitHub Issues. Detailed internal planning artifacts and receipts remain local. Published architecture and acceptance documents remain reviewable here.
+
+The private [repository](https://github.com/serhii-nochevnyi/remote-sessions), seven [wave milestones](https://github.com/serhii-nochevnyi/remote-sessions/milestones), branches and PR workflow are user-authorized. Jira is not this project's tracker. No feature implementation or automatic merge permission follows from this planning PR.
+
+## Research implications for W1
+
+- Current create can spawn before its reply succeeds (`crates/host-agent/src/engine.rs`); persist request identity and reconcile exact reserved IDs before any retry. SQLite cannot include the external tmux action in its transaction.
+- Native create must receive only workspace/profile IDs; the host checks actual service access and installed provider environment (`apps/client/src-tauri/src/lib.rs`, `scripts/runtime_lab.py`). Internal and accessible KINGSTON project paths need explicit native acceptance.
+- Current terminal geometry is part of the React key (`apps/client/src/App.tsx`); remove it from connection identity and coordinate tmux, PTY and xterm dimensions under the owner lease.
+- The bounded viewer channel currently blocks when full (`crates/desktop-bridge/src/lib.rs`). Prove runtime/healthy-view progress with a stalled observer and fresh-redraw recovery. Cover fragmented query, focus and large Unicode paste behavior as well.
+- Shared host/native/frontend files make creation and resize poor candidates for simultaneous unrestricted edits. Plans must sequence the shared boundaries and give every slice executable acceptance.
+
+The research freshly passed six frontend tests. Earlier native/launchd/real-provider reports remain historical; none prove the proposed W1 flows. W1 needs dedicated crash/resize/pressure tests and logged-in Mac evidence for both providers, separate from P0 reports. Initial clean-checkout CI exposed documentation links into local planning; this PR repairs them. Full core/native CI passed on the first PR revision.
 
 ## Scheduling and external inputs
 
