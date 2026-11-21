@@ -80,3 +80,5 @@ docs/planning/           Historical v0.2 architecture/plan/UI/mockups
 `docs/planning` remains the unchanged v0.2 snapshot. ADR-12 supersedes its Go stack and Go/Rust cryptographic interoperability requirement. The remaining session/ownership/encryption invariants still apply. Mockup HTML files are Codex visualization fragments, not standalone applications.
 
 The private repository is [serhii-nochevnyi/remote-sessions](https://github.com/serhii-nochevnyi/remote-sessions). Development uses GitHub milestones/issues, feature branches and pull requests. Internal `.planning/` artifacts remain local; the reviewed roadmap is published in `docs/ROADMAP.md`. Product name and `dev.remotesessions.app` remain development placeholders; choose a company-owned identifier before signing/pairing rollout.
+
+Detailed next-wave delivery: [W1 implementation plan](docs/W1-PLAN.md) and [GitHub milestone](https://github.com/serhii-nochevnyi/remote-sessions/milestone/1).

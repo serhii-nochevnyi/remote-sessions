@@ -47,7 +47,7 @@ The old P0–P5 names are scope categories, not a second execution schedule: W1 
 
 ## Wave 1 intended scope
 
-Outcome: create and use a session entirely from the Mac interface. Detailed technical choices remain subject to INV-001 and its accepted ADR.
+Outcome: create and use a session entirely from the Mac interface. Technical choices are fixed in accepted [ADR-13](decisions/ADR-13-local-desktop-workflow.md); the checked [W1 delivery plan](W1-PLAN.md) defines implementation order and acceptance.
 
 - Native folder picker with cancel semantics; bounded, typed workspace identity; project path/name shown before launch.
 - Host-resolved Claude/Codex profiles with readiness errors; provider authentication and approval/sandbox defaults remain on the Mac.
@@ -74,9 +74,9 @@ Relevant existing acceptance IDs: A01, A02, A04 (local ownership subset), A06 (a
 
 ## Wave 1 planning status
 
-All four Wave 1 research lines completed against baseline `91d9695`; durable receipts and materialized artifact digests were verified. The user accepted [ADR-13](decisions/ADR-13-local-desktop-workflow.md) on 2026-11-21, selecting SQLite-backed operation identity, a restricted native launch path and in-place owner resize. Gate 1 passed. Formal MVP decomposition is in progress; no executable ticket set or validated dependency graph is claimed yet.
+All four Wave 1 research lines completed against baseline `91d9695`; durable receipts and materialized artifact digests were verified. The user accepted [ADR-13](decisions/ADR-13-local-desktop-workflow.md) on 2026-11-21, selecting SQLite-backed operation identity, a restricted native launch path and in-place owner resize. Gate 1 passed. Formal MVP decomposition passed the independent typed checker with no findings. Gate 2 generated nine tickets in eight execution waves; all 12 accepted requirements and 20 task validation rows are covered. Implementation is pending.
 
-Next: typed MVP researcher/planner/checker → graph validation → reviewed task set → GitHub Issues. Detailed internal planning artifacts and receipts remain local. Published architecture and acceptance documents remain reviewable here.
+See the [W1 delivery plan](W1-PLAN.md) for the nine linked GitHub Issues, dependency graph, planned branches, review rules and acceptance evidence. Next: implement T-01-01 (workspace picker and provider readiness). Detailed internal planning artifacts and receipts remain local. All merges are manual; current-head review is required.
 
 The private [repository](https://github.com/serhii-nochevnyi/remote-sessions), seven [wave milestones](https://github.com/serhii-nochevnyi/remote-sessions/milestones), branches and PR workflow are user-authorized. Jira is not this project's tracker. No feature implementation or automatic merge permission follows from this planning PR.
 
