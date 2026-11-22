@@ -3,7 +3,8 @@
 
 Build with make build-runtime and npm run tauri -- build --debug --bundles app.
 Start python3 scripts/desktop_lab.py up --w1, then run this script with --report
-and an owner-approved, accessible --kingston directory under /Volumes/KINGSTON.
+and an owner-approved, accessible --kingston parent under /Volumes/KINGSTON.
+Each run creates and retains a disposable workspace under that parent.
 Use the printed app commands in a second terminal. Quit each app when prompted.
 Use normal provider-controlled login/trust and submit zero model prompts.
 Finish with python3 scripts/desktop_lab.py down --w1.
@@ -892,6 +893,14 @@ def workspace_on_kingston(path):
     return folder
 
 
+def prepare_kingston_workspace(report, path):
+    root = workspace_on_kingston(path)
+    folder = root / ('KINGSTON Проба ' + uuid4().hex)
+    folder.mkdir(mode=0o700)
+    report['kingston'] = path_identity(folder)
+    return folder
+
+
 def run_recovery(report, kingston):
     require(sys.platform == 'darwin' and sys.stdin.isatty(), 'Use a logged-in Mac Terminal for this procedure')
     lab = W1Record(W1_MANIFEST)
@@ -924,11 +933,10 @@ def run_recovery(report, kingston):
     print('Use the indicated app in each case. Quit other Remote Sessions windows first. '
           'Follow normal provider login and trust prompts and submit zero model prompts.')
     if kingston is None:
-        kingston = input('Enter an owner-approved accessible KINGSTON directory, or Enter to skip. ').strip()
+        kingston = input('Enter an owner-approved KINGSTON parent for a new workspace, or Enter to skip. ').strip()
     if kingston:
         try:
-            kingston = workspace_on_kingston(kingston)
-            report['kingston'] = path_identity(kingston)
+            kingston = prepare_kingston_workspace(report, kingston)
         except (OSError, ValueError) as error:
             report['kingston'] = {'issue': str(error)}
             kingston = None
@@ -984,7 +992,7 @@ def report_path(value):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--report', type=Path, required=True, help='New private JSON report path')
-    parser.add_argument('--kingston', type=Path, help='Owner-approved directory on /Volumes/KINGSTON')
+    parser.add_argument('--kingston', type=Path, help='Owner-approved parent for a new workspace on /Volumes/KINGSTON')
     args = parser.parse_args()
     try:
         path = report_path(args.report)

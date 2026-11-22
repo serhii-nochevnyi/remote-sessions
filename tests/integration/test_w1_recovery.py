@@ -22,7 +22,8 @@ sys.path.insert(0, str(ROOT / 'scripts'))
 import desktop_lab
 import runtime_lab
 from w1_recovery import (CASE_CHECKS, ResponseLoss, Verdict, read_frame,
-                         case_status, catalog_snapshot, pane, request_frame, response_state)
+                         case_status, catalog_snapshot, pane, prepare_kingston_workspace,
+                         request_frame, response_state)
 
 
 class ManifestTests(unittest.TestCase):
@@ -264,6 +265,31 @@ class LossTests(unittest.TestCase):
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_repeated_kingston_runs_create_distinct_reported_workspaces(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            existing = root / 'owner file'
+            existing.write_text('keep', encoding='utf-8')
+            first_report, second_report = {}, {}
+            with patch('w1_recovery.workspace_on_kingston', return_value=root):
+                first = prepare_kingston_workspace(first_report, root)
+                (first / 'prior run').touch()
+                second = prepare_kingston_workspace(second_report, root)
+
+            self.assertNotEqual(first, second)
+            self.assertEqual(existing.read_text(encoding='utf-8'), 'keep')
+            self.assertTrue((first / 'prior run').is_file())
+            self.assertEqual(list(second.iterdir()), [])
+            for folder, report in ((first, first_report), (second, second_report)):
+                self.assertEqual(folder.parent, root)
+                self.assertIn(' ', folder.name)
+                self.assertFalse(folder.name.isascii())
+                metadata = folder.stat()
+                self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o700)
+                self.assertEqual(report['kingston'], {
+                    'path': str(folder), 'inode': metadata.st_ino, 'device': metadata.st_dev,
+                })
+
     def test_catalog_snapshot_decodes_the_persisted_profile(self):
         with tempfile.TemporaryDirectory() as directory:
             catalog = Path(directory).resolve()
