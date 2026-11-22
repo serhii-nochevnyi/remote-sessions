@@ -1,4 +1,5 @@
 //! In-memory local writer leases. Restart revokes every token; runtime lifetime is independent.
+use crate::model::{ResizeEpoch, TerminalView};
 use anyhow::{Result, ensure};
 use std::{
     collections::HashMap,
@@ -11,6 +12,9 @@ struct Lease {
     token: Uuid,
     deadline: Instant,
     next_sequence: u64,
+    next_resize: u64,
+    terminal: Option<TerminalView>,
+    epoch: Option<ResizeEpoch>,
 }
 #[derive(Default)]
 pub struct Ownership {
@@ -20,12 +24,31 @@ impl Ownership {
     pub fn revoke(&mut self, runtime: Uuid) {
         self.leases.remove(&runtime);
     }
-    pub fn acquire(&mut self, runtime: Uuid, now: Instant) -> Result<Uuid> {
-        self.leases.retain(|_, lease| lease.deadline > now);
+    pub fn unowned(&self, runtime: Uuid, now: Instant) -> Result<()> {
         ensure!(
-            !self.leases.contains_key(&runtime),
+            !self
+                .leases
+                .get(&runtime)
+                .is_some_and(|lease| lease.deadline > now),
             "Інший клієнт уже керує цією сесією"
         );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn acquire(&mut self, runtime: Uuid, now: Instant) -> Result<Uuid> {
+        self.grant(runtime, None, None, now)
+    }
+
+    pub fn grant(
+        &mut self,
+        runtime: Uuid,
+        terminal: Option<TerminalView>,
+        epoch: Option<ResizeEpoch>,
+        now: Instant,
+    ) -> Result<Uuid> {
+        self.unowned(runtime, now)?;
+        self.leases.retain(|_, lease| lease.deadline > now);
         let token = Uuid::new_v4();
         self.leases.insert(
             runtime,
@@ -33,9 +56,37 @@ impl Ownership {
                 token,
                 deadline: now + TTL,
                 next_sequence: 0,
+                next_resize: 0,
+                terminal,
+                epoch,
             },
         );
         Ok(token)
+    }
+    pub fn resize(
+        &mut self,
+        terminal: &TerminalView,
+        token: Uuid,
+        epoch: ResizeEpoch,
+        sequence: u64,
+        now: Instant,
+    ) -> Result<()> {
+        let lease = self
+            .leases
+            .get_mut(&terminal.target.runtime_id)
+            .ok_or_else(|| anyhow::anyhow!("Керування втрачено"))?;
+        ensure!(
+            lease.token == token
+                && lease.deadline > now
+                && lease.terminal.as_ref() == Some(terminal)
+                && lease.epoch == Some(epoch),
+            "Resize authority changed"
+        );
+        ensure!(lease.next_resize == sequence, "Resize sequence rejected");
+        lease.next_resize = sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("Resize sequence exhausted"))?;
+        Ok(())
     }
     pub fn renew(&mut self, runtime: Uuid, token: Uuid, now: Instant) -> Result<()> {
         let lease = self
@@ -61,6 +112,12 @@ impl Ownership {
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("Input sequence exhausted"))?;
         Ok(())
+    }
+    pub fn terminal(&self, runtime: Uuid, token: Uuid) -> Option<TerminalView> {
+        self.leases
+            .get(&runtime)
+            .filter(|lease| lease.token == token)
+            .and_then(|lease| lease.terminal.clone())
     }
     pub fn release(&mut self, runtime: Uuid, token: Uuid) {
         if self

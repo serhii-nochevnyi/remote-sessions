@@ -6,8 +6,10 @@ fn scaffold_status() -> remote_sessions_core::Status {
 #[cfg(target_os = "macos")]
 mod desktop {
     use remote_sessions_desktop_bridge::{
-        Attachment, Chunk, CreateSubmission, DesktopBridge, Inventory, LocalCreateStatus,
-        ProductIssue, ProviderProfile, WorkspaceReadiness, WorkspaceSelection,
+        Attachment, Chunk, CreateSubmission, DesktopBridge, GeometryEvent, GridAcknowledgement,
+        Inventory, LocalCreateStatus, ProductIssue, ProviderProfile, ResizeEpoch, ResizeResult,
+        TerminalSize, TerminalStatus, WorkspaceReadiness, WorkspaceSelection,
+        encode_local_observation, encode_renderer_observation,
     };
     use tauri::{State, WebviewWindow, async_runtime};
     use tauri_plugin_dialog::{DialogExt, FilePath};
@@ -113,7 +115,54 @@ mod desktop {
         view_id: String,
         bridge: State<'_, DesktopBridge>,
     ) -> Result<Chunk, String> {
-        bridge.read(&view_id).await.map_err(|e| e.to_string())
+        let chunk = bridge.read(&view_id).await.map_err(|e| e.to_string())?;
+        if resize_trace()
+            && let Some(status) = &chunk.status
+            && status.committed.revision > 0
+            && let Ok(line) = encode_local_observation(status)
+        {
+            eprintln!("RS_W1_RESIZE_PROVIDER {line}");
+        }
+        Ok(chunk)
+    }
+    #[tauri::command]
+    pub async fn terminal_status(
+        view_id: String,
+        bridge: State<'_, DesktopBridge>,
+    ) -> Result<TerminalStatus, String> {
+        bridge.status(&view_id).await.map_err(|e| e.to_string())
+    }
+    #[tauri::command]
+    pub async fn terminal_resize(
+        view_id: String,
+        epoch: ResizeEpoch,
+        size: TerminalSize,
+        bridge: State<'_, DesktopBridge>,
+    ) -> Result<ResizeResult, String> {
+        bridge
+            .resize(&view_id, size, epoch)
+            .await
+            .map_err(|e| e.to_string())
+    }
+    #[tauri::command]
+    pub async fn terminal_acknowledge_grid(
+        view_id: String,
+        acknowledgement: GridAcknowledgement,
+        bridge: State<'_, DesktopBridge>,
+    ) -> Result<GeometryEvent, String> {
+        let event = bridge
+            .acknowledge_grid(&view_id, acknowledgement)
+            .await
+            .map_err(|e| e.to_string())?;
+        if resize_trace()
+            && let Ok(line) = encode_renderer_observation(&event, acknowledgement)
+        {
+            eprintln!("RS_W1_RESIZE_GRID {line}");
+        }
+        Ok(event)
+    }
+    fn resize_trace() -> bool {
+        cfg!(debug_assertions) && std::env::var("RS_W1_RESIZE_TRACE").as_deref() == Ok("1")
     }
     #[tauri::command]
     pub async fn terminal_input(
@@ -167,6 +216,9 @@ pub fn run() {
                 desktop::local_create_status,
                 desktop::terminal_attach,
                 desktop::terminal_read,
+                desktop::terminal_status,
+                desktop::terminal_resize,
+                desktop::terminal_acknowledge_grid,
                 desktop::terminal_detach,
                 desktop::terminal_input
             ])

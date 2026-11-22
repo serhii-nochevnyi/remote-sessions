@@ -176,7 +176,7 @@ export default function App() {
         <button className="back-button" onClick={() => { focusRuntime.current = null; setViews(value => ({ ...value, active: null })); }}>← Усі сесії</button>
         {active ? <section ref={panel} id="session-panel" tabIndex={-1} className="session-panel" role="tabpanel" aria-labelledby={`tab-${active.runtime_id}`}>
           <div className="session-toolbar"><span>{runtimeTitle(active)}</span><span>{active.width} × {active.height}</span></div>
-          {online && current && !current.exited ? <TerminalView key={`${active.runtime_id}:${agentPid}:${current.width}:${current.height}`} runtimeId={active.runtime_id} epoch={agentPid} label={`Термінал ${runtimeTitle(active)}`} /> : <div className="empty-state"><h2>{!online ? "З’єднання перерване" : "Сесія завершена або недоступна"}</h2><p>{!online ? "Вкладка збережена. Підключимося автоматично, коли агент повернеться." : "Автоматичний повторний запуск процесу не виконується."}</p></div>}
+          {online && current && !current.exited ? <TerminalView key={`${active.runtime_id}:${agentPid}`} runtimeId={active.runtime_id} epoch={agentPid} label={`Термінал ${runtimeTitle(active)}`} /> : <div className="empty-state"><h2>{!online ? "З’єднання перерване" : "Сесія завершена або недоступна"}</h2><p>{!online ? "Вкладка збережена. Підключимося автоматично, коли агент повернеться." : "Автоматичний повторний запуск процесу не виконується."}</p></div>}
         </section> : <div className="empty-state"><h2>Відкрий сесію зі списку</h2><p>{isTauri() ? "Наявні сесії можна переглядати у вкладках." : "Браузерний перегляд не має доступу до локальних процесів."}</p></div>}
         <footer><span>{message}</span></footer>
       </main>

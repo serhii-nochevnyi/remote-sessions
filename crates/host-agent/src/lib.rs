@@ -30,6 +30,16 @@ use tokio::{
 
 pub use catalog::{initialize_catalog, product_catalog_directory};
 
+#[doc(hidden)]
+pub fn encode_local_observation(value: &impl Serialize) -> Result<String> {
+    Ok(serde_json::to_string(value)?)
+}
+
+#[doc(hidden)]
+pub fn decode_local_fixture<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    Ok(serde_json::from_slice(bytes)?)
+}
+
 const REQUEST_LIMIT: usize = 65_536;
 const RESPONSE_LIMIT: usize = 1_048_576;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -203,7 +213,8 @@ pub async fn serve_catalog_fixture(
 
 async fn dispatch(
     bytes: &[u8],
-    engine: &Mutex<Engine>,
+    engine: &Engine,
+    creations: &Mutex<()>,
     catalog: Option<&CatalogLane>,
 ) -> Result<Vec<u8>> {
     if serde_json::from_slice::<serde_json::Value>(bytes)?
@@ -221,15 +232,15 @@ async fn dispatch(
                         reservation,
                     },
                 ) => {
+                    let _creation = creations.lock().await;
                     let state = engine
-                        .lock()
-                        .await
                         .create(lane, key, workspace_id, profile, reservation)
                         .await;
                     ProductResponse::Create { state }
                 }
                 (Some(lane), ProductRequest::CreateStatus { key }) => {
-                    let state = engine.lock().await.create_status(lane, key).await;
+                    let _creation = creations.lock().await;
+                    let state = engine.create_status(lane, key).await;
                     ProductResponse::Create { state }
                 }
                 (Some(lane), product) => lane.call(product).await,
@@ -244,12 +255,15 @@ async fn dispatch(
         return Ok(serde_json::to_vec(&ProductEnvelope { product })?);
     }
     let request = serde_json::from_slice::<Request>(bytes)?;
-    let mut engine = engine.lock().await;
     let response = match request {
         Request::List {} => Response::Runtimes {
             runtimes: engine.inventory(catalog).await?,
         },
-        request => engine.handle(request).await?,
+        request @ Request::Create { .. } => {
+            let _creation = creations.lock().await;
+            engine.handle(request, catalog).await?
+        }
+        request => engine.handle(request, catalog).await?,
     };
     Ok(serde_json::to_vec(&response)?)
 }
@@ -262,11 +276,8 @@ async fn serve_local(
     let guard = AgentLock::acquire(&directory)?;
     let listener = UnixListener::bind(&guard.socket)?;
     fs::set_permissions(&guard.socket, fs::Permissions::from_mode(0o600))?;
-    let engine = Arc::new(Mutex::new(Engine {
-        tmux,
-        socket: directory.join("tmux.sock"),
-        ownership: Default::default(),
-    }));
+    let engine = Arc::new(Engine::new(tmux, directory.join("tmux.sock")));
+    let creations = Arc::new(Mutex::new(()));
     let permits = Arc::new(Semaphore::new(16));
     let mut jobs = JoinSet::new();
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -281,12 +292,13 @@ async fn serve_local(
                 if !stream.peer_cred().is_ok_and(|peer| peer.uid() == geteuid().as_raw()) { continue; }
                 let Ok(permit) = permits.clone().try_acquire_owned() else { continue; };
                 let engine = engine.clone();
+                let creations = creations.clone();
                 let catalog = catalog.clone();
                 jobs.spawn(async move {
                     let _permit = permit;
                     let result: Result<Vec<u8>> = async {
                         let bytes = read_frame(&mut stream, REQUEST_LIMIT).await?;
-                        dispatch(&bytes, &engine, catalog.as_ref()).await
+                        dispatch(&bytes, &engine, &creations, catalog.as_ref()).await
                     }.await;
                     let response = result.or_else(|error| serde_json::to_vec(&Response::Error { message: error.to_string() }));
                     if let Ok(mut bytes) = response && bytes.len() < RESPONSE_LIMIT {

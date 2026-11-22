@@ -23,6 +23,22 @@ pub enum Request {
     Acquire {
         runtime_id: Uuid,
     },
+    OpenTerminal {
+        runtime_id: Uuid,
+        view_id: Uuid,
+    },
+    AcquireTerminal {
+        terminal: TerminalView,
+    },
+    TerminalStatus {
+        terminal: TerminalView,
+    },
+    ResizeTerminal {
+        terminal: TerminalView,
+        token: Uuid,
+        sequence: u64,
+        size: TerminalSize,
+    },
     Renew {
         runtime_id: Uuid,
         token: Uuid,
@@ -64,6 +80,103 @@ pub struct Runtime {
     pub operation_id: Option<Uuid>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalSize {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+impl TerminalSize {
+    pub fn supported(self) -> bool {
+        (2..=500).contains(&self.cols) && (2..=200).contains(&self.rows)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalTarget {
+    pub runtime_id: Uuid,
+    pub generation: Uuid,
+    pub session: String,
+    pub window: String,
+    pub pane: String,
+    pub pid: u32,
+    pub process_start: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalView {
+    pub target: TerminalTarget,
+    pub view_id: Uuid,
+    pub agent_epoch: Uuid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResizeEpoch {
+    pub agent: Uuid,
+    pub owner: Uuid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResizeIntent {
+    pub epoch: ResizeEpoch,
+    pub id: Uuid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommittedGeometry {
+    pub size: TerminalSize,
+    pub revision: u64,
+    pub intent: Option<ResizeIntent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderSample {
+    pub size: TerminalSize,
+    pub sampled_at_us: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationState {
+    Pending,
+    Observed,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalStatus {
+    pub terminal: TerminalView,
+    pub epoch: Option<ResizeEpoch>,
+    pub committed: CommittedGeometry,
+    pub provider: Option<ProviderSample>,
+    pub observation: ObservationState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ResizeResult {
+    Committed {
+        admission: ResizeIntent,
+        status: TerminalStatus,
+    },
+    Rejected {
+        terminal: TerminalView,
+        intent: ResizeIntent,
+    },
+    Uncertain {
+        terminal: TerminalView,
+        intent: ResizeIntent,
+    },
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeOrigin {
@@ -93,6 +206,20 @@ pub enum Response {
     },
     Control {
         token: Uuid,
+    },
+    TerminalOpened {
+        status: TerminalStatus,
+    },
+    TerminalControl {
+        token: Uuid,
+        epoch: ResizeEpoch,
+    },
+    TerminalStatus {
+        status: TerminalStatus,
+    },
+    TerminalChanged {},
+    Resize {
+        resize: ResizeResult,
     },
     Accepted {},
     Stopped {

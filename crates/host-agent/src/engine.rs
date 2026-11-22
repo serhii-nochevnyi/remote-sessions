@@ -3,26 +3,64 @@ use crate::{
         CatalogLane, Operation, OperationStage, PaneIdentity, ServerGeneration, StoredOutcome,
     },
     model::{
-        CreateState, LaunchOutcome, PaneLiveness, ProductIssue, ProviderProfile, Request, Response,
-        Runtime, RuntimeOrigin, parse_name, tmux_name,
+        CommittedGeometry, CreateState, LaunchOutcome, ObservationState, PaneLiveness,
+        ProductIssue, ProviderProfile, ProviderSample, Request, ResizeEpoch, ResizeIntent,
+        ResizeResult, Response, Runtime, RuntimeOrigin, TerminalSize, TerminalStatus,
+        TerminalTarget, TerminalView, parse_name, tmux_name,
     },
     product_launch::{LAUNCH_COMMAND, LaunchGuard, NONCE_ENV, read_setup_fault, workspace_locator},
 };
 use anyhow::{Context, Result, bail, ensure};
 use std::{
+    collections::HashMap,
+    fs::{self, OpenOptions},
+    os::{
+        fd::AsRawFd,
+        unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
+    },
     path::{Path, PathBuf},
     process::Stdio,
-    time::{Duration, Instant},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{io::AsyncWriteExt, process::Command};
 use uuid::Uuid;
 
 pub struct Engine {
-    pub tmux: PathBuf,
-    pub socket: PathBuf,
-    pub ownership: crate::ownership::Ownership,
+    tmux: PathBuf,
+    socket: PathBuf,
+    agent_epoch: Uuid,
+    ownership: Mutex<crate::ownership::Ownership>,
+    lanes: Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<ResizeLane>>>>,
 }
 
+#[derive(Default)]
+struct ResizeLane {
+    confirmed: Option<(TerminalTarget, ResizeEpoch)>,
+    reconcile: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GeometryReadback {
+    target: TerminalTarget,
+    server: ServerGeneration,
+    name: String,
+    nonce: String,
+    tty: PathBuf,
+    epoch: Option<ResizeEpoch>,
+    committed: CommittedGeometry,
+}
+
+const EPOCH_OPTION: &str = "@rs_resize_epoch";
+const INTENT_OPTION: &str = "@rs_resize_intent";
+const GEOMETRY_FORMAT: &str = concat!(
+    "#{pid}|#{start_time}|#{@rs_create_generation}|#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}|",
+    "#{session_name}|#{window_index}|#{pane_index}|#{@rs_create_nonce}|#{pane_dead}|",
+    "#{session_windows}|#{window_panes}|#{window-size}|#{pane_tty}|",
+    "#{pane_width}|#{pane_height}|#{window_width}|#{window_height}|",
+    "#{@rs_resize_epoch}|#{@rs_resize_intent}"
+);
+const MAX_REVISION: u64 = (1 << 53) - 1;
 const GENERATION_OPTION: &str = "@rs_create_generation";
 const GENERATION_FORMAT: &str = "#{pid}|#{start_time}|#{@rs_create_generation}";
 const PANE_OPTION: &str = "@rs_create_nonce";
@@ -95,11 +133,255 @@ fn tmux_word(value: &str) -> String {
     format!("\"{escaped}\"")
 }
 
+fn parse_uuid(value: &str) -> Result<Uuid> {
+    let id = Uuid::parse_str(value)?;
+    ensure!(
+        !id.is_nil() && id.to_string() == value,
+        "Invalid epoch or intent"
+    );
+    Ok(id)
+}
+
+fn epoch_text(epoch: Option<ResizeEpoch>) -> String {
+    epoch.map_or_else(String::new, |epoch| {
+        format!("{}:{}", epoch.agent, epoch.owner)
+    })
+}
+
+fn parse_epoch(value: &str) -> Result<Option<ResizeEpoch>> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let (agent, owner) = value.split_once(':').context("Malformed engine epoch")?;
+    Ok(Some(ResizeEpoch {
+        agent: parse_uuid(agent)?,
+        owner: parse_uuid(owner)?,
+    }))
+}
+
+fn intent_text(committed: CommittedGeometry) -> String {
+    committed.intent.map_or_else(String::new, |intent| {
+        format!(
+            "{}:{}:{}:{}:{}",
+            epoch_text(Some(intent.epoch)),
+            intent.id,
+            committed.revision,
+            committed.size.cols,
+            committed.size.rows
+        )
+    })
+}
+
+fn parse_committed(marker: &str, size: TerminalSize) -> Result<CommittedGeometry> {
+    if marker.is_empty() {
+        return Ok(CommittedGeometry {
+            size,
+            revision: 0,
+            intent: None,
+        });
+    }
+    let mut parts = marker.rsplitn(5, ':');
+    let rows: u16 = parts.next().context("Missing intent rows")?.parse()?;
+    let cols: u16 = parts.next().context("Missing intent columns")?.parse()?;
+    let revision = parts.next().context("Missing intent revision")?.parse()?;
+    let id = parse_uuid(parts.next().context("Missing intent ID")?)?;
+    let epoch = parse_epoch(parts.next().context("Missing intent epoch")?)?
+        .context("Missing intent epoch")?;
+    ensure!(
+        size == (TerminalSize { cols, rows }) && (1..=MAX_REVISION).contains(&revision),
+        "Intent marker does not match the virtual grid"
+    );
+    let committed = CommittedGeometry {
+        size,
+        revision,
+        intent: Some(ResizeIntent { epoch, id }),
+    };
+    ensure!(intent_text(committed) == marker, "Malformed intent marker");
+    Ok(committed)
+}
+
+fn format_equal(field: &str, value: impl std::fmt::Display) -> String {
+    format!("#{{==:#{{{field}}},{value}}}")
+}
+
+fn format_all(predicates: impl IntoIterator<Item = String>) -> String {
+    fn combine(values: &[String]) -> String {
+        if let [value] = values {
+            return value.clone();
+        }
+        let (left, right) = values.split_at(values.len() / 2);
+        format!("#{{&&:{},{}}}", combine(left), combine(right))
+    }
+    let values: Vec<_> = predicates.into_iter().collect();
+    assert!(!values.is_empty());
+    combine(&values)
+}
+
+impl GeometryReadback {
+    fn guard(&self, predecessor: Option<ResizeEpoch>) -> String {
+        format_all([
+            format_equal("pid", self.server.pid),
+            format_equal("start_time", self.server.start),
+            format_equal(GENERATION_OPTION, self.target.generation),
+            format_equal("session_name", &self.name),
+            format_equal("session_id", &self.target.session),
+            format_equal("window_id", &self.target.window),
+            format_equal("pane_id", &self.target.pane),
+            format_equal("pane_pid", self.target.pid),
+            format_equal("pane_tty", self.tty.display()),
+            format_equal(PANE_OPTION, &self.nonce),
+            format_equal("session_windows", 1),
+            format_equal("window_panes", 1),
+            format_equal("pane_dead", 0),
+            format_equal("window-size", "manual"),
+            format_equal("after-set-option", ""),
+            format_equal("after-resize-window", ""),
+            format_equal("after-display-message", ""),
+            format_equal("command-error", ""),
+            format_equal(EPOCH_OPTION, epoch_text(predecessor)),
+        ])
+    }
+
+    fn status(&self, terminal: TerminalView, provider: Option<ProviderSample>) -> TerminalStatus {
+        let observation = match provider {
+            Some(sample) if sample.size == self.committed.size => ObservationState::Observed,
+            Some(_) => ObservationState::Pending,
+            None => ObservationState::Unavailable,
+        };
+        TerminalStatus {
+            terminal,
+            epoch: self.epoch,
+            committed: self.committed,
+            provider,
+            observation,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn process_start(pid: u32) -> Result<u64> {
+    use nix::libc;
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let length = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    let read = unsafe {
+        libc::proc_pidinfo(
+            i32::try_from(pid)?,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            length,
+        )
+    };
+    ensure!(read == length, "Process identity unavailable");
+    let info = unsafe { info.assume_init() };
+    ensure!(
+        info.pbi_pid == pid && info.pbi_start_tvsec > 0,
+        "Process identity changed"
+    );
+    Ok(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+}
+
+#[cfg(target_os = "linux")]
+fn process_start(pid: u32) -> Result<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let (_, fields) = stat
+        .rsplit_once(") ")
+        .context("Process identity unavailable")?;
+    Ok(fields
+        .split_whitespace()
+        .nth(19)
+        .context("Missing process start")?
+        .parse()?)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_start(_: u32) -> Result<u64> {
+    bail!("Process identity unavailable on this platform")
+}
+
+fn tty_identity(metadata: &fs::Metadata) -> Result<(u64, u64, u64)> {
+    ensure!(
+        metadata.file_type().is_char_device() && metadata.uid() == nix::unistd::geteuid().as_raw(),
+        "Unexpected provider terminal device"
+    );
+    Ok((metadata.dev(), metadata.ino(), metadata.rdev()))
+}
+
+fn sample_tty(path: &Path) -> Result<(ProviderSample, (u64, u64, u64))> {
+    use nix::libc;
+    let tty = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)?;
+    let identity = tty_identity(&tty.metadata()?)?;
+    let mut size = std::mem::MaybeUninit::<libc::winsize>::uninit();
+    let result = unsafe { libc::ioctl(tty.as_raw_fd(), libc::TIOCGWINSZ, size.as_mut_ptr()) };
+    let sampled_at_us = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros())?;
+    if result == -1 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let size = unsafe { size.assume_init() };
+    let size = TerminalSize {
+        cols: size.ws_col,
+        rows: size.ws_row,
+    };
+    ensure!(size.supported(), "Provider grid outside supported range");
+    Ok((
+        ProviderSample {
+            size,
+            sampled_at_us,
+        },
+        identity,
+    ))
+}
+
+#[doc(hidden)]
+pub fn set_local_pty_nonblocking(fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result<()> {
+    use nix::libc;
+    let fd = fd.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 impl Engine {
+    pub(crate) fn new(tmux: PathBuf, socket: PathBuf) -> Self {
+        Self {
+            tmux,
+            socket,
+            agent_epoch: Uuid::new_v4(),
+            ownership: Mutex::default(),
+            lanes: Mutex::default(),
+        }
+    }
+
+    fn owners(&self) -> std::sync::MutexGuard<'_, crate::ownership::Ownership> {
+        self.ownership.lock().expect("ownership state poisoned")
+    }
+
+    fn lane(&self, runtime: Uuid) -> Arc<tokio::sync::Mutex<ResizeLane>> {
+        self.lanes
+            .lock()
+            .expect("runtime lanes poisoned")
+            .entry(runtime)
+            .or_default()
+            .clone()
+    }
+
     async fn command(&self, args: &[&str]) -> Result<String> {
+        self.bounded_command(args, Duration::from_secs(3)).await
+    }
+
+    async fn geometry_command(&self, args: &[&str]) -> Result<String> {
+        self.bounded_command(args, Duration::from_millis(650)).await
+    }
+
+    async fn bounded_command(&self, args: &[&str], wait: Duration) -> Result<String> {
         // Never start tmux here: its lifetime belongs to a separate launchd job.
         let output = tokio::time::timeout(
-            Duration::from_secs(3),
+            wait,
             Command::new(&self.tmux)
                 .args(["-N", "-S"])
                 .arg(&self.socket)
@@ -336,7 +618,7 @@ impl Engine {
     }
 
     pub(crate) async fn create(
-        &mut self,
+        &self,
         catalog: &CatalogLane,
         key: Uuid,
         workspace_id: Uuid,
@@ -606,6 +888,350 @@ impl Engine {
         Ok(runtimes)
     }
 
+    async fn geometry(&self, runtime_id: Uuid, pane: &str) -> Result<GeometryReadback> {
+        let output = self
+            .geometry_command(&["display-message", "-p", "-t", pane, GEOMETRY_FORMAT])
+            .await?;
+        let mut lines = output.lines();
+        let fields: Vec<_> = lines
+            .next()
+            .context("Missing terminal target")?
+            .split('|')
+            .collect();
+        ensure!(
+            lines.next().is_none() && fields.len() == 22,
+            "Invalid terminal metadata"
+        );
+        let server = generation(&fields[..3].join("|")).context("Invalid terminal generation")?;
+        let identity = pane_identity(&fields[3..7]).context("Invalid terminal pane")?;
+        ensure!(
+            parse_name(fields[7]).is_some_and(|(_, id)| id == runtime_id)
+                && fields[8..10] == ["0", "0"]
+                && fields[11..15] == ["0", "1", "1", "manual"],
+            "Terminal target changed or is unsupported"
+        );
+        let stamp = fields[10];
+        if !stamp.is_empty() {
+            let (nonce, ids) = stamp
+                .split_once(':')
+                .context("Invalid terminal launch stamp")?;
+            parse_uuid(nonce)?;
+            let parsed: Vec<_> = ids.split(':').collect();
+            ensure!(
+                pane_identity(&parsed) == Some(identity.clone()),
+                "Terminal launch stamp changed"
+            );
+        }
+        let tty = fields[15];
+        ensure!(
+            (tty.strip_prefix("/dev/ttys")
+                .or_else(|| tty.strip_prefix("/dev/pts/")))
+            .is_some_and(
+                |suffix| !suffix.is_empty() && suffix.bytes().all(|c| c.is_ascii_alphanumeric())
+            ),
+            "Unsupported terminal device"
+        );
+        let size = TerminalSize {
+            cols: fields[16].parse()?,
+            rows: fields[17].parse()?,
+        };
+        ensure!(
+            size.supported()
+                && size.cols == fields[18].parse::<u16>()?
+                && size.rows == fields[19].parse::<u16>()?,
+            "Window and pane grids disagree or are unsupported"
+        );
+        let target = TerminalTarget {
+            runtime_id,
+            generation: server.token,
+            session: identity.session,
+            window: identity.window,
+            pane: identity.pane,
+            pid: identity.pid,
+            process_start: process_start(identity.pid)?,
+        };
+        let epoch = parse_epoch(fields[20])?;
+        let committed = parse_committed(fields[21], size)?;
+        ensure!(
+            committed.intent.is_none() || epoch.is_some(),
+            "Resize intent has no engine epoch"
+        );
+        Ok(GeometryReadback {
+            target,
+            server,
+            name: fields[7].to_owned(),
+            nonce: stamp.to_owned(),
+            tty: tty.into(),
+            epoch,
+            committed,
+        })
+    }
+
+    async fn geometry_for_runtime(
+        &self,
+        runtime: &Runtime,
+        catalog: Option<&CatalogLane>,
+    ) -> Result<GeometryReadback> {
+        let server = self.generation().await?;
+        let read = self.geometry(runtime.runtime_id, &runtime.pane_id).await?;
+        ensure!(
+            !runtime.exited
+                && Some(read.target.pid) == runtime.pane_pid
+                && read.server == server
+                && read.name == runtime.tmux_name,
+            "Terminal identity changed"
+        );
+        let id = runtime.runtime_id;
+        let operations = match catalog {
+            Some(lane) => match lane.run(move |db, _| db.by_runtime(&[id])).await {
+                Ok(operations) => operations,
+                Err(_) if read.nonce.is_empty() => Vec::new(),
+                Err(issue) => bail!("Managed terminal catalog unavailable: {issue:?}"),
+            },
+            None => Vec::new(),
+        };
+        if let Some(operation) = operations.first() {
+            let OperationStage::Finished(StoredOutcome::Launched { identity, .. }) =
+                &operation.stage
+            else {
+                bail!("Managed launch is unconfirmed");
+            };
+            let observed = self.observe(operation).await?;
+            ensure!(
+                observed.identity == *identity
+                    && read.server == operation.generation
+                    && (
+                        identity.session.as_str(),
+                        identity.window.as_str(),
+                        identity.pane.as_str(),
+                        identity.pid
+                    ) == (
+                        read.target.session.as_str(),
+                        read.target.window.as_str(),
+                        read.target.pane.as_str(),
+                        read.target.pid
+                    ),
+                "Managed terminal identity changed"
+            );
+        } else {
+            ensure!(read.nonce.is_empty(), "Managed terminal is uncorroborated");
+        }
+        Ok(read)
+    }
+
+    async fn scoped_geometry(&self, terminal: &TerminalView) -> Result<GeometryReadback> {
+        ensure!(
+            terminal.agent_epoch == self.agent_epoch && !terminal.view_id.is_nil(),
+            "Terminal view changed"
+        );
+        let read = self
+            .geometry(terminal.target.runtime_id, &terminal.target.pane)
+            .await?;
+        ensure!(read.target == terminal.target, "Terminal target changed");
+        Ok(read)
+    }
+
+    async fn sample_provider(&self, before: &GeometryReadback) -> Result<ProviderSample> {
+        let (sample, device) = sample_tty(&before.tty)?;
+        let after = self
+            .geometry(before.target.runtime_id, &before.target.pane)
+            .await?;
+        ensure!(
+            *before == after && tty_identity(&fs::symlink_metadata(&after.tty)?)? == device,
+            "Provider sample lost its target identity"
+        );
+        Ok(sample)
+    }
+
+    async fn rotate_epoch(
+        &self,
+        from: &GeometryReadback,
+        successor: ResizeEpoch,
+    ) -> Result<GeometryReadback> {
+        let conditional_absence = if from.epoch.is_none() { "-o " } else { "" };
+        let branch = format!(
+            "set-option -p {conditional_absence}-t {} {EPOCH_OPTION} {} ; display-message -p rs-fenced",
+            from.target.pane,
+            epoch_text(Some(successor))
+        );
+        let reply = self
+            .geometry_command(&[
+                "if-shell",
+                "-F",
+                "-t",
+                &from.target.pane,
+                &from.guard(from.epoch),
+                &branch,
+            ])
+            .await?;
+        ensure!(
+            reply.trim_end() == "rs-fenced",
+            "Engine epoch predecessor changed"
+        );
+        let after = self
+            .geometry(from.target.runtime_id, &from.target.pane)
+            .await?;
+        ensure!(
+            after.target == from.target && after.epoch == Some(successor) && after.tty == from.tty,
+            "Engine epoch transition is unconfirmed"
+        );
+        Ok(after)
+    }
+
+    async fn acquire_terminal(
+        &self,
+        runtime_id: Uuid,
+        terminal: Option<TerminalView>,
+        catalog: Option<&CatalogLane>,
+    ) -> Result<Response> {
+        self.owners().unowned(runtime_id, Instant::now())?;
+        let read = match &terminal {
+            Some(terminal) => self.scoped_geometry(terminal).await?,
+            None => {
+                self.geometry_for_runtime(&self.find(runtime_id).await?, catalog)
+                    .await?
+            }
+        };
+        let lane = self.lane(runtime_id);
+        let mut lane = lane.try_lock().context("Terminal mutation in progress")?;
+        self.owners().unowned(runtime_id, Instant::now())?;
+        let recover = lane.reconcile
+            || lane
+                .confirmed
+                .as_ref()
+                .is_none_or(|(target, _)| *target != read.target);
+        if !recover && lane.confirmed.as_ref().map(|(_, epoch)| *epoch) != read.epoch {
+            lane.reconcile = true;
+            bail!("Engine epoch changed and must be reconciled");
+        }
+        lane.reconcile = true;
+        let epoch = ResizeEpoch {
+            agent: self.agent_epoch,
+            owner: Uuid::new_v4(),
+        };
+        let after = self.rotate_epoch(&read, epoch).await?;
+        self.sample_provider(&after).await?;
+        let native = terminal.is_some();
+        let token = self
+            .owners()
+            .grant(runtime_id, terminal, Some(epoch), Instant::now())?;
+        lane.confirmed = Some((after.target, epoch));
+        lane.reconcile = false;
+        if native {
+            Ok(Response::TerminalControl { token, epoch })
+        } else {
+            Ok(Response::Control { token })
+        }
+    }
+
+    async fn commit_geometry(
+        &self,
+        read: &GeometryReadback,
+        committed: CommittedGeometry,
+    ) -> Result<Option<GeometryReadback>> {
+        let marker = intent_text(committed);
+        let guard = format_all([
+            read.guard(read.epoch),
+            format_equal(INTENT_OPTION, intent_text(read.committed)),
+            format_equal("window_width", read.committed.size.cols),
+            format_equal("window_height", read.committed.size.rows),
+        ]);
+        // @invariant: The selected branch reaches resize and the correlated write in one non-yielding queue turn.
+        let branch = format!(
+            "resize-window -t {} -x {} -y {} ; set-option -p -t {} {INTENT_OPTION} {} ; display-message -p rs-committed",
+            read.target.window, committed.size.cols, committed.size.rows, read.target.pane, marker
+        );
+        let reply = self
+            .geometry_command(&["if-shell", "-F", "-t", &read.target.pane, &guard, &branch])
+            .await?;
+        if reply.is_empty() {
+            return Ok(None);
+        }
+        ensure!(
+            reply.trim_end() == "rs-committed",
+            "Engine resize receipt is unconfirmed"
+        );
+        let after = self
+            .geometry(read.target.runtime_id, &read.target.pane)
+            .await?;
+        ensure!(
+            after.target == read.target
+                && after.epoch == read.epoch
+                && after.tty == read.tty
+                && after.committed == committed,
+            "Engine resize intent is unconfirmed"
+        );
+        Ok(Some(after))
+    }
+
+    async fn resize_terminal(
+        &self,
+        terminal: TerminalView,
+        token: Uuid,
+        sequence: u64,
+        size: TerminalSize,
+    ) -> Result<Response> {
+        ensure!(
+            size.supported(),
+            "Terminal proposal outside supported range"
+        );
+        let runtime_id = terminal.target.runtime_id;
+        let lane = self
+            .lanes
+            .lock()
+            .expect("runtime lanes poisoned")
+            .get(&runtime_id)
+            .cloned()
+            .context("Resize authority unavailable")?;
+        let mut lane = lane.try_lock().context("Terminal mutation in progress")?;
+        let read = self.scoped_geometry(&terminal).await?;
+        let epoch = read.epoch.context("Engine epoch unavailable")?;
+        ensure!(
+            !lane.reconcile
+                && lane
+                    .confirmed
+                    .as_ref()
+                    .is_some_and(
+                        |(target, confirmed)| *target == read.target && *confirmed == epoch
+                    ),
+            "Resize authority unavailable"
+        );
+        let revision = read.committed.revision + 1;
+        ensure!(revision <= MAX_REVISION, "Terminal revision exhausted");
+        self.owners()
+            .resize(&terminal, token, epoch, sequence, Instant::now())?;
+        lane.reconcile = true;
+        let intent = ResizeIntent {
+            epoch,
+            id: Uuid::new_v4(),
+        };
+        let committed = CommittedGeometry {
+            size,
+            revision,
+            intent: Some(intent),
+        };
+        let resize = match self.commit_geometry(&read, committed).await {
+            Ok(Some(after)) => {
+                lane.reconcile = false;
+                let mut status = after.status(terminal, None);
+                status.observation = ObservationState::Pending;
+                ResizeResult::Committed {
+                    admission: intent,
+                    status,
+                }
+            }
+            Ok(None) => {
+                self.owners().release(runtime_id, token);
+                ResizeResult::Rejected { terminal, intent }
+            }
+            Err(_) => {
+                self.owners().release(runtime_id, token);
+                ResizeResult::Uncertain { terminal, intent }
+            }
+        };
+        Ok(Response::Resize { resize })
+    }
+
     async fn find(&self, id: Uuid) -> Result<Runtime> {
         self.list()
             .await?
@@ -614,7 +1240,11 @@ impl Engine {
             .context("managed runtime not found; it may have ended with the tmux service")
     }
 
-    pub async fn handle(&mut self, request: Request) -> Result<Response> {
+    pub(crate) async fn handle(
+        &self,
+        request: Request,
+        catalog: Option<&CatalogLane>,
+    ) -> Result<Response> {
         match request {
             Request::Health {} => Ok(Response::Health {
                 agent_pid: std::process::id(),
@@ -641,7 +1271,7 @@ impl Engine {
                         .any(|r| r.runtime_id == runtime_id || r.session_id == session_id),
                     "session/runtime already exists; reconcile instead of retrying creation"
                 );
-                self.ownership.revoke(runtime_id);
+                self.owners().revoke(runtime_id);
                 let cwd = cwd.canonicalize()?;
                 let name = tmux_name(session_id, runtime_id);
                 // More than one command argument makes tmux use direct exec, not sh -c.
@@ -691,17 +1321,57 @@ impl Engine {
                 })
             }
             Request::Acquire { runtime_id } => {
-                ensure!(!self.find(runtime_id).await?.exited, "Runtime has exited");
-                Ok(Response::Control {
-                    token: self.ownership.acquire(runtime_id, Instant::now())?,
+                self.acquire_terminal(runtime_id, None, catalog).await
+            }
+            Request::OpenTerminal {
+                runtime_id,
+                view_id,
+            } => {
+                ensure!(!view_id.is_nil(), "Invalid terminal view");
+                let read = self
+                    .geometry_for_runtime(&self.find(runtime_id).await?, catalog)
+                    .await?;
+                let terminal = TerminalView {
+                    target: read.target.clone(),
+                    agent_epoch: self.agent_epoch,
+                    view_id,
+                };
+                let sample = self.sample_provider(&read).await.ok();
+                Ok(Response::TerminalOpened {
+                    status: read.status(terminal, sample),
                 })
             }
+            Request::AcquireTerminal { terminal } => {
+                self.acquire_terminal(terminal.target.runtime_id, Some(terminal), catalog)
+                    .await
+            }
+            Request::TerminalStatus { terminal } => {
+                if terminal.agent_epoch != self.agent_epoch {
+                    return Ok(Response::TerminalChanged {});
+                }
+                let read = self
+                    .geometry(terminal.target.runtime_id, &terminal.target.pane)
+                    .await?;
+                if read.target != terminal.target || terminal.view_id.is_nil() {
+                    return Ok(Response::TerminalChanged {});
+                }
+                let sample = self.sample_provider(&read).await.ok();
+                Ok(Response::TerminalStatus {
+                    status: read.status(terminal, sample),
+                })
+            }
+            Request::ResizeTerminal {
+                terminal,
+                token,
+                sequence,
+                size,
+            } => self.resize_terminal(terminal, token, sequence, size).await,
             Request::Renew { runtime_id, token } => {
-                self.ownership.renew(runtime_id, token, Instant::now())?;
+                self.owners().renew(runtime_id, token, Instant::now())?;
                 Ok(Response::Accepted {})
             }
             Request::Release { runtime_id, token } => {
-                self.ownership.release(runtime_id, token);
+                self.owners().release(runtime_id, token);
                 Ok(Response::Accepted {})
             }
             Request::Input {
@@ -715,9 +1385,19 @@ impl Engine {
                     !data.is_empty() && data.len() <= 4096,
                     "Input must contain 1..4096 bytes"
                 );
+                let lane = self.lane(runtime_id);
+                let _mutation = lane.lock().await;
                 let runtime = self.find(runtime_id).await?;
                 ensure!(!runtime.exited, "Runtime has exited");
-                self.ownership
+                if let Some(terminal) = self.owners().terminal(runtime_id, token) {
+                    ensure!(
+                        runtime.pane_id == terminal.target.pane
+                            && runtime.pane_pid == Some(terminal.target.pid)
+                            && process_start(terminal.target.pid)? == terminal.target.process_start,
+                        "Input target changed"
+                    );
+                }
+                self.owners()
                     .input(runtime_id, token, sequence, Instant::now())?;
                 // Hex arguments cannot become tmux keys, command separators or shell code.
                 let target = format!("={}:0.0", runtime.tmux_name);
@@ -764,13 +1444,15 @@ impl Engine {
                 runtime_id,
                 expected_pane_id,
             } => {
+                let lane = self.lane(runtime_id);
+                let _mutation = lane.lock().await;
                 let runtime = self.find(runtime_id).await?;
                 ensure!(
                     runtime.pane_id == expected_pane_id,
                     "runtime precondition failed"
                 );
                 let target = format!("={}", runtime.tmux_name);
-                self.ownership.revoke(runtime_id);
+                self.owners().revoke(runtime_id);
                 self.command(&["kill-session", "-t", &target]).await?;
                 Ok(Response::Stopped { runtime_id })
             }
@@ -824,3 +1506,7 @@ mod tests {
         assert!(validate_launch(Path::new("/tmp"), &["/bin/sh".into(), "-i".into()]).is_ok());
     }
 }
+
+#[cfg(test)]
+#[path = "w1_resize_tests.rs"]
+mod w1_resize_tests;
