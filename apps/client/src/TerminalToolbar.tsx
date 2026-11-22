@@ -16,6 +16,7 @@ interface TerminalToolbarProps {
 export function TerminalToolbar({ title, fontSize, expanded, nativeWindow, onZoom, onExpand, onReturnFocus }: TerminalToolbarProps) {
   const [fullscreen, setFullscreen] = useState(false);
   const [changing, setChanging] = useState(false);
+  const [readFailed, setReadFailed] = useState(false);
   const [error, setError] = useState("");
   const pending = useRef(false);
 
@@ -28,11 +29,12 @@ export function TerminalToolbar({ title, fontSize, expanded, nativeWindow, onZoo
       const read = ++revision;
       try {
         const actual = await localClient.windowFullscreen();
-        if (!disposed && !pending.current && read === revision) setFullscreen(actual);
-      } catch {
         if (!disposed && !pending.current && read === revision) {
-          setError(value => value || "Не вдалося визначити стан повноекранного режиму.");
+          setFullscreen(actual);
+          setReadFailed(false);
         }
+      } catch {
+        if (!disposed && !pending.current && read === revision) setReadFailed(true);
       }
     }
     function refreshSoon() {
@@ -74,7 +76,8 @@ export function TerminalToolbar({ title, fontSize, expanded, nativeWindow, onZoo
     }
   }
 
-  if (!title && !fullscreen) return null;
+  const fullscreenError = error || (readFailed ? "Не вдалося визначити стан повноекранного режиму." : "");
+  if (!title && !fullscreen && !changing && !fullscreenError) return null;
 
   return <div className="session-toolbar" role="group" aria-label="Вигляд термінала">
     {title && <span>{title}</span>}
@@ -95,6 +98,6 @@ export function TerminalToolbar({ title, fontSize, expanded, nativeWindow, onZoo
         {changing ? "Змінюємо режим вікна…" : fullscreen ? "Вийти з повноекранного режиму" : "Повноекранний режим"}
       </button>}
     </div>
-    {error && <span className="fullscreen-error" role="status">{error}</span>}
+    {fullscreenError && <span className="fullscreen-error" role="status">{fullscreenError}</span>}
   </div>;
 }

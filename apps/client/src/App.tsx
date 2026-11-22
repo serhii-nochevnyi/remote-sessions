@@ -218,7 +218,7 @@ export default function App() {
             nativeWindow={canCreate} onZoom={zoom} onExpand={() => {
               setPreferences(value => ({ ...value, expanded: !value.expanded }));
               focusTerminal();
-            }} onReturnFocus={focusTerminal} />
+            }} onReturnFocus={activeId ? focusTerminal : focusSidebar} />
           {views.open.filter(id => id !== activeId).map(id =>
             <section key={id} id={`panel-${id}`} hidden role="tabpanel" aria-labelledby={`tab-${id}`} />)}
           {activeId ? <section key={activeId} ref={panel} id={`panel-${activeId}`} tabIndex={-1} className="session-panel"

@@ -41,10 +41,10 @@ export function SessionTabs({ views, title, onFocusTab, onActivate, onMove, onCl
     onActivate(id);
   }
 
-  function navigate(event: KeyboardEvent<HTMLButtonElement>, id: string) {
+  function navigate(event: KeyboardEvent<HTMLDivElement>, id: string) {
     if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || event.nativeEvent.isComposing) return;
     const target = tabKey(views, id, event.key);
-    if (!target) return;
+    if (!target || (target.action === "activate" && event.target !== document.getElementById(`tab-${id}`))) return;
     event.preventDefault();
     if (target.action === "activate") activate(target.id);
     else focusTab(target.id);
@@ -73,10 +73,10 @@ export function SessionTabs({ views, title, onFocusTab, onActivate, onMove, onCl
       const name = title(id);
       const selected = views.active === id;
       const tabIndex = stop === id ? 0 : -1;
-      return <div className={`tab-wrap ${selected ? "selected" : ""}`} role="presentation" key={id}>
+      return <div className={`tab-wrap ${selected ? "selected" : ""}`} role="presentation" key={id}
+        onKeyDown={event => navigate(event, id)}>
         <button type="button" role="tab" id={`tab-${id}`} aria-selected={selected} aria-controls={`panel-${id}`}
-          tabIndex={tabIndex} onFocus={() => { setFocused(id); onFocusTab(); }} onClick={() => activate(id)}
-          onKeyDown={event => navigate(event, id)}>{name}</button>
+          tabIndex={tabIndex} onFocus={() => { setFocused(id); onFocusTab(); }} onClick={() => activate(id)}>{name}</button>
         <button type="button" className="tab-action" tabIndex={tabIndex} disabled={!adjacentView(views, id, -1)}
           aria-label={`Перемістити вкладку ${name} ліворуч`} title="Перемістити ліворуч"
           onMouseDown={keepPointerFocus} onClick={() => move(id, -1)}>←</button>

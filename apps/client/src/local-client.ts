@@ -380,7 +380,7 @@ export function selectCreatedRuntime(views: SessionViews, operation: LocalCreate
   if (handled.has(operation.reference) || (result.result !== "launched" && result.result !== "exited")) return views;
   const id = result.runtime.runtime_id;
   const next = openView(views, id, [id]);
-  return preserveActive && (views.active !== null || views.open.includes(id)) ? { ...next, active: views.active } : next;
+  return preserveActive && views.open.length > 0 ? { ...next, active: views.active } : next;
 }
 export const localClient = {
   inventory: async () => parseInventory(await invoke<unknown>("local_inventory")),

@@ -42,7 +42,7 @@ test("the actual reordered tabs and selection survive relaunch and delayed inven
   assert.deepEqual(loadPresentation(storage), restored);
 });
 
-test("a recovered create already present in saved order preserves a null selection", () => {
+test("create recovery preserves saved order and a null selection", () => {
   const restored = parsePresentation({ ...record, active: null });
   assert.ok(restored);
   const operation: LocalCreate = {
@@ -53,6 +53,10 @@ test("a recovered create already present in saved order preserves a null selecti
     },
   };
   assert.deepEqual(selectCreatedRuntime(restored.views, operation, new Set(), true), restored.views);
+  const otherTabs = { open: [c, a], active: null };
+  assert.deepEqual(selectCreatedRuntime(otherTabs, operation, new Set(), true), restored.views);
+  assert.deepEqual(selectCreatedRuntime(defaults.views, operation, new Set(), true), { open: [b], active: b });
+  assert.deepEqual(selectCreatedRuntime(otherTabs, operation, new Set()), { open: [c, a, b], active: b });
 });
 
 test("version, shape, UUID membership, duplicate identity and font bounds are validated", () => {
