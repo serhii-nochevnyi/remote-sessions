@@ -81,8 +81,7 @@ fn pane_identity(fields: &[&str]) -> Option<PaneIdentity> {
     })
 }
 
-// These words are parsed by tmux inside its format-only condition. Escaped
-// bytes are data even when the path contains tmux syntax or shell metacharacters.
+// @security: Escape argument bytes so tmux parses path syntax and metacharacters as data.
 fn tmux_word(value: &str) -> String {
     let escaped: String = value
         .bytes()
@@ -180,7 +179,7 @@ impl Engine {
             return generation(output.trim_end()).context("invalid tmux generation token");
         }
         let token = Uuid::new_v4();
-        // The whole test and token installation run on the same server.
+        // @invariant: The tmux server checks its identity and the empty token before setting the token.
         let guard = format!("#{{&&:#{{==:#{{pid}},{pid}}},#{{==:#{{start_time}},{start}}}}}");
         let guard = format!("#{{&&:{guard},#{{==:#{{{GENERATION_OPTION}}},}}}}");
         let set = format!("set-option -s {GENERATION_OPTION} {token}");
@@ -316,7 +315,7 @@ impl Engine {
         let name = &operation.target;
         let pane_target = format!("={name}:0.0");
         let nonce = operation.nonce;
-        // -c is itself a tmux format. Escape every literal hash before quoting.
+        // @security: Double literal hashes to prevent tmux format expansion in the working directory.
         let cwd = tmux_word(&cwd.replace('#', "##"));
         let launcher = tmux_word(launcher);
         let profile = operation.profile.executable_name();
@@ -459,8 +458,7 @@ impl Engine {
             }
             return Self::fail_reserved(catalog, key, runtime_id, issue).await;
         }
-        // The transaction must acknowledge its commit to this caller before a
-        // tmux client can be started. A lost commit acknowledgement never sends.
+        // @invariant: Only the caller with an acknowledged durable marker write may dispatch the spawn.
         match catalog.run(move |db, _| db.mark(key, runtime_id)).await {
             Ok(true) => {}
             Ok(false) => return unknown(None),
@@ -588,7 +586,7 @@ impl Engine {
             if !ids.is_empty()
                 && let Ok(operations) = catalog.run(move |db, _| db.by_runtime(&ids)).await
             {
-                // A storage or verification fault leaves the tmux inventory available.
+                // @contract: Catalog or identity faults leave the underlying tmux inventory visible.
                 for operation in operations {
                     if let OperationStage::Finished(StoredOutcome::Launched { identity, .. }) =
                         &operation.stage

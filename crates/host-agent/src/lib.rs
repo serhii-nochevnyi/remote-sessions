@@ -185,7 +185,6 @@ pub async fn serve_with_catalog(directory: PathBuf, tmux: PathBuf, catalog: Path
     serve_local(directory, tmux, Some(lane)).await
 }
 
-/// Runs the same dispatcher and SQLite ledger in an isolated development fixture.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub async fn serve_catalog_fixture(

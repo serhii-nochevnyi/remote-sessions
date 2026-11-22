@@ -278,7 +278,7 @@ async fn w1_create_concurrent_equal_keys_finalize_once_and_preserve_original_res
             setup_issue: None,
         }
     );
-    // Replaced pane evidence affects the current observation without rewriting history.
+    // @contract: A replaced pane changes current liveness and preserves the stored launch outcome.
     fixture.set(&format!("{}.pane", runtime.tmux_name), "$1|@1|%9|309\n");
     assert_eq!(
         fixture.status(key).await,
@@ -379,7 +379,7 @@ async fn w1_create_uncertain_marker_ack_and_after_marker_before_send_are_status_
     let job = fixture.serve(lane.clone()).await;
     let workspace = fixture.register().await;
     let (key, id) = fixture.reserve(&lane, workspace).await;
-    // Simulate a durable commit followed by loss of the worker's acknowledgement.
+    // @invariant: A committed marker blocks redispatch even when its acknowledgement is lost.
     let timed_out = lane
         .run(move |db, _| {
             assert!(db.mark(key, id)?);

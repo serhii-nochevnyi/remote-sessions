@@ -250,7 +250,6 @@ fn private_file(file: &File, directory: &Path) -> Result<()> {
 
 fn options() -> OpenOptions {
     let mut options = OpenOptions::new();
-    // Symlink rejection is also checked against the directory entry after open.
     options.mode(0o600);
     options
 }
@@ -327,7 +326,7 @@ impl Store {
 
     fn write(&self, pending: &Pending) -> Result<()> {
         let destination = self.record_path(pending.reference);
-        // Never replace unreadable evidence.
+        // @invariant: Preserve unreadable records as evidence of a possible prior submission.
         match fs::symlink_metadata(&destination) {
             Ok(_) => {
                 let saved = self.read(pending.reference)?;
@@ -474,7 +473,7 @@ impl DesktopBridge {
         {
             Ok(response) => response_state(response),
             Err(CreateDeliveryError::BeforeSend) if first_send => {
-                // An unavailable connection proves this first submission never wrote a request.
+                // @invariant: Reset to fresh only when the first attempt could not write a request.
                 operation.submission = Submission::Fresh;
                 let saved = Store::open(directory).and_then(|store| store.write(&operation));
                 let disposition = if saved.is_ok() {
@@ -660,7 +659,7 @@ mod tests {
             let one = Store::open(directory).unwrap().list().unwrap().0.remove(0);
             assert_eq!(one.submission, Submission::Sent);
             assert!(create_one.contains(&one.key.to_string()));
-            drop(initial); // No bytes of a reply.
+            drop(initial);
 
             let (mut status, _) = listener.accept().await.unwrap();
             assert!(frame(&mut status).await.contains(&one.key.to_string()));

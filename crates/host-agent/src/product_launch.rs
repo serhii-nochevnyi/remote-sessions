@@ -181,7 +181,7 @@ pub(crate) fn read_setup_fault(directory: &Path, nonce: Uuid) -> Option<ProductI
     ProductIssue::decode(&issue)
 }
 
-/// Internal tmux child entry point. Only a fixed provider can be executed.
+// @security: The tmux child can exec only a fixed provider after validating its launch guard.
 #[doc(hidden)]
 pub fn managed_launch_argument(args: &[std::ffi::OsString]) -> Option<anyhow::Result<()>> {
     if args.first()? != LAUNCH_COMMAND {
