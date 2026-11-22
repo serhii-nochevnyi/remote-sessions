@@ -6,8 +6,8 @@ fn scaffold_status() -> remote_sessions_core::Status {
 #[cfg(target_os = "macos")]
 mod desktop {
     use remote_sessions_desktop_bridge::{
-        Attachment, Chunk, DesktopBridge, Inventory, ProductIssue, ProviderProfile,
-        WorkspaceReadiness, WorkspaceSelection,
+        Attachment, Chunk, CreateSubmission, DesktopBridge, Inventory, LocalCreateStatus,
+        ProductIssue, ProviderProfile, WorkspaceReadiness, WorkspaceSelection,
     };
     use tauri::{State, WebviewWindow, async_runtime};
     use tauri_plugin_dialog::{DialogExt, FilePath};
@@ -52,6 +52,37 @@ mod desktop {
             .pick_workspace(picked)
             .await
             .map_err(|_| "Не вдалося підтвердити папку в локальному агенті.".into())
+    }
+
+    #[tauri::command]
+    pub async fn local_create_session(
+        workspace_id: String,
+        profile: ProviderProfile,
+        separate_from: Option<String>,
+        continue_reference: Option<String>,
+        bridge: State<'_, DesktopBridge>,
+    ) -> Result<CreateSubmission, String> {
+        Ok(bridge
+            .create_session(
+                &workspace_id,
+                profile,
+                separate_from.as_deref(),
+                continue_reference.as_deref(),
+            )
+            .await)
+    }
+
+    #[tauri::command]
+    pub async fn local_create_status(
+        reference: Option<String>,
+        presented: Option<bool>,
+        bridge: State<'_, DesktopBridge>,
+    ) -> Result<LocalCreateStatus, String> {
+        if presented == Some(true) {
+            let reference = reference.as_deref().ok_or("Не вказано запис створення.")?;
+            return Ok(bridge.acknowledge_create(reference).await);
+        }
+        Ok(bridge.create_status(reference.as_deref()).await)
     }
 
     #[tauri::command]
@@ -132,6 +163,8 @@ pub fn run() {
                 desktop::local_inventory,
                 desktop::local_pick_workspace,
                 desktop::local_workspace_readiness,
+                desktop::local_create_session,
+                desktop::local_create_status,
                 desktop::terminal_attach,
                 desktop::terminal_read,
                 desktop::terminal_detach,

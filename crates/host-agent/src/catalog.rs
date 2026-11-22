@@ -1,10 +1,14 @@
 use crate::{
-    model::{ProductIssue, ProductRequest, ProductResponse, WorkspaceDisplay},
-    product_launch::{ServiceProfiles, WorkspaceIdentity, resolve_workspace},
+    model::{
+        LaunchOutcome, ProductIssue, ProductRequest, ProductResponse, ProviderProfile,
+        WorkspaceDisplay, tmux_name,
+    },
+    product_launch::{PreparedLaunch, ServiceProfiles, WorkspaceIdentity, resolve_workspace},
 };
 use anyhow::{Context, Result as AnyResult, ensure};
 use nix::{libc, unistd::geteuid};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     fs::{self, DirBuilder, File, OpenOptions},
     io::{self, Read, Write},
@@ -16,7 +20,7 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 const APPLICATION_ID: i32 = 0x5253_4341;
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 const BUSY_TIMEOUT_MS: u32 = 100;
 const PRODUCT_TIMEOUT: Duration = Duration::from_secs(2);
 const DB: &str = "catalog.sqlite3";
@@ -36,6 +40,27 @@ const WORKSPACE_SCHEMA: &str = "CREATE TABLE workspaces (
     device BLOB NOT NULL CHECK (length(device) = 8),
     inode BLOB NOT NULL CHECK (length(inode) = 8),
     UNIQUE (locator, canonical, device, inode)
+) STRICT";
+const SESSION_SCHEMA: &str = "CREATE TABLE sessions (
+    id TEXT PRIMARY KEY NOT NULL,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id)
+) STRICT";
+const ATTEMPT_SCHEMA: &str = "CREATE TABLE runtime_attempts (
+    id TEXT PRIMARY KEY NOT NULL,
+    session_id TEXT NOT NULL UNIQUE REFERENCES sessions(id),
+    target TEXT NOT NULL UNIQUE,
+    nonce TEXT NOT NULL UNIQUE,
+    generation TEXT NOT NULL,
+    policy TEXT NOT NULL
+) STRICT";
+const OPERATION_SCHEMA: &str = "CREATE TABLE create_operations (
+    key TEXT PRIMARY KEY NOT NULL,
+    id TEXT NOT NULL UNIQUE,
+    runtime_id TEXT NOT NULL UNIQUE REFERENCES runtime_attempts(id),
+    profile TEXT NOT NULL,
+    stage TEXT NOT NULL CHECK (stage IN ('reserved', 'marked', 'finished')),
+    outcome TEXT,
+    CHECK ((stage = 'finished') = (outcome IS NOT NULL))
 ) STRICT";
 
 type CatalogResult<T> = Result<T, ProductIssue>;
@@ -181,6 +206,19 @@ impl CatalogFiles {
         if self.db != current.db || self.record != current.record {
             return Err(ProductIssue::CatalogUnsafe);
         }
+        let mut db = file_options()
+            .read(true)
+            .open(dir.join(DB))
+            .map_err(storage_error)?;
+        if private_file(&db.metadata().map_err(storage_error)?)? != self.db {
+            return Err(ProductIssue::CatalogUnsafe);
+        }
+        let mut header = [0; 16];
+        db.read_exact(&mut header)
+            .map_err(|_| ProductIssue::CatalogUnavailable)?;
+        if &header != b"SQLite format 3\0" {
+            return Err(ProductIssue::CatalogUnavailable);
+        }
         Ok(())
     }
 
@@ -282,6 +320,7 @@ pub(crate) fn provision(dir: &Path) -> CatalogResult<()> {
         )
         .map_err(database_error)?;
     migrate_to_v1(&transaction)?;
+    migrate_to_v2(&transaction)?;
     transaction.commit().map_err(database_error)?;
 
     let mut record = file_options()
@@ -356,14 +395,22 @@ fn validate_schema(connection: &Connection, version: i32) -> CatalogResult<()> {
         .map_err(database_error)?
         .collect::<rusqlite::Result<_>>()
         .map_err(database_error)?;
-    let expected = [
-        ("catalog_meta", META_SCHEMA),
-        ("workspaces", WORKSPACE_SCHEMA),
-    ];
+    let mut expected = vec![("catalog_meta", META_SCHEMA)];
+    if version >= 1 {
+        expected.push(("workspaces", WORKSPACE_SCHEMA));
+    }
+    if version >= 2 {
+        expected.extend([
+            ("create_operations", OPERATION_SCHEMA),
+            ("runtime_attempts", ATTEMPT_SCHEMA),
+            ("sessions", SESSION_SCHEMA),
+        ]);
+    }
+    expected.sort_unstable_by_key(|(name, _)| *name);
     if !actual
         .iter()
         .map(|(name, sql)| (name.as_str(), sql.as_str()))
-        .eq(expected.into_iter().take(version as usize + 1))
+        .eq(expected)
     {
         return Err(ProductIssue::CatalogUnsupported);
     }
@@ -375,8 +422,135 @@ fn migrate_to_v1(connection: &Connection) -> CatalogResult<()> {
         .execute_batch(WORKSPACE_SCHEMA)
         .map_err(database_error)?;
     connection
-        .pragma_update(None, "user_version", SCHEMA_VERSION)
+        .pragma_update(None, "user_version", 1)
         .map_err(database_error)
+}
+
+fn migrate_to_v2(connection: &Connection) -> CatalogResult<()> {
+    for schema in [SESSION_SCHEMA, ATTEMPT_SCHEMA, OPERATION_SCHEMA] {
+        connection.execute_batch(schema).map_err(database_error)?;
+    }
+    connection
+        .pragma_update(None, "user_version", 2)
+        .map_err(database_error)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ServerGeneration {
+    pub pid: u32,
+    pub start: u64,
+    pub token: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PaneIdentity {
+    pub session: String,
+    pub window: String,
+    pub pane: String,
+    pub pid: u32,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum StoredOutcome {
+    Failed(ProductIssue),
+    Launched {
+        identity: PaneIdentity,
+        outcome: Box<LaunchOutcome>,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OperationStage {
+    Reserved,
+    Marked,
+    Finished(StoredOutcome),
+}
+
+#[derive(Debug)]
+pub(crate) struct Operation {
+    pub key: Uuid,
+    pub id: Uuid,
+    pub workspace_id: Uuid,
+    pub profile: ProviderProfile,
+    pub session_id: Uuid,
+    pub runtime_id: Uuid,
+    pub target: String,
+    pub nonce: Uuid,
+    pub generation: ServerGeneration,
+    pub locator: String,
+    pub policy: PreparedLaunch,
+    pub stage: OperationStage,
+}
+
+const OPERATION_QUERY: &str = "SELECT o.key, o.id, s.workspace_id, o.profile, s.id, a.id,
+    a.target, a.nonce, a.generation, w.locator, a.policy, o.stage, o.outcome
+    FROM create_operations o JOIN runtime_attempts a ON a.id = o.runtime_id
+    JOIN sessions s ON s.id = a.session_id JOIN workspaces w ON w.id = s.workspace_id";
+
+fn json<T: Serialize>(value: &T) -> CatalogResult<String> {
+    serde_json::to_string(value).map_err(|_| ProductIssue::CatalogUnavailable)
+}
+
+fn read_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Operation> {
+    fn invalid(
+        index: usize,
+        error: impl std::error::Error + Send + Sync + 'static,
+    ) -> rusqlite::Error {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    }
+    fn uuid(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Uuid> {
+        Uuid::try_parse(&row.get::<_, String>(index)?).map_err(|error| invalid(index, error))
+    }
+    fn decode<T: DeserializeOwned>(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<T> {
+        serde_json::from_str(&row.get::<_, String>(index)?).map_err(|error| invalid(index, error))
+    }
+    let session_id = uuid(row, 4)?;
+    let runtime_id = uuid(row, 5)?;
+    let target: String = row.get(6)?;
+    if target != tmux_name(session_id, runtime_id) {
+        return Err(invalid(6, io::Error::other("invalid reserved tmux target")));
+    }
+    let operation = Operation {
+        key: uuid(row, 0)?,
+        id: uuid(row, 1)?,
+        workspace_id: uuid(row, 2)?,
+        profile: decode(row, 3)?,
+        session_id,
+        runtime_id,
+        target,
+        nonce: uuid(row, 7)?,
+        generation: decode(row, 8)?,
+        locator: row.get(9)?,
+        policy: decode(row, 10)?,
+        stage: match row.get::<_, String>(11)?.as_str() {
+            "reserved" => OperationStage::Reserved,
+            "marked" => OperationStage::Marked,
+            "finished" => OperationStage::Finished(decode(row, 12)?),
+            _ => return Err(invalid(11, io::Error::other("invalid launch stage"))),
+        },
+    };
+    if let OperationStage::Finished(StoredOutcome::Launched { identity, outcome }) =
+        &operation.stage
+    {
+        let runtime = &outcome.runtime;
+        if (runtime.session_id, runtime.runtime_id) != (operation.session_id, operation.runtime_id)
+            || runtime.tmux_name != operation.target
+            || runtime.pane_id != identity.pane
+            || runtime.pane_pid != Some(identity.pid)
+            || runtime.workspace_id != Some(operation.workspace_id)
+            || runtime.operation_id != Some(operation.id)
+        {
+            return Err(invalid(
+                12,
+                io::Error::other("outcome identity differs from reservation"),
+            ));
+        }
+    }
+    Ok(operation)
 }
 
 pub(crate) struct Catalog {
@@ -387,6 +561,11 @@ pub(crate) struct Catalog {
 }
 
 impl Catalog {
+    #[cfg(test)]
+    pub(crate) fn connection_for_test(&self) -> &Connection {
+        &self.connection
+    }
+
     fn open(dir: &Path) -> CatalogResult<Self> {
         let lock = CatalogLock::acquire(dir, false)?;
         let files = CatalogFiles::inspect(dir)?;
@@ -418,11 +597,14 @@ impl Catalog {
             return Err(ProductIssue::CatalogUnavailable);
         }
         files.verify(dir)?;
-        if version == 0 {
+        if version < SCHEMA_VERSION {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(database_error)?;
-            migrate_to_v1(&transaction)?;
+            if version == 0 {
+                migrate_to_v1(&transaction)?;
+            }
+            migrate_to_v2(&transaction)?;
             validate_schema(&transaction, SCHEMA_VERSION)?;
             transaction.commit().map_err(database_error)?;
         }
@@ -432,6 +614,154 @@ impl Catalog {
             files,
             provision_id,
         })
+    }
+
+    pub(crate) fn operation(&self, key: Uuid) -> CatalogResult<Option<Operation>> {
+        self.connection
+            .query_row(
+                &format!("{OPERATION_QUERY} WHERE o.key = ?1"),
+                [key.to_string()],
+                read_operation,
+            )
+            .optional()
+            .map_err(database_error)
+    }
+
+    pub(crate) fn by_runtime(&self, ids: &[Uuid]) -> CatalogResult<Vec<Operation>> {
+        let mut query = self
+            .connection
+            .prepare(&format!(
+                "{OPERATION_QUERY} WHERE a.id = ?1 AND o.stage = 'finished'"
+            ))
+            .map_err(database_error)?;
+        ids.iter()
+            .filter_map(|id| {
+                query
+                    .query_row([id.to_string()], read_operation)
+                    .optional()
+                    .transpose()
+            })
+            .collect::<rusqlite::Result<_>>()
+            .map_err(database_error)
+    }
+
+    pub(crate) fn marked_targets(
+        &self,
+        generation: ServerGeneration,
+    ) -> CatalogResult<Vec<String>> {
+        let mut query = self.connection.prepare(
+            "SELECT a.target FROM runtime_attempts a JOIN create_operations o ON o.runtime_id = a.id
+             WHERE o.stage = 'marked' AND a.generation = ?1",
+        ).map_err(database_error)?;
+        query
+            .query_map([json(&generation)?], |row| row.get(0))
+            .map_err(database_error)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(database_error)
+    }
+
+    pub(crate) fn reserve(&mut self, operation: &Operation) -> CatalogResult<bool> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
+        if tx
+            .query_row(
+                "SELECT 1 FROM create_operations WHERE key = ?1",
+                [operation.key.to_string()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(database_error)?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO sessions (id, workspace_id) VALUES (?1, ?2)",
+            params![
+                operation.session_id.to_string(),
+                operation.workspace_id.to_string()
+            ],
+        )
+        .map_err(database_error)?;
+        tx.execute(
+            "INSERT INTO runtime_attempts (id, session_id, target, nonce, generation, policy)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                operation.runtime_id.to_string(),
+                operation.session_id.to_string(),
+                operation.target,
+                operation.nonce.to_string(),
+                json(&operation.generation)?,
+                json(&operation.policy)?
+            ],
+        )
+        .map_err(database_error)?;
+        tx.execute(
+            "INSERT INTO create_operations (key, id, runtime_id, profile, stage)
+            VALUES (?1, ?2, ?3, ?4, 'reserved')",
+            params![
+                operation.key.to_string(),
+                operation.id.to_string(),
+                operation.runtime_id.to_string(),
+                json(&operation.profile)?
+            ],
+        )
+        .map_err(database_error)?;
+        tx.commit().map_err(database_error)?;
+        Ok(true)
+    }
+
+    pub(crate) fn preflight(
+        &self,
+        id: Uuid,
+        profile: ProviderProfile,
+        profiles: &ServiceProfiles,
+    ) -> CatalogResult<(String, PreparedLaunch)> {
+        let (locator, identity) = self.workspace(id)?;
+        let policy = profiles.preflight(Path::new(&locator), &identity, profile)?;
+        Ok((locator, policy))
+    }
+
+    pub(crate) fn mark(&mut self, key: Uuid, runtime_id: Uuid) -> CatalogResult<bool> {
+        self.advance(key, runtime_id, "reserved", "marked", None)
+    }
+
+    pub(crate) fn finalize(
+        &mut self,
+        key: Uuid,
+        runtime_id: Uuid,
+        outcome: &StoredOutcome,
+    ) -> CatalogResult<bool> {
+        let from = match outcome {
+            StoredOutcome::Failed(_) => "reserved",
+            StoredOutcome::Launched { .. } => "marked",
+        };
+        self.advance(key, runtime_id, from, "finished", Some(json(outcome)?))
+    }
+
+    fn advance(
+        &mut self,
+        key: Uuid,
+        runtime_id: Uuid,
+        from: &str,
+        to: &str,
+        outcome: Option<String>,
+    ) -> CatalogResult<bool> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
+        let changed = tx
+            .execute(
+                "UPDATE create_operations SET stage = ?1, outcome = ?2
+             WHERE key = ?3 AND runtime_id = ?4 AND stage = ?5",
+                params![to, outcome, key.to_string(), runtime_id.to_string(), from],
+            )
+            .map_err(database_error)?;
+        tx.commit().map_err(database_error)?;
+        Ok(changed == 1)
     }
 
     fn register(
@@ -503,14 +833,13 @@ impl Catalog {
         &mut self,
         request: ProductRequest,
         profiles: &ServiceProfiles,
-        reply: &oneshot::Sender<ProductResponse>,
+        cancelled: impl Fn() -> bool,
     ) -> CatalogResult<ProductResponse> {
-        self.validate_files()?;
         match request {
             ProductRequest::RegisterWorkspace { locator } => {
                 let identity = resolve_workspace(Path::new(&locator))?;
                 self.validate_files()?;
-                if reply.is_closed() {
+                if cancelled() {
                     return Err(ProductIssue::WorkspaceCheckTimedOut);
                 }
                 let workspace = self.register(locator, identity)?;
@@ -520,18 +849,17 @@ impl Catalog {
                 workspace_id,
                 profile,
             } => {
-                let (locator, saved) = self.workspace(workspace_id)?;
-                profiles.preflight(Path::new(&locator), &saved, profile)?;
+                self.preflight(workspace_id, profile, profiles)?;
                 Ok(ProductResponse::Ready {})
+            }
+            ProductRequest::CreateManaged { .. } | ProductRequest::CreateStatus { .. } => {
+                Err(ProductIssue::InvalidRequest)
             }
         }
     }
 }
 
-struct Job {
-    request: ProductRequest,
-    reply: oneshot::Sender<ProductResponse>,
-}
+type Job = Box<dyn FnOnce(&mut CatalogResult<Catalog>, &ServiceProfiles) + Send>;
 
 #[derive(Clone)]
 pub(crate) struct CatalogLane {
@@ -561,32 +889,8 @@ impl CatalogLane {
                     ),
                     Err(issue) => eprintln!("local catalog unavailable ({issue:?})"),
                 }
-                while let Some(Job { request, reply }) = queue.blocking_recv() {
-                    if reply.is_closed() {
-                        continue;
-                    }
-                    let result = match &mut catalog {
-                        Ok(catalog) => {
-                            let result = catalog.handle(request, &profiles, &reply);
-                            if catalog.connection.is_autocommit() {
-                                result
-                            } else {
-                                Err(ProductIssue::CatalogUnavailable)
-                            }
-                        }
-                        Err(issue) => Err(*issue),
-                    };
-                    if let Err(
-                        issue @ (ProductIssue::CatalogUnsafe
-                        | ProductIssue::CatalogMissing
-                        | ProductIssue::CatalogUnsupported
-                        | ProductIssue::CatalogUnavailable),
-                    ) = result
-                    {
-                        catalog = Err(issue);
-                    }
-                    let _ = reply
-                        .send(result.unwrap_or_else(|issue| ProductResponse::Blocked { issue }));
+                while let Some(job) = queue.blocking_recv() {
+                    job(&mut catalog, &profiles);
                 }
             })
         {
@@ -596,23 +900,70 @@ impl CatalogLane {
     }
 
     pub(crate) async fn call(&self, request: ProductRequest) -> ProductResponse {
+        self.submit(move |catalog, profiles, reply| {
+            catalog.handle(request, profiles, || reply.is_closed())
+        })
+        .await
+        .unwrap_or_else(|issue| ProductResponse::Blocked { issue })
+    }
+
+    pub(crate) async fn run<T: Send + 'static>(
+        &self,
+        action: impl FnOnce(&mut Catalog, &ServiceProfiles) -> CatalogResult<T> + Send + 'static,
+    ) -> CatalogResult<T> {
+        self.submit(move |catalog, profiles, _| action(catalog, profiles))
+            .await
+    }
+
+    async fn submit<T: Send + 'static>(
+        &self,
+        action: impl FnOnce(
+            &mut Catalog,
+            &ServiceProfiles,
+            &oneshot::Sender<CatalogResult<T>>,
+        ) -> CatalogResult<T>
+        + Send
+        + 'static,
+    ) -> CatalogResult<T> {
         let (reply, response) = oneshot::channel();
-        match self.jobs.try_send(Job { request, reply }) {
+        let job = Box::new(
+            move |slot: &mut CatalogResult<Catalog>, profiles: &ServiceProfiles| {
+                if reply.is_closed() {
+                    return;
+                }
+                let result = match slot {
+                    Ok(catalog) => catalog
+                        .validate_files()
+                        .and_then(|()| action(catalog, profiles, &reply))
+                        .and_then(|value| {
+                            if !catalog.connection.is_autocommit() {
+                                return Err(ProductIssue::CatalogUnavailable);
+                            }
+                            catalog.validate_files()?;
+                            Ok(value)
+                        }),
+                    Err(issue) => Err(*issue),
+                };
+                if let Err(
+                    issue @ (ProductIssue::CatalogUnsafe
+                    | ProductIssue::CatalogMissing
+                    | ProductIssue::CatalogUnsupported
+                    | ProductIssue::CatalogUnavailable),
+                ) = &result
+                {
+                    *slot = Err(*issue);
+                }
+                let _ = reply.send(result);
+            },
+        );
+        match self.jobs.try_send(job) {
             Ok(()) => match tokio::time::timeout(PRODUCT_TIMEOUT, response).await {
                 Ok(Ok(response)) => response,
-                Ok(Err(_)) => ProductResponse::Blocked {
-                    issue: ProductIssue::CatalogUnavailable,
-                },
-                Err(_) => ProductResponse::Blocked {
-                    issue: ProductIssue::WorkspaceCheckTimedOut,
-                },
+                Ok(Err(_)) => Err(ProductIssue::CatalogUnavailable),
+                Err(_) => Err(ProductIssue::WorkspaceCheckTimedOut),
             },
-            Err(mpsc::error::TrySendError::Full(_)) => ProductResponse::Blocked {
-                issue: ProductIssue::CatalogBusy,
-            },
-            Err(mpsc::error::TrySendError::Closed(_)) => ProductResponse::Blocked {
-                issue: ProductIssue::CatalogUnavailable,
-            },
+            Err(mpsc::error::TrySendError::Full(_)) => Err(ProductIssue::CatalogBusy),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(ProductIssue::CatalogUnavailable),
         }
     }
 }
@@ -688,14 +1039,15 @@ mod tests {
                 issue: ProductIssue::WorkspaceCheckTimedOut,
             }
         );
-        assert!(job.unwrap().reply.is_closed());
+        let mut unavailable = Err(ProductIssue::CatalogBusy);
+        job.unwrap()(&mut unavailable, &ServiceProfiles::new(None));
     }
 
     #[test]
     fn w1_readiness_expired_registration_does_not_write() {
         let (temp, dir) = fixture();
         let mut catalog = Catalog::open(&dir).unwrap();
-        let (reply, response) = oneshot::channel();
+        let (reply, response) = oneshot::channel::<()>();
         drop(response);
         let request = ProductRequest::RegisterWorkspace {
             locator: temp
@@ -707,7 +1059,7 @@ mod tests {
                 .unwrap(),
         };
         assert_eq!(
-            catalog.handle(request, &ServiceProfiles::new(None), &reply),
+            catalog.handle(request, &ServiceProfiles::new(None), || reply.is_closed()),
             Err(ProductIssue::WorkspaceCheckTimedOut)
         );
         let count: i64 = catalog
@@ -799,21 +1151,39 @@ mod tests {
     }
 
     #[test]
-    fn w1_readiness_failed_migration_rolls_back_version_and_schema() {
+    fn w1_create_migration_rollback_then_upgrade_preserves_workspace_identity() {
         let (_temp, dir) = fixture();
+        let workspace = dir.parent().unwrap();
+        let locator = workspace.to_str().unwrap().to_owned();
+        let mut opened = Catalog::open(&dir).unwrap();
+        let original = opened
+            .register(locator.clone(), resolve_workspace(workspace).unwrap())
+            .unwrap();
+        drop(opened);
         let mut reader = connect(&dir).unwrap();
         reader
-            .execute_batch("DROP TABLE workspaces; PRAGMA user_version = 0;")
+            .execute_batch(
+                "DROP TABLE create_operations; DROP TABLE runtime_attempts;
+                DROP TABLE sessions; PRAGMA user_version = 1;",
+            )
             .unwrap();
         let before = fs::read(dir.join(DB)).unwrap();
         let snapshot = reader.transaction().unwrap();
-        assert_eq!(pragma::<i32>(&snapshot, "user_version").unwrap(), 0);
+        assert_eq!(pragma::<i32>(&snapshot, "user_version").unwrap(), 1);
         assert_eq!(Catalog::open(&dir).err(), Some(ProductIssue::CatalogBusy));
         snapshot.rollback().unwrap();
-        assert_eq!(pragma::<i32>(&reader, "user_version").unwrap(), 0);
+        assert_eq!(pragma::<i32>(&reader, "user_version").unwrap(), 1);
         assert_eq!(fs::read(dir.join(DB)).unwrap(), before);
-        validate_schema(&reader, 0).unwrap();
+        validate_schema(&reader, 1).unwrap();
         drop(reader);
-        assert!(Catalog::open(&dir).is_ok());
+        let reopened = Catalog::open(&dir).unwrap();
+        assert_eq!(
+            reopened.workspace(original.workspace_id).unwrap().0,
+            locator
+        );
+        assert_eq!(
+            pragma::<i32>(&reopened.connection, "user_version").unwrap(),
+            SCHEMA_VERSION
+        );
     }
 }

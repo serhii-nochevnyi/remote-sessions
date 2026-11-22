@@ -1,21 +1,24 @@
 use crate::model::{ProductIssue, ProviderProfile};
 use nix::libc;
+use serde::{Deserialize, Serialize};
 use std::{
     ffi::{CString, OsStr},
     fs::{self, OpenOptions},
-    io::{self, Read},
+    io::{self, Read, Write},
     os::unix::{
         ffi::OsStrExt,
         fs::{MetadataExt, OpenOptionsExt},
+        process::CommandExt,
     },
     path::{Component, Path, PathBuf},
 };
+use uuid::Uuid;
 
 const MAX_LOCATOR_BYTES: usize = 4096;
 const POLICY_VERSION: u32 = 1;
 const MAX_INTERPRETER_DEPTH: u8 = 4;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceIdentity {
     pub canonical: String,
     pub device: u64,
@@ -79,11 +82,126 @@ pub fn resolve_workspace(locator: &Path) -> Result<WorkspaceIdentity, ProductIss
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreparedLaunch {
     pub policy_version: u32,
     pub workspace: WorkspaceIdentity,
     pub executable: PathBuf,
-    pub path: std::ffi::OsString,
+    pub path: String,
+    pub executable_identity: (u64, u64),
+}
+
+pub(crate) const NONCE_ENV: &str = "RS_CREATE_NONCE";
+pub(crate) const LAUNCH_COMMAND: &str = "__managed-launch";
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct LaunchGuard {
+    pub locator: String,
+    pub profile: ProviderProfile,
+    pub policy: PreparedLaunch,
+    pub service_state: PathBuf,
+    pub nonce: Uuid,
+}
+
+impl LaunchGuard {
+    pub(crate) fn argument(&self) -> anyhow::Result<String> {
+        let bytes = serde_json::to_vec(self)?;
+        anyhow::ensure!(
+            bytes.len() <= 16_384,
+            "launch policy exceeds argument limit"
+        );
+        Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+
+    fn decode(argument: &str) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            argument.len() <= 32_768
+                && argument.len().is_multiple_of(2)
+                && argument.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "invalid launch policy argument"
+        );
+        let bytes: Result<Vec<_>, _> = (0..argument.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&argument[index..index + 2], 16))
+            .collect();
+        Ok(serde_json::from_slice(&bytes?)?)
+    }
+
+    fn exec(&self) -> ProductIssue {
+        if self.policy.policy_version != POLICY_VERSION
+            || std::env::var(NONCE_ENV).ok().as_deref() != Some(&self.nonce.to_string())
+        {
+            return ProductIssue::LaunchSetupFailed;
+        }
+        let Ok(cwd) = fs::metadata(".") else {
+            return ProductIssue::WorkspaceChanged;
+        };
+        if (cwd.dev(), cwd.ino()) != (self.policy.workspace.device, self.policy.workspace.inode) {
+            return ProductIssue::WorkspaceChanged;
+        }
+        let profiles = ServiceProfiles::new(Some(OsStr::new(&self.policy.path)));
+        match profiles.preflight(
+            Path::new(&self.locator),
+            &self.policy.workspace,
+            self.profile,
+        ) {
+            Ok(policy) if policy == self.policy => {}
+            Ok(_) => return ProductIssue::ProviderNotExecutable,
+            Err(issue) => return issue,
+        }
+        let _error = std::process::Command::new(&self.policy.executable)
+            .env("PATH", &self.policy.path)
+            .env_remove(NONCE_ENV)
+            .exec();
+        ProductIssue::LaunchSetupFailed
+    }
+}
+
+fn setup_fault_path(directory: &Path, nonce: Uuid) -> PathBuf {
+    directory.join(format!("create-setup-{}", nonce.simple()))
+}
+
+pub(crate) fn read_setup_fault(directory: &Path, nonce: Uuid) -> Option<ProductIssue> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(setup_fault_path(directory, nonce))
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file()
+        || meta.uid() != nix::unistd::geteuid().as_raw()
+        || meta.mode() & 0o7777 != 0o600
+        || meta.nlink() != 1
+        || meta.len() > 128
+    {
+        return None;
+    }
+    let mut issue = String::new();
+    file.take(129).read_to_string(&mut issue).ok()?;
+    ProductIssue::decode(&issue)
+}
+
+/// Internal tmux child entry point. Only a fixed provider can be executed.
+#[doc(hidden)]
+pub fn managed_launch_argument(args: &[std::ffi::OsString]) -> Option<anyhow::Result<()>> {
+    if args.first()? != LAUNCH_COMMAND {
+        return None;
+    }
+    Some((|| {
+        anyhow::ensure!(args.len() == 2, "invalid managed launch arguments");
+        let guard = LaunchGuard::decode(args[1].to_str().unwrap_or_default())?;
+        let issue = guard.exec();
+        if crate::validate_directory(&guard.service_state).is_ok()
+            && let Ok(mut file) = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(setup_fault_path(&guard.service_state, guard.nonce))
+        {
+            let _ = file.write_all(issue.encode().as_bytes());
+        }
+        anyhow::bail!("managed provider setup failed ({issue:?})")
+    })())
 }
 
 pub struct ServiceProfiles {
@@ -118,22 +236,25 @@ impl ServiceProfiles {
             return Err(ProductIssue::WorkspaceChanged);
         }
 
-        let name = match profile {
-            ProviderProfile::ClaudeCode => "claude",
-            ProviderProfile::Codex => "codex",
-        };
-        let executable = self.lookup(name)?;
+        let executable = self.lookup(profile.executable_name())?;
         self.verify_entrypoint(&executable, MAX_INTERPRETER_DEPTH)
             .map_err(|issue| match issue {
                 EntryPointIssue::Invalid => ProductIssue::ProviderNotExecutable,
                 EntryPointIssue::Interpreter => ProductIssue::InterpreterUnavailable,
             })?;
+        let metadata = executable
+            .metadata()
+            .map_err(|_| ProductIssue::ProviderNotExecutable)?;
+        let path = std::env::join_paths(&self.search)
+            .map_err(|_| ProductIssue::ProviderNotExecutable)?
+            .into_string()
+            .map_err(|_| ProductIssue::ProviderNotExecutable)?;
         Ok(PreparedLaunch {
             policy_version: POLICY_VERSION,
             workspace: current,
             executable,
-            path: std::env::join_paths(&self.search)
-                .map_err(|_| ProductIssue::ProviderNotExecutable)?,
+            path,
+            executable_identity: (metadata.dev(), metadata.ino()),
         })
     }
 
