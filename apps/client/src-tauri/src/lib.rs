@@ -711,7 +711,9 @@ mod desktop {
                 | "geometry_routing"
                 | "stream_closed"
                 | "terminal_status_changed"
-                | "invalid_geometry_boundary"
+                | "geometry_revision_not_new"
+                | "geometry_status_rejected"
+                | "geometry_output_incomplete"
                 | "renderer_grid_mismatch"
                 | "stale_grid_ack"
                 | "renderer_write_timeout"),

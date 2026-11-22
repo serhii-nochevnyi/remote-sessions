@@ -4,7 +4,7 @@ import { Terminal } from "@xterm/xterm";
 import { suppressViewerQueries } from "./terminal-protocol";
 import { localClient } from "./local-client";
 import type { GeometryEvent, TerminalSize, TerminalStatus, TerminalStreamFailure } from "./local-client";
-import { OrderedGeometry, ResizeProposals } from "./terminal-geometry";
+import { GeometryBoundaryError, OrderedGeometry, ResizeProposals } from "./terminal-geometry";
 import "@xterm/xterm/css/xterm.css";
 
 function geometryText(status: TerminalStatus): string {
@@ -16,11 +16,11 @@ function geometryText(status: TerminalStatus): string {
 }
 
 function streamFailure(error: unknown, stage: TerminalStreamFailure): TerminalStreamFailure {
+  if (error instanceof GeometryBoundaryError) return error.reason;
   if (!(error instanceof Error)) return stage;
   switch (error.message) {
     case "Потік перервано": return "stream_closed";
     case "Стан термінала змінився": return "terminal_status_changed";
-    case "Не вдалося узгодити межу зміни розміру": return "invalid_geometry_boundary";
     case "Розміри відображення не збігаються": return "renderer_grid_mismatch";
     case "Підтвердження розміру застаріло": return "stale_grid_ack";
     case "Не вдалося обробити вивід термінала": return "renderer_write_timeout";

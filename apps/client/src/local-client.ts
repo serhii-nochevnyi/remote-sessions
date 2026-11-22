@@ -66,8 +66,9 @@ export interface Chunk {
   readonly status?: TerminalStatus | null;
   readonly geometry?: GeometryEvent | null;
 }
+export type GeometryBoundaryFailure = "geometry_revision_not_new" | "geometry_status_rejected" | "geometry_output_incomplete";
 export type TerminalStreamFailure = "attachment_setup" | "read_response" | "grid_ack_response"
-  | "geometry_routing" | "stream_closed" | "terminal_status_changed" | "invalid_geometry_boundary"
+  | "geometry_routing" | "stream_closed" | "terminal_status_changed" | GeometryBoundaryFailure
   | "renderer_grid_mismatch" | "stale_grid_ack" | "renderer_write_timeout";
 export type ProviderProfile = "claude_code" | "codex";
 export interface WorkspaceDisplay { readonly workspace_id: string; readonly label: string }

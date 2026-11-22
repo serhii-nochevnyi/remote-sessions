@@ -121,6 +121,96 @@ const RESUME: u64 = 0;
 const DRAIN: u64 = 1;
 const PAUSE: u64 = 2;
 const CLOSE: u64 = 3;
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const DRAIN_TIMEOUT_ERROR: &str = "Terminal output did not reach a geometry boundary";
+const OUTPUT_CHUNK_SIZE: usize = 8192;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VtState {
+    Ground,
+    Escape,
+    EscapeIntermediate,
+    CsiEntry,
+    CsiParam,
+    CsiIntermediate,
+    CsiIgnore,
+    Osc,
+    DcsEntry,
+    DcsParam,
+    DcsIntermediate,
+    DcsIgnore,
+    DcsPassthrough,
+    SosPmApc,
+}
+
+impl VtState {
+    fn next(self, code: u32) -> Self {
+        use VtState::*;
+        // @contract: Follow the xterm 6.0.0 VT500 transition table and string end handlers.
+        match code {
+            0x1b => return Escape,
+            0x90 => return DcsEntry,
+            0x98 | 0x9e | 0x9f => return SosPmApc,
+            0x9b => return CsiEntry,
+            0x9d => return Osc,
+            0x18 | 0x1a | 0x80..=0x9f => return Ground,
+            0x07 if self == Osc => return Ground,
+            0..=0x1f | 0x7f => return self,
+            _ => {}
+        }
+        match (self, code) {
+            (Escape, 0x50) => DcsEntry,
+            (Escape, 0x58 | 0x5e | 0x5f) => SosPmApc,
+            (Escape, 0x5b) => CsiEntry,
+            (Escape, 0x5d) => Osc,
+            (Escape | EscapeIntermediate, 0x20..=0x2f) => EscapeIntermediate,
+            (CsiEntry | CsiParam | CsiIntermediate, 0x20..=0x2f) => CsiIntermediate,
+            (CsiEntry, 0x30..=0x3f) | (CsiParam, 0x30..=0x3b) => CsiParam,
+            (CsiParam, 0x3c..=0x3f) | (CsiIntermediate, 0x30..=0x3f) => CsiIgnore,
+            (CsiIgnore, 0x20..=0x3f | 0xa0..) => CsiIgnore,
+            (DcsEntry | DcsParam | DcsIntermediate, 0x20..=0x2f) => DcsIntermediate,
+            (DcsEntry, 0x30..=0x3f) | (DcsParam, 0x30..=0x3b) => DcsParam,
+            (DcsParam, 0x3c..=0x3f) | (DcsIntermediate, 0x30..=0x3f) => DcsIgnore,
+            (DcsEntry | DcsParam | DcsIntermediate, 0x40..=0x7e) => DcsPassthrough,
+            (Osc | DcsIgnore | DcsPassthrough, _) | (SosPmApc, 0x20..=0x7e) => self,
+            _ => Ground,
+        }
+    }
+}
+
+fn scan_output(vt: &mut VtState, bytes: &[u8]) -> usize {
+    // @contract: Keep the structurally incomplete tail, including malformed xterm starters.
+    let mut offset = 0;
+    'decode: while let Some(&lead) = bytes.get(offset) {
+        let start = offset;
+        offset += 1;
+        let (more, mask, minimum) = match lead {
+            0..=0x7f => {
+                *vt = vt.next(u32::from(lead));
+                continue;
+            }
+            0xc0..=0xdf => (1, 0x1f, 0x80),
+            0xe0..=0xef => (2, 0x0f, 0x800),
+            0xf0..=0xf7 => (3, 0x07, 0x10000),
+            _ => continue,
+        };
+        let mut code = u32::from(lead & mask);
+        for _ in 0..more {
+            match bytes.get(offset).copied() {
+                Some(byte @ 0x80..=0xbf) => {
+                    code = (code << 6) | u32::from(byte & 0x3f);
+                    offset += 1;
+                }
+                Some(_) => continue 'decode,
+                None => return start,
+            }
+        }
+        if code >= minimum && code != 0xfeff && char::from_u32(code).is_some() {
+            *vt = vt.next(code);
+        }
+    }
+    offset
+}
 
 struct Output {
     receiver: mpsc::Receiver<PtyEvent>,
@@ -212,26 +302,38 @@ fn sample_master(master: &dyn MasterPty) -> Result<GridSample> {
 }
 
 fn read_pty(mut reader: Box<dyn Read + Send>, sender: mpsc::Sender<PtyEvent>, state: &AtomicU64) {
-    let mut bytes = [0_u8; 8192];
+    let mut bytes = [0_u8; OUTPUT_CHUNK_SIZE];
+    let mut carry = 0;
+    let mut vt = VtState::Ground;
     loop {
         match state.load(Ordering::Acquire) {
             CLOSE => return,
             PAUSE => std::thread::sleep(Duration::from_millis(5)),
-            _ => match reader.read(&mut bytes) {
+            _ => match reader.read(&mut bytes[carry..]) {
                 Ok(0) => return,
                 Ok(count) => {
-                    if sender
-                        .blocking_send(PtyEvent::Bytes(bytes[..count].to_vec()))
-                        .is_err()
+                    if state.load(Ordering::Acquire) == CLOSE {
+                        return;
+                    }
+                    let end = carry + count;
+                    let complete = scan_output(&mut vt, &bytes[..end]);
+                    if complete != 0
+                        && sender
+                            .blocking_send(PtyEvent::Bytes(bytes[..complete].to_vec()))
+                            .is_err()
                     {
                         return;
                     }
+                    bytes.copy_within(complete..end, 0);
+                    carry = end - complete;
                 }
                 Err(error) if error.kind() == ErrorKind::Interrupted => {}
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    if state
-                        .compare_exchange(DRAIN, PAUSE, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
+                    if carry == 0
+                        && vt == VtState::Ground
+                        && state
+                            .compare_exchange(DRAIN, PAUSE, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
                         && sender.blocking_send(PtyEvent::Boundary).is_err()
                     {
                         return;
@@ -291,6 +393,27 @@ async fn terminal_status(view: &View) -> Result<TerminalStatus> {
             bail!("Terminal attachment identity changed")
         }
         _ => bail!("Розмір термінала недоступний"),
+    }
+}
+
+fn drain_budget(started: Option<Instant>, now: Instant) -> Result<Option<Duration>> {
+    let remaining = started.map(|start| (start + DRAIN_TIMEOUT).saturating_duration_since(now));
+    ensure!(
+        remaining.is_none_or(|time| !time.is_zero()),
+        DRAIN_TIMEOUT_ERROR
+    );
+    Ok(remaining)
+}
+
+async fn terminal_status_during_drain(
+    view: &View,
+    remaining: Option<Duration>,
+) -> Result<TerminalStatus> {
+    match remaining {
+        Some(time) => tokio::time::timeout(time, terminal_status(view))
+            .await
+            .context(DRAIN_TIMEOUT_ERROR)?,
+        None => terminal_status(view).await,
     }
 }
 
@@ -436,7 +559,7 @@ async fn redraw_view(view: &View, boundary: &GeometryEvent) -> Result<GeometryEv
     })
 }
 
-async fn read_chunk(view: &View, output: &mut Output) -> Result<Chunk> {
+async fn read_chunk(view: &View, output: &mut Output, now: impl Fn() -> Instant) -> Result<Chunk> {
     ensure!(
         output.pending.is_none(),
         "Terminal grid acknowledgement required"
@@ -451,8 +574,12 @@ async fn read_chunk(view: &View, output: &mut Output) -> Result<Chunk> {
     if chunk.closed {
         return Ok(chunk);
     }
-    if Instant::now() >= output.refresh_at {
-        match terminal_status(view).await {
+    let reading_at = now();
+    let remaining = drain_budget(output.drain_started, reading_at)?;
+    if reading_at >= output.refresh_at {
+        let status = terminal_status_during_drain(view, remaining).await;
+        drain_budget(output.drain_started, now())?;
+        match status {
             Ok(status) if status.committed.revision >= output.status.committed.revision => {
                 output.status = status
             }
@@ -466,27 +593,29 @@ async fn read_chunk(view: &View, output: &mut Output) -> Result<Chunk> {
                 output.status.observation = ObservationState::Unavailable;
             }
         }
-        output.refresh_at = Instant::now() + Duration::from_millis(150);
+        output.refresh_at = now() + Duration::from_millis(150);
         chunk.status = Some(output.status.clone());
     }
+    let draining_at = now();
     if output.status.committed.revision > output.applied_revision
         && view
             .reader_state
             .compare_exchange(RESUME, DRAIN, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     {
-        output.drain_started = Some(Instant::now());
+        output.drain_started = Some(draining_at);
     }
-    ensure!(
-        output
-            .drain_started
-            .is_none_or(|start| start.elapsed() < Duration::from_secs(2)),
-        "Terminal output did not reach a geometry boundary"
-    );
-    match tokio::time::timeout(Duration::from_millis(150), output.receiver.recv()).await {
+    let poll = Duration::from_millis(150);
+    let wait = drain_budget(output.drain_started, draining_at)?
+        .unwrap_or(poll)
+        .min(poll);
+    let event = tokio::time::timeout(wait, output.receiver.recv()).await;
+    let remaining = drain_budget(output.drain_started, now())?;
+    match event {
         Ok(Some(PtyEvent::Bytes(data))) => chunk.data = data,
         Ok(Some(PtyEvent::Boundary)) => {
-            let status = terminal_status(view).await?;
+            let status = terminal_status_during_drain(view, remaining).await?;
+            drain_budget(output.drain_started, now())?;
             ensure!(
                 status.committed.revision >= output.status.committed.revision,
                 "Terminal geometry revision went backwards"
@@ -742,12 +871,16 @@ impl DesktopBridge {
     }
 
     pub async fn read(&self, view_id: &str) -> Result<Chunk> {
+        self.read_with_clock(view_id, Instant::now).await
+    }
+
+    async fn read_with_clock(&self, view_id: &str, now: impl Fn() -> Instant) -> Result<Chunk> {
         let view = self.view(view_id)?;
         let mut output = view
             .output
             .try_lock()
             .context("Terminal read already in progress")?;
-        let result = read_chunk(&view, &mut output).await;
+        let result = read_chunk(&view, &mut output, now).await;
         if result.as_ref().is_ok_and(|chunk| chunk.closed) || result.is_err() {
             view.close();
         }
@@ -937,10 +1070,13 @@ impl Drop for DesktopBridge {
 mod tests {
     use super::*;
     use std::{
+        cell::Cell,
         ffi::OsString,
         fs::{self, DirBuilder},
         os::unix::{ffi::OsStringExt, fs::DirBuilderExt},
         path::Path,
+        sync::mpsc as thread_channel,
+        thread::JoinHandle,
     };
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -1034,7 +1170,7 @@ mod tests {
         .unwrap();
     }
     #[tokio::test]
-    async fn w1_resize_private_ipc_admission_and_ordered_independent_grids() {
+    async fn w1_resize_w1_terminal_private_ipc_admission_and_ordered_independent_grids() {
         use remote_sessions_host::{
             decode_local_fixture, encode_local_observation,
             model::{CommittedGeometry, ProviderSample, ResizeIntent, TerminalTarget},
@@ -1074,7 +1210,11 @@ root=$(dirname "$0")
 case "$4" in
   attach-session)
     printf '%s\n%s\n' "$$" "$(tty)" > "$root/client"
-    printf 'initial stream'
+    printf 'initial stream\033['
+    while [ ! -f "$root/suffix" ]; do /bin/sleep 0.01; done
+    printf '2H'
+    while [ ! -f "$root/redraw" ]; do /bin/sleep 0.01; done
+    printf 'redraw stream'
     exec /bin/sleep 30
     ;;
   list-clients)
@@ -1209,7 +1349,7 @@ esac
                 let chunk = bridge.read(key).await.unwrap();
                 assert!(!chunk.closed);
                 output.extend(chunk.data);
-                if chunk.writable && output == b"initial stream" {
+                if chunk.writable && output == b"initial stream\x1b[" {
                     break;
                 }
             }
@@ -1236,17 +1376,24 @@ esac
             assert_eq!(status.provider.unwrap().size, initial_size);
             assert_eq!(admission_count.load(Ordering::Relaxed), 1);
 
-            let event = loop {
-                let chunk = bridge.read(key).await.unwrap();
-                assert!(!chunk.closed);
-                if let Some(event) = chunk.geometry {
-                    break event;
-                }
-            };
-            assert_eq!(event.status.terminal, view.status.terminal);
-            assert_eq!(event.client.size, desired);
-            assert_eq!(event.bridge_pty.size, desired);
-            assert!(!fixture.0.join("redraw").exists());
+            let live = bridge.view(key).unwrap();
+            live.output.lock().await.refresh_at = Instant::now();
+            let draining = bridge.read(key).await.unwrap();
+            assert_eq!(draining.status.unwrap().committed.revision, 1);
+            assert!(draining.geometry.is_none() && draining.data.is_empty());
+            assert_eq!(live.reader_state.load(Ordering::Acquire), DRAIN);
+            let started = live.output.lock().await.drain_started.unwrap();
+            live.output.lock().await.refresh_at = Instant::now();
+            let still_draining = bridge.read(key).await.unwrap();
+            assert!(still_draining.status.is_some());
+            assert!(still_draining.geometry.is_none() && still_draining.data.is_empty());
+            assert_eq!(live.output.lock().await.drain_started, Some(started));
+            assert_eq!(
+                sample_master(live.master.lock().unwrap().as_deref().unwrap())
+                    .unwrap()
+                    .size,
+                initial_size
+            );
             let acknowledgement = GridAcknowledgement {
                 renderer_id: Uuid::new_v4(),
                 epoch: Some(epoch),
@@ -1254,18 +1401,40 @@ esac
                 size: desired,
                 focused: true,
             };
-            assert!(
-                bridge
-                    .acknowledge_grid(
-                        key,
-                        GridAcknowledgement {
-                            revision: 0,
-                            ..acknowledgement
-                        }
-                    )
-                    .await
-                    .is_err()
-            );
+            assert!(bridge.acknowledge_grid(key, acknowledgement).await.is_err());
+            assert!(!fixture.0.join("redraw").exists());
+            fs::write(fixture.0.join("suffix"), b"").unwrap();
+            let event = loop {
+                let chunk = bridge.read(key).await.unwrap();
+                assert!(!chunk.closed);
+                output.extend(chunk.data);
+                if let Some(event) = chunk.geometry {
+                    break event;
+                }
+            };
+            assert_eq!(output, b"initial stream\x1b[2H");
+            assert_eq!(event.status.terminal, view.status.terminal);
+            assert_eq!(event.client.size, desired);
+            assert_eq!(event.bridge_pty.size, desired);
+            assert_eq!(live.reader_state.load(Ordering::Acquire), PAUSE);
+            assert!(!fixture.0.join("redraw").exists());
+            for wrong in [
+                GridAcknowledgement {
+                    revision: 0,
+                    ..acknowledgement
+                },
+                GridAcknowledgement {
+                    epoch: None,
+                    ..acknowledgement
+                },
+                GridAcknowledgement {
+                    size: initial_size,
+                    ..acknowledgement
+                },
+            ] {
+                assert!(bridge.acknowledge_grid(key, wrong).await.is_err());
+                assert_eq!(live.reader_state.load(Ordering::Acquire), PAUSE);
+            }
             assert!(!fixture.0.join("redraw").exists());
             provider_reached.store(1, Ordering::Relaxed);
             let observed = bridge.acknowledge_grid(key, acknowledgement).await.unwrap();
@@ -1276,6 +1445,14 @@ esac
                 fs::read_to_string(fixture.0.join("redraw")).unwrap(),
                 "redraw"
             );
+            assert_eq!(live.reader_state.load(Ordering::Acquire), RESUME);
+            let mut resumed = Vec::new();
+            while resumed.len() < b"redraw stream".len() {
+                let chunk = bridge.read(key).await.unwrap();
+                assert!(!chunk.closed && chunk.geometry.is_none());
+                resumed.extend(chunk.data);
+            }
+            assert_eq!(resumed, b"redraw stream");
             bridge.detach(key);
             assert!(bridge.resize(key, desired, epoch).await.is_err());
         })
@@ -1283,39 +1460,447 @@ esac
         .unwrap();
         server.abort();
     }
-    #[tokio::test]
-    async fn w1_resize_reader_barrier_follows_buffered_bytes_and_pauses_until_acknowledged() {
-        struct Fragments(usize);
-        impl Read for Fragments {
-            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-                self.0 += 1;
-                let next: &[u8] = match self.0 {
-                    1 => &[0xe6, 0xbc],
-                    2 => &[0xa2, 0x1b, b'['],
-                    3 => return Err(ErrorKind::WouldBlock.into()),
-                    4 => b"H",
-                    _ => return Ok(0),
-                };
-                bytes[..next.len()].copy_from_slice(next);
-                Ok(next.len())
+    struct ControlledReader {
+        steps: thread_channel::Receiver<std::io::Result<Vec<u8>>>,
+        requests: mpsc::UnboundedSender<usize>,
+    }
+
+    impl Read for ControlledReader {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            if self.requests.send(bytes.len()).is_err() {
+                return Ok(0);
             }
+            let Ok(step) = self.steps.recv_timeout(Duration::from_secs(5)) else {
+                return Ok(0);
+            };
+            let data = step?;
+            bytes[..data.len()].copy_from_slice(&data);
+            Ok(data.len())
+        }
+    }
+
+    struct ReadControl {
+        steps: thread_channel::Sender<std::io::Result<Vec<u8>>>,
+        requests: mpsc::UnboundedReceiver<usize>,
+        thread: JoinHandle<()>,
+    }
+
+    impl ReadControl {
+        async fn requested(&mut self) -> usize {
+            tokio::time::timeout(Duration::from_secs(2), self.requests.recv())
+                .await
+                .expect("PTY reader did not request another read")
+                .expect("PTY reader stopped")
         }
 
-        let state = Arc::new(AtomicU64::new(DRAIN));
-        let (sender, mut events) = mpsc::channel(1);
+        fn data(&self, bytes: &[u8]) {
+            self.steps.send(Ok(bytes.to_vec())).unwrap();
+        }
+
+        fn would_block(&self) {
+            self.steps.send(Err(ErrorKind::WouldBlock.into())).unwrap();
+        }
+
+        fn finish(self) {
+            drop(self.steps);
+            self.thread.join().unwrap();
+        }
+    }
+
+    fn controlled_reader(state: &Arc<AtomicU64>) -> (ReadControl, mpsc::Receiver<PtyEvent>) {
+        let (steps, commands) = thread_channel::channel();
+        let (requests, waits) = mpsc::unbounded_channel();
+        let (sender, events) = mpsc::channel(16);
         let reader = state.clone();
-        let producer =
-            std::thread::spawn(move || read_pty(Box::new(Fragments(0)), sender, &reader));
-        tokio::time::timeout(Duration::from_secs(2), async {
-            assert!(matches!(events.recv().await, Some(PtyEvent::Bytes(bytes)) if bytes == [0xe6, 0xbc]));
-            assert!(matches!(events.recv().await, Some(PtyEvent::Bytes(bytes)) if bytes == [0xa2, 0x1b, b'[']));
-            assert!(matches!(events.recv().await, Some(PtyEvent::Boundary)));
-            assert_eq!(state.load(Ordering::Acquire), PAUSE);
+        let thread = std::thread::spawn(move || {
+            read_pty(
+                Box::new(ControlledReader {
+                    steps: commands,
+                    requests,
+                }),
+                sender,
+                &reader,
+            );
+        });
+        (
+            ReadControl {
+                steps,
+                requests: waits,
+                thread,
+            },
+            events,
+        )
+    }
+
+    async fn read_event(events: &mut mpsc::Receiver<PtyEvent>) -> Option<PtyEvent> {
+        tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("PTY reader did not publish an event")
+    }
+
+    async fn expect_bytes(events: &mut mpsc::Receiver<PtyEvent>, expected: &[u8]) {
+        let Some(PtyEvent::Bytes(bytes)) = read_event(events).await else {
+            panic!("expected original PTY bytes");
+        };
+        assert_eq!(bytes, expected);
+        assert!(bytes.len() <= OUTPUT_CHUNK_SIZE);
+    }
+
+    #[tokio::test]
+    async fn w1_resize_w1_terminal_reader_barrier_waits_for_complete_output_and_ack() {
+        let state = Arc::new(AtomicU64::new(RESUME));
+        let (mut control, mut events) = controlled_reader(&state);
+        assert_eq!(control.requested().await, OUTPUT_CHUNK_SIZE);
+        control.data(b"prefix\xe1\x80");
+        expect_bytes(&mut events, b"prefix").await;
+        assert_eq!(control.requested().await, OUTPUT_CHUNK_SIZE - 2);
+
+        state.store(DRAIN, Ordering::Release);
+        for _ in 0..2 {
+            control.would_block();
+            assert_eq!(control.requested().await, OUTPUT_CHUNK_SIZE - 2);
             assert!(events.try_recv().is_err());
-            state.store(RESUME, Ordering::Release);
-            assert!(matches!(events.recv().await, Some(PtyEvent::Bytes(bytes)) if bytes == b"H"));
-            assert!(events.recv().await.is_none());
-        }).await.unwrap();
-        producer.join().unwrap();
+        }
+        control.data(b"\x80\x1b[");
+        expect_bytes(&mut events, b"\xe1\x80\x80\x1b[").await;
+        assert_eq!(control.requested().await, OUTPUT_CHUNK_SIZE);
+        for _ in 0..2 {
+            control.would_block();
+            assert_eq!(control.requested().await, OUTPUT_CHUNK_SIZE);
+            assert_eq!(state.load(Ordering::Acquire), DRAIN);
+            assert!(events.try_recv().is_err());
+        }
+        control.data(b"2H");
+        expect_bytes(&mut events, b"2H").await;
+        control.requested().await;
+        control.would_block();
+        assert!(matches!(
+            read_event(&mut events).await,
+            Some(PtyEvent::Boundary)
+        ));
+        assert_eq!(state.load(Ordering::Acquire), PAUSE);
+        assert!(events.try_recv().is_err());
+        assert!(control.requests.try_recv().is_err());
+        state.store(RESUME, Ordering::Release);
+        control.requested().await;
+        control.data(b"post-grid");
+        expect_bytes(&mut events, b"post-grid").await;
+        control.finish();
+        assert!(read_event(&mut events).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_reader_matches_vt_transitions_and_cancellation() {
+        let cases: &[[&[u8]; 4]] = &[
+            [b"\x1b]", b"2;title", b"", b"\x07A"],
+            [b"\x1b]2;title", b"\x1b", b"", b"\\A"],
+            [b"\x1b]2;cancel", b"\xef\xbb\xbf", b"", b"\x18A"],
+            [b"\x1bP", b"1qcancel\x07", b"", b"\x1aA"],
+            [b"\x1bP", b"1?ignoredq", b"", b"\xc2\x9cA"],
+            [b"\x1bX", b"payload\x07", b"", b"\x1b\\A"],
+            [b"\x1b^", b"payload", b"", b"\xc2\x9cA"],
+            [b"\x1b_", b"payload", b"", b"\xc3\xa9A"],
+            [b"\x1b", b"(", b"", b"BA"],
+            [b"\x1b[", b"1 ?>", b"", b"CA"],
+            [b"\x1b]2;ignored", b"\xc2", b"\x9b\x07", b"2CA"],
+            [b"\x1bP1qignored", b"\xc2", b"\x9d2;new title", b"\x07A"],
+            [b"\x1b[", b"\xc0", b"\x802", b"CA"],
+            [b"\x1b(", b"\xed\xa0", b"\x80", b"BA"],
+            [b"\x1b[", b"\xf5\x80\x80", b"\x80", b"CA"],
+            [b"\x1b]", b"\xe1\x80", b"\xc2\x9b", b"2CA"],
+        ];
+        for &[before, prefix, continuation, suffix] in cases {
+            let state = Arc::new(AtomicU64::new(RESUME));
+            let (mut control, mut events) = controlled_reader(&state);
+            control.requested().await;
+            control.data(before);
+            expect_bytes(&mut events, before).await;
+            control.requested().await;
+            state.store(DRAIN, Ordering::Release);
+            control.data(prefix);
+            if continuation.is_empty() {
+                expect_bytes(&mut events, prefix).await;
+            }
+            control.requested().await;
+            control.would_block();
+            control.requested().await;
+            assert_eq!(state.load(Ordering::Acquire), DRAIN, "prefix {prefix:?}");
+            assert!(events.try_recv().is_err());
+            if !continuation.is_empty() {
+                control.data(continuation);
+                expect_bytes(&mut events, &[prefix, continuation].concat()).await;
+                control.requested().await;
+                control.would_block();
+                control.requested().await;
+                assert!(events.try_recv().is_err(), "continuation {continuation:?}");
+            }
+            control.data(suffix);
+            expect_bytes(&mut events, suffix).await;
+            control.requested().await;
+            control.would_block();
+            assert!(matches!(
+                read_event(&mut events).await,
+                Some(PtyEvent::Boundary)
+            ));
+            state.store(CLOSE, Ordering::Release);
+            control.finish();
+        }
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_reader_preserves_fifo_and_chunk_cap_with_three_byte_carry() {
+        let state = Arc::new(AtomicU64::new(RESUME));
+        let (mut control, mut events) = controlled_reader(&state);
+        let mut start = vec![b'A'; OUTPUT_CHUNK_SIZE - 3];
+        start.extend(b"\xf0\x90\x80");
+        assert_eq!(control.requested().await, OUTPUT_CHUNK_SIZE);
+        control.data(&start);
+        expect_bytes(&mut events, &start[..OUTPUT_CHUNK_SIZE - 3]).await;
+        assert_eq!(control.requested().await, OUTPUT_CHUNK_SIZE - 3);
+        let mut end = vec![b'B'; OUTPUT_CHUNK_SIZE - 3];
+        end[0] = 0x80;
+        state.store(DRAIN, Ordering::Release);
+        control.would_block();
+        assert_eq!(control.requested().await, OUTPUT_CHUNK_SIZE - 3);
+        assert!(events.try_recv().is_err());
+        control.data(&end);
+        let expected = [&start[OUTPUT_CHUNK_SIZE - 3..], end.as_slice()].concat();
+        expect_bytes(&mut events, &expected).await;
+        assert_eq!(control.requested().await, OUTPUT_CHUNK_SIZE);
+        control.would_block();
+        assert!(matches!(
+            read_event(&mut events).await,
+            Some(PtyEvent::Boundary)
+        ));
+        state.store(CLOSE, Ordering::Release);
+        control.finish();
+    }
+
+    #[derive(Clone, Debug)]
+    struct AttachmentKiller(Arc<AtomicU64>);
+
+    impl ChildKiller for AttachmentKiller {
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn controlled_view(
+        bridge: &DesktopBridge,
+        target: &remote_sessions_host::model::TerminalTarget,
+        agent: Uuid,
+        revision: u64,
+    ) -> (Arc<View>, ReadControl, Arc<AtomicU64>) {
+        use remote_sessions_host::model::{CommittedGeometry, ResizeIntent};
+        let epoch = ResizeEpoch {
+            agent,
+            owner: Uuid::new_v4(),
+        };
+        let terminal = TerminalView {
+            target: target.clone(),
+            view_id: Uuid::new_v4(),
+            agent_epoch: epoch.agent,
+        };
+        let reader_state = Arc::new(AtomicU64::new(RESUME));
+        let (controller, receiver) = controlled_reader(&reader_state);
+        let kills = Arc::new(AtomicU64::new(0));
+        let status = TerminalStatus {
+            terminal: terminal.clone(),
+            epoch: Some(epoch),
+            committed: CommittedGeometry {
+                size: TerminalSize {
+                    cols: 110,
+                    rows: 32,
+                },
+                revision,
+                intent: (revision > 0).then(|| ResizeIntent {
+                    id: Uuid::new_v4(),
+                    epoch,
+                }),
+            },
+            provider: None,
+            observation: ObservationState::Unavailable,
+        };
+        let view = Arc::new(View {
+            terminal,
+            directory: PathBuf::new(),
+            tmux: "/unused/tmux".into(),
+            client_pid: 0,
+            tty: PathBuf::new(),
+            control: Arc::new(tokio::sync::Mutex::new(Control { lease: None })),
+            resize: tokio::sync::Mutex::new(()),
+            killer: Mutex::new(Box::new(AttachmentKiller(kills.clone()))),
+            master: Mutex::new(None),
+            output: tokio::sync::Mutex::new(Output {
+                receiver,
+                status,
+                refresh_at: Instant::now() + Duration::from_secs(60),
+                applied_revision: 0,
+                pending: None,
+                drain_started: None,
+                writable: false,
+            }),
+            reader_state,
+        });
+        bridge
+            .views
+            .lock()
+            .unwrap()
+            .insert(view.terminal.view_id.to_string(), view.clone());
+        (view, controller, kills)
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_expired_incomplete_drain_isolates_the_view_and_drops_its_tail() {
+        use remote_sessions_host::model::TerminalTarget;
+        let target = TerminalTarget {
+            runtime_id: Uuid::new_v4(),
+            generation: Uuid::new_v4(),
+            session: "$0".into(),
+            window: "@0".into(),
+            pane: "%0".into(),
+            pid: 123,
+            process_start: 456,
+        };
+        let bridge = DesktopBridge::new(None, "/unused/tmux".into());
+        let agent = Uuid::new_v4();
+        let (stalled, mut writer, stalled_kills) = controlled_view(&bridge, &target, agent, 1);
+        let (peer, mut peer_writer, peer_kills) = controlled_view(&bridge, &target, agent, 0);
+        let view_id = stalled.terminal.view_id.to_string();
+        let peer_id = peer.terminal.view_id.to_string();
+        let start = Instant::now();
+        writer.requested().await;
+        writer.data(b"before\xe1\x80");
+        let chunk = bridge.read_with_clock(&view_id, || start).await.unwrap();
+        assert_eq!(chunk.data, b"before");
+        assert!(chunk.geometry.is_none());
+        assert_eq!(writer.requested().await, OUTPUT_CHUNK_SIZE - 2);
+        for _ in 0..2 {
+            writer.would_block();
+            writer.requested().await;
+            assert_eq!(stalled.reader_state.load(Ordering::Acquire), DRAIN);
+        }
+        peer_writer.requested().await;
+        peer_writer.data(b"peer first");
+        assert_eq!(bridge.read(&peer_id).await.unwrap().data, b"peer first");
+        peer_writer.requested().await;
+        let chunk = bridge
+            .read_with_clock(&view_id, || {
+                start + DRAIN_TIMEOUT - Duration::from_millis(1)
+            })
+            .await
+            .unwrap();
+        assert!(chunk.data.is_empty() && chunk.geometry.is_none());
+        assert_eq!(stalled.output.lock().await.drain_started, Some(start));
+        let failure = bridge
+            .read_with_clock(&view_id, || start + DRAIN_TIMEOUT)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(failure.to_string(), DRAIN_TIMEOUT_ERROR);
+        assert!(stalled.closed());
+        assert_eq!(stalled_kills.load(Ordering::Relaxed), 1);
+        assert!(stalled.output.lock().await.pending.is_none());
+
+        let (fresh, mut fresh_writer, _) = controlled_view(&bridge, &target, agent, 0);
+        let fresh_id = fresh.terminal.view_id.to_string();
+        assert_ne!(fresh_id, view_id);
+        assert_eq!(fresh.terminal.target, stalled.terminal.target);
+        writer.data(b"\x80old tail");
+        writer.finish();
+        assert!(
+            read_event(&mut stalled.output.lock().await.receiver)
+                .await
+                .is_none()
+        );
+        assert!(bridge.read(&view_id).await.unwrap().closed);
+        fresh_writer.requested().await;
+        fresh_writer.data(b"fresh redraw");
+        assert_eq!(bridge.read(&fresh_id).await.unwrap().data, b"fresh redraw");
+        peer_writer.data(b"peer next");
+        assert_eq!(bridge.read(&peer_id).await.unwrap().data, b"peer next");
+        assert!(!peer.closed() && !fresh.closed());
+        assert_eq!(peer_kills.load(Ordering::Relaxed), 0);
+        fresh_writer.finish();
+        peer_writer.finish();
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_boundary_received_at_deadline_cannot_reach_geometry() {
+        use remote_sessions_host::model::TerminalTarget;
+        let target = TerminalTarget {
+            runtime_id: Uuid::new_v4(),
+            generation: Uuid::new_v4(),
+            session: "$0".into(),
+            window: "@0".into(),
+            pane: "%0".into(),
+            pid: 123,
+            process_start: 456,
+        };
+        let bridge = DesktopBridge::new(None, "/unused/tmux".into());
+        let (view, mut writer, kills) = controlled_view(&bridge, &target, Uuid::new_v4(), 1);
+        let view_id = view.terminal.view_id.to_string();
+        let start = Instant::now();
+        writer.requested().await;
+        writer.data(b"\x1b[");
+        assert_eq!(
+            bridge
+                .read_with_clock(&view_id, || start)
+                .await
+                .unwrap()
+                .data,
+            b"\x1b["
+        );
+        writer.requested().await;
+        writer.data(b"H");
+        let before_deadline = start + DRAIN_TIMEOUT - Duration::from_millis(100);
+        assert_eq!(
+            bridge
+                .read_with_clock(&view_id, || before_deadline)
+                .await
+                .unwrap()
+                .data,
+            b"H"
+        );
+        writer.requested().await;
+        writer.would_block();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while view.output.lock().await.receiver.is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(view.output.lock().await.receiver.len(), 1);
+        assert_eq!(view.reader_state.load(Ordering::Acquire), PAUSE);
+
+        let clock_reads = Cell::new(0);
+        let failure = bridge
+            .read_with_clock(&view_id, || {
+                let read = clock_reads.get() + 1;
+                clock_reads.set(read);
+                if read < 3 {
+                    before_deadline
+                } else {
+                    start + DRAIN_TIMEOUT
+                }
+            })
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(failure.to_string(), DRAIN_TIMEOUT_ERROR);
+        assert_eq!(clock_reads.get(), 3);
+        assert!(view.closed());
+        assert_eq!(kills.load(Ordering::Relaxed), 1);
+        let mut output = view.output.lock().await;
+        assert!(output.pending.is_none());
+        assert_eq!(output.applied_revision, 0);
+        assert!(output.receiver.try_recv().is_err());
+        writer.finish();
     }
 }
