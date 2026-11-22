@@ -378,11 +378,17 @@ export function mergeCreateOperations(current: readonly LocalCreate[], incoming:
 export function selectCreatedRuntime(views: SessionViews, operation: LocalCreate, handled: ReadonlySet<string>, preserveActive = false): SessionViews {
   const result = operation.disposition;
   if (handled.has(operation.reference) || (result.result !== "launched" && result.result !== "exited")) return views;
-  const next = openView(views, result.runtime.runtime_id, [result.runtime.runtime_id]);
-  return preserveActive && views.active ? { ...next, active: views.active } : next;
+  const id = result.runtime.runtime_id;
+  const next = openView(views, id, [id]);
+  return preserveActive && (views.active !== null || views.open.includes(id)) ? { ...next, active: views.active } : next;
 }
 export const localClient = {
   inventory: async () => parseInventory(await invoke<unknown>("local_inventory")),
+  windowFullscreen: async (fullscreen?: boolean) => {
+    const result = await invoke<unknown>("local_window_fullscreen", fullscreen === undefined ? {} : { fullscreen });
+    if (typeof result !== "boolean") throw Error("Некоректний стан повноекранного режиму");
+    return result;
+  },
   pickWorkspace: async () => parseWorkspaceSelection(await invoke<unknown>("local_pick_workspace")),
   workspaceReadiness: async (workspaceId: string, profile: ProviderProfile) =>
     parseWorkspaceReadiness(await invoke<unknown>("local_workspace_readiness", { workspaceId, profile })),

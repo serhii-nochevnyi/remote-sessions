@@ -15,29 +15,35 @@ function geometryText(status: TerminalStatus): string {
   return `Сітка ${cols}×${rows} · ${measured}${pending}`;
 }
 
-export function TerminalView({ runtimeId, epoch, label }: { runtimeId: string; epoch: number; label: string }) {
+export function TerminalView({ runtimeId, epoch, label, fontSize }: { runtimeId: string; epoch: number; label: string; fontSize: number }) {
   const element = useRef<HTMLDivElement>(null);
+  const font = useRef(fontSize);
+  const updateFont = useRef<((size: number) => void) | null>(null);
   const reconnectDelay = useRef(500);
   const [status, setStatus] = useState("Підключення…");
   const [retry, setRetry] = useState(0);
   useEffect(() => {
+    font.current = fontSize;
+    updateFont.current?.(fontSize);
+  }, [fontSize]);
+  useEffect(() => {
     const container = element.current;
     if (!container) return;
     const rendererId = crypto.randomUUID();
-    const terminal = new Terminal({ disableStdin: true, fontSize: 13, lineHeight: 1.25,
+    const terminal = new Terminal({ disableStdin: true, fontSize: font.current, lineHeight: 1.25,
       fontFamily: "Menlo, Monaco, monospace", screenReaderMode: true, scrollback: 2000,
       theme: { background: "#111a21", foreground: "#d9e6e2" } });
     const fit = new FitAddon();
     const queryHandlers = suppressViewerQueries(terminal);
     terminal.loadAddon(fit);
     terminal.open(container);
+    if (document.activeElement === container) terminal.focus();
 
     const proposals = new ResizeProposals();
     let routing: OrderedGeometry | undefined;
     let disposed = false;
     let currentView: string | null = null;
     let writable = false;
-    let initiallyFocused = false;
     let inputFailed = false;
     let resizeUnavailable = false;
     let pendingBytes = 0;
@@ -45,6 +51,7 @@ export function TerminalView({ runtimeId, epoch, label }: { runtimeId: string; e
     let finishWrite: (() => void) | undefined;
     let reconnect: ReturnType<typeof setTimeout> | undefined;
     let frame = 0;
+    let layoutReady = false;
     const detach = (view: string) => localClient.detach(view).catch(() => undefined);
 
     function report() {
@@ -54,8 +61,9 @@ export function TerminalView({ runtimeId, epoch, label }: { runtimeId: string; e
     }
 
     async function propose() {
+      if (disposed || !currentView || !writable || inputFailed || !layoutReady) return;
       const proposal = proposals.take();
-      if (!proposal || disposed || !currentView) return;
+      if (!proposal) return;
       try {
         const result = await localClient.resize(proposal.terminal.view_id, proposal.epoch, proposal.size);
         if (disposed || currentView !== proposal.terminal.view_id) return;
@@ -74,27 +82,24 @@ export function TerminalView({ runtimeId, epoch, label }: { runtimeId: string; e
     }
 
     function layout() {
-      if (!routing || disposed || !currentView) return;
-      if (writable && !inputFailed) {
-        terminal.options.fontSize = 13;
-        const size = fit.proposeDimensions();
-        if (size) {
-          proposals.offer({ cols: Math.min(500, Math.max(2, size.cols)), rows: Math.min(200, Math.max(2, size.rows)) });
-          void propose();
-        }
-      } else {
-        const style = getComputedStyle(container!);
-        const width = container!.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
-        const height = container!.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
-        terminal.options.fontSize = Math.min(13, Math.max(9, Math.floor(Math.min(width / (terminal.cols * 0.62), height / (terminal.rows * 1.3)))));
-      }
+      if (!routing || disposed || !currentView || !writable || inputFailed || !container!.clientWidth || !container!.clientHeight) return;
+      const size = fit.proposeDimensions();
+      if (!size || !Number.isFinite(size.cols) || !Number.isFinite(size.rows)) return;
+      proposals.offer({ cols: Math.min(500, Math.max(2, size.cols)), rows: Math.min(200, Math.max(2, size.rows)) });
+      layoutReady = true;
+      void propose();
     }
 
     function layoutSoon() {
+      layoutReady = false;
       cancelAnimationFrame(frame);
       frame = requestAnimationFrame(layout);
     }
 
+    updateFont.current = size => {
+      terminal.options.fontSize = size;
+      layoutSoon();
+    };
     const observer = new ResizeObserver(layoutSoon);
     observer.observe(container);
 
@@ -102,6 +107,7 @@ export function TerminalView({ runtimeId, epoch, label }: { runtimeId: string; e
       const view = currentView;
       if (!view || !writable || disposed || inputFailed) return;
       if (pendingBytes + data.length > 65536) {
+        proposals.close();
         inputFailed = true; terminal.options.disableStdin = true;
         setStatus("Ввід завеликий. Перепідключіть термінал перед продовженням."); return;
       }
@@ -178,14 +184,8 @@ export function TerminalView({ runtimeId, epoch, label }: { runtimeId: string; e
           if (disposed || currentView !== view) return;
           writable = chunk.writable && !inputFailed;
           terminal.options.disableStdin = !writable;
-          if (writable && !initiallyFocused) {
-            initiallyFocused = true;
-            terminal.focus();
-          }
           if (proposals.observe(routing.status, writable, routing.applied)) {
             resizeUnavailable = false;
-            layoutSoon();
-          } else if (chunk.geometry && !writable) {
             layoutSoon();
           }
           if (chunk.geometry) resizeUnavailable = false;
@@ -210,6 +210,7 @@ export function TerminalView({ runtimeId, epoch, label }: { runtimeId: string; e
     void stream();
     return () => {
       disposed = true;
+      updateFont.current = null;
       clearTimeout(reconnect);
       cancelAnimationFrame(frame);
       routing?.close();
@@ -220,8 +221,13 @@ export function TerminalView({ runtimeId, epoch, label }: { runtimeId: string; e
       observer.disconnect();
       if (currentView) void detach(currentView);
       queryHandlers.forEach(handler => handler.dispose());
+      if (terminal.textarea === document.activeElement && container.isConnected) container.focus();
       terminal.dispose();
     };
   }, [runtimeId, epoch, retry]);
-  return <><div className="stream-status" role="status"><span>{status}</span><button onClick={() => setRetry(value => value + 1)}>Перепідключити</button></div><div className="terminal-view live-terminal" style={{ overflow: "auto" }} ref={element} aria-label={label} /></>;
+  return <><div className="stream-status" role="status"><span>{status}</span><button type="button" onClick={() => {
+    element.current?.focus();
+    setRetry(value => value + 1);
+  }}>Перепідключити</button></div>
+    <div className="terminal-view"><div className="live-terminal" ref={element} role="region" aria-label={label} tabIndex={0} /></div></>;
 }

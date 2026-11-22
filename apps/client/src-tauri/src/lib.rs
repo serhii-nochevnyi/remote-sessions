@@ -104,6 +104,18 @@ mod desktop {
         bridge.inventory().await.map_err(|e| e.to_string())
     }
     #[tauri::command]
+    pub fn local_window_fullscreen(
+        window: WebviewWindow,
+        fullscreen: Option<bool>,
+    ) -> Result<bool, String> {
+        if let Some(fullscreen) = fullscreen {
+            window
+                .set_fullscreen(fullscreen)
+                .map_err(|e| e.to_string())?;
+        }
+        window.is_fullscreen().map_err(|e| e.to_string())
+    }
+    #[tauri::command]
     pub async fn terminal_attach(
         runtime_id: String,
         bridge: State<'_, DesktopBridge>,
@@ -210,6 +222,7 @@ pub fn run() {
             .invoke_handler(tauri::generate_handler![
                 scaffold_status,
                 desktop::local_inventory,
+                desktop::local_window_fullscreen,
                 desktop::local_pick_workspace,
                 desktop::local_workspace_readiness,
                 desktop::local_create_session,
