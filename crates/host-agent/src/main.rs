@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use remote_sessions_host::{
-    find_executable,
+    find_executable, initialize_catalog,
     model::{Request, Response},
-    request, serve,
+    request, serve, serve_with_catalog,
 };
 use std::{os::unix::process::CommandExt, path::PathBuf};
 use uuid::Uuid;
@@ -18,11 +18,14 @@ struct Cli {
     state_dir: Option<PathBuf>,
     #[arg(long, global = true, default_value = "tmux")]
     tmux: String,
+    #[arg(long, global = true)]
+    catalog_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: Action,
 }
 #[derive(Subcommand)]
 enum Action {
+    CatalogInit,
     Doctor,
     Serve,
     Health,
@@ -55,6 +58,13 @@ enum Action {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if matches!(cli.command, Action::CatalogInit) {
+        return initialize_catalog(
+            cli.catalog_dir
+                .as_deref()
+                .context("--catalog-dir is required")?,
+        );
+    }
     if matches!(cli.command, Action::Doctor) {
         let dependencies: Vec<_> = [&*cli.tmux, "claude", "codex"]
             .into_iter()
@@ -76,6 +86,9 @@ async fn main() -> Result<()> {
     if matches!(cli.command, Action::Serve) {
         let tmux =
             find_executable(&cli.tmux).context("tmux executable not found; install tmux first")?;
+        if let Some(catalog) = cli.catalog_dir {
+            return serve_with_catalog(directory, tmux, catalog).await;
+        }
         return serve(directory, tmux).await;
     }
     let attaching = matches!(cli.command, Action::Attach { .. });
@@ -102,7 +115,7 @@ async fn main() -> Result<()> {
             runtime_id,
             expected_pane_id,
         },
-        Action::Serve | Action::Doctor => unreachable!(),
+        Action::CatalogInit | Action::Serve | Action::Doctor => unreachable!(),
     };
     let response = request(&directory, &message).await?;
     if let Response::Error { message } = &response {

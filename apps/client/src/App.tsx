@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { isTauri } from "@tauri-apps/api/core";
 import { TerminalView } from "./TerminalView";
+import { CreateSessionDialog } from "./CreateSessionDialog";
 import { closeView, openView } from "./session-state.ts";
 import type { SessionViews } from "./session-state.ts";
 import { localClient, runtimeTitle } from "./local-client";
@@ -8,6 +9,9 @@ import type { RuntimeInfo } from "./local-client";
 import "./App.css";
 
 export default function App() {
+  const [preflightOpen, setPreflightOpen] = useState(false);
+  const preflightButton = useRef<HTMLButtonElement>(null);
+  const canCheckWorkspace = isTauri() && navigator.userAgent.includes("Macintosh");
   const [views, setViews] = useState<SessionViews>({ open: [], active: null });
   const [runtimes, setRuntimes] = useState<readonly RuntimeInfo[]>([]);
   const remembered = useRef(new Map<string, RuntimeInfo>());
@@ -47,6 +51,9 @@ export default function App() {
       <aside className="sidebar" aria-label="Сесії на Mac">
         <div className="host-label"><strong>Цей Mac</strong><small>{online ? "Локальне керування" : "Очікуємо агента"}</small></div>
         <h1>Сесії</h1>
+        {canCheckWorkspace && <button className="session-row" ref={preflightButton} onClick={() => setPreflightOpen(true)}>
+          Перевірити проєкт
+        </button>}
         {runtimes.length === 0 && <p className="sidebar-note">{online ? "Поки немає запущених сесій." : "Список з’явиться після підключення."}</p>}
         {runtimes.map(runtime => <button className="session-row" key={runtime.runtime_id} aria-current={views.active === runtime.runtime_id ? "true" : undefined} onClick={() => select(runtime.runtime_id)}>
           <span className="session-icon" aria-hidden="true">›_</span><span><strong>{runtimeTitle(runtime)}</strong><small>{runtime.exited ? "Завершена" : online ? "Працює" : "Стан невідомий"}</small></span>
@@ -71,5 +78,6 @@ export default function App() {
         <footer><span>{message}</span></footer>
       </main>
     </div><div className="notice" role="status">{notice}</div>
+    {preflightOpen && <CreateSessionDialog onDismiss={() => setPreflightOpen(false)} returnFocus={preflightButton} />}
   </div>;
 }

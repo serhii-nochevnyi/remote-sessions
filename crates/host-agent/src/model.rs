@@ -89,6 +89,68 @@ pub enum Response {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderProfile {
+    ClaudeCode,
+    Codex,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductIssue {
+    InvalidRequest,
+    InvalidFolder,
+    UnsupportedPath,
+    FolderUnavailable,
+    FolderAccessDenied,
+    WorkspaceUnknown,
+    WorkspaceChanged,
+    WorkspaceCheckTimedOut,
+    ProviderMissing,
+    ProviderNotExecutable,
+    InterpreterUnavailable,
+    CatalogUnconfigured,
+    CatalogMissing,
+    CatalogUnsafe,
+    CatalogBusy,
+    CatalogUnsupported,
+    CatalogUnavailable,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceDisplay {
+    pub workspace_id: Uuid,
+    pub label: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProductEnvelope<T> {
+    pub product: T,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProductRequest {
+    RegisterWorkspace {
+        locator: String,
+    },
+    WorkspaceReadiness {
+        workspace_id: Uuid,
+        profile: ProviderProfile,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProductResponse {
+    WorkspaceRegistered { workspace: WorkspaceDisplay },
+    Ready {},
+    Blocked { issue: ProductIssue },
+}
+
 pub fn tmux_name(session_id: Uuid, runtime_id: Uuid) -> String {
     format!("rs_{}_{}", session_id.simple(), runtime_id.simple())
 }
