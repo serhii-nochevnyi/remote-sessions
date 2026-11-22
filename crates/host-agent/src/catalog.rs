@@ -537,10 +537,15 @@ fn read_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Operation> {
         &operation.stage
     {
         let runtime = &outcome.runtime;
+        let pid_matches = match runtime.pane_pid {
+            Some(pid) => pid == identity.pid,
+            None => runtime.exited,
+        };
         if (runtime.session_id, runtime.runtime_id) != (operation.session_id, operation.runtime_id)
             || runtime.tmux_name != operation.target
             || runtime.pane_id != identity.pane
-            || runtime.pane_pid != Some(identity.pid)
+            || identity.pid == 0
+            || !pid_matches
             || runtime.workspace_id != Some(operation.workspace_id)
             || runtime.operation_id != Some(operation.id)
         {

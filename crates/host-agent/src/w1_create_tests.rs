@@ -30,7 +30,11 @@ case "$4" in
         case "$6" in *"$token"*) ;; *) exit 0 ;; esac
         test -n "$name"
         test -n "$nonce"
-        case "$branch" in *"__managed-launch"*"-Fp"*"$name:0.0"*) ;; *) exit 1 ;; esac
+        stamp_format='#{session_id}:#{window_id}:#{pane_id}:#{pane_pid}'
+        case "$branch" in
+          *"__managed-launch "*" ; set-option -Fp -t =$name:0.0 @rs_create_nonce '$nonce:$stamp_format' ; set-option -p -t =$name:0.0 @rs_command codex") ;;
+          *) exit 1 ;;
+        esac
         printf '%s %s\n' "$name" "$nonce" >> dispatched
         mode=normal
         if test -f mode; then mode=$(cat mode); fi
@@ -41,13 +45,20 @@ case "$4" in
         printf '$%s|@%s|%%%s|%s\n' "$count" "$count" "$count" "$((300 + count))" > "$name.pane"
         tr '|' ':' < "$name.pane" > "$name.stamp"
         printf '0\n' > "$name.dead"
-        if test "$mode" = exited; then printf '1\n' > "$name.dead"; fi
+        receipt=$(cat "$name.pane")
+        if test "$mode" = exited; then
+          printf '1\n' > "$name.dead"
+          printf '%s|\n' "${receipt%|*}" > "$name.pane"
+        fi
         if test "$mode" = effect-lost; then exit 1; fi
-        cat "$name.pane" ;;
+        printf '%s\n' "$receipt" ;;
       *) exit 1 ;;
     esac ;;
   show-environment)
-    name=$(printf '%s\n' "$6" | cut -c2-)
+    test "$#" -eq 14
+    case "$6" in =rs_*) ;; *) exit 1 ;; esac
+    name=${6#=}
+    test "$5 $7 $8 $9 ${10} ${11} ${12} ${13}" = "-t RS_CREATE_NONCE ; list-panes -s -t =$name:0 -F"
     nonce=$(cat "$name.nonce")
     pane=$(cat "$name.pane")
     stamp=$(cat "$name.stamp")
@@ -257,6 +268,7 @@ async fn w1_create_concurrent_equal_keys_finalize_once_and_preserve_original_res
 
     fs::rename(&fixture.workspace, fixture.root.join("moved")).unwrap();
     fixture.set(&format!("{}.dead", runtime.tmux_name), "1\n");
+    fixture.set(&format!("{}.pane", runtime.tmux_name), "$1|@1|%1|\n");
     let job = fixture.restart(job).await;
     assert_eq!(
         fixture.call(&request).await,
@@ -411,12 +423,16 @@ async fn w1_create_effect_before_reply_requires_exact_generation_nonce_and_pane(
     let name = name.trim_end();
     let nonce_path = format!("{name}.nonce");
     let pane_path = format!("{name}.pane");
+    let stamp_path = format!("{name}.stamp");
     let nonce = fs::read(fixture.root.join(&nonce_path)).unwrap();
     let pane = fs::read(fixture.root.join(&pane_path)).unwrap();
+    let stamp = fs::read(fixture.root.join(&stamp_path)).unwrap();
     let generation = fs::read(fixture.root.join("generation")).unwrap();
     for (file, invalid, original) in [
         (nonce_path.as_str(), Uuid::new_v4().to_string(), &nonce),
         (pane_path.as_str(), "$1|@1|%99|301\n".into(), &pane),
+        (pane_path.as_str(), "$1|@1|%1|302\n".into(), &pane),
+        (pane_path.as_str(), "$1|@1|%1|\n".into(), &pane),
         ("generation", Uuid::new_v4().to_string(), &generation),
     ] {
         fixture.set(file, invalid);
@@ -433,6 +449,18 @@ async fn w1_create_effect_before_reply_requires_exact_generation_nonce_and_pane(
     ));
     fixture.set(&nonce_path, nonce);
     fixture.set(&format!("{name}.dead"), "1\n");
+    fixture.set(&pane_path, "$1|@1|%99|\n");
+    assert!(matches!(
+        fixture.status(key).await,
+        CreateState::Unknown { .. }
+    ));
+    fixture.set(&pane_path, "$1|@1|%1|\n");
+    fixture.set(&stamp_path, "$1:@1:%1:\n");
+    assert!(matches!(
+        fixture.status(key).await,
+        CreateState::Unknown { .. }
+    ));
+    fixture.set(&stamp_path, stamp);
     let job = fixture.restart(job).await;
     let CreateState::Confirmed {
         outcome,
@@ -443,10 +471,49 @@ async fn w1_create_effect_before_reply_requires_exact_generation_nonce_and_pane(
         panic!("expected retained pane")
     };
     assert!(outcome.runtime.exited);
+    assert_eq!(outcome.runtime.pane_pid, None);
     assert_eq!(
         crate::model::parse_name(name),
         Some((outcome.runtime.session_id, outcome.runtime.runtime_id))
     );
+    assert_eq!(fixture.dispatches(), 1);
+    stop(job).await;
+}
+
+#[tokio::test]
+async fn w1_create_quick_exit_with_no_current_pid_finalizes_and_survives_restart() {
+    let fixture = Fixture::new();
+    let job = fixture.serve(fixture.lane()).await;
+    let workspace = fixture.register().await;
+    let key = Uuid::new_v4();
+    fixture.set("mode", "exited");
+    let request = create(key, workspace, None);
+    let launched = fixture.call(&request).await;
+    let CreateState::Confirmed {
+        outcome,
+        current: PaneLiveness::Exited,
+        setup_issue: None,
+    } = &launched
+    else {
+        panic!("expected a confirmed retained pane");
+    };
+    let runtime = &outcome.runtime;
+    assert_eq!(runtime.pane_id, "%1");
+    assert_eq!(runtime.pane_pid, None);
+    assert_eq!(runtime.origin, RuntimeOrigin::Managed);
+    assert_eq!(runtime.workspace_id, Some(workspace));
+    assert!(runtime.exited);
+
+    let job = fixture.restart(job).await;
+    assert_eq!(fixture.status(key).await, launched);
+    assert_eq!(fixture.call(&request).await, launched);
+    let Response::Runtimes { runtimes } = crate::request(&fixture.root, &Request::List {})
+        .await
+        .unwrap()
+    else {
+        panic!("expected inventory");
+    };
+    assert_eq!(runtimes.as_slice(), std::slice::from_ref(runtime));
     assert_eq!(fixture.dispatches(), 1);
     stop(job).await;
 }
@@ -491,9 +558,10 @@ async fn w1_create_sqlite_full_blocks_failed_marker_or_finalization_and_preserve
         ];
         fixture.set("names", format!("{}\n{}\n", legacy[0], legacy[1]));
         for (index, name) in legacy.iter().enumerate() {
+            let pid = if index == 0 { "90" } else { "" };
             fixture.set(
                 &format!("{name}.pane"),
-                format!("$9|@9|%{}|{}\n", 9 + index, 90 + index),
+                format!("$9|@9|%{}|{pid}\n", 9 + index),
             );
             fixture.set(&format!("{name}.dead"), format!("{index}\n"));
         }
@@ -528,6 +596,7 @@ async fn w1_create_sqlite_full_blocks_failed_marker_or_finalization_and_preserve
             assert_eq!(runtime.origin, RuntimeOrigin::Legacy);
             assert_eq!((runtime.workspace_id, runtime.operation_id), (None, None));
             assert_eq!(runtime.exited, index == 1);
+            assert_eq!(runtime.pane_pid, (index == 0).then_some(90));
         }
         assert!(matches!(
             fixture.status(key).await,

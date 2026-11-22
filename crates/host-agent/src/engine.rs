@@ -220,18 +220,19 @@ impl Engine {
     }
 
     async fn observe(&self, operation: &Operation) -> Result<Observation> {
-        let target = format!("={}", operation.target);
+        let session_target = format!("={}", operation.target);
+        let window_target = format!("{session_target}:0");
         let output = self
             .command(&[
                 "show-environment",
                 "-t",
-                &target,
+                &session_target,
                 NONCE_ENV,
                 ";",
                 "list-panes",
                 "-s",
                 "-t",
-                &target,
+                &window_target,
                 "-F",
                 EVIDENCE_FORMAT,
             ])
@@ -250,16 +251,26 @@ impl Engine {
             generation(&fields[..3].join("|")) == Some(operation.generation),
             "tmux generation changed"
         );
-        let identity = pane_identity(&fields[3..7]).context("invalid pane identity")?;
-        let binding = format!("{nonce}:{}", fields[3..7].join(":"));
+        let (stamped_nonce, stamp) = fields[10].split_once(':').context("missing pane nonce")?;
+        let stamp: Vec<_> = stamp.split(':').collect();
+        let identity = pane_identity(&stamp).context("invalid launch pane stamp")?;
         ensure!(
-            fields[7] == operation.target && fields[8..10] == ["0", "0"] && fields[10] == binding,
+            fields[7] == operation.target
+                && fields[8..10] == ["0", "0"]
+                && stamped_nonce == nonce
+                && fields[3..6] == stamp[..3],
             "mismatched launch target or pane nonce"
         );
         let exited = match fields[11] {
             "0" => false,
             "1" => true,
             _ => bail!("invalid pane liveness"),
+        };
+        // @invariant: A retained dead pane may omit its current PID. Its launch stamp still binds the original PID.
+        let pane_pid = match fields[6] {
+            "" if exited => None,
+            pid if pid.parse::<u32>() == Ok(identity.pid) => Some(identity.pid),
+            _ => bail!("mismatched or missing pane PID"),
         };
         Ok(Observation {
             runtime: Runtime {
@@ -268,7 +279,7 @@ impl Engine {
                 tmux_name: operation.target.clone(),
                 pane_id: identity.pane.clone(),
                 command: operation.profile.executable_name().into(),
-                pane_pid: Some(identity.pid),
+                pane_pid,
                 exited,
                 width: fields[12].parse()?,
                 height: fields[13].parse()?,
@@ -303,6 +314,7 @@ impl Engine {
         let guard = format!("#{{&&:#{{==:#{{pid}},{pid}}},#{{==:#{{start_time}},{start}}}}}");
         let guard = format!("#{{&&:{guard},#{{==:#{{{GENERATION_OPTION}}},{token}}}}}");
         let name = &operation.target;
+        let pane_target = format!("={name}:0.0");
         let nonce = operation.nonce;
         // -c is itself a tmux format. Escape every literal hash before quoting.
         let cwd = tmux_word(&cwd.replace('#', "##"));
@@ -311,8 +323,8 @@ impl Engine {
         let branch = format!(
             "new-session -d -E -s {name} -n {profile} -c {cwd} -x 100 -y 30 \
              -e {NONCE_ENV}={nonce} -P -F '{RECEIPT_FORMAT}' -- {launcher} {LAUNCH_COMMAND} {capsule} ; \
-             set-option -Fp -t ={name}:0.0 {PANE_OPTION} '{nonce}:#{{session_id}}:#{{window_id}}:#{{pane_id}}:#{{pane_pid}}' ; \
-             set-option -t ={name} @rs_command {profile}"
+             set-option -Fp -t {pane_target} {PANE_OPTION} '{nonce}:#{{session_id}}:#{{window_id}}:#{{pane_id}}:#{{pane_pid}}' ; \
+             set-option -p -t {pane_target} @rs_command {profile}"
         );
         Ok((guard, branch))
     }
@@ -584,7 +596,6 @@ impl Engine {
                             runtime.runtime_id == operation.runtime_id
                                 && runtime.session_id == operation.session_id
                                 && runtime.pane_id == identity.pane
-                                && runtime.pane_pid == Some(identity.pid)
                         })
                         && let Ok(observed) = self.observe(&operation).await
                         && observed.identity == *identity
@@ -656,7 +667,8 @@ impl Engine {
                     .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("CLI");
-                self.command(&["set-option", "-t", &name, "@rs_command", label])
+                let target = format!("={name}:0.0");
+                self.command(&["set-option", "-t", &target, "@rs_command", label])
                     .await?;
                 Ok(Response::Created {
                     runtime: self.find(runtime_id).await?,
