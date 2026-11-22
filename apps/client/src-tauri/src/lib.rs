@@ -564,13 +564,24 @@ mod desktop {
         view_id: String,
         bridge: State<'_, DesktopBridge>,
     ) -> Result<Chunk, String> {
-        let chunk = bridge.read(&view_id).await.map_err(|e| e.to_string())?;
-        if resize_trace()
-            && let Some(status) = &chunk.status
-            && status.committed.revision > 0
-            && let Ok(line) = encode_local_observation(status)
-        {
-            eprintln!("RS_W1_RESIZE_PROVIDER {line}");
+        let trace = resize_trace();
+        let chunk = bridge.read(&view_id).await.map_err(|error| {
+            let message = error.to_string();
+            if trace {
+                trace_stream_failure(&view_id, "read", bridge_failure_reason(&message));
+            }
+            message
+        })?;
+        if trace {
+            if chunk.closed {
+                trace_stream_failure(&view_id, "read", "stream_closed");
+            }
+            if let Some(status) = &chunk.status
+                && status.committed.revision > 0
+                && let Ok(line) = encode_local_observation(status)
+            {
+                eprintln!("RS_W1_RESIZE_PROVIDER {line}");
+            }
         }
         Ok(chunk)
     }
@@ -599,19 +610,79 @@ mod desktop {
         acknowledgement: GridAcknowledgement,
         bridge: State<'_, DesktopBridge>,
     ) -> Result<GeometryEvent, String> {
+        let trace = resize_trace();
         let event = bridge
             .acknowledge_grid(&view_id, acknowledgement)
             .await
-            .map_err(|e| e.to_string())?;
-        if resize_trace()
-            && let Ok(line) = encode_renderer_observation(&event, acknowledgement)
-        {
+            .map_err(|error| {
+                let message = error.to_string();
+                if trace {
+                    trace_stream_failure(&view_id, "acknowledge", bridge_failure_reason(&message));
+                }
+                message
+            })?;
+        if trace && let Ok(line) = encode_renderer_observation(&event, acknowledgement) {
             eprintln!("RS_W1_RESIZE_GRID {line}");
         }
         Ok(event)
     }
     fn resize_trace() -> bool {
         cfg!(debug_assertions) && std::env::var("RS_W1_RESIZE_TRACE").as_deref() == Ok("1")
+    }
+
+    fn bridge_failure_reason(message: &str) -> &'static str {
+        match message {
+            "View detached" => "view_detached",
+            "View lock unavailable" => "view_lock_unavailable",
+            "Terminal read already in progress" => "read_in_progress",
+            "Terminal grid acknowledgement required" => "grid_ack_required",
+            "Terminal output did not reach a geometry boundary" => "geometry_drain_timeout",
+            "Terminal attachment identity changed" => "attachment_identity_changed",
+            "Розмір термінала недоступний" => {
+                "terminal_status_unavailable"
+            }
+            "Terminal geometry revision went backwards" => "geometry_revision_regressed",
+            "Native PTY unavailable" => "native_pty_unavailable",
+            "Native PTY resize was not observed" => "native_pty_resize_unobserved",
+            "Tmux client resize was not observed" => "tmux_client_resize_unobserved",
+            "Terminal boundary already in progress" => "boundary_in_progress",
+            "No pending geometry boundary" => "boundary_missing",
+            "Terminal renderer acknowledgement is stale or mismatched" => "grid_ack_mismatch",
+            "Terminal geometry boundary was superseded" => "boundary_superseded",
+            "Attachment PTY descriptor unavailable" => "attachment_pty_unavailable",
+            "Attachment client unavailable" | "Exact tmux attachment client unavailable" => {
+                "tmux_client_unavailable"
+            }
+            "Ambiguous attachment client" => "tmux_client_ambiguous",
+            "Invalid tmux client grid" => "tmux_client_grid_invalid",
+            "Attachment grid changed" => "attachment_grid_changed",
+            "IPC read timeout" => "agent_read_timeout",
+            "IPC frame is incomplete or exceeds limit" | "invalid agent response" => {
+                "agent_response_invalid"
+            }
+            "local agent is unavailable" => "agent_unavailable",
+            "deadline has elapsed" => "bridge_operation_timeout",
+            _ => "bridge_error",
+        }
+    }
+
+    fn trace_stream_failure(view_id: &str, stage: &str, reason: &str) {
+        use std::io::Write;
+
+        let uuid = view_id.len() == 36
+            && view_id.bytes().enumerate().all(|(index, byte)| {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            });
+        if uuid {
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "RS_W1_RESIZE_FAILURE {{\"view_id\":\"{view_id}\",\"stage\":\"{stage}\",\"reason\":\"{reason}\"}}"
+            );
+        }
     }
     #[tauri::command]
     pub async fn terminal_input(
@@ -626,8 +697,28 @@ mod desktop {
             .map_err(|e| e.to_string())
     }
     #[tauri::command]
-    pub fn terminal_detach(view_id: String, bridge: State<'_, DesktopBridge>) {
+    pub fn terminal_detach(
+        view_id: String,
+        failure: Option<String>,
+        bridge: State<'_, DesktopBridge>,
+    ) {
         bridge.detach(&view_id);
+        if resize_trace()
+            && let Some(
+                reason @ ("attachment_setup"
+                | "read_response"
+                | "grid_ack_response"
+                | "geometry_routing"
+                | "stream_closed"
+                | "terminal_status_changed"
+                | "invalid_geometry_boundary"
+                | "renderer_grid_mismatch"
+                | "stale_grid_ack"
+                | "renderer_write_timeout"),
+            ) = failure.as_deref()
+        {
+            trace_stream_failure(&view_id, "renderer_detach", reason);
+        }
     }
 }
 

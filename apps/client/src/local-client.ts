@@ -66,6 +66,9 @@ export interface Chunk {
   readonly status?: TerminalStatus | null;
   readonly geometry?: GeometryEvent | null;
 }
+export type TerminalStreamFailure = "attachment_setup" | "read_response" | "grid_ack_response"
+  | "geometry_routing" | "stream_closed" | "terminal_status_changed" | "invalid_geometry_boundary"
+  | "renderer_grid_mismatch" | "stale_grid_ack" | "renderer_write_timeout";
 export type ProviderProfile = "claude_code" | "codex";
 export interface WorkspaceDisplay { readonly workspace_id: string; readonly label: string }
 type PaneLiveness = "live" | "exited" | "unavailable";
@@ -414,7 +417,9 @@ export const localClient = {
   acknowledgeGrid: async (viewId: string, acknowledgement: GridAcknowledgement) =>
     parseGeometryEvent(await invoke<unknown>("terminal_acknowledge_grid", { viewId, acknowledgement })),
   input: async (viewId: string, data: readonly number[], paste: boolean) => { await invoke("terminal_input", { viewId, data, paste }); },
-  detach: async (viewId: string) => { await invoke("terminal_detach", { viewId }); },
+  detach: async (viewId: string, failure?: TerminalStreamFailure) => {
+    await invoke("terminal_detach", { viewId, failure });
+  },
 };
 export function runtimeTitle(runtime: RuntimeInfo): string {
   const command = runtime.command.toLowerCase();

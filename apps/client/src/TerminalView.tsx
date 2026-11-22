@@ -3,7 +3,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import { suppressViewerQueries } from "./terminal-protocol";
 import { localClient } from "./local-client";
-import type { GeometryEvent, TerminalSize, TerminalStatus } from "./local-client";
+import type { GeometryEvent, TerminalSize, TerminalStatus, TerminalStreamFailure } from "./local-client";
 import { OrderedGeometry, ResizeProposals } from "./terminal-geometry";
 import "@xterm/xterm/css/xterm.css";
 
@@ -13,6 +13,19 @@ function geometryText(status: TerminalStatus): string {
   const measured = provider ? `розмір процесу ${provider.size.cols}×${provider.size.rows}` : "розмір процесу недоступний";
   const pending = status.observation === "pending" ? " · зміна триває" : "";
   return `Сітка ${cols}×${rows} · ${measured}${pending}`;
+}
+
+function streamFailure(error: unknown, stage: TerminalStreamFailure): TerminalStreamFailure {
+  if (!(error instanceof Error)) return stage;
+  switch (error.message) {
+    case "Потік перервано": return "stream_closed";
+    case "Стан термінала змінився": return "terminal_status_changed";
+    case "Не вдалося узгодити межу зміни розміру": return "invalid_geometry_boundary";
+    case "Розміри відображення не збігаються": return "renderer_grid_mismatch";
+    case "Підтвердження розміру застаріло": return "stale_grid_ack";
+    case "Не вдалося обробити вивід термінала": return "renderer_write_timeout";
+    default: return stage;
+  }
 }
 
 export function TerminalView({ runtimeId, epoch, label, fontSize }: { runtimeId: string; epoch: number; label: string; fontSize: number }) {
@@ -53,7 +66,7 @@ export function TerminalView({ runtimeId, epoch, label, fontSize }: { runtimeId:
     let reconnect: ReturnType<typeof setTimeout> | undefined;
     let frame = 0;
     let layoutReady = false;
-    const detach = (view: string) => localClient.detach(view).catch(() => undefined);
+    const detach = (view: string, failure?: TerminalStreamFailure) => localClient.detach(view, failure).catch(() => undefined);
 
     function report() {
       if (!routing || disposed || !currentView || inputFailed) return;
@@ -140,6 +153,7 @@ export function TerminalView({ runtimeId, epoch, label, fontSize }: { runtimeId:
       send(new TextEncoder().encode(paste ? data.slice(6, -6) : data), paste);
     });
     const binaryInput = terminal.onBinary(data => send(Uint8Array.from(data, char => char.charCodeAt(0))));
+    let streamStage: TerminalStreamFailure = "attachment_setup";
     const sink = {
       write: (data: readonly number[]) => new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => {
@@ -158,14 +172,16 @@ export function TerminalView({ runtimeId, epoch, label, fontSize }: { runtimeId:
         terminal.resize(size.cols, size.rows);
         return { cols: terminal.cols, rows: terminal.rows };
       },
-      acknowledge: (event: GeometryEvent, size: TerminalSize) =>
-        localClient.acknowledgeGrid(event.status.terminal.view_id, {
+      acknowledge: (event: GeometryEvent, size: TerminalSize) => {
+        streamStage = "grid_ack_response";
+        return localClient.acknowledgeGrid(event.status.terminal.view_id, {
           renderer_id: rendererId,
           epoch: event.status.epoch,
           revision: event.status.committed.revision,
           size,
           focused: terminal.textarea === document.activeElement,
-        }),
+        });
+      },
     };
     async function stream() {
       try {
@@ -180,8 +196,10 @@ export function TerminalView({ runtimeId, epoch, label, fontSize }: { runtimeId:
         container.setAttribute("data-terminal-attached", "");
         layoutSoon();
         while (!disposed && currentView === view) {
+          streamStage = "read_response";
           const chunk = await localClient.read(view);
           if (disposed || currentView !== view) return;
+          streamStage = "geometry_routing";
           await routing.consume(chunk, sink);
           if (disposed || currentView !== view) return;
           writable = chunk.writable && !inputFailed;
@@ -204,7 +222,7 @@ export function TerminalView({ runtimeId, epoch, label, fontSize }: { runtimeId:
         terminal.options.disableStdin = true;
         routing?.close();
         proposals.close();
-        if (previous) void detach(previous);
+        if (previous) void detach(previous, streamFailure(error, streamStage));
         setStatus(`Перепідключення… ${String(error)}`);
         reconnect = setTimeout(() => setRetry(value => value + 1), reconnectDelay.current);
         reconnectDelay.current = Math.min(reconnectDelay.current * 2, 4000);
