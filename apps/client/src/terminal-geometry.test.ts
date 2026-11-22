@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import xterm from "@xterm/xterm";
 import { parseChunk, parseGeometryEvent, parseResizeResult, parseTerminalStatus } from "./local-client.ts";
 import type { GeometryEvent, TerminalSize } from "./local-client.ts";
-import { OrderedGeometry, ResizeProposals } from "./terminal-geometry.ts";
+import { GeometryBoundaryError, OrderedGeometry, ResizeProposals } from "./terminal-geometry.ts";
 
 const uuid = (id: number) => `11111111-1111-4111-8111-${String(id).padStart(12, "0")}`;
 const agent = uuid(1);
@@ -184,10 +185,10 @@ test("well-formed stale resize replies cannot complete the current scope or revi
   }))), false);
 });
 
-function bytes(data: number[]) { return { data, writable: false, closed: false }; }
+function bytes(data: readonly number[]) { return { data, writable: false, closed: false }; }
 function boundary(geometry = parseGeometryEvent(fixtureEvent())) { return { ...bytes([]), geometry }; }
 
-test("parse callbacks precede the grid and targeted redraw, including split UTF-8 and alternate-screen output", async () => {
+test("each write callback precedes grid application and the matching ACK", async () => {
   const order: string[] = [];
   const routing = new OrderedGeometry(initial());
   let done: (() => void) | undefined;
@@ -197,9 +198,15 @@ test("parse callbacks precede the grid and targeted redraw, including split UTF-
       done = () => { order.push("parsed"); resolve(); };
     }),
     resize: (size: TerminalSize) => { order.push("grid"); return size; },
-    acknowledge: async (event: GeometryEvent) => { order.push("redraw"); return event; },
+    acknowledge: async (event: GeometryEvent, size: TerminalSize) => {
+      assert.equal(event.status.terminal.view_id, terminal.view_id);
+      assert.equal(event.status.committed.revision, 1);
+      assert.deepEqual(size, sizes[0]);
+      order.push("ack");
+      return event;
+    },
   };
-  const writes = [[0xe6, 0xbc], [0xa2, 0x1b], [0x5b, 0x3f, 0x31, 0x30, 0x34], [0x39, 0x68]];
+  const writes = [[0xe6, 0xbc, 0xa2, 0x1b], [0x5b, 0x3f, 0x31, 0x30, 0x34], [0x39, 0x68]];
   for (const write of writes) {
     const pending = routing.consume(bytes(write), sink);
     assert.notEqual(order[order.length - 1], "parsed");
@@ -208,7 +215,7 @@ test("parse callbacks precede the grid and targeted redraw, including split UTF-
   }
   await routing.consume(boundary(), sink);
   assert.deepEqual(order, [
-    "write:230", "parsed", "write:162", "parsed", "write:91", "parsed", "write:57", "parsed", "grid", "redraw",
+    "write:230", "parsed", "write:91", "parsed", "write:57", "parsed", "grid", "ack",
   ]);
   assert.equal(routing.applied, 1);
 });
@@ -223,11 +230,13 @@ test("partial parser boundaries and stale revisions dispose only one stream with
   const broken = new OrderedGeometry(initial());
   const healthy = new OrderedGeometry(initial());
   await broken.consume(bytes([0x1b, 0x5d, 0x30]), sink);
-  await assert.rejects(broken.consume(boundary(), sink));
+  await assert.rejects(broken.consume(boundary(), sink), {
+    name: "Error", message: "Не вдалося узгодити межу зміни розміру", reason: "geometry_output_incomplete",
+  });
   await broken.consume(bytes([0x07]), sink);
   assert.deepEqual(order, ["write:27"]);
   await healthy.consume(boundary(), sink);
-  await assert.rejects(healthy.consume(boundary(), sink));
+  await assert.rejects(healthy.consume(boundary(), sink), { reason: "geometry_revision_not_new" });
   assert.deepEqual(order, ["write:27", "grid", "redraw"]);
   const fresh = new OrderedGeometry(initial());
   await fresh.consume(bytes([0x41]), sink);
@@ -235,9 +244,37 @@ test("partial parser boundaries and stale revisions dispose only one stream with
   assert.deepEqual(order, ["write:27", "grid", "redraw", "write:65", "grid", "redraw"]);
 });
 
-test("wrong-generation, old-owner and late callbacks leave the renderer grid unchanged", async () => {
-  const result = fixtureEvent();
-  const stale = parseGeometryEvent(mutate(result, "status.terminal.target.generation", uuid(70)));
+test("geometry failures report the first predicate and never resize or ACK", async () => {
+  const sink = {
+    write: async () => {},
+    resize: () => assert.fail("rejected geometry resized"),
+    acknowledge: async () => assert.fail("rejected geometry was acknowledged"),
+  };
+  const status = parseTerminalStatus(fixtureStatus(2, sizes[1]));
+  const currentEvent = fixtureEvent(2, sizes[1]);
+  const wrongView = parseGeometryEvent(mutate(currentEvent, "status.terminal.view_id", uuid(69)));
+  const wrongGeneration = parseGeometryEvent(mutate(currentEvent, "status.terminal.target.generation", uuid(70)));
+  const wrongSize = parseGeometryEvent(fixtureEvent(2, sizes[2]));
+  const wrongIntent = parseGeometryEvent(mutate(currentEvent, "status.committed.intent.id", uuid(95)));
+  const wrongIntentOwner = parseGeometryEvent(mutate(currentEvent, "status.committed.intent.epoch.owner", uuid(94)));
+  for (const event of [wrongView, wrongGeneration, wrongSize, wrongIntent, wrongIntentOwner, parseGeometryEvent(fixtureEvent())]) {
+    const routing = new OrderedGeometry(initial());
+    await routing.consume({ ...bytes([]), status }, sink);
+    await assert.rejects(routing.consume(boundary(event), sink), { reason: "geometry_status_rejected" });
+  }
+  const handoff = new OrderedGeometry(initial());
+  await handoff.consume({ ...bytes([]), status: { ...initial(), epoch: { agent, owner: uuid(71) } } }, sink);
+  await assert.rejects(handoff.consume(boundary(), sink), { reason: "geometry_status_rejected" });
+
+  const routing = new OrderedGeometry(status);
+  await routing.consume(bytes([0x1b]), sink);
+  await assert.rejects(routing.consume(boundary(wrongView), sink), { reason: "geometry_revision_not_new" });
+  const incomplete = new OrderedGeometry(initial());
+  await incomplete.consume(bytes([0x1b]), sink);
+  await assert.rejects(incomplete.consume(boundary(wrongView), sink), { reason: "geometry_status_rejected" });
+});
+
+test("late write and ACK callbacks stay inside the disposed attachment", async () => {
   let writes = 0;
   let changed = 0;
   let resolve: (() => void) | undefined;
@@ -246,19 +283,148 @@ test("wrong-generation, old-owner and late callbacks leave the renderer grid unc
     resize: (size: TerminalSize) => { changed++; return size; },
     acknowledge: async (event: GeometryEvent) => event,
   };
-  const routing = new OrderedGeometry(initial());
-  await assert.rejects(routing.consume(boundary(stale), sink));
-  assert.equal(changed, 0);
-  const handoff = new OrderedGeometry(initial());
-  await handoff.consume({ ...bytes([]), status: { ...initial(), epoch: { agent, owner: uuid(71) } } }, sink);
-  await assert.rejects(handoff.consume(boundary(), sink));
-  assert.equal(changed, 0);
   const disconnected = new OrderedGeometry(initial());
   const pending = disconnected.consume(bytes([0x1b]), sink);
   disconnected.close();
+  assert.equal(changed, 0);
+  assert.equal(writes, 1);
+
+  const old = new OrderedGeometry(initial());
+  let finishAck: ((event: GeometryEvent) => void) | undefined;
+  const outstanding = old.consume(boundary(), {
+    ...sink,
+    acknowledge: () => new Promise(resolve => { finishAck = resolve; }),
+  });
+  assert.equal(changed, 1);
+  old.close();
+  const nextTerminal = { ...terminal, view_id: uuid(72) };
+  const fresh = new OrderedGeometry({ ...initial(), terminal: nextTerminal });
+  const freshEvent = parseGeometryEvent(mutate(fixtureEvent(2), "status.terminal.view_id", nextTerminal.view_id));
+  await fresh.consume(boundary(freshEvent), sink);
   resolve!();
   await pending;
   await disconnected.consume(boundary(), sink);
-  assert.equal(changed, 0);
-  assert.equal(writes, 1);
+  finishAck!(parseGeometryEvent(fixtureEvent()));
+  await outstanding;
+  assert.equal(changed, 2);
+  assert.equal(disconnected.applied, 0);
+  assert.equal(old.applied, 0);
+  assert.equal(fresh.applied, 2);
+  assert.equal(fresh.status.terminal.view_id, nextTerminal.view_id);
 });
+
+const encode = (text: string) => Array.from(new TextEncoder().encode(text));
+const followup = encode("\x1b[2C!");
+
+const renderCases = [
+  { name: "CSI", chunks: [encode("A\x1b[2"), encode("CB")], premature: 1, rendered: "A  B" },
+  { name: "CSI ignore", chunks: [encode("A\x1b[2 ?>"), encode("CB")], premature: 1, rendered: "AB" },
+  { name: "ESC intermediate", chunks: [encode("A\x1b("), encode("BB")], premature: 1, rendered: "AB" },
+  { name: "OSC with split ESC-ST", chunks: [encode("A\x1b]2;title"), [0x1b], encode("\\B")],
+    premature: 2, rendered: "AB", controls: ["osc:title"] },
+  { name: "OSC with BEL", chunks: [encode("A\x1b]2;title"), encode("\x07B")],
+    premature: 1, rendered: "AB", controls: ["osc:title"] },
+  { name: "DCS with decoded C1 ST", chunks: [encode("A\x1bP1qpayload"), [0xc2, 0x9c, 0x42]],
+    premature: 1, rendered: "AB", controls: ["dcs:payload"] },
+  { name: "DCS ignore", chunks: [encode("A\x1bP1?qunsupported"), encode("\x1b\\B")], premature: 1, rendered: "AB" },
+  { name: "SOS, PM and APC strings", chunks: [encode("A\x1bXignore\x1b^ignore\x1b_ignore"), [0xc2, 0x9c, 0x42]],
+    premature: 1, rendered: "AB" },
+  { name: "OSC interrupted by decoded C1 CSI followed by BEL",
+    chunks: [encode("A\x1b]2;ignored"), [0xc2, 0x9b, 0x07], encode("2CB")], premature: 2, rendered: "A  B" },
+  { name: "OSC cancelled by CAN", chunks: [encode("A\x1b]2;discard"), [0x18, 0x42]],
+    premature: 1, rendered: "AB" },
+  { name: "DCS cancelled by SUB", chunks: [encode("A\x1bP1qdiscard"), [0x1a, 0x42]],
+    premature: 1, rendered: "AB" },
+  { name: "malformed C0 with a noncontinuation", chunks: [[0x41], [0xc0, 0x1b, 0x5b], encode("2CB")],
+    premature: 1, extraPrefix: [0xc0], rendered: "A  B" },
+  { name: "malformed C0 with an overlong continuation", chunks: [encode("A\x1b["), [0xc0, 0x80, 0x32], encode("CB")],
+    premature: 1, extraPrefix: [0xc0], rendered: "A  B" },
+  { name: "E1 80 / 80 combined by native framing", chunks: [[0x41], [0xe1, 0x80, 0x80, 0x42]],
+    premature: 1, extraPrefix: [0xe1, 0x80], rendered: "AကB" },
+  { name: "a cancelled scalar before another starter", chunks: [[0x41, 0xe1, 0x80], [0xc2, 0x9b, 0x32, 0x43, 0x42]],
+    premature: 1, rendered: "A  B" },
+] satisfies {
+  name: string; chunks: number[][]; premature: number; extraPrefix?: number[];
+  rendered: string; controls?: string[];
+}[];
+
+function rendererFixture() {
+  const xtermTerminal = new xterm.Terminal({ cols: original.cols, rows: original.rows, allowProposedApi: true });
+  const controls: string[] = [];
+  xtermTerminal.parser.registerOscHandler(2, data => { controls.push(`osc:${data}`); return true; });
+  xtermTerminal.parser.registerDcsHandler({ final: "q" }, data => { controls.push(`dcs:${data}`); return true; });
+  return {
+    xtermTerminal,
+    controls,
+    write: (data: readonly number[]) => new Promise<void>(done => xtermTerminal.write(Uint8Array.from(data), done)),
+    line: () => xtermTerminal.buffer.active.getLine(0)?.translateToString(true),
+  };
+}
+
+test("xterm's unfinished scalar after a misframed E1 80 / 80 split rejects the grid", { timeout: 2000 }, async t => {
+  const renderer = rendererFixture();
+  t.after(() => renderer.xtermTerminal.dispose());
+  const routing = new OrderedGeometry(initial());
+  const sink = {
+    write: renderer.write,
+    resize: () => assert.fail("incomplete output resized"),
+    acknowledge: async () => assert.fail("incomplete output was acknowledged"),
+  };
+  await routing.consume(bytes([0x41, 0xe1, 0x80]), sink);
+  await routing.consume(bytes([0x80]), sink);
+  assert.equal(renderer.line(), "A");
+  await assert.rejects(routing.consume(boundary(), sink), { reason: "geometry_output_incomplete" });
+});
+
+for (const { name, chunks, premature, extraPrefix, rendered, controls = [] } of renderCases) {
+  test(`xterm 6.0.0 renders ${name} across the ordered geometry boundary`, { timeout: 2000 }, async t => {
+    const partial = rendererFixture();
+    const renderer = rendererFixture();
+    const contiguous = rendererFixture();
+    t.after(() => {
+      partial.xtermTerminal.dispose();
+      renderer.xtermTerminal.dispose();
+      contiguous.xtermTerminal.dispose();
+    });
+    const broken = new OrderedGeometry(initial());
+    const rejectingSink = {
+      write: partial.write,
+      resize: () => assert.fail("incomplete output resized"),
+      acknowledge: async () => assert.fail("incomplete output was acknowledged"),
+    };
+    for (const data of chunks.slice(0, premature)) await broken.consume(bytes(data), rejectingSink);
+    if (extraPrefix) await broken.consume(bytes(extraPrefix), rejectingSink);
+    await assert.rejects(broken.consume(boundary(), rejectingSink), (error: unknown) =>
+      error instanceof GeometryBoundaryError && error.reason === "geometry_output_incomplete");
+
+    const order: string[] = [];
+    const event = parseGeometryEvent(fixtureEvent());
+    const routing = new OrderedGeometry(initial());
+    const sink = {
+      write: async (data: readonly number[]) => { await renderer.write(data); order.push("write callback"); },
+      resize: (size: TerminalSize) => {
+        assert.equal(renderer.line(), rendered);
+        assert.deepEqual(renderer.controls, controls);
+        renderer.xtermTerminal.resize(size.cols, size.rows);
+        order.push("resize");
+        return { cols: renderer.xtermTerminal.cols, rows: renderer.xtermTerminal.rows };
+      },
+      acknowledge: async (received: GeometryEvent, size: TerminalSize) => {
+        assert.equal(received, event);
+        assert.deepEqual(size, event.status.committed.size);
+        order.push("ack");
+        return received;
+      },
+    };
+    for (const data of chunks) await routing.consume(bytes(data), sink);
+    assert.equal(routing.applied, 0);
+    await routing.consume(boundary(event), sink);
+    assert.equal(routing.applied, event.status.committed.revision);
+    await routing.consume(bytes(followup), sink);
+    assert.deepEqual(order, [...chunks.map(() => "write callback"), "resize", "ack", "write callback"]);
+    await contiguous.write([...chunks.flat(), ...followup]);
+    assert.equal(renderer.line(), `${rendered}  !`);
+    assert.equal(renderer.line(), contiguous.line());
+    assert.deepEqual(renderer.controls, contiguous.controls);
+  });
+}

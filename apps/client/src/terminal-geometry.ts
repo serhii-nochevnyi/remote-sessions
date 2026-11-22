@@ -1,5 +1,5 @@
 import type {
-  Chunk, GeometryEvent, ResizeEpoch, ResizeResult, TerminalScope, TerminalSize, TerminalStatus,
+  Chunk, GeometryBoundaryFailure, GeometryEvent, ResizeEpoch, ResizeResult, TerminalScope, TerminalSize, TerminalStatus,
 } from "./local-client.ts";
 
 export function sameSize(left: TerminalSize, right: TerminalSize): boolean {
@@ -97,62 +97,148 @@ export class ResizeProposals {
   }
 }
 
-class OutputBoundary {
-  private state: "ground" | "escape" | "intermediate" | "csi" | "osc" | "string" | "string_escape" = "ground";
-  private bytes = 0;
-  private codePoint = 0;
-  private minimum = 0;
+type VtState = "ground" | "escape" | "escapeIntermediate" | "osc" | "sosPmApc"
+  | "csiEntry" | "csiParam" | "csiIntermediate" | "csiIgnore"
+  | "dcsEntry" | "dcsParam" | "dcsIntermediate" | "dcsIgnore" | "dcsPassthrough";
 
-  get complete() {
-    return this.state === "ground" && this.bytes === 0;
+// @contract: Follow the xterm 6.0.0 VT500 transition table and string end handlers.
+function nextVtState(state: VtState, code: number): VtState {
+  switch (code) {
+    case 0x1b: return "escape";
+    case 0x90: return "dcsEntry";
+    case 0x98: case 0x9e: case 0x9f: return "sosPmApc";
+    case 0x9b: return "csiEntry";
+    case 0x9d: return "osc";
   }
+  if (code === 0x18 || code === 0x1a || (code >= 0x80 && code <= 0x9f)) return "ground";
+  if (code === 0x07 && state === "osc") return "ground";
+  if (code < 0x20 || code === 0x7f) return state;
 
-  accept(data: readonly number[]) {
-    for (const byte of data) {
-      if (this.bytes) {
-        if ((byte & 0xc0) === 0x80) {
-          this.codePoint = (this.codePoint << 6) | (byte & 0x3f);
-          if (--this.bytes === 0) {
-            const code = this.codePoint;
-            this.control(code >= this.minimum && code <= 0x10ffff ? code : 0xfffd);
-          }
-          continue;
-        }
-        this.bytes = 0;
-        this.control(0xfffd);
+  const intermediate = code <= 0x2f;
+  const parameter = code >= 0x30 && code <= 0x3b;
+  const privateMarker = code >= 0x3c && code <= 0x3f;
+  const final = code >= 0x40 && code <= 0x7e;
+  switch (state) {
+    case "escape":
+      switch (code) {
+        case 0x50: return "dcsEntry";
+        case 0x58: case 0x5e: case 0x5f: return "sosPmApc";
+        case 0x5b: return "csiEntry";
+        case 0x5d: return "osc";
       }
-      if (byte >= 0xc2 && byte <= 0xf4) {
-        this.bytes = byte < 0xe0 ? 1 : byte < 0xf0 ? 2 : 3;
-        this.minimum = this.bytes === 1 ? 0x80 : this.bytes === 2 ? 0x800 : 0x10000;
-        this.codePoint = byte & (0x7f >> (this.bytes + 1));
-      } else {
-        this.control(byte < 0x80 ? byte : 0xfffd);
-      }
-    }
-  }
-
-  private control(code: number) {
-    if (code === 0x18 || code === 0x1a || code === 0x9c) { this.state = "ground"; return; }
-    if (this.state === "osc" || this.state === "string") {
-      if (this.state === "osc" && code === 7) this.state = "ground";
-      else if (code === 0x1b) this.state = "string_escape";
-      return;
-    }
-    if (this.state === "string_escape") {
-      if (code === 0x5c) { this.state = "ground"; return; }
-      this.state = "escape";
-    }
-    if (code === 0x1b) { this.state = "escape"; return; }
-    if (code === 0x9b || (this.state === "escape" && code === 0x5b)) { this.state = "csi"; return; }
-    if (code === 0x9d || (this.state === "escape" && code === 0x5d)) { this.state = "osc"; return; }
-    if ([0x90, 0x98, 0x9e, 0x9f].includes(code) ||
-      (this.state === "escape" && [0x50, 0x58, 0x5e, 0x5f].includes(code))) { this.state = "string"; return; }
-    if (this.state === "escape" && code >= 0x20 && code <= 0x2f) this.state = "intermediate";
-    else if ((this.state === "escape" || this.state === "intermediate") && code >= 0x30 && code <= 0x7e) this.state = "ground";
-    else if (this.state === "csi" && code >= 0x40 && code <= 0x7e) this.state = "ground";
+      return intermediate ? "escapeIntermediate" : "ground";
+    case "escapeIntermediate":
+      return intermediate ? state : "ground";
+    case "csiEntry":
+      if (intermediate) return "csiIntermediate";
+      return parameter || privateMarker ? "csiParam" : "ground";
+    case "csiParam":
+      if (intermediate) return "csiIntermediate";
+      if (privateMarker) return "csiIgnore";
+      return parameter ? state : "ground";
+    case "csiIntermediate":
+      if (parameter || privateMarker) return "csiIgnore";
+      return intermediate ? state : "ground";
+    case "csiIgnore":
+      return final ? "ground" : state;
+    case "dcsEntry":
+      if (intermediate) return "dcsIntermediate";
+      if (parameter || privateMarker) return "dcsParam";
+      return final ? "dcsPassthrough" : "ground";
+    case "dcsParam":
+      if (intermediate) return "dcsIntermediate";
+      if (privateMarker) return "dcsIgnore";
+      if (parameter) return state;
+      return final ? "dcsPassthrough" : "ground";
+    case "dcsIntermediate":
+      if (intermediate) return state;
+      if (parameter || privateMarker) return "dcsIgnore";
+      return final ? "dcsPassthrough" : "ground";
+    case "osc": case "dcsIgnore": case "dcsPassthrough":
+      return state;
+    case "sosPmApc":
+      return code <= 0x7e ? state : "ground";
+    case "ground":
+      return state;
   }
 }
 
+class OutputBoundary {
+  private state: VtState = "ground";
+  private readonly interim = new Uint8Array(3);
+
+  get complete() {
+    return this.state === "ground" && this.interim[0] === 0;
+  }
+
+  accept(data: readonly number[]) {
+    const start = this.interim[0] ? this.resumeScalar(data) : 0;
+    if (start === undefined) return;
+    let offset = start;
+    decode: while (offset < data.length) {
+      const first = offset;
+      const lead = data[offset++]!;
+      if (lead < 0x80) {
+        this.state = nextVtState(this.state, lead);
+        continue;
+      }
+      if (lead < 0xc0 || lead > 0xf7) continue;
+      const length = lead < 0xe0 ? 2 : lead < 0xf0 ? 3 : 4;
+      let code = lead & (0x7f >> length);
+      for (let index = 1; index < length; index++) {
+        const byte = data[offset];
+        if (byte === undefined) {
+          for (let tail = first; tail < offset; tail++) this.interim[tail - first] = data[tail]!;
+          return;
+        }
+        if ((byte & 0xc0) !== 0x80) continue decode;
+        code = (code << 6) | (byte & 0x3f);
+        offset++;
+      }
+      this.scalar(code, length);
+    }
+  }
+
+  private resumeScalar(data: readonly number[]): number | undefined {
+    const lead = this.interim[0]!;
+    const length = lead < 0xe0 ? 2 : lead < 0xf0 ? 3 : 4;
+    let code = lead & (0x7f >> length);
+    let carried = 1;
+    // @contract: xterm 6.0.0 stops counting saved continuations when the low six bits are zero.
+    for (; carried < this.interim.length; carried++) {
+      const payload = this.interim[carried]! & 0x3f;
+      if (!payload) break;
+      code = (code << 6) | payload;
+    }
+    let offset = 0;
+    const missing = length - carried;
+    for (; offset < missing; offset++) {
+      const byte = data[offset];
+      if (byte === undefined) return;
+      if ((byte & 0xc0) !== 0x80) break;
+      this.interim[carried + offset] = byte;
+      code = (code << 6) | (byte & 0x3f);
+    }
+    if (offset === missing) this.scalar(code, length);
+    this.interim.fill(0);
+    return offset;
+  }
+
+  private scalar(code: number, length: number) {
+    const minimum = length === 2 ? 0x80 : length === 3 ? 0x800 : 0x10000;
+    if (code >= minimum && code <= 0x10ffff && code !== 0xfeff &&
+      (code < 0xd800 || code > 0xdfff)) this.state = nextVtState(this.state, code);
+  }
+}
+
+export class GeometryBoundaryError extends Error {
+  readonly reason: GeometryBoundaryFailure;
+
+  constructor(reason: GeometryBoundaryFailure) {
+    super("Не вдалося узгодити межу зміни розміру");
+    this.reason = reason;
+  }
+}
 interface GeometrySink {
   write(data: readonly number[]): Promise<void>;
   resize(size: TerminalSize): TerminalSize;
@@ -201,9 +287,9 @@ export class OrderedGeometry {
       }
       const event = chunk.geometry;
       if (!event) return;
-      if (event.status.committed.revision <= this.applied || !this.observe(event.status) || !this.output.complete) {
-        throw Error("Не вдалося узгодити межу зміни розміру");
-      }
+      if (event.status.committed.revision <= this.applied) throw new GeometryBoundaryError("geometry_revision_not_new");
+      if (!this.observe(event.status)) throw new GeometryBoundaryError("geometry_status_rejected");
+      if (!this.output.complete) throw new GeometryBoundaryError("geometry_output_incomplete");
       const actual = sink.resize(event.status.committed.size);
       if (this.closed || !sameSize(actual, event.status.committed.size)) throw Error("Розміри відображення не збігаються");
       const acknowledged = await sink.acknowledge(event, actual);

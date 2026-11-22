@@ -66,6 +66,10 @@ export interface Chunk {
   readonly status?: TerminalStatus | null;
   readonly geometry?: GeometryEvent | null;
 }
+export type GeometryBoundaryFailure = "geometry_revision_not_new" | "geometry_status_rejected" | "geometry_output_incomplete";
+export type TerminalStreamFailure = "attachment_setup" | "read_response" | "grid_ack_response"
+  | "geometry_routing" | "stream_closed" | "terminal_status_changed" | GeometryBoundaryFailure
+  | "renderer_grid_mismatch" | "stale_grid_ack" | "renderer_write_timeout";
 export type ProviderProfile = "claude_code" | "codex";
 export interface WorkspaceDisplay { readonly workspace_id: string; readonly label: string }
 type PaneLiveness = "live" | "exited" | "unavailable";
@@ -378,11 +382,24 @@ export function mergeCreateOperations(current: readonly LocalCreate[], incoming:
 export function selectCreatedRuntime(views: SessionViews, operation: LocalCreate, handled: ReadonlySet<string>, preserveActive = false): SessionViews {
   const result = operation.disposition;
   if (handled.has(operation.reference) || (result.result !== "launched" && result.result !== "exited")) return views;
-  const next = openView(views, result.runtime.runtime_id, [result.runtime.runtime_id]);
-  return preserveActive && views.active ? { ...next, active: views.active } : next;
+  const id = result.runtime.runtime_id;
+  const next = openView(views, id, [id]);
+  return preserveActive && views.open.length > 0 ? { ...next, active: views.active } : next;
 }
+
+async function invokeFullscreen(action: "read" | "enter" | "exit" | "cancelExit" | "focusAfterExit", intent?: string): Promise<boolean> {
+  const result = await invoke<unknown>("local_window_fullscreen", { action, intent });
+  if (typeof result !== "boolean") throw Error("Некоректна відповідь повноекранного режиму");
+  return result;
+}
+
 export const localClient = {
   inventory: async () => parseInventory(await invoke<unknown>("local_inventory")),
+  windowFullscreen: () => invokeFullscreen("read"),
+  enterWindowFullscreen: () => invokeFullscreen("enter"),
+  exitWindowFullscreen: (intent: string) => invokeFullscreen("exit", intent),
+  cancelWindowFullscreenExit: (intent: string) => invokeFullscreen("cancelExit", intent),
+  focusWindowAfterFullscreenExit: (intent: string) => invokeFullscreen("focusAfterExit", intent),
   pickWorkspace: async () => parseWorkspaceSelection(await invoke<unknown>("local_pick_workspace")),
   workspaceReadiness: async (workspaceId: string, profile: ProviderProfile) =>
     parseWorkspaceReadiness(await invoke<unknown>("local_workspace_readiness", { workspaceId, profile })),
@@ -401,7 +418,9 @@ export const localClient = {
   acknowledgeGrid: async (viewId: string, acknowledgement: GridAcknowledgement) =>
     parseGeometryEvent(await invoke<unknown>("terminal_acknowledge_grid", { viewId, acknowledgement })),
   input: async (viewId: string, data: readonly number[], paste: boolean) => { await invoke("terminal_input", { viewId, data, paste }); },
-  detach: async (viewId: string) => { await invoke("terminal_detach", { viewId }); },
+  detach: async (viewId: string, failure?: TerminalStreamFailure) => {
+    await invoke("terminal_detach", { viewId, failure });
+  },
 };
 export function runtimeTitle(runtime: RuntimeInfo): string {
   const command = runtime.command.toLowerCase();

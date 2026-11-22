@@ -104,6 +104,455 @@ mod desktop {
         bridge.inventory().await.map_err(|e| e.to_string())
     }
     #[tauri::command]
+    pub async fn local_window_fullscreen(
+        window: WebviewWindow,
+        action: String,
+        intent: Option<String>,
+    ) -> Result<bool, String> {
+        let (reply, mut response) = async_runtime::channel(1);
+        let invoking_window = window.clone();
+        window
+            .run_on_main_thread(move || {
+                let window = invoking_window;
+                let result = match (action.as_str(), intent) {
+                    ("read", None) => fullscreen::read(&window),
+                    ("enter", None) => window
+                        .set_fullscreen(true)
+                        .map_err(|e| e.to_string())
+                        .and_then(|()| fullscreen::read(&window)),
+                    ("exit", Some(intent)) => match fullscreen::exit(window, intent, reply.clone())
+                    {
+                        Ok(true) => return,
+                        outcome => outcome,
+                    },
+                    ("cancelExit", Some(intent)) => fullscreen::cancel(&window, &intent),
+                    ("focusAfterExit", Some(intent)) => fullscreen::focus(&window, &intent),
+                    _ => Err("Некоректна дія повноекранного режиму.".into()),
+                };
+                let _ = reply.try_send(result);
+            })
+            .map_err(|e| e.to_string())?;
+        response.recv().await.ok_or("Вікно недоступне.")?
+    }
+
+    mod fullscreen {
+        use std::{
+            cell::{OnceCell, RefCell},
+            collections::HashMap,
+            ffi::{CStr, c_char, c_void},
+            mem, ptr,
+        };
+        use tauri::{Webview, WebviewWindow, Wry, async_runtime::Sender};
+
+        type Object = *mut c_void;
+        type Selector = *const c_void;
+        type NotificationHandler = extern "C" fn(Object, Selector, Object);
+        type ExitReply = Sender<Result<bool, String>>;
+        #[cfg(target_arch = "aarch64")]
+        type ObjcBool = bool;
+        #[cfg(target_arch = "x86_64")]
+        type ObjcBool = i8;
+
+        #[link(name = "objc")]
+        unsafe extern "C" {
+            fn objc_getClass(name: *const c_char) -> Object;
+            fn objc_allocateClassPair(
+                superclass: Object,
+                name: *const c_char,
+                extra: usize,
+            ) -> Object;
+            fn objc_disposeClassPair(class: Object);
+            fn objc_registerClassPair(class: Object);
+            fn class_addMethod(
+                class: Object,
+                selector: Selector,
+                imp: NotificationHandler,
+                types: *const c_char,
+            ) -> ObjcBool;
+            fn sel_registerName(name: *const c_char) -> Selector;
+            fn objc_msgSend();
+            fn objc_release(object: Object);
+        }
+
+        #[link(name = "Foundation", kind = "framework")]
+        #[link(name = "AppKit", kind = "framework")]
+        unsafe extern "C" {
+            static NSWindowDidExitFullScreenNotification: Object;
+            static NSWindowWillCloseNotification: Object;
+            static NSWindowDidBecomeKeyNotification: Object;
+            static NSApplicationDidResignActiveNotification: Object;
+        }
+
+        unsafe extern "C" {
+            static _dispatch_main_q: u8;
+            fn dispatch_time(when: u64, delta: i64) -> u64;
+            fn dispatch_async_f(queue: Object, context: Object, work: extern "C" fn(Object));
+            fn dispatch_after_f(
+                when: u64,
+                queue: Object,
+                context: Object,
+                work: extern "C" fn(Object),
+            );
+        }
+
+        struct Observer {
+            center: Object,
+            object: Object,
+        }
+
+        impl Observer {
+            fn new(window: Object) -> Result<Self, String> {
+                let class =
+                    OBSERVER_CLASS.with(|class| *class.get_or_init(register_observer_class));
+                // @invariant: AppKit-thread registration owns the +new observer until Drop.
+                unsafe {
+                    let object = send_object(class, c"new");
+                    if object.is_null() {
+                        return Err("Не вдалося спостерігати за режимом вікна.".into());
+                    }
+                    let center = send_object(
+                        objc_getClass(c"NSNotificationCenter".as_ptr()),
+                        c"defaultCenter",
+                    );
+                    let observer = Self { center, object };
+                    let add: unsafe extern "C" fn(
+                        Object,
+                        Selector,
+                        Object,
+                        Selector,
+                        Object,
+                        Object,
+                    ) = mem::transmute(objc_msgSend as unsafe extern "C" fn());
+                    for (handler, name, source) in [
+                        (
+                            c"remoteSessionsDidExit:",
+                            NSWindowDidExitFullScreenNotification,
+                            window,
+                        ),
+                        (
+                            c"remoteSessionsWillClose:",
+                            NSWindowWillCloseNotification,
+                            window,
+                        ),
+                        (
+                            c"remoteSessionsFocusChanged:",
+                            NSWindowDidBecomeKeyNotification,
+                            ptr::null_mut(),
+                        ),
+                        (
+                            c"remoteSessionsFocusChanged:",
+                            NSApplicationDidResignActiveNotification,
+                            ptr::null_mut(),
+                        ),
+                    ] {
+                        add(
+                            center,
+                            sel_registerName(c"addObserver:selector:name:object:".as_ptr()),
+                            object,
+                            sel_registerName(handler.as_ptr()),
+                            name,
+                            source,
+                        );
+                    }
+                    Ok(observer)
+                }
+            }
+
+            fn remove_exit_notification(&self, window: Object) {
+                unsafe {
+                    let remove: unsafe extern "C" fn(Object, Selector, Object, Object, Object) =
+                        mem::transmute(objc_msgSend as unsafe extern "C" fn());
+                    remove(
+                        self.center,
+                        sel_registerName(c"removeObserver:name:object:".as_ptr()),
+                        self.object,
+                        NSWindowDidExitFullScreenNotification,
+                        window,
+                    );
+                }
+            }
+        }
+
+        impl Drop for Observer {
+            fn drop(&mut self) {
+                // @invariant: Unregister the observer on the AppKit thread before releasing it.
+                unsafe {
+                    let remove: unsafe extern "C" fn(Object, Selector, Object) =
+                        mem::transmute(objc_msgSend as unsafe extern "C" fn());
+                    remove(
+                        self.center,
+                        sel_registerName(c"removeObserver:".as_ptr()),
+                        self.object,
+                    );
+                    objc_release(self.object);
+                }
+            }
+        }
+
+        struct PendingExit {
+            window: WebviewWindow,
+            intent: String,
+            observer: Observer,
+            notified: bool,
+            // @invariant: A consumed reply marks settled readback and enables one focus request.
+            reply: Option<ExitReply>,
+        }
+
+        thread_local! {
+            static OBSERVER_CLASS: OnceCell<Object> = const { OnceCell::new() };
+            static EXITS: RefCell<HashMap<Object, PendingExit>> = RefCell::new(HashMap::new());
+        }
+
+        unsafe fn send_object(receiver: Object, selector: &CStr) -> Object {
+            // @contract: The selector takes no arguments and returns an Objective-C object.
+            unsafe {
+                let send: unsafe extern "C" fn(Object, Selector) -> Object =
+                    mem::transmute(objc_msgSend as unsafe extern "C" fn());
+                send(receiver, sel_registerName(selector.as_ptr()))
+            }
+        }
+
+        fn register_observer_class() -> Object {
+            // @contract: Notification handlers have the Objective-C signature void(id, SEL, id).
+            unsafe {
+                let class = objc_allocateClassPair(
+                    objc_getClass(c"NSObject".as_ptr()),
+                    c"RSFullscreenExitObserver".as_ptr(),
+                    0,
+                );
+                if class.is_null() {
+                    return class;
+                }
+                for (selector, handler) in [
+                    (c"remoteSessionsDidExit:", did_exit as NotificationHandler),
+                    (c"remoteSessionsWillClose:", will_close),
+                    (c"remoteSessionsFocusChanged:", focus_changed),
+                ] {
+                    if class_addMethod(
+                        class,
+                        sel_registerName(selector.as_ptr()),
+                        handler,
+                        c"v@:@".as_ptr(),
+                    ) as u8
+                        == 0
+                    {
+                        objc_disposeClassPair(class);
+                        return ptr::null_mut();
+                    }
+                }
+                objc_registerClassPair(class);
+                class
+            }
+        }
+
+        fn on_main_queue<F: FnOnce() + 'static>(delay_ns: i64, work: F) {
+            extern "C" fn run<F: FnOnce()>(context: Object) {
+                // @invariant: The dispatch callback consumes its Box<F> exactly once.
+                let work = unsafe { Box::from_raw(context.cast::<F>()) };
+                work();
+            }
+            let context = Box::into_raw(Box::new(work)).cast();
+            // @invariant: The dispatch callback and its capture stay on the AppKit thread.
+            unsafe {
+                let queue = (&raw const _dispatch_main_q).cast_mut().cast();
+                if delay_ns == 0 {
+                    dispatch_async_f(queue, context, run::<F>);
+                } else {
+                    dispatch_after_f(dispatch_time(0, delay_ns), queue, context, run::<F>);
+                }
+            }
+        }
+
+        fn observed_exit(observer: Object) -> Option<(Object, String)> {
+            EXITS.with_borrow(|exits| {
+                exits.iter().find_map(|(&window, exit)| {
+                    (exit.observer.object == observer).then(|| (window, exit.intent.clone()))
+                })
+            })
+        }
+
+        extern "C" fn did_exit(observer: Object, _: Selector, _: Object) {
+            let observed = EXITS.with_borrow_mut(|exits| {
+                exits.iter_mut().find_map(|(&window, exit)| {
+                    if exit.observer.object != observer || exit.notified {
+                        return None;
+                    }
+                    exit.notified = true;
+                    Some((window, exit.intent.clone()))
+                })
+            });
+            if let Some((window, intent)) = observed {
+                // @invariant: Settled readback runs after the AppKit notification callback unwinds.
+                on_main_queue(0, move || settle(window, &intent));
+            }
+        }
+
+        extern "C" fn will_close(observer: Object, _: Selector, _: Object) {
+            if let Some((window, intent)) = observed_exit(observer) {
+                cancel_from_notification(window, &intent);
+            }
+        }
+
+        extern "C" fn focus_changed(observer: Object, _: Selector, notification: Object) {
+            if let Some((window, intent)) = observed_exit(observer) {
+                let source = unsafe { send_object(notification, c"object") };
+                if source != window {
+                    cancel_from_notification(window, &intent);
+                }
+            }
+        }
+
+        fn take_exit(window: Object, intent: &str) -> Option<PendingExit> {
+            EXITS.with_borrow_mut(|exits| {
+                let exit = exits.get(&window)?;
+                if exit.intent == intent {
+                    exits.remove(&window)
+                } else {
+                    None
+                }
+            })
+        }
+
+        fn complete(exit: PendingExit, result: Result<bool, String>) {
+            drop(exit.observer);
+            if let Some(reply) = exit.reply {
+                let _ = reply.try_send(result);
+            }
+        }
+
+        fn finish(window: Object, intent: &str, result: Result<bool, String>) {
+            if let Some(exit) = take_exit(window, intent) {
+                complete(exit, result);
+            }
+        }
+
+        fn cancel_from_notification(window: Object, intent: &str) {
+            if let Some(exit) = take_exit(window, intent) {
+                // @invariant: Revoke eligibility now and release the observer after its callback.
+                on_main_queue(0, move || complete(exit, Ok(false)));
+            }
+        }
+
+        fn native_window(window: &WebviewWindow) -> Result<Object, String> {
+            let native = window.ns_window().map_err(|e| e.to_string())?;
+            if native.is_null() {
+                Err("Вікно недоступне.".into())
+            } else {
+                Ok(native)
+            }
+        }
+
+        pub fn read(window: &WebviewWindow) -> Result<bool, String> {
+            let native = native_window(window)?;
+            // @contract: AppKit's NSWindowStyleMask is an NSUInteger with FullScreen at bit 14.
+            let style = unsafe {
+                let send: unsafe extern "C" fn(Object, Selector) -> usize =
+                    mem::transmute(objc_msgSend as unsafe extern "C" fn());
+                send(native, sel_registerName(c"styleMask".as_ptr()))
+            };
+            Ok(style & (1 << 14) != 0)
+        }
+
+        pub fn exit(
+            window: WebviewWindow,
+            intent: String,
+            reply: ExitReply,
+        ) -> Result<bool, String> {
+            let native = native_window(&window)?;
+            if EXITS.with_borrow(|exits| exits.contains_key(&native)) {
+                return Err("Режим вікна вже змінюється.".into());
+            }
+            if !window.is_fullscreen().map_err(|e| e.to_string())? || !read(&window)? {
+                return Ok(false);
+            }
+
+            let observer = Observer::new(native)?;
+            EXITS.with_borrow_mut(|exits| {
+                exits.insert(
+                    native,
+                    PendingExit {
+                        window: window.clone(),
+                        intent: intent.clone(),
+                        observer,
+                        notified: false,
+                        reply: Some(reply),
+                    },
+                )
+            });
+            if let Err(error) = window.set_fullscreen(false) {
+                drop(take_exit(native, &intent));
+                return Err(error.to_string());
+            }
+            on_main_queue(5_000_000_000, move || {
+                finish(
+                    native,
+                    &intent,
+                    Err("Не вдалося підтвердити вихід із повноекранного режиму.".into()),
+                );
+            });
+            Ok(true)
+        }
+
+        fn settle(native: Object, intent: &str) {
+            let window = EXITS.with_borrow(|exits| {
+                exits
+                    .get(&native)
+                    .filter(|exit| exit.intent == intent)
+                    .map(|exit| exit.window.clone())
+            });
+            let Some(window) = window else {
+                return;
+            };
+            let result = (|| {
+                if read(&window)? || window.is_fullscreen().map_err(|e| e.to_string())? {
+                    return Err("Вікно залишилося в повноекранному режимі.".into());
+                }
+                window.is_focused().map_err(|e| e.to_string())
+            })();
+            if result != Ok(true) {
+                finish(native, intent, result);
+                return;
+            }
+
+            let reply = EXITS.with_borrow_mut(|exits| {
+                let exit = exits
+                    .get_mut(&native)
+                    .filter(|exit| exit.intent == intent)?;
+                exit.observer.remove_exit_notification(native);
+                exit.reply.take()
+            });
+            if let Some(reply) = reply
+                && reply.try_send(Ok(true)).is_err()
+            {
+                drop(take_exit(native, intent));
+            }
+        }
+
+        pub fn cancel(window: &WebviewWindow, intent: &str) -> Result<bool, String> {
+            finish(native_window(window)?, intent, Ok(false));
+            Ok(false)
+        }
+
+        pub fn focus(window: &WebviewWindow, intent: &str) -> Result<bool, String> {
+            let native = native_window(window)?;
+            let settled = EXITS.with_borrow(|exits| {
+                exits
+                    .get(&native)
+                    .is_some_and(|exit| exit.intent == intent && exit.reply.is_none())
+            });
+            if !settled {
+                return Ok(false);
+            }
+            drop(take_exit(native, intent));
+            if !window.is_focused().map_err(|e| e.to_string())? || read(window)? {
+                return Ok(false);
+            }
+            let webview: &Webview<Wry> = window.as_ref();
+            webview.set_focus().map_err(|e| e.to_string())?;
+            Ok(true)
+        }
+    }
+    #[tauri::command]
     pub async fn terminal_attach(
         runtime_id: String,
         bridge: State<'_, DesktopBridge>,
@@ -115,13 +564,24 @@ mod desktop {
         view_id: String,
         bridge: State<'_, DesktopBridge>,
     ) -> Result<Chunk, String> {
-        let chunk = bridge.read(&view_id).await.map_err(|e| e.to_string())?;
-        if resize_trace()
-            && let Some(status) = &chunk.status
-            && status.committed.revision > 0
-            && let Ok(line) = encode_local_observation(status)
-        {
-            eprintln!("RS_W1_RESIZE_PROVIDER {line}");
+        let trace = resize_trace();
+        let chunk = bridge.read(&view_id).await.map_err(|error| {
+            let message = error.to_string();
+            if trace {
+                trace_stream_failure(&view_id, "read", bridge_failure_reason(&message));
+            }
+            message
+        })?;
+        if trace {
+            if chunk.closed {
+                trace_stream_failure(&view_id, "read", "stream_closed");
+            }
+            if let Some(status) = &chunk.status
+                && status.committed.revision > 0
+                && let Ok(line) = encode_local_observation(status)
+            {
+                eprintln!("RS_W1_RESIZE_PROVIDER {line}");
+            }
         }
         Ok(chunk)
     }
@@ -150,19 +610,79 @@ mod desktop {
         acknowledgement: GridAcknowledgement,
         bridge: State<'_, DesktopBridge>,
     ) -> Result<GeometryEvent, String> {
+        let trace = resize_trace();
         let event = bridge
             .acknowledge_grid(&view_id, acknowledgement)
             .await
-            .map_err(|e| e.to_string())?;
-        if resize_trace()
-            && let Ok(line) = encode_renderer_observation(&event, acknowledgement)
-        {
+            .map_err(|error| {
+                let message = error.to_string();
+                if trace {
+                    trace_stream_failure(&view_id, "acknowledge", bridge_failure_reason(&message));
+                }
+                message
+            })?;
+        if trace && let Ok(line) = encode_renderer_observation(&event, acknowledgement) {
             eprintln!("RS_W1_RESIZE_GRID {line}");
         }
         Ok(event)
     }
     fn resize_trace() -> bool {
         cfg!(debug_assertions) && std::env::var("RS_W1_RESIZE_TRACE").as_deref() == Ok("1")
+    }
+
+    fn bridge_failure_reason(message: &str) -> &'static str {
+        match message {
+            "View detached" => "view_detached",
+            "View lock unavailable" => "view_lock_unavailable",
+            "Terminal read already in progress" => "read_in_progress",
+            "Terminal grid acknowledgement required" => "grid_ack_required",
+            "Terminal output did not reach a geometry boundary" => "geometry_drain_timeout",
+            "Terminal attachment identity changed" => "attachment_identity_changed",
+            "Розмір термінала недоступний" => {
+                "terminal_status_unavailable"
+            }
+            "Terminal geometry revision went backwards" => "geometry_revision_regressed",
+            "Native PTY unavailable" => "native_pty_unavailable",
+            "Native PTY resize was not observed" => "native_pty_resize_unobserved",
+            "Tmux client resize was not observed" => "tmux_client_resize_unobserved",
+            "Terminal boundary already in progress" => "boundary_in_progress",
+            "No pending geometry boundary" => "boundary_missing",
+            "Terminal renderer acknowledgement is stale or mismatched" => "grid_ack_mismatch",
+            "Terminal geometry boundary was superseded" => "boundary_superseded",
+            "Attachment PTY descriptor unavailable" => "attachment_pty_unavailable",
+            "Attachment client unavailable" | "Exact tmux attachment client unavailable" => {
+                "tmux_client_unavailable"
+            }
+            "Ambiguous attachment client" => "tmux_client_ambiguous",
+            "Invalid tmux client grid" => "tmux_client_grid_invalid",
+            "Attachment grid changed" => "attachment_grid_changed",
+            "IPC read timeout" => "agent_read_timeout",
+            "IPC frame is incomplete or exceeds limit" | "invalid agent response" => {
+                "agent_response_invalid"
+            }
+            "local agent is unavailable" => "agent_unavailable",
+            "deadline has elapsed" => "bridge_operation_timeout",
+            _ => "bridge_error",
+        }
+    }
+
+    fn trace_stream_failure(view_id: &str, stage: &str, reason: &str) {
+        use std::io::Write;
+
+        let uuid = view_id.len() == 36
+            && view_id.bytes().enumerate().all(|(index, byte)| {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            });
+        if uuid {
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "RS_W1_RESIZE_FAILURE {{\"view_id\":\"{view_id}\",\"stage\":\"{stage}\",\"reason\":\"{reason}\"}}"
+            );
+        }
     }
     #[tauri::command]
     pub async fn terminal_input(
@@ -177,8 +697,30 @@ mod desktop {
             .map_err(|e| e.to_string())
     }
     #[tauri::command]
-    pub fn terminal_detach(view_id: String, bridge: State<'_, DesktopBridge>) {
+    pub fn terminal_detach(
+        view_id: String,
+        failure: Option<String>,
+        bridge: State<'_, DesktopBridge>,
+    ) {
         bridge.detach(&view_id);
+        if resize_trace()
+            && let Some(
+                reason @ ("attachment_setup"
+                | "read_response"
+                | "grid_ack_response"
+                | "geometry_routing"
+                | "stream_closed"
+                | "terminal_status_changed"
+                | "geometry_revision_not_new"
+                | "geometry_status_rejected"
+                | "geometry_output_incomplete"
+                | "renderer_grid_mismatch"
+                | "stale_grid_ack"
+                | "renderer_write_timeout"),
+            ) = failure.as_deref()
+        {
+            trace_stream_failure(&view_id, "renderer_detach", reason);
+        }
     }
 }
 
@@ -210,6 +752,7 @@ pub fn run() {
             .invoke_handler(tauri::generate_handler![
                 scaffold_status,
                 desktop::local_inventory,
+                desktop::local_window_fullscreen,
                 desktop::local_pick_workspace,
                 desktop::local_workspace_readiness,
                 desktop::local_create_session,
