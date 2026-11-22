@@ -4,7 +4,6 @@ import { DEFAULT_TERMINAL_FONT, MAX_TERMINAL_FONT, MIN_TERMINAL_FONT } from "./p
 import type { ZoomAction } from "./presentation-preferences.ts";
 
 export interface FullscreenExitFocus {
-  readonly signal: AbortSignal;
   readonly dispose: () => void;
   readonly restore: (focusWebview: () => Promise<boolean>) => Promise<void>;
 }
@@ -68,15 +67,12 @@ export function TerminalToolbar({ title, fontSize, expanded, nativeWindow, onZoo
       if (fullscreen) {
         const intent = crypto.randomUUID();
         const focus = onFullscreenExit(button);
-        const cancel = () => { void localClient.cancelWindowFullscreenExit(intent).catch(() => {}); };
-        focus?.signal.addEventListener("abort", cancel, { once: true });
         try {
           if (await localClient.exitWindowFullscreen(intent)) {
             setFullscreen(false);
             await focus?.restore(() => localClient.focusWindowAfterFullscreenExit(intent));
           }
         } finally {
-          focus?.signal.removeEventListener("abort", cancel);
           focus?.dispose();
           await localClient.cancelWindowFullscreenExit(intent).catch(() => {});
         }

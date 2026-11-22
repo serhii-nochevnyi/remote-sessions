@@ -6,13 +6,20 @@ import { TerminalToolbar } from "./TerminalToolbar";
 import type { FullscreenExitFocus } from "./TerminalToolbar";
 import { CreateSessionDialog } from "./CreateSessionDialog";
 import { SessionTabs } from "./SessionTabs";
-import { canRestoreTerminalFocus, closeView, moveView, openView, viewAvailability } from "./session-state.ts";
+import { canRestoreTerminalFocus, closeView, moveView, openView, restoreFullscreenExitFocus, viewAvailability } from "./session-state.ts";
 import type { SessionViews, TerminalFocusTarget } from "./session-state.ts";
 import { loadPresentation, savePresentation, zoomFont, zoomShortcut } from "./presentation-preferences.ts";
 import type { ZoomAction } from "./presentation-preferences.ts";
 import { localClient, runtimeTitle, selectCreatedRuntime } from "./local-client";
 import type { LocalCreate, RuntimeInfo } from "./local-client";
 import "./App.css";
+
+interface FullscreenFocusIntent {
+  readonly button: HTMLButtonElement;
+  readonly original: HTMLTextAreaElement | undefined;
+  keepTerminal: boolean;
+  target: HTMLElement | null;
+}
 
 export default function App() {
   const [createOpen, setCreateOpen] = useState(false);
@@ -29,13 +36,10 @@ export default function App() {
   const runtimeOperations = useRef(new Map<string, string>());
   const presentation = useRef(new Map<string, string>());
   const focusRuntime = useRef<string | null>(null);
+  const app = useRef<HTMLDivElement>(null);
   const panel = useRef<HTMLElement>(null);
   const liveScope = useRef<{ runtimeId: string; epoch: number } | null>(null);
-  const fullscreenFocus = useRef<{
-    controller: AbortController;
-    button: HTMLButtonElement;
-    textarea: HTMLTextAreaElement;
-  } | null>(null);
+  const fullscreenFocus = useRef<FullscreenFocusIntent | null>(null);
   const [online, setOnline] = useState(false);
   const [agentPid, setAgentPid] = useState(0);
   const [message, setMessage] = useState(isTauri() ? "Підключення до Mac…" : "Для живих сесій відкрийте десктопний застосунок.");
@@ -46,11 +50,14 @@ export default function App() {
   }
   const activeStatus = activeId ? availability(activeId) : undefined;
   const connection = online ? agentPid : 0;
-  const cancelFullscreenFocus = useCallback(() => fullscreenFocus.current?.controller.abort(), []);
+  // @invariant: A newer DOM focus choice revokes terminal focus while AppKit still settles the exit.
+  const cancelTerminalFocusRestore = useCallback(() => {
+    if (fullscreenFocus.current) fullscreenFocus.current.keepTerminal = false;
+  }, []);
   useLayoutEffect(() => {
     liveScope.current = activeId && activeStatus === "live" ? { runtimeId: activeId, epoch: agentPid } : null;
-    return cancelFullscreenFocus;
-  }, [activeId, activeStatus, agentPid, cancelFullscreenFocus]);
+    return cancelTerminalFocusRestore;
+  }, [activeId, activeStatus, agentPid, cancelTerminalFocusRestore]);
   const setViews = useCallback((update: (views: SessionViews) => SessionViews) => {
     setPreferences(value => {
       const next = update(value.views);
@@ -85,43 +92,52 @@ export default function App() {
     return () => { disposed = true; clearTimeout(timer); };
   }, []);
   const focusTerminal = useCallback(() => {
-    cancelFullscreenFocus();
+    cancelTerminalFocusRestore();
     (panel.current?.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea") ?? panel.current)?.focus();
-  }, [cancelFullscreenFocus]);
+  }, [cancelTerminalFocusRestore]);
   function currentTerminal(): TerminalFocusTarget<HTMLTextAreaElement> | null {
     const textarea = panel.current?.querySelector<HTMLTextAreaElement>(".live-terminal[data-terminal-attached] .xterm-helper-textarea");
     return liveScope.current && textarea ? { ...liveScope.current, textarea } : null;
   }
   function captureFullscreenFocus(button: HTMLButtonElement): FullscreenExitFocus | undefined {
-    cancelFullscreenFocus();
+    const mountedApp = app.current;
+    if (!mountedApp) return;
     const mountedPanel = panel.current;
     const captured = currentTerminal();
-    if (!mountedPanel || !captured?.textarea.isConnected || createDialogActive.current) return;
-
     focusRuntime.current = null;
-    const controller = new AbortController();
-    const intent = { controller, button, textarea: captured.textarea };
+    const intent: FullscreenFocusIntent = {
+      button,
+      original: captured?.textarea,
+      keepTerminal: Boolean(captured?.textarea.isConnected) && !createDialogActive.current,
+      target: null,
+    };
     fullscreenFocus.current = intent;
-    const eligible = () => canRestoreTerminalFocus(captured, currentTerminal(),
-      fullscreenFocus.current === intent && !createDialogActive.current);
+    const terminalEligible = () => captured && canRestoreTerminalFocus(captured, currentTerminal(),
+      intent.keepTerminal && !createDialogActive.current);
     const observer = new MutationObserver(() => {
-      if (!eligible()) controller.abort();
+      if (!terminalEligible()) {
+        intent.keepTerminal = false;
+        observer.disconnect();
+      }
     });
-    observer.observe(mountedPanel, { subtree: true, childList: true, attributes: true, attributeFilter: ["data-terminal-attached"] });
+    if (mountedPanel && intent.keepTerminal) {
+      observer.observe(mountedPanel, { subtree: true, childList: true, attributes: true, attributeFilter: ["data-terminal-attached"] });
+    }
+    function currentTarget() {
+      if (!mountedApp?.isConnected || app.current !== mountedApp || fullscreenFocus.current !== intent) return null;
+      if (captured && terminalEligible()) return captured.textarea;
+      const target = intent.target;
+      if (!target?.isConnected || !mountedApp.contains(target) || target.closest(":disabled, [hidden], [inert]")) return null;
+      if (createDialogActive.current && !target.closest("dialog[open]")) return null;
+      return target;
+    }
     function dispose() {
       observer.disconnect();
       if (fullscreenFocus.current === intent) fullscreenFocus.current = null;
     }
-    controller.signal.addEventListener("abort", dispose, { once: true });
     return {
-      signal: controller.signal,
       dispose,
-      async restore(focusWebview) {
-        if (!eligible()) return;
-        if (await focusWebview() && eligible() && document.hasFocus()) {
-          captured.textarea.focus({ preventScroll: true });
-        }
-      },
+      restore: focusWebview => restoreFullscreenExitFocus(currentTarget, focusWebview, () => document.hasFocus()),
     };
   }
   useEffect(() => {
@@ -187,7 +203,10 @@ export default function App() {
     }
   }, [views]);
   function changeDialog(open: boolean) {
-    if (open) cancelFullscreenFocus();
+    if (open) {
+      cancelTerminalFocusRestore();
+      if (fullscreenFocus.current) fullscreenFocus.current.target = null;
+    }
     createDialogActive.current = open;
     setCreateOpen(open);
   }
@@ -196,7 +215,7 @@ export default function App() {
     changeDialog(false);
   }
   function select(id: string) {
-    cancelFullscreenFocus();
+    cancelTerminalFocusRestore();
     if (activeId === id) {
       focusTerminal();
       return;
@@ -205,13 +224,13 @@ export default function App() {
     setViews(value => openView(value, id, runtimes.map(r => r.runtime_id)));
   }
   function close(id: string) {
-    cancelFullscreenFocus();
+    cancelTerminalFocusRestore();
     if (focusRuntime.current === id) focusRuntime.current = null;
     setViews(value => closeView(value, id));
     setNotice("Вкладку закрито. Доступні сесії можна відкрити знову зі списку.");
   }
   function activateTab(id: string) {
-    cancelFullscreenFocus();
+    cancelTerminalFocusRestore();
     focusRuntime.current = null;
     if (id !== activeId) setViews(value => openView(value, id, value.open));
   }
@@ -242,13 +261,20 @@ export default function App() {
     event.stopPropagation();
     zoom(action);
   }
-  return <div className={`app${canCreate ? " desktop" : ""}${activeId ? " has-session" : ""}${expanded && activeId ? " expanded" : ""}`}
+  return <div ref={app} className={`app${canCreate ? " desktop" : ""}${activeId ? " has-session" : ""}${expanded && activeId ? " expanded" : ""}`}
     onPointerDownCapture={event => {
-      if (fullscreenFocus.current?.button !== event.target) cancelFullscreenFocus();
+      const intent = fullscreenFocus.current;
+      const target = event.nativeEvent.target;
+      if (!intent || !(target instanceof Node) || intent.button.contains(target)) return;
+      cancelTerminalFocusRestore();
+      if (!intent.target?.contains(target)) intent.target = null;
     }} onFocusCapture={event => {
       const intent = fullscreenFocus.current;
       const target = event.nativeEvent.target;
-      if (intent && target !== intent.button && target !== intent.textarea) cancelFullscreenFocus();
+      if (intent && target instanceof HTMLElement && target !== intent.button && target !== intent.original) {
+        cancelTerminalFocusRestore();
+        intent.target = target;
+      }
     }}>
     <header className="titlebar"><strong>Remote Sessions</strong><span className="badge">Локальні сесії</span><span className="connection-badge">{online ? "● Підключено" : "○ Немає з’єднання"}</span></header>
     <div className="workspace">
@@ -266,16 +292,16 @@ export default function App() {
       </aside>
       <main className="main">
         <SessionTabs views={views} title={tabTitle} onFocusTab={() => {
-          cancelFullscreenFocus();
+          cancelTerminalFocusRestore();
           focusRuntime.current = null;
         }}
           onActivate={activateTab} onMove={(id, direction) => {
-            cancelFullscreenFocus();
+            cancelTerminalFocusRestore();
             setViews(value => moveView(value, id, direction));
           }}
           onClose={close} onEmptyFocus={focusSidebar} />
         <button className="back-button" onClick={() => {
-          cancelFullscreenFocus();
+          cancelTerminalFocusRestore();
           focusRuntime.current = null;
           setViews(value => ({ ...value, active: null }));
           requestAnimationFrame(focusSidebar);

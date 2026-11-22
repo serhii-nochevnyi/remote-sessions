@@ -33,6 +33,17 @@ export function canRestoreTerminalFocus<T extends { readonly isConnected: boolea
     captured.textarea === current.textarea;
 }
 
+export async function restoreFullscreenExitFocus(
+  currentTarget: () => Pick<HTMLElement, "focus"> | null,
+  focusWebview: () => Promise<boolean>,
+  windowHasFocus: () => boolean,
+): Promise<void> {
+  const target = currentTarget();
+  if (target && await focusWebview() && currentTarget() === target && windowHasFocus()) {
+    target.focus({ preventScroll: true });
+  }
+}
+
 export function openView(state: SessionViews, id: string, knownIds: readonly string[] = demoSessions.map(session => session.id)): SessionViews {
   if (!knownIds.includes(id)) return state;
   return { open: state.open.includes(id) ? state.open : [...state.open, id], active: id };

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { canRestoreTerminalFocus, closeView, demoSessions, focusAfterClose, moveView, openView, parseScaffoldStatus, tabKey, tabStop } from "./session-state.ts";
+import { canRestoreTerminalFocus, closeView, demoSessions, focusAfterClose, moveView, openView, parseScaffoldStatus, restoreFullscreenExitFocus, tabKey, tabStop } from "./session-state.ts";
 
 test("closing every view preserves the session catalog and allows reopening", () => {
   const catalogBefore = structuredClone(demoSessions);
@@ -82,6 +82,41 @@ test("fullscreen exit restores focus only to the current mounted terminal", () =
   assert.equal(canRestoreTerminalFocus(captured, { ...captured, textarea: { isConnected: true } }, true), false);
   textarea.isConnected = false;
   assert.equal(canRestoreTerminalFocus(captured, captured, true), false);
+});
+
+test("fullscreen exit hands keyboard focus to the newer dialog target after native focus", async () => {
+  const order: string[] = [];
+  const terminal = { focus: () => assert.fail("old terminal received focus") };
+  const dialog = { focus: (options?: FocusOptions) => {
+    assert.deepEqual(options, { preventScroll: true });
+    order.push("dialog");
+  } };
+  let current: Pick<HTMLElement, "focus"> = terminal;
+  const settle = () => restoreFullscreenExitFocus(() => current, async () => {
+    order.push("webview");
+    return true;
+  }, () => true);
+  current = dialog;
+  await settle();
+  assert.deepEqual(order, ["webview", "dialog"]);
+});
+
+test("fullscreen exit skips DOM focus when the target or window changes during native focus", async () => {
+  const stale = { focus: () => assert.fail("stale target received focus") };
+  const newer = { focus: () => assert.fail("newer target was changed by the older handoff") };
+  let current: Pick<HTMLElement, "focus"> | null = stale;
+  await restoreFullscreenExitFocus(() => current, async () => {
+    current = newer;
+    return true;
+  }, () => true);
+  current = stale;
+  await restoreFullscreenExitFocus(() => current, async () => {
+    current = null;
+    return true;
+  }, () => true);
+  await restoreFullscreenExitFocus(() => stale, async () => false, () => true);
+  await restoreFullscreenExitFocus(() => stale, async () => true, () => false);
+  await restoreFullscreenExitFocus(() => null, async () => assert.fail("native focus without a target"), () => true);
 });
 
 test("native boundary validates the shared status fixture and fails closed", () => {
