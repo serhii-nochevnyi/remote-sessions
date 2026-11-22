@@ -16,7 +16,56 @@ export interface RuntimeInfo {
 }
 export interface Inventory { readonly agent_pid: number; readonly runtimes: readonly RuntimeInfo[] }
 export interface Attachment { readonly view_id: string; readonly cols: number; readonly rows: number }
-export interface Chunk { readonly writable: boolean; readonly data: readonly number[]; readonly closed: boolean }
+export interface TerminalSize { readonly cols: number; readonly rows: number }
+export interface ResizeEpoch { readonly agent: string; readonly owner: string }
+export interface ResizeIntent { readonly epoch: ResizeEpoch; readonly id: string }
+export interface TerminalScope {
+  readonly view_id: string;
+  readonly agent_epoch: string;
+  readonly target: {
+    readonly runtime_id: string;
+    readonly generation: string;
+    readonly session: string;
+    readonly window: string;
+    readonly pane: string;
+    readonly pid: number;
+    readonly process_start: number;
+  };
+}
+export interface CommittedGeometry {
+  readonly size: TerminalSize;
+  readonly revision: number;
+  readonly intent: ResizeIntent | null;
+}
+export interface GridSample { readonly size: TerminalSize; readonly sampled_at_us: number }
+export interface TerminalStatus {
+  readonly terminal: TerminalScope;
+  readonly epoch: ResizeEpoch | null;
+  readonly committed: CommittedGeometry;
+  readonly provider: GridSample | null;
+  readonly observation: "pending" | "observed" | "unavailable";
+}
+export interface GeometryEvent {
+  readonly status: TerminalStatus;
+  readonly bridge_pty: GridSample;
+  readonly client: GridSample;
+}
+export interface GridAcknowledgement {
+  readonly renderer_id: string;
+  readonly epoch: ResizeEpoch | null;
+  readonly revision: number;
+  readonly size: TerminalSize;
+  readonly focused: boolean;
+}
+export type ResizeResult = { readonly result: "committed"; readonly admission: ResizeIntent; readonly status: TerminalStatus }
+  | { readonly result: "uncertain" | "rejected"; readonly terminal: TerminalScope; readonly intent: ResizeIntent };
+export interface Chunk {
+  readonly writable: boolean;
+  readonly data: readonly number[];
+  readonly closed: boolean;
+  readonly status?: TerminalStatus | null;
+  readonly geometry?: GeometryEvent | null;
+}
 export type ProviderProfile = "claude_code" | "codex";
 export interface WorkspaceDisplay { readonly workspace_id: string; readonly label: string }
 type PaneLiveness = "live" | "exited" | "unavailable";
@@ -110,12 +159,127 @@ export function parseAttachment(value: unknown): Attachment {
 export function parseChunk(value: unknown): Chunk {
   const item = record(value);
   if (typeof item.writable !== "boolean" || typeof item.closed !== "boolean" || !Array.isArray(item.data) || item.data.length > 8192) throw Error("Некоректний потік термінала");
-  return { writable: item.writable, closed: item.closed, data: item.data.map((byte: unknown) => integer(byte, 0, 255)) };
+  const chunk = { writable: item.writable, closed: item.closed, data: item.data.map((byte: unknown) => integer(byte, 0, 255)) };
+  if (!("status" in item) && !("geometry" in item)) return chunk;
+  expectKeys(item, "writable", "closed", "data", "status", "geometry");
+  const status = item.status === null ? null : parseTerminalStatus(item.status);
+  const geometry = item.geometry === null ? null : parseGeometryEvent(item.geometry);
+  if (geometry && (chunk.closed || chunk.data.length || status)) throw Error("Некоректна межа зміни розміру");
+  return { ...chunk, status, geometry };
 }
 function expectKeys(item: Record<string, unknown>, ...keys: string[]) {
   if (Object.keys(item).length !== keys.length || keys.some(key => !Object.prototype.hasOwnProperty.call(item, key))) {
     throw Error("Некоректна відповідь агента");
   }
+}
+function scopeId(value: unknown): string {
+  const parsed = id(value);
+  if (parsed === "00000000-0000-0000-0000-000000000000") throw Error("Некоректна прив’язка термінала");
+  return parsed;
+}
+function tmuxId(value: unknown, prefix: string): string {
+  if (typeof value !== "string" || value[0] !== prefix || !/^(0|[1-9][0-9]{0,9})$/.test(value.slice(1))) {
+    throw Error("Некоректна прив’язка термінала");
+  }
+  integer(Number(value.slice(1)), 0, 2 ** 32 - 1);
+  return value;
+}
+function parseTerminalScope(value: unknown): TerminalScope {
+  const item = record(value);
+  expectKeys(item, "view_id", "agent_epoch", "target");
+  const target = record(item.target);
+  expectKeys(target, "runtime_id", "generation", "session", "window", "pane", "pid", "process_start");
+  return { view_id: scopeId(item.view_id), agent_epoch: scopeId(item.agent_epoch), target: {
+    runtime_id: scopeId(target.runtime_id), generation: scopeId(target.generation),
+    session: tmuxId(target.session, "$"), window: tmuxId(target.window, "@"), pane: tmuxId(target.pane, "%"),
+    pid: integer(target.pid, 1, 2 ** 31 - 1), process_start: integer(target.process_start, 1, Number.MAX_SAFE_INTEGER),
+  } };
+}
+function parseEpoch(value: unknown): ResizeEpoch {
+  const item = record(value);
+  expectKeys(item, "agent", "owner");
+  return { agent: scopeId(item.agent), owner: scopeId(item.owner) };
+}
+function parseIntent(value: unknown): ResizeIntent {
+  const item = record(value);
+  expectKeys(item, "epoch", "id");
+  return { epoch: parseEpoch(item.epoch), id: scopeId(item.id) };
+}
+function parseSize(value: unknown): TerminalSize {
+  const item = record(value);
+  expectKeys(item, "cols", "rows");
+  return { cols: integer(item.cols, 2, 500), rows: integer(item.rows, 2, 200) };
+}
+function parseGridSample(value: unknown): GridSample {
+  const item = record(value);
+  expectKeys(item, "size", "sampled_at_us");
+  return { size: parseSize(item.size), sampled_at_us: integer(item.sampled_at_us, 1, Number.MAX_SAFE_INTEGER) };
+}
+function sameSize(left: TerminalSize, right: TerminalSize): boolean {
+  return left.cols === right.cols && left.rows === right.rows;
+}
+export function parseTerminalStatus(value: unknown): TerminalStatus {
+  const item = record(value);
+  expectKeys(item, "terminal", "epoch", "committed", "provider", "observation");
+  const terminal = parseTerminalScope(item.terminal);
+  const epoch = item.epoch === null ? null : parseEpoch(item.epoch);
+  const committed = record(item.committed);
+  expectKeys(committed, "size", "revision", "intent");
+  const size = parseSize(committed.size);
+  const revision = integer(committed.revision, 0, Number.MAX_SAFE_INTEGER);
+  const intent = committed.intent === null ? null : parseIntent(committed.intent);
+  if ((revision === 0) !== (intent === null) || (intent && !epoch)) throw Error("Некоректний намір зміни розміру");
+  const provider = item.provider === null ? null : parseGridSample(item.provider);
+  const observation = item.observation;
+  if (observation !== "pending" && observation !== "observed" && observation !== "unavailable") throw Error("Некоректний стан розміру");
+  if ((observation === "observed" && (!provider || !sameSize(size, provider.size)))
+    || (observation === "unavailable" && provider)
+    || (observation === "pending" && provider && sameSize(size, provider.size))) throw Error("Некоректний вимір розміру");
+  return { terminal, epoch, committed: { size, revision, intent }, provider, observation };
+}
+export function parseResizeResult(value: unknown): ResizeResult {
+  const item = record(value);
+  if (item.result === "committed") {
+    expectKeys(item, "result", "admission", "status");
+    const status = parseTerminalStatus(item.status);
+    const admission = parseIntent(item.admission);
+    const intent = status.committed.intent;
+    const epoch = status.epoch;
+    if (!intent || !epoch || epoch.agent !== status.terminal.agent_epoch ||
+      epoch.agent !== intent.epoch.agent || epoch.owner !== intent.epoch.owner ||
+      admission.id !== intent.id || admission.epoch.agent !== epoch.agent || admission.epoch.owner !== epoch.owner) {
+      throw Error("Некоректна відповідь на зміну розміру");
+    }
+    return { result: "committed", admission, status };
+  }
+  if (item.result === "uncertain" || item.result === "rejected") {
+    expectKeys(item, "result", "terminal", "intent");
+    const terminal = parseTerminalScope(item.terminal);
+    const intent = parseIntent(item.intent);
+    if (intent.epoch.agent !== terminal.agent_epoch) throw Error("Некоректна відповідь на зміну розміру");
+    return { result: item.result, terminal, intent };
+  }
+  throw Error("Некоректний результат зміни розміру");
+}
+export function parseGeometryEvent(value: unknown): GeometryEvent {
+  const item = record(value);
+  expectKeys(item, "status", "bridge_pty", "client");
+  const status = parseTerminalStatus(item.status);
+  const bridge_pty = parseGridSample(item.bridge_pty);
+  const client = parseGridSample(item.client);
+  if (status.committed.revision < 1 || !sameSize(status.committed.size, bridge_pty.size)
+    || !sameSize(status.committed.size, client.size)) throw Error("Розміри потоку термінала не збігаються");
+  return { status, bridge_pty, client };
+}
+function parseLiveAttachment(value: unknown): Attachment & { status: TerminalStatus } {
+  const attachment = parseAttachment(value);
+  const item = record(value);
+  expectKeys(item, "view_id", "cols", "rows", "status");
+  const status = parseTerminalStatus(item.status);
+  if (attachment.view_id !== status.terminal.view_id || !sameSize(attachment, status.committed.size)) {
+    throw Error("Некоректна прив’язка термінала");
+  }
+  return { ...attachment, status };
 }
 function parseWorkspaceIssue(item: Record<string, unknown>): Blocked {
   expectKeys(item, "result", "issue");
@@ -228,8 +392,14 @@ export const localClient = {
     parseCreateStatus(await invoke<unknown>("local_create_status", reference ? { reference } : {})),
   acknowledgeCreate: async (reference: string) =>
     parseCreateStatus(await invoke<unknown>("local_create_status", { reference, presented: true })),
-  attach: async (runtimeId: string) => parseAttachment(await invoke<unknown>("terminal_attach", { runtimeId })),
+  attach: async (runtimeId: string) => parseLiveAttachment(await invoke<unknown>("terminal_attach", { runtimeId })),
   read: async (viewId: string) => parseChunk(await invoke<unknown>("terminal_read", { viewId })),
+  terminalStatus: async (viewId: string) =>
+    parseTerminalStatus(await invoke<unknown>("terminal_status", { viewId })),
+  resize: async (viewId: string, epoch: ResizeEpoch, size: TerminalSize) =>
+    parseResizeResult(await invoke<unknown>("terminal_resize", { viewId, epoch, size })),
+  acknowledgeGrid: async (viewId: string, acknowledgement: GridAcknowledgement) =>
+    parseGeometryEvent(await invoke<unknown>("terminal_acknowledge_grid", { viewId, acknowledgement })),
   input: async (viewId: string, data: readonly number[], paste: boolean) => { await invoke("terminal_input", { viewId, data, paste }); },
   detach: async (viewId: string) => { await invoke("terminal_detach", { viewId }); },
 };
