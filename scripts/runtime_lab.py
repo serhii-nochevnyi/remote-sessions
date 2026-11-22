@@ -193,8 +193,16 @@ class W1Record:
         for name in ('agent', 'tmux'):
             if loaded[name] is not None:
                 run('launchctl', 'bootout', self.targets[name])
-        if any(self.loaded_pid(name, allow_missing=True) is not None for name in self.targets):
-            raise RuntimeError('W1 jobs are still loaded')
+        deadline = time.monotonic() + 15
+        while True:
+            remaining = [name for name in self.targets
+                         if self.loaded_pid(name, allow_missing=True) is not None]
+            if not remaining:
+                break
+            delay = deadline - time.monotonic()
+            if delay <= 0:
+                raise TimeoutError('W1 jobs are still loaded: ' + ', '.join(remaining))
+            time.sleep(min(0.1, delay))
         self.validate_directories(stopping=True)
         for path in (self.state, self.catalog):
             if path.exists():

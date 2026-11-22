@@ -148,10 +148,11 @@ class ManifestTests(unittest.TestCase):
                 lab.restart_agent()
         launchctl.assert_called_once_with('launchctl', 'print', lab.targets['agent'], check=False)
 
-    def test_teardown_only_unloads_two_jobs_and_removes_their_private_paths(self):
+    def test_teardown_waits_for_both_jobs_and_removes_only_their_private_paths(self):
         self.save()
         lab = self.load(stopping=True)
         loaded = set(self.targets)
+        pending_prints = dict(zip(self.targets, (2, 1)))
 
         def fake_run(*args, **_):
             target = args[2]
@@ -159,16 +160,55 @@ class ManifestTests(unittest.TestCase):
                 loaded.remove(target)
                 return subprocess.CompletedProcess(args, 0, '', '')
             if target not in loaded:
-                return subprocess.CompletedProcess(args, 113, '', 'Could not find service')
+                if pending_prints[target] == 0:
+                    return subprocess.CompletedProcess(args, 113, '', 'Could not find service')
+                self.assertTrue(all(path.exists() for path in (self.manifest, self.state, self.catalog)))
+                pending_prints[target] -= 1
             plist = self.state / (target.rsplit('.', 1)[1] + '.plist')
             return subprocess.CompletedProcess(args, 0, f'path = {plist}\npid = 21\n', '')
 
-        with patch.object(runtime_lab, 'run', side_effect=fake_run) as launchctl:
+        with (patch.object(runtime_lab, 'run', side_effect=fake_run) as launchctl,
+              patch.object(runtime_lab.time, 'sleep') as sleep):
             lab.close()
+        self.assertEqual(sleep.call_count, 2)
         bootouts = [c.args for c in launchctl.call_args_list if c.args[1] == 'bootout']
         self.assertEqual(bootouts, [('launchctl', 'bootout', target) for target in reversed(self.targets)])
         self.assertFalse(self.manifest.exists() or self.state.exists() or self.catalog.exists())
         self.assertTrue(self.manifest.parent.is_dir())
+
+    def test_teardown_timeout_preserves_manifest_and_directories(self):
+        self.save()
+        lab = self.load(stopping=True)
+        with (patch.object(lab, 'loaded_pid', return_value=0) as loaded_pid,
+              patch.object(runtime_lab, 'run'),
+              patch.object(runtime_lab.time, 'monotonic', side_effect=[10, 25]),
+              patch.object(runtime_lab.time, 'sleep') as sleep):
+            with self.assertRaisesRegex(TimeoutError, 'W1 jobs are still loaded'):
+                lab.close()
+        self.assertEqual(loaded_pid.call_count, 4)
+        sleep.assert_not_called()
+        self.assertTrue(all(path.exists() for path in (self.manifest, self.state, self.catalog)))
+
+    def test_teardown_propagates_unexpected_print_error_and_preserves_paths(self):
+        self.save()
+        lab = self.load(stopping=True)
+        prints = iter([
+            (0, f'path = {self.state / "tmux.plist"}\npid = 21\n', ''),
+            (0, f'path = {self.state / "agent.plist"}\npid = 22\n', ''),
+            (0, f'path = {self.state / "tmux.plist"}\npid = 21\n', ''),
+            (1, '', 'Operation not permitted'),
+        ])
+
+        def fake_run(*args, **_):
+            result = next(prints) if args[1] == 'print' else (0, '', '')
+            return subprocess.CompletedProcess(args, *result)
+
+        with (patch.object(runtime_lab, 'run', side_effect=fake_run),
+              patch.object(runtime_lab.time, 'sleep') as sleep):
+            with self.assertRaisesRegex(runtime_lab.ProcessFailure, 'Operation not permitted'):
+                lab.close()
+        sleep.assert_not_called()
+        self.assertTrue(all(path.exists() for path in (self.manifest, self.state, self.catalog)))
 
     def test_start_provisions_before_bootstrap_and_uses_exact_path(self):
         lab = runtime_lab.Lab.__new__(runtime_lab.Lab)
