@@ -4,6 +4,8 @@ pub mod engine;
 pub mod model;
 pub mod ownership;
 pub mod product_launch;
+#[cfg(test)]
+mod w1_create_tests;
 
 use anyhow::{Context, Result, ensure};
 use catalog::CatalogLane;
@@ -120,15 +122,48 @@ pub async fn product_request(
     Ok(reply.product)
 }
 
-async fn exchange<T: Serialize, R: DeserializeOwned>(directory: &Path, request: &T) -> Result<R> {
-    validate_directory(directory)?;
-    let mut stream = UnixStream::connect(directory.join("agent.sock"))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateDeliveryError {
+    BeforeSend,
+    Uncertain,
+}
+
+pub async fn submit_product_create(
+    directory: &Path,
+    product: &ProductRequest,
+) -> std::result::Result<ProductResponse, CreateDeliveryError> {
+    let stream = connect_agent(directory)
         .await
-        .context("local agent is unavailable")?;
+        .map_err(|_| CreateDeliveryError::BeforeSend)?;
+    let reply: ProductEnvelope<ProductResponse> = exchange_on(stream, &ProductEnvelope { product })
+        .await
+        .map_err(|_| CreateDeliveryError::Uncertain)?;
+    Ok(reply.product)
+}
+
+async fn connect_agent(directory: &Path) -> Result<UnixStream> {
+    validate_directory(directory)?;
+    let stream = tokio::time::timeout(
+        IO_TIMEOUT,
+        UnixStream::connect(directory.join("agent.sock")),
+    )
+    .await?
+    .context("local agent is unavailable")?;
     ensure!(
         stream.peer_cred()?.uid() == geteuid().as_raw(),
         "unexpected agent UID"
     );
+    Ok(stream)
+}
+
+async fn exchange<T: Serialize, R: DeserializeOwned>(directory: &Path, request: &T) -> Result<R> {
+    exchange_on(connect_agent(directory).await?, request).await
+}
+
+async fn exchange_on<T: Serialize, R: DeserializeOwned>(
+    mut stream: UnixStream,
+    request: &T,
+) -> Result<R> {
     let mut bytes = serde_json::to_vec(request)?;
     bytes.push(b'\n');
     ensure!(bytes.len() <= REQUEST_LIMIT, "request too large");
@@ -150,6 +185,22 @@ pub async fn serve_with_catalog(directory: PathBuf, tmux: PathBuf, catalog: Path
     serve_local(directory, tmux, Some(lane)).await
 }
 
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub async fn serve_catalog_fixture(
+    directory: PathBuf,
+    tmux: PathBuf,
+    catalog: PathBuf,
+    service_path: &std::ffi::OsStr,
+) -> Result<()> {
+    catalog::provision(&catalog).map_err(|issue| anyhow::anyhow!("fixture catalog: {issue:?}"))?;
+    let lane = CatalogLane::start(
+        move || Ok(catalog),
+        ServiceProfiles::new(Some(service_path)),
+    );
+    serve_local(directory, tmux, Some(lane)).await
+}
+
 async fn dispatch(
     bytes: &[u8],
     engine: &Mutex<Engine>,
@@ -160,9 +211,29 @@ async fn dispatch(
         .is_some()
     {
         let product = match serde_json::from_slice::<ProductEnvelope<ProductRequest>>(bytes) {
-            Ok(envelope) => match catalog {
-                Some(lane) => lane.call(envelope.product).await,
-                None => ProductResponse::Blocked {
+            Ok(envelope) => match (catalog, envelope.product) {
+                (
+                    Some(lane),
+                    ProductRequest::CreateManaged {
+                        key,
+                        workspace_id,
+                        profile,
+                        reservation,
+                    },
+                ) => {
+                    let state = engine
+                        .lock()
+                        .await
+                        .create(lane, key, workspace_id, profile, reservation)
+                        .await;
+                    ProductResponse::Create { state }
+                }
+                (Some(lane), ProductRequest::CreateStatus { key }) => {
+                    let state = engine.lock().await.create_status(lane, key).await;
+                    ProductResponse::Create { state }
+                }
+                (Some(lane), product) => lane.call(product).await,
+                (None, _) => ProductResponse::Blocked {
                     issue: ProductIssue::CatalogUnconfigured,
                 },
             },
@@ -173,7 +244,13 @@ async fn dispatch(
         return Ok(serde_json::to_vec(&ProductEnvelope { product })?);
     }
     let request = serde_json::from_slice::<Request>(bytes)?;
-    let response = engine.lock().await.handle(request).await?;
+    let mut engine = engine.lock().await;
+    let response = match request {
+        Request::List {} => Response::Runtimes {
+            runtimes: engine.inventory(catalog).await?,
+        },
+        request => engine.handle(request).await?,
+    };
     Ok(serde_json::to_vec(&response)?)
 }
 
@@ -268,7 +345,7 @@ mod tests {
         assert!(read_frame(&mut partial, 10).await.is_err());
     }
 
-    fn fixture_program(path: &Path, script: &str) {
+    pub(super) fn fixture_program(path: &Path, script: &str) {
         fs::write(path, script).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }

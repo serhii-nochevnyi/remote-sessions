@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use remote_sessions_host::{
     find_executable, initialize_catalog,
     model::{Request, Response},
+    product_launch::managed_launch_argument,
     request, serve, serve_with_catalog,
 };
 use std::{os::unix::process::CommandExt, path::PathBuf};
@@ -55,8 +56,16 @@ enum Action {
     },
 }
 
+fn main() -> Result<()> {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if let Some(result) = managed_launch_argument(&args) {
+        return result;
+    }
+    cli_main()
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn cli_main() -> Result<()> {
     let cli = Cli::parse();
     if matches!(cli.command, Action::CatalogInit) {
         return initialize_catalog(

@@ -1,5 +1,10 @@
 //! Local desktop views with host-enforced exclusive input leases.
+mod pending_create;
+
 use anyhow::{Context, Result, bail, ensure};
+pub use pending_create::{
+    CreateDisposition, CreateSubmission, LocalCreate, LocalCreateStatus, ProviderReadiness,
+};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 pub use remote_sessions_host::model::{ProductIssue, ProviderProfile, WorkspaceDisplay};
 use remote_sessions_host::{
@@ -103,6 +108,7 @@ pub struct DesktopBridge {
     directory: Option<PathBuf>,
     tmux: PathBuf,
     views: Mutex<HashMap<String, Arc<View>>>,
+    creates: tokio::sync::Mutex<()>,
 }
 impl DesktopBridge {
     pub fn new(directory: Option<PathBuf>, tmux: PathBuf) -> Self {
@@ -111,6 +117,7 @@ impl DesktopBridge {
             directory,
             tmux,
             views: Mutex::new(HashMap::new()),
+            creates: tokio::sync::Mutex::new(()),
         }
     }
     fn directory(&self) -> Result<&PathBuf> {
@@ -143,7 +150,7 @@ impl DesktopBridge {
                 Ok(WorkspaceSelection::Selected { workspace })
             }
             ProductResponse::Blocked { issue } => Ok(WorkspaceSelection::Blocked { issue }),
-            ProductResponse::Ready {} => bail!("Unexpected workspace selection response"),
+            _ => bail!("Unexpected workspace selection response"),
         }
     }
 
@@ -164,7 +171,7 @@ impl DesktopBridge {
         match product_request(self.directory()?, &request).await? {
             ProductResponse::Ready {} => Ok(WorkspaceReadiness::Ready {}),
             ProductResponse::Blocked { issue } => Ok(WorkspaceReadiness::Blocked { issue }),
-            ProductResponse::WorkspaceRegistered { .. } => bail!("Unexpected readiness response"),
+            _ => bail!("Unexpected readiness response"),
         }
     }
     pub async fn inventory(&self) -> Result<Inventory> {

@@ -1,9 +1,24 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { localClient, parseWorkspaceReadiness, parseWorkspaceSelection, workspaceIssueText } from "./local-client.ts";
+import {
+  localClient, mergeCreateOperations, parseCreateStatus, parseCreateSubmission, parseWorkspaceReadiness,
+  parseWorkspaceSelection, selectCreatedRuntime, workspaceIssueText,
+} from "./local-client.ts";
+import { closeView, openView } from "./session-state.ts";
+import type { SessionViews } from "./session-state.ts";
 
 const workspaceId = "11111111-1111-4111-8111-111111111111";
 const workspace = { workspace_id: workspaceId, label: "Проєкт з пробілами" };
+const reference = "22222222-2222-4222-8222-222222222222";
+const separateReference = "33333333-3333-4333-8333-333333333333";
+const runtimeId = "44444444-4444-4444-8444-444444444444";
+const sessionId = "55555555-5555-4555-8555-555555555555";
+const runtime = { runtime_id: runtimeId, session_id: sessionId, command: "codex", pane_pid: 101, exited: false, width: 100, height: 30 };
+const unknown = { result: "unknown", issue: null };
+const launched = { result: "launched", runtime, current: "live", readiness: "unobserved" };
+function operation(disposition: unknown, id = reference) {
+  return { reference: id, workspace_id: workspaceId, profile: "codex", presented: false, disposition };
+}
 
 test("w1_readiness validates selection and excludes locator and runtime data", () => {
   assert.deepEqual(parseWorkspaceSelection({ result: "cancelled" }), { result: "cancelled" });
@@ -16,6 +31,81 @@ test("w1_readiness validates selection and excludes locator and runtime data", (
   assert.throws(() => parseWorkspaceReadiness({ result: "ready", executable: "/private/bin/codex" }));
   assert.throws(() => parseWorkspaceReadiness({ result: "blocked", issue: "toString" }));
   assert.throws(() => parseWorkspaceReadiness({ result: "started", runtime_id: workspaceId }));
+});
+
+test("create decodes distinct dispositions and keeps host keys out of native replies", () => {
+  for (const disposition of [
+    { result: "pending" },
+    { result: "failed", issue: "workspace_changed" },
+    { result: "unknown", issue: "catalog_missing" },
+    unknown,
+    launched,
+    { result: "exited", runtime: { ...runtime, exited: true }, current: "exited", setup_issue: "workspace_changed" },
+    { result: "exited", runtime: { ...runtime, exited: true }, current: "unavailable", setup_issue: null },
+  ]) {
+    const reply = { result: "recorded", operation: operation(disposition) };
+    assert.deepEqual(parseCreateSubmission(reply), reply);
+  }
+  assert.deepEqual(parseCreateSubmission({ result: "blocked", issue: "pending_unavailable" }),
+    { result: "blocked", issue: "pending_unavailable" });
+  assert.throws(() => parseCreateStatus({ operations: [{ ...operation(unknown), key: reference }], issue: null }));
+  assert.throws(() => parseCreateStatus({ operations: [operation({ ...launched, readiness: "ready" })], issue: null }));
+  assert.throws(() => parseCreateStatus({ operations: [operation(unknown), operation(unknown)], issue: null }));
+});
+
+test("inventory first and create result first select the same runtime once", () => {
+  const [confirmed] = parseCreateStatus({ operations: [operation(launched)], issue: null }).operations;
+  assert.ok(confirmed);
+  const empty: SessionViews = { open: [], active: null };
+  const inventoryFirst = openView(empty, runtimeId, [runtimeId]);
+  const createFirst = selectCreatedRuntime(empty, confirmed, new Set());
+  assert.deepEqual(selectCreatedRuntime(inventoryFirst, confirmed, new Set()), createFirst);
+  const userSelection = openView(createFirst, sessionId, [sessionId]);
+  assert.equal(selectCreatedRuntime(userSelection, confirmed, new Set(), true).active, sessionId);
+  const handled = new Set([reference]);
+  assert.equal(selectCreatedRuntime(userSelection, confirmed, handled), userSelection);
+  const closed = closeView(userSelection, runtimeId);
+  assert.equal(selectCreatedRuntime(closed, confirmed, handled), closed);
+});
+
+test("a deliberate second operation and reference-scoped refresh preserve both outcomes", async () => {
+  const calls: unknown[] = [];
+  const windowDescriptor = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: {
+      __TAURI_INTERNALS__: {
+        invoke(command: string, args?: Record<string, unknown>) {
+          calls.push([command, args]);
+          if (command === "local_create_status") {
+            if (!args?.reference) return { operations: [operation(unknown)], issue: null };
+            return { operations: [args.reference === reference ? operation(launched) : operation(unknown, separateReference)], issue: null };
+          }
+          if (command === "local_create_session") return { result: "recorded", operation: operation(unknown, separateReference) };
+          throw Error("Unexpected native command");
+        },
+      },
+    },
+  });
+  try {
+    const recovered = await localClient.createStatus();
+    const separate = await localClient.createSession(workspaceId, "codex", { separateFrom: reference });
+    if (separate.result !== "recorded") throw Error("Unexpected blocked operation");
+    let merged = mergeCreateOperations(recovered.operations, [separate.operation]);
+    merged = mergeCreateOperations(merged, (await localClient.createStatus(reference)).operations);
+    merged = mergeCreateOperations(merged, (await localClient.createStatus(separateReference)).operations);
+    assert.deepEqual(merged.map(item => [item.reference, item.disposition.result]),
+      [[reference, "launched"], [separateReference, "unknown"]]);
+    assert.deepEqual(calls, [
+      ["local_create_status", {}],
+      ["local_create_session", { workspaceId, profile: "codex", separateFrom: reference }],
+      ["local_create_status", { reference }],
+      ["local_create_status", { reference: separateReference }],
+    ]);
+  } finally {
+    if (windowDescriptor) Object.defineProperty(globalThis, "window", windowDescriptor);
+    else Reflect.deleteProperty(globalThis, "window");
+  }
 });
 
 test("w1_readiness accepts typed failures with recovery text", () => {
