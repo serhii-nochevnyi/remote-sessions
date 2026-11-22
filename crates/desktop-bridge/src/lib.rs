@@ -1,9 +1,11 @@
 //! Local desktop views with host-enforced exclusive input leases.
 use anyhow::{Context, Result, bail, ensure};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
+pub use remote_sessions_host::model::{ProductIssue, ProviderProfile, WorkspaceDisplay};
 use remote_sessions_host::{
-    model::{Request, Response, Runtime},
-    request,
+    model::{ProductRequest, ProductResponse, Request, Response, Runtime},
+    product_launch::workspace_locator,
+    product_request, request,
 };
 use serde::Serialize;
 use std::{
@@ -35,6 +37,21 @@ pub struct Chunk {
     pub writable: bool,
     pub data: Vec<u8>,
     pub closed: bool,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum WorkspaceSelection {
+    Cancelled {},
+    Selected { workspace: WorkspaceDisplay },
+    Blocked { issue: ProductIssue },
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum WorkspaceReadiness {
+    Ready {},
+    Blocked { issue: ProductIssue },
 }
 
 struct Control {
@@ -100,6 +117,55 @@ impl DesktopBridge {
         self.directory
             .as_ref()
             .context("Локальний агент не налаштований. Запустіть desktop lab.")
+    }
+    pub async fn pick_workspace(&self, picked: Option<PathBuf>) -> Result<WorkspaceSelection> {
+        let Some(path) = picked else {
+            return Ok(WorkspaceSelection::Cancelled {});
+        };
+        let locator = match workspace_locator(&path) {
+            Ok(locator) => locator.to_owned(),
+            Err(issue) => return Ok(WorkspaceSelection::Blocked { issue }),
+        };
+        match product_request(
+            self.directory()?,
+            &ProductRequest::RegisterWorkspace { locator },
+        )
+        .await?
+        {
+            ProductResponse::WorkspaceRegistered { workspace } => {
+                ensure!(
+                    !workspace.workspace_id.is_nil()
+                        && !workspace.label.is_empty()
+                        && workspace.label.len() <= 4096
+                        && !workspace.label.chars().any(char::is_control),
+                    "Invalid workspace display metadata"
+                );
+                Ok(WorkspaceSelection::Selected { workspace })
+            }
+            ProductResponse::Blocked { issue } => Ok(WorkspaceSelection::Blocked { issue }),
+            ProductResponse::Ready {} => bail!("Unexpected workspace selection response"),
+        }
+    }
+
+    pub async fn workspace_readiness(
+        &self,
+        workspace_id: &str,
+        profile: ProviderProfile,
+    ) -> Result<WorkspaceReadiness> {
+        let Ok(workspace_id) = Uuid::parse_str(workspace_id) else {
+            return Ok(WorkspaceReadiness::Blocked {
+                issue: ProductIssue::InvalidRequest,
+            });
+        };
+        let request = ProductRequest::WorkspaceReadiness {
+            workspace_id,
+            profile,
+        };
+        match product_request(self.directory()?, &request).await? {
+            ProductResponse::Ready {} => Ok(WorkspaceReadiness::Ready {}),
+            ProductResponse::Blocked { issue } => Ok(WorkspaceReadiness::Blocked { issue }),
+            ProductResponse::WorkspaceRegistered { .. } => bail!("Unexpected readiness response"),
+        }
     }
     pub async fn inventory(&self) -> Result<Inventory> {
         let directory = self.directory()?;
@@ -340,5 +406,107 @@ impl DesktopBridge {
 impl Drop for DesktopBridge {
     fn drop(&mut self) {
         self.detach_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        ffi::OsString,
+        fs::{self, DirBuilder},
+        os::unix::{ffi::OsStringExt, fs::DirBuilderExt},
+        path::Path,
+    };
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        net::UnixListener,
+    };
+
+    struct Fixture(PathBuf);
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn w1_readiness_cancel_and_non_utf8_never_contact_agent() {
+        let bridge = DesktopBridge::new(None, "/unused/tmux".into());
+        assert_eq!(
+            bridge.pick_workspace(None).await.unwrap(),
+            WorkspaceSelection::Cancelled {}
+        );
+        let non_utf8 = Path::new("/tmp").join(OsString::from_vec(vec![0xff]));
+        assert_eq!(
+            bridge.pick_workspace(Some(non_utf8)).await.unwrap(),
+            WorkspaceSelection::Blocked {
+                issue: ProductIssue::UnsupportedPath
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn w1_readiness_bridge_uses_typed_ipc_and_omits_locator_from_reply() {
+        let root = Path::new("/tmp")
+            .canonicalize()
+            .unwrap()
+            .join(format!("rs-{}", Uuid::new_v4().simple()));
+        DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let fixture = Fixture(root);
+        let locator = fixture.0.join("Проєкт з пробілами");
+        fs::create_dir(&locator).unwrap();
+        let listener = UnixListener::bind(fixture.0.join("agent.sock")).unwrap();
+        let id = Uuid::new_v4();
+        let expected = format!(
+            "{{\"product\":{{\"op\":\"register_workspace\",\"locator\":\"{}\"}}}}\n",
+            locator.display()
+        );
+        let readiness = format!(
+            "{{\"product\":{{\"op\":\"workspace_readiness\",\"workspace_id\":\"{id}\",\"profile\":\"claude_code\"}}}}\n"
+        );
+        let registered = format!(
+            "{{\"product\":{{\"result\":\"workspace_registered\",\"workspace\":{{\"workspace_id\":\"{id}\",\"label\":\"Проєкт з пробілами\"}}}}}}\n"
+        );
+        let server = async move {
+            for (expected, response) in [
+                (expected, registered),
+                (readiness, "{\"product\":{\"result\":\"blocked\",\"issue\":\"interpreter_unavailable\"}}\n".into()),
+            ] {
+                let (mut client, _) = listener.accept().await.unwrap();
+                let mut line = String::new();
+                BufReader::new(&mut client).read_line(&mut line).await.unwrap();
+                assert_eq!(line, expected);
+                client.write_all(response.as_bytes()).await.unwrap();
+            }
+        };
+        let browser = async {
+            let bridge = DesktopBridge::new(Some(fixture.0.clone()), "/unused/tmux".into());
+            let WorkspaceSelection::Selected { workspace } =
+                bridge.pick_workspace(Some(locator)).await.unwrap()
+            else {
+                panic!("expected selected project")
+            };
+            assert_eq!(workspace.workspace_id, id);
+            assert_eq!(workspace.label, "Проєкт з пробілами");
+            assert_eq!(
+                bridge
+                    .workspace_readiness(
+                        &workspace.workspace_id.to_string(),
+                        ProviderProfile::ClaudeCode
+                    )
+                    .await
+                    .unwrap(),
+                WorkspaceReadiness::Blocked {
+                    issue: ProductIssue::InterpreterUnavailable
+                }
+            );
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(server, browser);
+        })
+        .await
+        .unwrap();
     }
 }

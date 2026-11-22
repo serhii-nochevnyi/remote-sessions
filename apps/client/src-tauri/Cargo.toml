@@ -18,3 +18,4 @@ remote-sessions-core = { path = "../../../crates/client-core" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 remote-sessions-desktop-bridge = { path = "../../../crates/desktop-bridge" }
+tauri-plugin-dialog = { version = "=2.8.4", default-features = false }
