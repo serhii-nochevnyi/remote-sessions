@@ -837,7 +837,6 @@ async fn w1_terminal_parked_read_gets_producer_full_and_late_lease_is_released_o
 }
 
 async fn saturate_parked(view: &View, reader: &mut ReadControl) {
-    // The parked status request owns Output, so drive the producer directly.
     for _ in 0..=OUTPUT_SLOTS {
         reader.requested().await;
         reader.data(b"pressure");

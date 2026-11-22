@@ -89,10 +89,7 @@ enum Retirement {
 
 const VIEW_LIMIT: usize = 8;
 const OUTPUT_SLOTS: usize = 16;
-// Allows an inspector-paused WebView to resume without retaining any view resources.
 const NOTICE_TTL: Duration = Duration::from_secs(120);
-// The nonblocking reader normally exits within one poll and the owned child is
-// polled for reap after termination. Keep the slot charged if either misses this bound.
 const CLEANUP_BUDGET: Duration = Duration::from_secs(2);
 const CLEANUP_POLL: Duration = Duration::from_millis(5);
 
@@ -316,7 +313,6 @@ struct View {
     reader_state: Arc<AtomicU64>,
     views: Weak<Mutex<Views>>,
     retirement: watch::Sender<Option<Retirement>>,
-    // Read registration and retirement are serialized by the registry lock.
     reading: AtomicBool,
     handle: tokio::runtime::Handle,
     #[cfg(test)]
@@ -338,7 +334,6 @@ impl View {
         let Some(reason) = publish(sender, event) else {
             return true;
         };
-        // Serialize a producer Full with read/ACK completion and explicit detach.
         let at = self.retire_locked(&mut views, reason);
         drop(views);
         if let Retirement::Typed(TerminalClosure::Overflow { high_water }) = reason {
@@ -400,7 +395,6 @@ impl View {
     }
 
     async fn release(&self, token: Uuid) {
-        // The same-user host also expires leases if release cannot be delivered.
         let _ = tokio::time::timeout(
             Duration::from_secs(1),
             request(
@@ -415,8 +409,6 @@ impl View {
     }
 }
 
-// An in-flight read owns delivery of the closure. Cancellation hands it back
-// to the bounded registry for a subsequent first pull.
 struct PendingRead<'a> {
     view: &'a View,
     views: &'a Mutex<Views>,
@@ -481,7 +473,6 @@ fn supervise(
             cleanup.release(token).await;
         }
     });
-    // Only this task touches the owned child. Check and reap before signalling.
     let mut signalled = false;
     let mut reap = false;
     let mut reader = reader;
@@ -509,7 +500,6 @@ fn supervise(
             }
         }
         if reap && reader.is_none() && output_cleanup.is_finished() {
-            // Slot release precedes the final record, even if the child reaped first.
             drop(allocation);
             view.trace_pressure("cleanup_complete");
             return;
@@ -623,8 +613,6 @@ async fn refresh_control(view: &View) {
     };
     match request(&view.directory, &message).await {
         Ok(Response::TerminalControl { token, epoch }) => {
-            // A late acquire belongs to this view even if retirement won during IPC.
-            // Fence installation against the same lock that removes the live entry.
             {
                 let views = view.views.upgrade();
                 let _registry = views.as_ref().map(|views| views.lock().unwrap());
@@ -1192,7 +1180,6 @@ impl DesktopBridge {
             Err(error) => (None, Some(error)),
         };
         let owner = view.clone();
-        // Register the live view and its cleanup owner before opening the reader gate.
         tokio::task::spawn_blocking(move || supervise(owner, child, reader, allocation));
         if let Some(error) = error {
             let _ = view.retire_locked(&mut views, Retirement::Failed);

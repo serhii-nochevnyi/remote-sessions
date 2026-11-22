@@ -204,7 +204,6 @@ interface TerminalViewCallbacks {
   reconnect(error: unknown): void;
 }
 
-// Each effect creates a scope for exactly one native view and renderer.
 export class TerminalViewScope {
   private attached: string | null = null;
   private retired = false;

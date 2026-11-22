@@ -248,8 +248,6 @@ def mono(at_us, anchor):
 
 
 def fixture(state):
-    # Raw mode preserves the exact CR input sent by xterm/the bridge. The
-    # heartbeat and ledger make progress independently of screen publication.
     tty.setraw(sys.stdin.fileno(), termios.TCSANOW)
     instance = str(uuid.uuid4())
 
@@ -277,8 +275,6 @@ def fixture(state):
         started = ns()
         total = 0
         for burst in range(BURSTS[leg]):
-            # Replace every visible row, giving the tmux client actual byte
-            # work even where repeated output would otherwise be optimized.
             rows = [bytes([65 + ((row + burst) % 26)]) * 70 for row in range(24)]
             data = b'\x1b[H' + b'\r\n'.join(rows) + f'\r\nRSPROGRESS{burst:04d}'.encode()
             render(data)
@@ -519,8 +515,6 @@ def signed_app(bundle, state, role):
     signature = run_command('/usr/bin/codesign', '-d', '--verbose=4', bundle).stderr
     code_hash = re.search(r'^CDHash=([0-9a-f]{40,64})$', signature, re.M)
     need(code_hash is not None, 'native build signature identity unavailable')
-    # Bundle IDs can change the signature blob. Compare the actual signed copies
-    # after stripping signatures on private copies of their executables.
     unsigned = state / f'unsigned-{role}'
     shutil.copyfile(binary, unsigned)
     run_command('/usr/bin/codesign', '--remove-signature', unsigned)

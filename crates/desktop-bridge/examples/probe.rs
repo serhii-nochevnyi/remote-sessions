@@ -1278,8 +1278,6 @@ async fn pressure_probe(args: Vec<String>) -> Result<()> {
     let victim = bridge.attach_observer(&runtime_id).await?;
     let victim_process = PressureView::observe(&bridge, &victim).await?;
     let committed = async {
-        // Read the startup redraw before pressure. Stop pulling this observer
-        // before commit so it has not armed DRAIN or paused at its marker.
         pressure_bytes(&bridge, &victim, false, b"RSSTARTREADY").await?;
         let size = if owner.status.committed.size == NORMAL {
             NARROW
