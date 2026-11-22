@@ -198,7 +198,8 @@ impl ServiceProfiles {
             .ok_or(EntryPointIssue::Interpreter)?;
         let mut resolved =
             executable_path(interpreter).map_err(|_| EntryPointIssue::Interpreter)?;
-        if resolved == Path::new("/usr/bin/env") {
+        let env = Path::new("/usr/bin/env");
+        if interpreter == env || resolved == env {
             let first = words.next().ok_or(EntryPointIssue::Interpreter)?;
             let name = if first == "-S" {
                 words.next().ok_or(EntryPointIssue::Interpreter)?
