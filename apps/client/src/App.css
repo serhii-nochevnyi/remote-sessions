@@ -33,7 +33,7 @@ h1 { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var
 .session-toolbar > span { align-self: center; }
 .terminal-controls, .zoom-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .terminal-controls button { background: var(--surface); border: 1px solid var(--border); border-radius: 5px; min-height: 30px; padding: 4px 8px; }
-.terminal-controls button:disabled { opacity: 0.5; cursor: default; }
+.terminal-controls button:disabled, .terminal-controls button[aria-disabled="true"] { opacity: 0.5; cursor: default; }
 .fullscreen-error { flex-basis: 100%; }
 .terminal-view { display: flex; height: 420px; padding: 20px 18px; background: #111a21; min-width: 0; }
 .input-note { padding: 14px 18px; color: var(--muted); font-size: 12px; line-height: 1.6; }

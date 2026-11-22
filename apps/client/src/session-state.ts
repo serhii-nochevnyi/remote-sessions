@@ -17,6 +17,22 @@ export interface SessionViews {
   readonly active: string | null;
 }
 
+export interface TerminalFocusTarget<T> {
+  readonly runtimeId: string;
+  readonly epoch: number;
+  readonly textarea: T;
+}
+
+export function canRestoreTerminalFocus<T extends { readonly isConnected: boolean }>(
+  captured: TerminalFocusTarget<T>,
+  current: TerminalFocusTarget<T> | null,
+  ownsFocusIntent: boolean,
+): boolean {
+  return ownsFocusIntent && captured.textarea.isConnected && current !== null &&
+    captured.runtimeId === current.runtimeId && captured.epoch === current.epoch &&
+    captured.textarea === current.textarea;
+}
+
 export function openView(state: SessionViews, id: string, knownIds: readonly string[] = demoSessions.map(session => session.id)): SessionViews {
   if (!knownIds.includes(id)) return state;
   return { open: state.open.includes(id) ? state.open : [...state.open, id], active: id };

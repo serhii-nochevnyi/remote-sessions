@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { closeView, demoSessions, focusAfterClose, moveView, openView, parseScaffoldStatus, tabKey, tabStop } from "./session-state.ts";
+import { canRestoreTerminalFocus, closeView, demoSessions, focusAfterClose, moveView, openView, parseScaffoldStatus, tabKey, tabStop } from "./session-state.ts";
 
 test("closing every view preserves the session catalog and allows reopening", () => {
   const catalogBefore = structuredClone(demoSessions);
@@ -68,6 +68,20 @@ test("closing a tab falls back to its next neighbor, then its previous one", () 
   const last = { open: ["C"], active: "C" };
   assert.equal(tabStop(closeView(last, "C"), focusAfterClose(last, "C", "C")), null);
   assert.equal(closeView(last, "removed"), last);
+});
+
+test("fullscreen exit restores focus only to the current mounted terminal", () => {
+  const textarea = { isConnected: true };
+  const captured = { runtimeId: "A", epoch: 12, textarea };
+
+  assert.equal(canRestoreTerminalFocus(captured, { ...captured }, true), true);
+  assert.equal(canRestoreTerminalFocus(captured, captured, false), false);
+  assert.equal(canRestoreTerminalFocus(captured, null, true), false);
+  assert.equal(canRestoreTerminalFocus(captured, { ...captured, runtimeId: "B" }, true), false);
+  assert.equal(canRestoreTerminalFocus(captured, { ...captured, epoch: 13 }, true), false);
+  assert.equal(canRestoreTerminalFocus(captured, { ...captured, textarea: { isConnected: true } }, true), false);
+  textarea.isConnected = false;
+  assert.equal(canRestoreTerminalFocus(captured, captured, true), false);
 });
 
 test("native boundary validates the shared status fixture and fails closed", () => {

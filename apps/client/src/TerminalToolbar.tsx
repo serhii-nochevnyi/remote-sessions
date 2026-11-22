@@ -3,6 +3,12 @@ import { localClient } from "./local-client";
 import { DEFAULT_TERMINAL_FONT, MAX_TERMINAL_FONT, MIN_TERMINAL_FONT } from "./presentation-preferences.ts";
 import type { ZoomAction } from "./presentation-preferences.ts";
 
+export interface FullscreenExitFocus {
+  readonly signal: AbortSignal;
+  readonly dispose: () => void;
+  readonly restore: (focusWebview: () => Promise<boolean>) => Promise<void>;
+}
+
 interface TerminalToolbarProps {
   readonly title: string | undefined;
   readonly fontSize: number;
@@ -11,9 +17,10 @@ interface TerminalToolbarProps {
   readonly onZoom: (action: ZoomAction) => void;
   readonly onExpand: () => void;
   readonly onReturnFocus: () => void;
+  readonly onFullscreenExit: (button: HTMLButtonElement) => FullscreenExitFocus | undefined;
 }
 
-export function TerminalToolbar({ title, fontSize, expanded, nativeWindow, onZoom, onExpand, onReturnFocus }: TerminalToolbarProps) {
+export function TerminalToolbar({ title, fontSize, expanded, nativeWindow, onZoom, onExpand, onReturnFocus, onFullscreenExit }: TerminalToolbarProps) {
   const [fullscreen, setFullscreen] = useState(false);
   const [changing, setChanging] = useState(false);
   const [readFailed, setReadFailed] = useState(false);
@@ -52,20 +59,37 @@ export function TerminalToolbar({ title, fontSize, expanded, nativeWindow, onZoo
     };
   }, [nativeWindow, changing]);
 
-  async function toggleFullscreen() {
+  async function toggleFullscreen(button: HTMLButtonElement) {
     if (pending.current) return;
     pending.current = true;
     setChanging(true);
     setError("");
-    onReturnFocus();
     try {
-      const target = !(await localClient.windowFullscreen());
-      await localClient.windowFullscreen(target);
+      if (fullscreen) {
+        const intent = crypto.randomUUID();
+        const focus = onFullscreenExit(button);
+        const cancel = () => { void localClient.cancelWindowFullscreenExit(intent).catch(() => {}); };
+        focus?.signal.addEventListener("abort", cancel, { once: true });
+        try {
+          if (await localClient.exitWindowFullscreen(intent)) {
+            setFullscreen(false);
+            await focus?.restore(() => localClient.focusWindowAfterFullscreenExit(intent));
+          }
+        } finally {
+          focus?.signal.removeEventListener("abort", cancel);
+          focus?.dispose();
+          await localClient.cancelWindowFullscreenExit(intent).catch(() => {});
+        }
+        return;
+      }
+
+      onReturnFocus();
+      await localClient.enterWindowFullscreen();
       for (let attempt = 0; attempt < 10; attempt++) {
         await new Promise<void>(resolve => setTimeout(resolve, attempt === 0 ? 500 : 150));
         const actual = await localClient.windowFullscreen();
         setFullscreen(actual);
-        if (actual === target) return;
+        if (actual) return;
       }
       setError("Не вдалося підтвердити зміну повноекранного режиму.");
     } catch {
@@ -94,7 +118,7 @@ export function TerminalToolbar({ title, fontSize, expanded, nativeWindow, onZoo
         </div>
         <button type="button" onClick={onExpand}>{expanded ? "Відновити вигляд" : "Розгорнути термінал"}</button>
       </>}
-      {nativeWindow && <button type="button" disabled={changing} onClick={() => void toggleFullscreen()}>
+      {nativeWindow && <button type="button" aria-disabled={changing} onClick={event => void toggleFullscreen(event.currentTarget)}>
         {changing ? "Змінюємо режим вікна…" : fullscreen ? "Вийти з повноекранного режиму" : "Повноекранний режим"}
       </button>}
     </div>

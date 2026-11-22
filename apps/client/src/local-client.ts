@@ -382,13 +382,20 @@ export function selectCreatedRuntime(views: SessionViews, operation: LocalCreate
   const next = openView(views, id, [id]);
   return preserveActive && views.open.length > 0 ? { ...next, active: views.active } : next;
 }
+
+async function invokeFullscreen(action: "read" | "enter" | "exit" | "cancelExit" | "focusAfterExit", intent?: string): Promise<boolean> {
+  const result = await invoke<unknown>("local_window_fullscreen", { action, intent });
+  if (typeof result !== "boolean") throw Error("Некоректна відповідь повноекранного режиму");
+  return result;
+}
+
 export const localClient = {
   inventory: async () => parseInventory(await invoke<unknown>("local_inventory")),
-  windowFullscreen: async (fullscreen?: boolean) => {
-    const result = await invoke<unknown>("local_window_fullscreen", fullscreen === undefined ? {} : { fullscreen });
-    if (typeof result !== "boolean") throw Error("Некоректний стан повноекранного режиму");
-    return result;
-  },
+  windowFullscreen: () => invokeFullscreen("read"),
+  enterWindowFullscreen: () => invokeFullscreen("enter"),
+  exitWindowFullscreen: (intent: string) => invokeFullscreen("exit", intent),
+  cancelWindowFullscreenExit: (intent: string) => invokeFullscreen("cancelExit", intent),
+  focusWindowAfterFullscreenExit: (intent: string) => invokeFullscreen("focusAfterExit", intent),
   pickWorkspace: async () => parseWorkspaceSelection(await invoke<unknown>("local_pick_workspace")),
   workspaceReadiness: async (workspaceId: string, profile: ProviderProfile) =>
     parseWorkspaceReadiness(await invoke<unknown>("local_workspace_readiness", { workspaceId, profile })),

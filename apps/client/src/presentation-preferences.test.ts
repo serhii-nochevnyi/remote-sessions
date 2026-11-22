@@ -101,31 +101,40 @@ test("zoom clamps and resets, and only the Cmd terminal shortcuts are intercepte
   assert.equal(zoomShortcut({ ...cmd, key: "c" }), undefined);
 });
 
-test("the native fullscreen boundary sends only the desired state and requires boolean readback", async () => {
+test("the native fullscreen boundary correlates exit, focus and cancellation and requires boolean replies", async () => {
   const original = Object.getOwnPropertyDescriptor(globalThis, "window");
   const calls: unknown[] = [];
-  let actual: unknown = false;
+  let reply: unknown = false;
   Object.defineProperty(globalThis, "window", {
     configurable: true,
     value: {
       __TAURI_INTERNALS__: {
-        invoke(command: string, args: { fullscreen?: boolean }) {
+        invoke(command: string, args: unknown) {
           calls.push([command, args]);
-          if (args.fullscreen !== undefined) actual = args.fullscreen;
-          return actual;
+          return reply;
         },
       },
     },
   });
   try {
     assert.equal(await localClient.windowFullscreen(), false);
-    assert.equal(await localClient.windowFullscreen(true), true);
-    assert.equal(await localClient.windowFullscreen(false), false);
-    actual = { fullscreen: true };
-    await assert.rejects(localClient.windowFullscreen());
+    reply = true;
+    assert.equal(await localClient.enterWindowFullscreen(), true);
+    assert.equal(await localClient.exitWindowFullscreen(a), true);
+    assert.equal(await localClient.focusWindowAfterFullscreenExit(a), true);
+    reply = false;
+    assert.equal(await localClient.cancelWindowFullscreenExit(a), false);
+    assert.equal(await localClient.exitWindowFullscreen(b), false);
+    reply = { fullscreen: true };
+    await assert.rejects(localClient.windowFullscreen(), /Некоректна відповідь повноекранного режиму/);
     assert.deepEqual(calls, [
-      ["local_window_fullscreen", {}], ["local_window_fullscreen", { fullscreen: true }],
-      ["local_window_fullscreen", { fullscreen: false }], ["local_window_fullscreen", {}],
+      ["local_window_fullscreen", { action: "read", intent: undefined }],
+      ["local_window_fullscreen", { action: "enter", intent: undefined }],
+      ["local_window_fullscreen", { action: "exit", intent: a }],
+      ["local_window_fullscreen", { action: "focusAfterExit", intent: a }],
+      ["local_window_fullscreen", { action: "cancelExit", intent: a }],
+      ["local_window_fullscreen", { action: "exit", intent: b }],
+      ["local_window_fullscreen", { action: "read", intent: undefined }],
     ]);
   } finally {
     if (original) Object.defineProperty(globalThis, "window", original);

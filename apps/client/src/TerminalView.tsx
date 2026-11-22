@@ -27,8 +27,9 @@ export function TerminalView({ runtimeId, epoch, label, fontSize }: { runtimeId:
     updateFont.current?.(fontSize);
   }, [fontSize]);
   useEffect(() => {
-    const container = element.current;
-    if (!container) return;
+    const mountedElement = element.current;
+    if (!mountedElement) return;
+    const container = mountedElement;
     const rendererId = crypto.randomUUID();
     const terminal = new Terminal({ disableStdin: true, fontSize: font.current, lineHeight: 1.25,
       fontFamily: "Menlo, Monaco, monospace", screenReaderMode: true, scrollback: 2000,
@@ -82,7 +83,7 @@ export function TerminalView({ runtimeId, epoch, label, fontSize }: { runtimeId:
     }
 
     function layout() {
-      if (!routing || disposed || !currentView || !writable || inputFailed || !container!.clientWidth || !container!.clientHeight) return;
+      if (!routing || disposed || !currentView || !writable || inputFailed || !container.clientWidth || !container.clientHeight) return;
       const size = fit.proposeDimensions();
       if (!size || !Number.isFinite(size.cols) || !Number.isFinite(size.rows)) return;
       proposals.offer({ cols: Math.min(500, Math.max(2, size.cols)), rows: Math.min(200, Math.max(2, size.rows)) });
@@ -176,6 +177,7 @@ export function TerminalView({ runtimeId, epoch, label, fontSize }: { runtimeId:
         if (attachment.status.terminal.target.runtime_id !== runtimeId) throw Error("Сесія змінилася");
         routing = new OrderedGeometry(attachment.status);
         terminal.resize(attachment.cols, attachment.rows);
+        container.setAttribute("data-terminal-attached", "");
         layoutSoon();
         while (!disposed && currentView === view) {
           const chunk = await localClient.read(view);
@@ -197,6 +199,7 @@ export function TerminalView({ runtimeId, epoch, label, fontSize }: { runtimeId:
         if (disposed) return;
         const previous = currentView;
         currentView = null;
+        container.removeAttribute("data-terminal-attached");
         writable = false;
         terminal.options.disableStdin = true;
         routing?.close();
@@ -210,6 +213,7 @@ export function TerminalView({ runtimeId, epoch, label, fontSize }: { runtimeId:
     void stream();
     return () => {
       disposed = true;
+      container.removeAttribute("data-terminal-attached");
       updateFont.current = null;
       clearTimeout(reconnect);
       cancelAnimationFrame(frame);
