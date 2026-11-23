@@ -13,6 +13,7 @@ these records. Use --describe-native to print the operator sequence and schema.
 import argparse
 from contextlib import ExitStack, closing
 import hashlib
+from itertools import count
 import json
 import os
 from pathlib import Path
@@ -44,6 +45,10 @@ BURSTS = {'startup': 12, 'bridge': 320, 'native': 750}
 MARKERS = {'startup': 'RSSTARTREADY', 'bridge': 'RSBRIDGEKEPT', 'native': 'RSNATIVEKEPT'}
 MAX_RECORD = 65_536
 PUBLICATION_WAIT_SECONDS = 0.25
+NATIVE_OWNER_SETUP_SECONDS = 1800
+NATIVE_INSPECTOR_SETUP_SECONDS = 1800
+NATIVE_FINAL_RECORD_SECONDS = 7200
+NATIVE_FIXTURE_GRACE_SECONDS = 60
 CLEANUP_NS = 2_000_000_000
 PS_START = re.compile(r'[A-Z][a-z]{2} [A-Z][a-z]{2}\s[ 0-9][0-9] \d\d:\d\d:\d\d \d{4}')
 
@@ -315,7 +320,7 @@ def fixture(state):
     instance = str(uuid.uuid4())
 
     def heartbeat():
-        for sequence in range(40_000):
+        for sequence in count():
             write_json(state / 'pressure-heartbeat.json',
                        {'pid': os.getpid(), 'instance': instance, 'sequence': sequence, 'at_ns': ns()}, replace=True)
             time.sleep(0.025)
@@ -353,8 +358,13 @@ def fixture(state):
     threading.Thread(target=heartbeat, daemon=True).start()
     threading.Thread(target=input_ledger, daemon=True).start()
     flood('startup')
-    for leg in ('bridge', 'native'):
-        for _ in range(24_000):
+    trigger_budgets = {
+        'bridge': 1200,
+        'native': NATIVE_OWNER_SETUP_SECONDS + NATIVE_INSPECTOR_SETUP_SECONDS + NATIVE_FIXTURE_GRACE_SECONDS,
+    }
+    for leg, seconds in trigger_budgets.items():
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
             if (state / f'pressure-{leg}.trigger').exists():
                 flood(leg)
                 break
@@ -362,7 +372,7 @@ def fixture(state):
         else:
             return
     # Keep the marker on screen after the last burst. Never re-emit it.
-    threading.Event().wait(1200)
+    threading.Event().wait(NATIVE_FINAL_RECORD_SECONDS + NATIVE_FIXTURE_GRACE_SECONDS)
 
 
 def workload(state, leg):
@@ -898,7 +908,7 @@ def native_leg(lab, options, report, expected, anchor, original_process):
             need(owner_child.poll() is None, 'owner app exited during setup')
             return raw_grid(owner.read(), expected)
 
-        wait(owner_opened, 150, 'real healthy owner view did not open')
+        wait(owner_opened, NATIVE_OWNER_SETUP_SECONDS, 'real healthy owner view did not open')
         victim_child, victim_process, victim = start_app(apps, lab, victim_bin, 'victim')
         opened = ns()
         publish_operator(ready_path, {
@@ -916,7 +926,7 @@ def native_leg(lab, options, report, expected, anchor, original_process):
             need(owner_child.poll() is None and victim_child.poll() is None, 'actual WebView app exited')
             return pause_path.exists()
 
-        wait(pause_ready, 240, 'Inspector pause record was not supplied')
+        wait(pause_ready, NATIVE_INSPECTOR_SETUP_SECONDS, 'Inspector pause record was not supplied')
         pause, pre_owner, pre_victim, clients = native_preflight(
             lab, pause_path, anchor, run_id, expected, owner, victim, opened)
         need(same_process(original_process, live_process(expected['pid'])), 'native fixture process changed')
@@ -952,7 +962,7 @@ def native_leg(lab, options, report, expected, anchor, original_process):
                         replacements[view] = sample
             return read_if_present(options.native_evidence)
 
-        evidence = wait(evidence_ready, 900, 'Root native evidence was not supplied')
+        evidence = wait(evidence_ready, NATIVE_FINAL_RECORD_SECONDS, 'Root native evidence was not supplied')
         exact(evidence, 'run_id source tree builds pause raw providers')
         need(evidence['run_id'] == run_id and all(evidence[key] == source[key] for key in source)
              and evidence['builds'] == builds and evidence['pause'] == pause,
@@ -1137,6 +1147,11 @@ def main():
         parser.error('--report must be a new private output file')
     report = {'format': 'w1-terminal-pressure-1', 'run_id': str(uuid.uuid4()),
               'started_ns': ns(), 'bridge': {'outcome': 'owed'}, 'native': {'outcome': 'owed'}}
+    if options.native_evidence:
+        report['native_operator_budget_seconds'] = {
+            'owner_setup': NATIVE_OWNER_SETUP_SECONDS, 'inspector_setup': NATIVE_INSPECTOR_SETUP_SECONDS,
+            'final_record': NATIVE_FINAL_RECORD_SECONDS, 'fixture_grace': NATIVE_FIXTURE_GRACE_SECONDS,
+        }
     with output_file:
         try:
             need(sys.platform == 'darwin', 'pressure acceptance requires a logged-in Mac')
