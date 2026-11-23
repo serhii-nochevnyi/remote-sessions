@@ -133,20 +133,24 @@ def grid_sample(value):
 
 def capture_json(path):
     invalid = 'record must be a bounded private file'
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    with os.fdopen(descriptor, 'rb') as stream:
-        deadline = time.monotonic() + PUBLICATION_WAIT_SECONDS
-        while True:
-            meta = os.fstat(stream.fileno())
-            need(stat.S_ISREG(meta.st_mode) and stat.S_IMODE(meta.st_mode) == 0o600
-                 and meta.st_uid == os.getuid()
-                 and 0 < meta.st_size <= MAX_RECORD, invalid)
+    deadline = time.monotonic() + PUBLICATION_WAIT_SECONDS
+    while True:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, 'rb') as stream:
+            while True:
+                meta = os.fstat(stream.fileno())
+                need(stat.S_ISREG(meta.st_mode) and stat.S_IMODE(meta.st_mode) == 0o600
+                     and meta.st_uid == os.getuid()
+                     and 0 < meta.st_size <= MAX_RECORD, invalid)
+                if meta.st_nlink in (0, 1):
+                    break
+                remaining = deadline - time.monotonic()
+                need(meta.st_nlink == 2 and remaining > 0, invalid)
+                time.sleep(min(0.01, remaining))
             if meta.st_nlink == 1:
+                data = stream.read(MAX_RECORD + 1)
                 break
-            remaining = deadline - time.monotonic()
-            need(meta.st_nlink == 2 and remaining > 0, invalid)
-            time.sleep(min(0.01, remaining))
-        data = stream.read(MAX_RECORD + 1)
+        need(time.monotonic() < deadline, invalid)
     need(len(data) == meta.st_size, 'record changed during read')
 
     def unique(pairs):
@@ -199,6 +203,21 @@ def test_record_publication():
         else:
             raise ProofError('publication overwrote an existing record')
         need(capture_json(path) == record and not pending.exists(), 'failed publication changed record')
+
+        replacement = {'sequence': 2}
+        fstat = os.fstat
+        observed_links = []
+
+        def replace_before_fstat(descriptor):
+            if not observed_links:
+                write_json(path, replacement, replace=True)
+            metadata = fstat(descriptor)
+            observed_links.append(metadata.st_nlink)
+            return metadata
+
+        with patch.object(os, 'fstat', side_effect=replace_before_fstat):
+            need(capture_json(path) == replacement, 'reader did not capture the replacement')
+        need(observed_links == [0, 1], 'reader did not reopen the unlinked generation')
 
         os.link(path, pending)
         with patch.object(time, 'monotonic', side_effect=(0, PUBLICATION_WAIT_SECONDS)):
