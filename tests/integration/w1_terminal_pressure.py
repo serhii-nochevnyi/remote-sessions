@@ -43,6 +43,7 @@ PLAN_PATHS = (
 BURSTS = {'startup': 12, 'bridge': 320, 'native': 750}
 MARKERS = {'startup': 'RSSTARTREADY', 'bridge': 'RSBRIDGEKEPT', 'native': 'RSNATIVEKEPT'}
 MAX_RECORD = 65_536
+PUBLICATION_WAIT_SECONDS = 0.25
 CLEANUP_NS = 2_000_000_000
 PS_START = re.compile(r'[A-Z][a-z]{2} [A-Z][a-z]{2}\s[ 0-9][0-9] \d\d:\d\d:\d\d \d{4}')
 
@@ -131,12 +132,20 @@ def grid_sample(value):
 
 
 def capture_json(path):
+    invalid = 'record must be a bounded private file'
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(descriptor, 'rb') as stream:
-        meta = os.fstat(stream.fileno())
-        need(stat.S_ISREG(meta.st_mode) and stat.S_IMODE(meta.st_mode) == 0o600
-             and meta.st_uid == os.getuid() and meta.st_nlink == 1
-             and 0 < meta.st_size <= MAX_RECORD, 'record must be a bounded private file')
+        deadline = time.monotonic() + PUBLICATION_WAIT_SECONDS
+        while True:
+            meta = os.fstat(stream.fileno())
+            need(stat.S_ISREG(meta.st_mode) and stat.S_IMODE(meta.st_mode) == 0o600
+                 and meta.st_uid == os.getuid()
+                 and 0 < meta.st_size <= MAX_RECORD, invalid)
+            if meta.st_nlink == 1:
+                break
+            remaining = deadline - time.monotonic()
+            need(meta.st_nlink == 2 and remaining > 0, invalid)
+            time.sleep(min(0.01, remaining))
         data = stream.read(MAX_RECORD + 1)
     need(len(data) == meta.st_size, 'record changed during read')
 
@@ -164,6 +173,41 @@ def write_json(path, record, replace=False):
 
 def private_writer(path):
     return os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), 'w')
+
+
+def test_record_publication():
+    from tempfile import TemporaryDirectory
+    from unittest.mock import patch
+
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / 'record.json'
+        pending = path.with_name(path.name + '.tmp')
+        record = {'sequence': 1}
+        write_json(pending, record)
+        os.link(pending, path)
+        need(path.stat().st_nlink == 2, 'publication test requires two links')
+
+        with patch.object(time, 'monotonic', return_value=0), \
+                patch.object(time, 'sleep', side_effect=lambda _: pending.unlink()) as pause:
+            need(capture_json(path) == record, 'publication changed record contents')
+            need(pause.call_count == 1, 'reader did not wait for publication')
+
+        try:
+            write_json(path, {'sequence': 2})
+        except FileExistsError:
+            pass
+        else:
+            raise ProofError('publication overwrote an existing record')
+        need(capture_json(path) == record and not pending.exists(), 'failed publication changed record')
+
+        os.link(path, pending)
+        with patch.object(time, 'monotonic', side_effect=(0, PUBLICATION_WAIT_SECONDS)):
+            try:
+                capture_json(path)
+            except ProofError as error:
+                need(str(error) == 'record must be a bounded private file', 'unexpected rejection')
+            else:
+                raise ProofError('reader accepted a persistent hard link')
 
 
 def wait(check, seconds, message):
@@ -1045,7 +1089,13 @@ def main():
     parser.add_argument('--victim-app', type=Path, help='Signed debug victim application bundle')
     parser.add_argument('--describe-native', action='store_true', help='Print the native operator sequence and record schema')
     parser.add_argument('--fixture', type=Path, help=argparse.SUPPRESS)
+    parser.add_argument('--test-record-publication', action='store_true',
+                        help='Run the evidence publication regression without starting the lab')
     options = parser.parse_args()
+    if options.test_record_publication:
+        test_record_publication()
+        print('Evidence publication regression passed.')
+        return 0
     if options.fixture:
         fixture(options.fixture)
         return 0
