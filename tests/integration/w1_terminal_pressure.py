@@ -44,6 +44,7 @@ PLAN_PATHS = (
 BURSTS = {'startup': 12, 'bridge': 320, 'native': 750}
 MARKERS = {'startup': 'RSSTARTREADY', 'bridge': 'RSBRIDGEKEPT', 'native': 'RSNATIVEKEPT'}
 MAX_RECORD = 65_536
+MAX_PROVIDER_STATES = 4096
 PUBLICATION_WAIT_SECONDS = 0.25
 NATIVE_OWNER_SETUP_SECONDS = 1800
 NATIVE_INSPECTOR_SETUP_SECONDS = 1800
@@ -414,8 +415,29 @@ class Trace:
         self.offset = 0
         self.pressure = {}
         self.grids = []
-        self.providers = []
+        self._providers = {}
         self.failures = []
+
+    def provider_samples(self):
+        for first, latest in self._providers.values():
+            yield latest
+            if first is not latest:
+                yield first
+
+    def _retain_provider(self, item):
+        provider = item['provider']
+        identity = json.dumps({**item, 'provider': provider['size'] if provider is not None else None},
+                              sort_keys=True, separators=(',', ':'))
+        if identity not in self._providers:
+            need(len(self._providers) < MAX_PROVIDER_STATES, 'too many debug observations')
+            self._providers[identity] = (item, item)
+        elif provider is not None:
+            first, latest = self._providers[identity]
+            sampled_at = provider['sampled_at_us']
+            if sampled_at < first['provider']['sampled_at_us']:
+                self._providers[identity] = (item, latest)
+            elif sampled_at > latest['provider']['sampled_at_us']:
+                self._providers[identity] = (first, item)
 
     def read(self):
         with self.path.open('rb') as stream:
@@ -425,6 +447,7 @@ class Trace:
                 if not line or not line.endswith(b'\n'):
                     need(len(line) < MAX_RECORD, 'oversized native diagnostic record')
                     break
+                need(len(line) <= MAX_RECORD, 'oversized native diagnostic record')
                 self.offset = stream.tell()
                 if not line.startswith(PREFIX):
                     continue
@@ -448,14 +471,14 @@ class Trace:
                 elif kind == b'GRID':
                     self.grids.append(grid_observation(item))
                 elif kind == b'PROVIDER':
-                    self.providers.append(status(item))
+                    self._retain_provider(status(item))
                 else:
                     exact(item, 'view_id stage reason')
                     if item['reason'] == 'stream_closed' and item['stage'] in ('read', 'renderer_detach'):
                         need(uuid_text(item['view_id']), 'invalid stream closure identity')
                         self.failures.append(item)
         need(len(self.pressure) <= 128 and len(self.grids) <= 256
-             and len(self.providers) <= 8192 and len(self.failures) <= 256, 'too many debug observations')
+             and len(self.failures) <= 256, 'too many debug observations')
         return self
 
 
@@ -471,6 +494,129 @@ def grid_observation(item):
          and size(renderer['size']) == bridge['size'] == client['size'] == observed['committed']['size'],
          'renderer and bridge observations lack exact scope or grid')
     return item
+
+
+def successor_provider_observed(trace, expected, view_id, successor, anchor, detached, fresh):
+    return any(sample['terminal']['view_id'] == view_id and sample['terminal']['target'] == expected
+               and sample['epoch'] == successor and sample['provider'] is not None
+               and detached < mono(sample['provider']['sampled_at_us'], anchor) <= fresh
+               for sample in trace.provider_samples())
+
+
+def test_trace_retention():
+    from copy import deepcopy
+    from tempfile import TemporaryDirectory
+
+    def identity(number):
+        return str(uuid.UUID(int=number))
+
+    grid = {'cols': 80, 'rows': 24}
+    expected = {'runtime_id': identity(1), 'generation': identity(2), 'session': '$1',
+                'window': '@1', 'pane': '%1', 'pid': 100, 'process_start': 101}
+    view = identity(3)
+    successor = {'agent': identity(4), 'owner': identity(5)}
+
+    def provider(at_us):
+        return {'terminal': {'target': dict(expected), 'view_id': view, 'agent_epoch': successor['agent']},
+                'epoch': dict(successor), 'committed': {'size': dict(grid), 'revision': 1,
+                                                        'intent': {'id': identity(6), 'epoch': dict(successor)}},
+                'provider': {'size': dict(grid), 'sampled_at_us': at_us}, 'observation': 'observed'}
+
+    def line(kind, item):
+        return PREFIX + kind + b' ' + json.dumps(item).encode() + b'\n'
+
+    def append(path, lines):
+        with path.open('ab') as log:
+            log.writelines(lines)
+
+    def rejected(trace, message):
+        try:
+            trace.read()
+        except ProofError as error:
+            need(str(error) == message, 'unexpected diagnostic rejection')
+        else:
+            raise ProofError('reader accepted invalid diagnostic evidence')
+
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / 'trace.log'
+        trace = Trace(path)
+        attached = {'event': 'attached', 'view_id': view, 'pid': 102, 'at_us': 95}
+        full = {**attached, 'event': 'full', 'at_us': 97, 'high_water': CAPACITY}
+        grid_event = {'event': {'status': provider(100), 'bridge_pty': {'size': grid, 'sampled_at_us': 98},
+                                'client': {'size': grid, 'sampled_at_us': 99}},
+                      'renderer': {'renderer_id': identity(7), 'epoch': successor,
+                                   'revision': 1, 'size': grid, 'focused': True}}
+        append(path, [line(b'PRESSURE', attached), line(b'PRESSURE', full), line(b'GRID', grid_event),
+                      line(b'PROVIDER', provider(100)), line(b'PROVIDER', provider(101))])
+        captured = {'grid': trace.read().grids[0], 'provider': next(trace.provider_samples())}
+        original = deepcopy(captured)
+        for first in (102, 3102, 6102):
+            append(path, (line(b'PROVIDER', provider(at_us)) for at_us in range(first, first + 3000)))
+            trace.read()
+        append(path, [line(b'PROVIDER', provider(110)), PREFIX + b'UNKNOWN invalid-json\n'])
+        retained = list(trace.read().provider_samples())
+        need(retained == [provider(9101), provider(100)], 'equivalent traffic lost provider endpoints')
+        need(captured == original and captured['provider'] == provider(101), 'captured pressure witness changed')
+        need(trace.grids == [grid_event] and trace.pressure == {view: {'attached': attached, 'full': full}},
+             'provider retention changed independent diagnostics')
+        anchor = {'wall_us': 100, 'mono_ns': 100_000}
+        need(successor_provider_observed(trace, expected, view, successor, anchor, 99_000, 102_000)
+             and not successor_provider_observed(trace, expected, view, successor, anchor, 89_000, 98_000),
+             'historical successor status is missing or crossed the handoff window')
+
+        reordered = json.loads(json.dumps(provider(9101), sort_keys=True))
+        append(path, [line(b'PROVIDER', reordered), line(b'PROVIDER', provider(96))])
+        need(list(trace.read().provider_samples()) == [provider(9101), provider(96)],
+             'key order or delayed timestamps changed endpoint selection')
+
+        variants = []
+        for keys, value in (
+            (('terminal', 'target', 'runtime_id'), identity(13)),
+            (('terminal', 'target', 'generation'), identity(14)),
+            (('terminal', 'target', 'session'), '$2'), (('terminal', 'target', 'window'), '@2'),
+            (('terminal', 'target', 'pane'), '%2'), (('terminal', 'target', 'pid'), 103),
+            (('terminal', 'target', 'process_start'), 200), (('terminal', 'view_id'), identity(8)),
+            (('epoch', 'owner'), identity(9)), (('committed', 'revision'), 2),
+            (('committed', 'size', 'cols'), 81), (('committed', 'intent', 'id'), identity(10)),
+            (('committed', 'intent', 'epoch', 'owner'), identity(11)),
+            (('provider', 'size', 'cols'), 82), (('provider',), None), (('observation',), 'pending'),
+        ):
+            item = deepcopy(provider(9200))
+            field = item
+            for key in keys[:-1]:
+                field = field[key]
+            field[keys[-1]] = value
+            variants.append(item)
+        agent_changed = deepcopy(provider(9200))
+        agent_changed['terminal']['agent_epoch'] = identity(12)
+        agent_changed['epoch']['agent'] = identity(12)
+        agent_changed['committed']['intent']['epoch']['agent'] = identity(12)
+        variants.append(agent_changed)
+        append(path, (line(b'PROVIDER', item) for item in variants))
+        need(list(trace.read().provider_samples()) == [provider(9101), provider(96), *variants],
+             'distinct provider status identities were combined')
+
+        payload = line(b'PROVIDER', provider(101)).rstrip(b'\n')
+        for bad, message in (
+            (line(b'PROVIDER', provider(0)), 'invalid grid sample time'),
+            (payload.ljust(MAX_RECORD, b' ') + b'\n', 'oversized native diagnostic record'),
+            (line(b'PRESSURE', full), 'duplicate view retirement or diagnostic'),
+        ):
+            invalid = Trace(Path(directory) / 'invalid.log')
+            invalid.path.write_bytes(line(b'PROVIDER', provider(100)) + line(b'PRESSURE', full))
+            invalid.read()
+            append(invalid.path, [bad])
+            rejected(invalid, message)
+
+        capacity = Trace(Path(directory) / 'capacity.log')
+        with capacity.path.open('wb') as log:
+            for revision in range(1, MAX_PROVIDER_STATES + 2):
+                item = provider(100)
+                item['committed']['revision'] = revision
+                log.write(line(b'PROVIDER', item))
+        rejected(capacity, 'too many debug observations')
+        need(sum(1 for _ in capacity.provider_samples()) == MAX_PROVIDER_STATES,
+             'distinct provider states exceeded their budget')
 
 
 def full_cleanup(trace, view_id, pid, anchor):
@@ -690,7 +836,7 @@ def observe_native_pressure(lab, expected, pause, pre_grid, bindings, owner, vic
             if (observation['epoch'] != healthy_epoch or claimed['revision'] <= first_revision
                     or claimed['intent']['epoch'] != healthy_epoch or not trigger < bridge_at <= client_at):
                 continue
-            match = next((sample for sample in reversed(owner.providers)
+            match = next((sample for sample in owner.provider_samples()
                           if sample['terminal'] == observation['terminal']
                           and committed_key(sample) == committed_key(observation)
                           and sample['provider'] is not None and sample['observation'] == 'observed'
@@ -804,10 +950,8 @@ def validate_raw_operator(data, lab, expected, pause, pressure, pre_victim, owne
     need(detach is not None and 'cleanup_complete' in owner_retirement
          and times[0] <= mono(detach['at_us'], anchor) <= times[1],
          'healthy owner did not detach before successor authority')
-    need(any(sample['terminal']['view_id'] == redraw['view_id'] and sample['terminal']['target'] == expected
-             and sample['epoch'] == successor and sample['provider'] is not None
-             and times[0] < mono(sample['provider']['sampled_at_us'], anchor) <= times[-1]
-             for sample in victim.providers), 'successor epoch was not observed in production status')
+    need(successor_provider_observed(victim, expected, redraw['view_id'], successor, anchor, times[0], times[-1]),
+         'successor epoch was not observed in production status')
     need(tmux_target(lab, expected) == replacement_grids[-1]['event']['status']['committed']['size'],
          'stale commands changed the replacement grid')
     return {'inspector': data, 'replacement_client': replacement_process,
@@ -1126,7 +1270,13 @@ def main():
     parser.add_argument('--fixture', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--test-record-publication', action='store_true',
                         help='Run the evidence publication regression without starting the lab')
+    parser.add_argument('--test-trace-retention', action='store_true',
+                        help='Run the diagnostic retention regression without starting the lab')
     options = parser.parse_args()
+    if options.test_trace_retention:
+        test_trace_retention()
+        print('Trace retention regression passed.')
+        return 0
     if options.test_record_publication:
         test_record_publication()
         print('Evidence publication regression passed.')
