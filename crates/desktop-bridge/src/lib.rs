@@ -193,7 +193,11 @@ struct NativeLease {
     resize_sequence: u64,
 }
 enum PtyEvent {
-    Bytes(Vec<u8>),
+    Bytes(Arc<Mutex<Vec<u8>>>),
+    Boundary,
+}
+enum PtyRead<'a> {
+    Bytes(&'a [u8]),
     Boundary,
 }
 const RESUME: u64 = 0;
@@ -324,7 +328,7 @@ impl View {
         self.reader_state.load(Ordering::Acquire) == CLOSE
     }
 
-    fn publish(&self, sender: &mpsc::Sender<PtyEvent>, event: PtyEvent) -> bool {
+    fn publish(&self, publisher: &mut PtyPublisher, event: PtyRead<'_>) -> bool {
         let Some(registry) = self.views.upgrade() else {
             return false;
         };
@@ -332,7 +336,7 @@ impl View {
         if self.closed() {
             return false;
         }
-        let Some(reason) = publish(sender, event) else {
+        let Some(reason) = publisher.publish(event) else {
             return true;
         };
         let at = self.retire_locked(&mut views, reason);
@@ -539,22 +543,60 @@ fn sample_master(master: &dyn MasterPty) -> Result<GridSample> {
     })
 }
 
-fn publish(sender: &mpsc::Sender<PtyEvent>, event: PtyEvent) -> Option<Retirement> {
-    match sender.try_send(event) {
-        Ok(()) => None,
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            Some(Retirement::Typed(TerminalClosure::Overflow {
-                high_water: sender.max_capacity(),
-            }))
+struct PtyPublisher {
+    sender: mpsc::Sender<PtyEvent>,
+    tail: Weak<Mutex<Vec<u8>>>,
+}
+
+impl PtyPublisher {
+    fn new(sender: mpsc::Sender<PtyEvent>) -> Self {
+        Self {
+            sender,
+            tail: Weak::new(),
         }
-        Err(mpsc::error::TrySendError::Closed(_)) => Some(Retirement::ReceiverClosed),
+    }
+
+    fn publish(&mut self, read: PtyRead<'_>) -> Option<Retirement> {
+        let event = match read {
+            PtyRead::Bytes(bytes) => {
+                if self.sender.is_closed() {
+                    return Some(Retirement::ReceiverClosed);
+                }
+                // @invariant: The consumer empties a claimed chunk under the same lock.
+                if let Some(tail) = self.tail.upgrade()
+                    && let Ok(mut queued) = tail.try_lock()
+                    && !queued.is_empty()
+                    && queued.len() + bytes.len() <= OUTPUT_CHUNK_SIZE
+                {
+                    queued.reserve_exact(bytes.len());
+                    queued.extend_from_slice(bytes);
+                    return None;
+                }
+                let queued = Arc::new(Mutex::new(bytes.to_vec()));
+                self.tail = Arc::downgrade(&queued);
+                PtyEvent::Bytes(queued)
+            }
+            PtyRead::Boundary => {
+                self.tail = Weak::new();
+                PtyEvent::Boundary
+            }
+        };
+        match self.sender.try_send(event) {
+            Ok(()) => None,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                Some(Retirement::Typed(TerminalClosure::Overflow {
+                    high_water: self.sender.max_capacity(),
+                }))
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Some(Retirement::ReceiverClosed),
+        }
     }
 }
 
 fn read_pty(
     mut reader: Box<dyn Read + Send>,
     state: &AtomicU64,
-    publish: impl Fn(PtyEvent) -> bool,
+    mut publish: impl FnMut(PtyRead<'_>) -> bool,
     retire: impl FnOnce(Retirement),
 ) {
     let mut bytes = [0_u8; OUTPUT_CHUNK_SIZE];
@@ -572,7 +614,7 @@ fn read_pty(
                     }
                     let end = carry + count;
                     let complete = scan_output(&mut vt, &bytes[..end]);
-                    if complete != 0 && !publish(PtyEvent::Bytes(bytes[..complete].to_vec())) {
+                    if complete != 0 && !publish(PtyRead::Bytes(&bytes[..complete])) {
                         return;
                     }
                     bytes.copy_within(complete..end, 0);
@@ -585,7 +627,7 @@ fn read_pty(
                         && state
                             .compare_exchange(DRAIN, PAUSE, Ordering::AcqRel, Ordering::Acquire)
                             .is_ok()
-                        && !publish(PtyEvent::Boundary)
+                        && !publish(PtyRead::Boundary)
                     {
                         return;
                     }
@@ -888,7 +930,7 @@ async fn read_chunk(view: &View, output: &mut Output, now: impl Fn() -> Instant)
     let event = tokio::time::timeout(wait, output.receiver.recv()).await;
     let remaining = drain_budget(output.drain_started, now())?;
     match event {
-        Ok(Some(PtyEvent::Bytes(data))) => chunk.data = data,
+        Ok(Some(PtyEvent::Bytes(data))) => chunk.data = std::mem::take(&mut *data.lock().unwrap()),
         Ok(Some(PtyEvent::Boundary)) => {
             let status = terminal_status_during_drain(view, remaining).await?;
             let remaining =
@@ -1174,10 +1216,11 @@ impl DesktopBridge {
             std::thread::Builder::new()
                 .spawn(move || {
                     if begin.recv().is_ok() {
+                        let mut publisher = PtyPublisher::new(sender);
                         read_pty(
                             reader,
                             &producer.reader_state,
-                            |event| producer.publish(&sender, event),
+                            |event| producer.publish(&mut publisher, event),
                             |reason| producer.retire(reason),
                         );
                     }

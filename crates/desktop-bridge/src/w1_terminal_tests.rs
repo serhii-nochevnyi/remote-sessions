@@ -86,6 +86,7 @@ fn controlled_reader(state: &Arc<AtomicU64>) -> (ReadControl, mpsc::Receiver<Pty
     let (sender, events) = mpsc::channel(OUTPUT_SLOTS);
     let reader = state.clone();
     let thread = std::thread::spawn(move || {
+        let mut publisher = PtyPublisher::new(sender);
         read_pty(
             Box::new(ControlledReader {
                 steps: commands,
@@ -93,7 +94,7 @@ fn controlled_reader(state: &Arc<AtomicU64>) -> (ReadControl, mpsc::Receiver<Pty
                 exit: None,
             }),
             &reader,
-            |event| publish(&sender, event).is_none(),
+            |event| publisher.publish(event).is_none(),
             |_| {},
         );
     });
@@ -119,6 +120,7 @@ async fn expect_bytes(events: &mut mpsc::Receiver<PtyEvent>, expected: &[u8]) {
     let Some(PtyEvent::Bytes(bytes)) = read_event(events).await else {
         panic!("expected original PTY bytes");
     };
+    let bytes = std::mem::take(&mut *bytes.lock().unwrap());
     assert_eq!(bytes, expected);
     assert!(bytes.len() <= OUTPUT_CHUNK_SIZE);
 }
@@ -249,6 +251,37 @@ async fn w1_terminal_reader_preserves_fifo_and_chunk_cap_with_three_byte_carry()
         read_event(&mut events).await,
         Some(PtyEvent::Boundary)
     ));
+    state.store(CLOSE, Ordering::Release);
+    control.finish();
+}
+
+#[tokio::test]
+async fn w1_terminal_reader_coalesces_framed_output_without_crossing_the_grid_marker() {
+    let state = Arc::new(AtomicU64::new(DRAIN));
+    let (mut control, mut events) = controlled_reader(&state);
+    control.requested().await;
+    control.data(b"first \xe2\x82");
+    assert_eq!(control.requested().await, OUTPUT_CHUNK_SIZE - 2);
+    control.data(b"\xac\x1b[");
+    control.requested().await;
+    control.would_block();
+    control.requested().await;
+    assert_eq!(state.load(Ordering::Acquire), DRAIN);
+    assert_eq!(events.len(), 1);
+    control.data(b"2H");
+    control.requested().await;
+    control.would_block();
+    until(|| events.len() == 2).await;
+    assert_eq!(state.load(Ordering::Acquire), PAUSE);
+
+    state.store(RESUME, Ordering::Release);
+    control.requested().await;
+    control.data(b"redraw");
+    control.requested().await;
+    assert_eq!(events.len(), 3);
+    expect_bytes(&mut events, b"first \xe2\x82\xac\x1b[2H").await;
+    assert!(matches!(events.try_recv(), Ok(PtyEvent::Boundary)));
+    expect_bytes(&mut events, b"redraw").await;
     state.store(CLOSE, Ordering::Release);
     control.finish();
 }
@@ -639,7 +672,7 @@ fn target() -> TerminalTarget {
 async fn saturate(view: &View, reader: &mut ReadControl, marker: bool) {
     for byte in 0..OUTPUT_SLOTS {
         reader.requested().await;
-        reader.data(&[byte as u8 + b'A']);
+        reader.data(&[byte as u8 + b'A'; OUTPUT_CHUNK_SIZE]);
     }
     reader.requested().await;
     assert_eq!(view.output.lock().await.receiver.len(), OUTPUT_SLOTS);
@@ -650,6 +683,51 @@ async fn saturate(view: &View, reader: &mut ReadControl, marker: bool) {
         reader.data(b"full");
     }
     view.retired().await;
+}
+
+#[tokio::test]
+async fn w1_terminal_delayed_reader_keeps_up_while_paused_peer_overflows() {
+    const BURST_BYTES: usize = 1745;
+    const BURSTS_PER_PULL: usize = 4;
+    let bridge = DesktopBridge::new(None, "/unused/tmux".into());
+    let target = target();
+    let agent = Uuid::new_v4();
+    let (healthy, mut owner, _) = controlled_view(&bridge, &target, agent, 0);
+    let (paused, mut victim, _) = controlled_view(&bridge, &target, agent, 0);
+    let healthy_id = healthy.terminal.view_id.to_string();
+    let victim_id = paused.terminal.view_id.to_string();
+    owner.requested().await;
+    victim.requested().await;
+    for pull in 0..=OUTPUT_SLOTS {
+        let mut expected = Vec::new();
+        for index in 0..BURSTS_PER_PULL {
+            let burst = [b'A' + ((pull * BURSTS_PER_PULL + index) % 26) as u8; BURST_BYTES];
+            expected.extend_from_slice(&burst);
+            owner.data(&burst);
+            owner.requested().await;
+            owner.would_block();
+            owner.requested().await;
+            if pull < OUTPUT_SLOTS {
+                victim.data(&burst);
+                victim.requested().await;
+            }
+        }
+        if pull == OUTPUT_SLOTS {
+            assert_eq!(paused.output.lock().await.receiver.len(), OUTPUT_SLOTS);
+            victim.data(&[b'Z'; BURST_BYTES]);
+            until(|| paused.closed()).await;
+            assert_eq!(bridge.read(&victim_id).await.unwrap().closure, Some(FULL));
+            assert!(bridge.read(&victim_id).await.is_err());
+        }
+        assert_eq!(healthy.output.lock().await.receiver.len(), 1);
+        let chunk = bridge.read(&healthy_id).await.unwrap();
+        assert!(!chunk.closed && chunk.geometry.is_none());
+        assert_eq!(chunk.data, expected);
+    }
+    assert!(!healthy.closed());
+    bridge.detach(&healthy_id);
+    owner.finish();
+    victim.finish();
 }
 
 #[tokio::test]
@@ -681,7 +759,7 @@ async fn w1_terminal_eof_detach_and_dropped_receiver_are_distinct() {
     let (tx, rx) = mpsc::channel(OUTPUT_SLOTS);
     drop(rx);
     assert!(matches!(
-        publish(&tx, PtyEvent::Boundary),
+        PtyPublisher::new(tx).publish(PtyRead::Boundary),
         Some(Retirement::ReceiverClosed)
     ));
     let bridge = Arc::new(DesktopBridge::new(None, "/unused/tmux".into()));
@@ -886,7 +964,7 @@ async fn w1_terminal_parked_read_gets_producer_full_and_late_lease_is_released_o
 async fn saturate_parked(view: &View, reader: &mut ReadControl) {
     for _ in 0..=OUTPUT_SLOTS {
         reader.requested().await;
-        reader.data(b"pressure");
+        reader.data(&[b'P'; OUTPUT_CHUNK_SIZE]);
     }
     tokio::time::timeout(Duration::from_secs(1), view.retired())
         .await
@@ -1142,14 +1220,7 @@ async fn w1_terminal_startup_full_is_retired_before_attach_replies() {
     fs::write(
         &tmux,
         r#"#!/bin/sh
-set -eu
-n=0
-while test "$n" -lt 64; do
-  printf startup
-  /bin/sleep 0.015
-  n=$((n + 1))
-done
-exec /bin/sleep 30
+exec /bin/dd if=/dev/zero bs=8192 count=32 2>/dev/null
 "#,
     )
     .unwrap();

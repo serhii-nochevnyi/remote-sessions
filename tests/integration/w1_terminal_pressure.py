@@ -984,12 +984,18 @@ NATIVE_INSTRUCTIONS = """\
 Use two signed copies of the same local debug executable with distinct bundle
 identifiers. The runner launches the owner first. In both apps select the
 printed raw runtime. Resize the owner once before opening the victim and once
-after the victim attaches. Use the private scoped GRID and PRESSURE records
-to bind both view and renderer IDs. After both applied the pre-pressure grid,
-use the victim's Inspect Element > Sources > Pause script execution.
-Confirm Immediate Pause Requested and enabled Continue and Step. Do not pause
-the app process or the owner. Inspect the old scope to confirm that no grid
-ACK is pending. Write pressure-operator-pause.json with these exact fields:
+after the victim attaches. Use the private scoped GRID and PRESSURE records to
+bind both view and renderer IDs. Open the victim Inspector from the HTML
+header to avoid sending mouse input through xterm. If using an operator fetch
+wrapper, capture the original fetch in a lexical const and guard installation
+so rerunning the snippet reuses the wrapper. Verify the ready result confirms
+the wrapper and the exact victim view. If Console output looks stale, switch
+to Sources and back to Console to refresh it before checking that result.
+Require both scoped GRID records to acknowledge the same committed revision
+and grid with no pending boundary before triggering pressure. In the victim
+Inspector choose Sources > Pause script execution. Confirm Immediate Pause
+Requested and enabled Continue and Step. Keep the owner running. Write
+pressure-operator-pause.json with these exact fields:
 
   run_id paused_at_ns owner_view victim_view owner_renderer victim_renderer
   inspector="immediate_pause_requested" continue_enabled=true
