@@ -367,6 +367,7 @@ fn controlled_view(
             drain_started: None,
             writable: false,
         }),
+        drain_revision: AtomicU64::new(0),
         reader_state,
         views: Arc::downgrade(&bridge.views),
         retirement: watch::channel(None).0,
@@ -475,6 +476,52 @@ async fn w1_terminal_expired_incomplete_drain_isolates_the_view_and_drops_its_ta
     assert_eq!(peer_kills.signals.load(Ordering::Relaxed), 0);
     fresh_writer.finish();
     peer_writer.finish();
+}
+
+#[tokio::test]
+async fn w1_terminal_watchdog_expires_only_its_generation_without_the_output_lock() {
+    let target = remote_sessions_host::model::TerminalTarget {
+        runtime_id: Uuid::new_v4(),
+        generation: Uuid::new_v4(),
+        session: "$0".into(),
+        window: "@0".into(),
+        pane: "%0".into(),
+        pid: 123,
+        process_start: 456,
+    };
+    let bridge = DesktopBridge::new(None, "/unused/tmux".into());
+    let (view, mut writer, _) = controlled_view(&bridge, &target, Uuid::new_v4(), 2);
+    let id = view.terminal.view_id;
+    writer.requested().await;
+    writer.data(b"before boundary");
+    let chunk = bridge.read(&id.to_string()).await.unwrap();
+    assert_eq!(chunk.data, b"before boundary");
+    writer.requested().await;
+
+    let key = id.to_string();
+    let mut reading = std::pin::pin!(bridge.read(&key));
+    std::future::poll_fn(|cx| {
+        use std::future::Future;
+        assert!(reading.as_mut().poll(cx).is_pending());
+        assert!(view.output.try_lock().is_err());
+        expire_drain(&bridge.views, id, 1);
+        assert!(!view.closed());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    writer.data(b"current drain");
+    assert_eq!(reading.await.unwrap().data, b"current drain");
+    writer.requested().await;
+
+    let output = view.output.lock().await;
+    expire_drain(&bridge.views, id, 2);
+    assert!(view.closed());
+    assert_eq!(
+        bridge.read(&key).await.unwrap().closure,
+        Some(TerminalClosure::GeometryTimeout)
+    );
+    drop(output);
+    writer.finish();
 }
 
 #[tokio::test]
@@ -1013,6 +1060,11 @@ esac
         focused: false,
     };
     let redraw = bridge.acknowledge_grid(&peer.view_id, ack).await.unwrap();
+    let live_peer = bridge.view(&peer.view_id).unwrap();
+    let output = live_peer.output.lock().await;
+    expire_drain(&bridge.views, live_peer.terminal.view_id, ack.revision);
+    assert!(!live_peer.closed());
+    drop(output);
     assert_eq!(redraw.status.terminal, peer.status.terminal);
     assert_eq!(redraw.bridge_pty.size, ack.size);
     assert_eq!(redraw.client.size, ack.size);

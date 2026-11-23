@@ -310,6 +310,7 @@ struct View {
     resize: tokio::sync::Mutex<()>,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     output: tokio::sync::Mutex<Output>,
+    drain_revision: AtomicU64,
     reader_state: Arc<AtomicU64>,
     views: Weak<Mutex<Views>>,
     retirement: watch::Sender<Option<Retirement>>,
@@ -817,6 +818,18 @@ async fn redraw_view(view: &View, boundary: &GeometryEvent) -> Result<GeometryEv
     })
 }
 
+fn expire_drain(registry: &Mutex<Views>, id: Uuid, revision: u64) {
+    let mut views = registry.lock().unwrap();
+    if let Some(view) = views.live.get(&id).cloned()
+        && view.drain_revision.load(Ordering::Relaxed) == revision
+    {
+        view.retire_locked(
+            &mut views,
+            Retirement::Typed(TerminalClosure::GeometryTimeout),
+        );
+    }
+}
+
 async fn read_chunk(view: &View, output: &mut Output, now: impl Fn() -> Instant) -> Result<Chunk> {
     ensure!(
         output.pending.is_none(),
@@ -856,20 +869,15 @@ async fn read_chunk(view: &View, output: &mut Output, now: impl Fn() -> Instant)
             .is_ok()
     {
         output.drain_started = Some(draining_at);
+        let revision = output.status.committed.revision;
+        view.drain_revision.store(revision, Ordering::Relaxed);
         let deadline = draining_at + DRAIN_TIMEOUT;
         let active = view.views.clone();
         let id = view.terminal.view_id;
         view.handle.spawn(async move {
             tokio::time::sleep_until(deadline.into()).await;
-            let Some(views) = active.upgrade() else {
-                return;
-            };
-            let view = views.lock().unwrap().live.get(&id).cloned();
-            if let Some(view) = view {
-                let output = view.output.lock().await;
-                if output.drain_started == Some(draining_at) {
-                    view.retire(Retirement::Typed(TerminalClosure::GeometryTimeout));
-                }
+            if let Some(views) = active.upgrade() {
+                expire_drain(&views, id, revision);
             }
         });
     }
@@ -1085,6 +1093,7 @@ impl DesktopBridge {
                 drain_started: None,
                 writable: false,
             }),
+            drain_revision: AtomicU64::new(0),
             reader_state: Arc::new(AtomicU64::new(RESUME)),
             views: Arc::downgrade(&self.views),
             retirement: watch::channel(None).0,
@@ -1379,6 +1388,7 @@ impl DesktopBridge {
                 output.pending = None;
                 output.applied_revision = acknowledgement.revision;
                 output.drain_started = None;
+                view.drain_revision.store(0, Ordering::Relaxed);
                 Ok(event)
             }
             Err(error) => {
