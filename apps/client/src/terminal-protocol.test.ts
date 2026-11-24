@@ -2,17 +2,17 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import xterm from "@xterm/xterm";
 import headless from "@xterm/headless";
-import { TerminalViewScope } from "./local-client.ts";
+import { TerminalViewScope, pasteIssueText } from "./local-client.ts";
 import type { Chunk, GeometryEvent, TerminalSize, TerminalStatus } from "./local-client.ts";
 import { OrderedGeometry } from "./terminal-geometry.ts";
-import { bindTerminalProtocol } from "./terminal-protocol.ts";
+import { bindTerminalPaste, bindTerminalProtocol, encodeTerminalPaste, TERMINAL_INPUT_BUDGET } from "./terminal-protocol.ts";
 
 const encode = (text: string) => Array.from(new TextEncoder().encode(text));
 const query = "\x1b[c\x1b[>c\x1b[5n\x1b[6n\x1b[?6n\x1b[4$p\x1b[?1004$p\x1b[18t" +
   "\x1bP$qm\x1b\\\x1bP+q544e\x1b\\\x1b]4;1;?;2;?\x07\x1b]10;?\x07\x1b]11;?\x1b\\\x1b]12;?\x07";
 
 type Emulator = InstanceType<typeof xterm.Terminal> | InstanceType<typeof headless.Terminal>;
-type LeasedInput = { view: string; bytes: number[]; paste: boolean };
+type LeasedInput = { view: string; bytes: number[] };
 type Color = { css: string; rgba: number };
 type Palette = { foreground: Color; background: Color; cursor: Color; ansi: Color[] };
 
@@ -28,8 +28,8 @@ function leasedTerminal(terminal: Emulator, view = "current", deliver?: (frame: 
   terminal.onData(data => emitted.push(data));
   let sent = Promise.resolve();
   const scope = new TerminalViewScope({
-    async input(view, bytes, paste) {
-      const frame = { view, bytes, paste };
+    async input(view, bytes) {
+      const frame = { view, bytes };
       leased.push(frame);
       await deliver?.(frame);
     },
@@ -37,7 +37,7 @@ function leasedTerminal(terminal: Emulator, view = "current", deliver?: (frame: 
     retire: () => protocol.dispose(),
     reconnect: () => {},
   });
-  const protocol = bindTerminalProtocol(terminal, (bytes, paste) => { sent = scope.send(bytes, paste); });
+  const protocol = bindTerminalProtocol(terminal, bytes => { sent = scope.send(bytes); });
   assert.equal(protocol.inputAvailable, true, "the input source in locked xterm 6.0.0 must be available");
   assert.equal(scope.bind(view), true);
   function consume(chunk: Chunk, render: () => Promise<void>) {
@@ -158,9 +158,9 @@ test("fragmented negotiation emits no leased bytes and real key and binary input
   assert.equal(terminal.modes.sendFocusMode, false);
   await fixture.sent();
   assert.deepEqual(fixture.leased, [
-    { view: "current", bytes: [27, 79, 65], paste: false },
-    { view: "current", bytes: [27, 91, 77, 32, 133, 34], paste: false },
-    { view: "current", bytes: [27, 91, 73], paste: false },
+    { view: "current", bytes: [27, 79, 65] },
+    { view: "current", bytes: [27, 91, 77, 32, 133, 34] },
+    { view: "current", bytes: [27, 91, 73] },
   ]);
 });
 
@@ -175,7 +175,7 @@ test("headless parse callbacks keep split replies out of the leased sink", async
   assert.deepEqual(fixture.leased, []);
   terminal.input("é\r", true);
   await fixture.sent();
-  assert.deepEqual(fixture.leased, [{ view: "current", bytes: [195, 169, 13], paste: false }]);
+  assert.deepEqual(fixture.leased, [{ view: "current", bytes: [195, 169, 13] }]);
 });
 
 test("mixed OSC queries preserve indexed and special color sets in their original slots", async t => {
@@ -407,7 +407,7 @@ test("a fresh attachment drops old parser completion and queued input", { timeou
   assert.equal(await pending, false);
   assert.equal(terminal.options.disableStdin, true);
   await old.sent();
-  assert.deepEqual(old.leased, [{ view: "old", bytes: encode("first"), paste: false }]);
+  assert.deepEqual(old.leased, [{ view: "old", bytes: encode("first") }]);
   assert.deepEqual(fresh.leased, []);
 
   replacement.arrowUp();
@@ -416,12 +416,12 @@ test("a fresh attachment drops old parser completion and queued input", { timeou
   nextTerminal.focus();
   assert.equal(replacement.focused(), true);
   assert.equal(replacement.click(2, 3), true);
-  nextTerminal.input("\x1b[200~Привіт\r\x1b[201~", true);
+  nextTerminal.input("Привіт\r", true);
   await fresh.sent();
   assert.deepEqual(fresh.leased, [
-    { view: "fresh", bytes: [27, 91, 65], paste: false },
-    { view: "fresh", bytes: [27, 91, 77, 32, 35, 36], paste: false },
-    { view: "fresh", bytes: encode("Привіт\r"), paste: true },
+    { view: "fresh", bytes: [27, 91, 65] },
+    { view: "fresh", bytes: [27, 91, 77, 32, 35, 36] },
+    { view: "fresh", bytes: encode("Привіт\r") },
   ]);
 });
 
@@ -453,5 +453,391 @@ test("an unavailable xterm input hook leaves the leased route disconnected after
     } finally {
       scope.retire();
     }
+  }
+});
+
+type ViewCallbacks = ConstructorParameters<typeof TerminalViewScope>[0];
+type PasteCallbacks = NonNullable<ViewCallbacks["paste"]>;
+type Gesture = Parameters<PasteCallbacks["stage"]>[0];
+type StageArgs = Parameters<PasteCallbacks["stage"]>;
+type Call = { kind: "input"; data: number[] }
+  | { kind: "stage"; gesture: Gesture; offset: number; data: number[] }
+  | { kind: "commit"; gesture: Gesture; bytes: number }
+  | { kind: "ack"; gesture: Gesture; receipt: string };
+
+const firstIncarnation = "10000000-0000-4000-8000-000000000001";
+const nextIncarnation = "10000000-0000-4000-8000-000000000002";
+const receiptId = "20000000-0000-4000-8000-000000000001";
+const readOnly: Chunk = { writable: false, closed: false, data: [] };
+
+function pasteFixture(options: Partial<PasteCallbacks & Pick<ViewCallbacks, "input" | "inputFailure">> = {}) {
+  const calls: Call[] = [];
+  const browser = browserFixture();
+  const viewId = "view";
+  let nativeIncarnation = firstIncarnation;
+  const scope = new TerminalViewScope({
+    async input(view, data) {
+      calls.push({ kind: "input", data });
+      await options.input?.(view, data);
+    },
+    paste: {
+      async stage(gesture, offset, data) {
+        calls.push({ kind: "stage", gesture, offset, data });
+        if (gesture.incarnation !== nativeIncarnation) return { result: "stale" };
+        return options.stage ? options.stage(gesture, offset, data) : { result: "staged" };
+      },
+      async commit(gesture, bytes) {
+        calls.push({ kind: "commit", gesture, bytes });
+        if (gesture.incarnation !== nativeIncarnation) return { result: "stale" };
+        return options.commit ? options.commit(gesture, bytes) : { result: "committed", receipt: receiptId };
+      },
+      async ack(gesture, receipt) {
+        calls.push({ kind: "ack", gesture, receipt });
+        assert.equal(receipt, receiptId);
+        return options.ack ? options.ack(gesture, receipt) : { result: "acknowledged", writable: true };
+      },
+      changed: () => options.changed?.(),
+    },
+    inputFailure: options.inputFailure ?? (() => assert.fail("Unexpected ordinary input failure")),
+    reconnect: () => {},
+    retire: () => protocol.dispose(),
+  });
+  const protocol = bindTerminalProtocol(browser.terminal, bytes => { void scope.send(bytes); });
+  assert(scope.bind(viewId));
+  const consume = (chunk: Chunk) => protocol.consume(scope, viewId, chunk, async () => {});
+  return {
+    browser, scope, calls, consume,
+    turnOwner(incarnation: string) { nativeIncarnation = incarnation; },
+    publish: (incarnation: string) => consume({ ...readOnly, writable: true, paste_incarnation: incarnation }),
+    paste(text: string) { return scope.paste(encodeTerminalPaste(text)); },
+    dispose() { scope.retire(); browser.terminal.dispose(); },
+  };
+}
+
+class ClipboardEventPath extends EventTarget {
+  private readonly capture = new EventTarget();
+  readonly element = new EventTarget();
+  readonly textarea = new EventTarget();
+
+  override addEventListener(type: string, listener: EventListenerOrEventListenerObject | null, options?: boolean | AddEventListenerOptions) {
+    const capture = options === true || (typeof options === "object" && options.capture);
+    (capture ? this.capture : this.element).addEventListener(type, listener);
+  }
+
+  override removeEventListener(type: string, listener: EventListenerOrEventListenerObject | null, options?: boolean | EventListenerOptions) {
+    const capture = options === true || (typeof options === "object" && options.capture);
+    (capture ? this.capture : this.element).removeEventListener(type, listener);
+  }
+
+  paste(target: EventTarget, text: string) {
+    const event = new Event("paste", { cancelable: true, bubbles: true });
+    const requested: string[] = [];
+    Object.defineProperty(event, "clipboardData", { value: {
+      getData(type: string) {
+        requested.push(type);
+        return type === "text/plain" ? text : "<p>not plain text</p>";
+      },
+    } });
+    let stopped = false;
+    const stop = event.stopImmediatePropagation.bind(event);
+    event.stopImmediatePropagation = () => { stopped = true; stop(); };
+    this.capture.dispatchEvent(event);
+    if (!stopped) target.dispatchEvent(event);
+    if (!stopped && target === this.textarea) this.element.dispatchEvent(event);
+    return { prevented: event.defaultPrevented, stopped, requested };
+  }
+}
+
+async function checkClipboardCapture(bracketed: boolean) {
+  const f = pasteFixture();
+  try {
+    await f.publish(firstIncarnation);
+    const terminal = f.browser.terminal;
+    await new Promise<void>(resolve => terminal.write(bracketed ? "\x1b[?2004h" : "\x1b[?2004l", resolve));
+    assert.equal(terminal.modes.bracketedPasteMode, bracketed);
+    const path = new ClipboardEventPath();
+    let leaked = 0;
+    const xtermListener = (event: Event) => {
+      leaked++;
+      terminal.paste((event as ClipboardEvent).clipboardData!.getData("text/plain"));
+      event.stopImmediatePropagation();
+    };
+    path.element.addEventListener("paste", xtermListener);
+    path.textarea.addEventListener("paste", xtermListener);
+    let queued = Promise.resolve();
+    const capture = bindTerminalPaste(path, bytes => { queued = f.scope.paste(bytes); });
+    for (const target of [path.textarea, path.element]) {
+      assert.deepEqual(path.paste(target, "друк\r\n🙂"), {
+        prevented: true, stopped: true, requested: ["text/plain"],
+      });
+      await queued;
+    }
+    for (const text of ["", "x".repeat(TERMINAL_INPUT_BUDGET + 1)]) {
+      assert.equal(path.paste(path.element, text).prevented, true);
+      await queued;
+    }
+    await f.consume(readOnly);
+    assert.equal(path.paste(path.textarea, "read-only").stopped, true);
+    await queued;
+    assert.equal(leaked, 0);
+    assert.deepEqual(f.calls.map(call => call.kind), ["stage", "commit", "ack", "stage", "commit", "ack"]);
+    assert.deepEqual(f.calls.filter(call => call.kind === "stage").map(call => call.data),
+      [encode("друк\n🙂"), encode("друк\n🙂")]);
+    assert.deepEqual(f.calls.filter(call => call.kind === "stage").map(call => call.gesture.operation), [1, 2]);
+    capture.dispose();
+    assert.equal(path.paste(path.element, "after disposal").prevented, false);
+    assert.equal(leaked, 1);
+    assert.equal(f.calls.length, 6);
+  } finally {
+    f.dispose();
+  }
+}
+
+test("clipboard capture precedes xterm listeners in normal mode", () => checkClipboardCapture(false));
+test("clipboard capture precedes xterm listeners in bracketed mode", () => checkClipboardCapture(true));
+
+test("queued paste keeps its lease on same-view reacquisition without a loss event", async () => {
+  for (const observed of [true, false]) {
+    const entered = deferred<void>();
+    const keyboard = deferred<void>();
+    const f = pasteFixture({ input: async () => { entered.resolve(); await keyboard.promise; } });
+    try {
+      await f.publish(firstIncarnation);
+      const before = f.scope.send(Uint8Array.of(65));
+      const stale = f.paste("old");
+      await entered.promise;
+      f.turnOwner(nextIncarnation);
+      if (observed) await f.publish(nextIncarnation);
+      keyboard.resolve();
+      await Promise.all([before, stale]);
+      assert.deepEqual(f.calls.map(call => call.kind), observed ? ["input"] : ["input", "stage"]);
+      const attempted = f.calls.find(call => call.kind === "stage");
+      if (attempted) assert.equal(attempted.gesture.incarnation, firstIncarnation);
+      assert.equal(f.scope.pasteMessage, pasteIssueText.stale);
+      if (!observed) await f.publish(nextIncarnation);
+      await f.paste("fresh");
+      const tail = f.calls.slice(-3);
+      assert.deepEqual(tail.map(call => call.kind), ["stage", "commit", "ack"]);
+      for (const call of tail) {
+        assert(call.kind !== "input");
+        assert.deepEqual(call.gesture, { viewId: "view", incarnation: nextIncarnation, operation: 2 });
+      }
+    } finally {
+      keyboard.resolve();
+      f.dispose();
+    }
+  }
+});
+
+test("lease loss between paste chunks prevents commit", async () => {
+  for (const change of ["read-only", "successor", "withheld", "retired"]) {
+    const entered = deferred<void>();
+    const response = deferred<{ result: "staged" }>();
+    const f = pasteFixture({ async stage(...[gesture, offset]: StageArgs) {
+      if (gesture.operation === 1 && offset === 0) { entered.resolve(); return response.promise; }
+      return { result: "staged" };
+    } });
+    try {
+      await f.publish(firstIncarnation);
+      const pending = f.paste("a".repeat(4096) + "☃");
+      await entered.promise;
+      f.turnOwner(nextIncarnation);
+      if (change === "read-only") await f.consume(readOnly);
+      if (change === "successor") await f.publish(nextIncarnation);
+      if (change === "retired") f.scope.retire();
+      response.resolve({ result: "staged" });
+      await pending;
+      const attempts = f.calls.filter(call => call.kind === "stage");
+      assert.deepEqual(attempts.map(call => call.offset), change === "withheld" ? [0, 4096] : [0]);
+      for (const call of attempts) assert.equal(call.gesture.incarnation, firstIncarnation);
+      assert.equal(f.calls.length, attempts.length);
+      if (change === "retired") {
+        assert.equal(f.scope.pasteMessage, undefined);
+      } else {
+        assert.equal(f.scope.pasteMessage, pasteIssueText.stale);
+        await f.publish(nextIncarnation);
+        await f.paste("fresh");
+        const commit = f.calls.find(call => call.kind === "commit");
+        assert.equal(commit?.gesture.incarnation, nextIncarnation);
+      }
+    } finally {
+      response.resolve({ result: "staged" });
+      f.dispose();
+    }
+  }
+});
+
+test("paste chunks reassemble UTF-8 after CRLF normalization", async () => {
+  const f = pasteFixture();
+  try {
+    await f.publish(firstIncarnation);
+    const unicode = "Ж\r\n🙂\r日本語\n\u0009";
+    const boundary = "a".repeat(4095);
+    const exactCap = "x".repeat(TERMINAL_INPUT_BUDGET);
+    for (const [input, expected] of [
+      [unicode, "Ж\n🙂\n日本語\n\t"],
+      [boundary + unicode, boundary + "Ж\n🙂\n日本語\n\t"],
+      [exactCap, exactCap],
+    ] as const) {
+      f.calls.length = 0;
+      await f.paste(input);
+      const expectedBytes = encode(expected);
+      const chunks = f.calls.filter(call => call.kind === "stage");
+      assert.deepEqual(chunks.flatMap(call => call.data), expectedBytes);
+      assert.deepEqual(chunks.map(call => call.offset), chunks.map((_, index) => index * 4096));
+      assert(chunks.every(call => call.data.length > 0 && call.data.length <= 4096));
+      if (input.startsWith(boundary)) {
+        assert.equal(chunks[0]?.data[4095], 0xd0);
+        assert.equal(chunks[1]?.data[0], 0x96);
+      }
+      const commits = f.calls.filter(call => call.kind === "commit");
+      assert.deepEqual(commits.map(call => call.bytes), [expectedBytes.length]);
+      assert.deepEqual(f.calls.map(call => call.kind).slice(-2), ["commit", "ack"]);
+      assert(!f.calls.some(call => call.kind === "input"));
+    }
+    assert.equal(encodeTerminalPaste("🙂".repeat(TERMINAL_INPUT_BUDGET / 4 + 1)), null);
+    assert.equal(encodeTerminalPaste(exactCap + "x"), null);
+    assert.deepEqual(Array.from(encodeTerminalPaste("\r\n".repeat(TERMINAL_INPUT_BUDGET))!), Array.from({ length: TERMINAL_INPUT_BUDGET }, () => 10));
+  } finally {
+    f.dispose();
+  }
+});
+
+test("paste and keyboard share one FIFO input queue", async () => {
+  const entered = deferred<void>();
+  const keyboard = deferred<void>();
+  const firstCommitEntered = deferred<Gesture>();
+  const firstReceipt = deferred<{ result: "committed"; receipt: string }>();
+  const commitEntered = deferred<Gesture>();
+  const knownReceipt = deferred<{ result: "committed"; receipt: string }>();
+  const f = pasteFixture({
+    input: async (_view, bytes) => {
+      if (bytes[0] === 65) { entered.resolve(); await keyboard.promise; }
+    },
+    async commit(gesture) {
+      if (gesture.operation === 1) { firstCommitEntered.resolve(gesture); return firstReceipt.promise; }
+      if (gesture.operation === 2) return { result: "unavailable" };
+      if (gesture.operation === 3) { commitEntered.resolve(gesture); return knownReceipt.promise; }
+      return { result: "committed", receipt: receiptId };
+    },
+    async ack(gesture) { return { result: "acknowledged", writable: gesture.operation !== 3 }; },
+  });
+  try {
+    await f.publish(firstIncarnation);
+    const before = f.scope.send(Uint8Array.of(65));
+    await entered.promise;
+    await f.paste("x".repeat(TERMINAL_INPUT_BUDGET));
+    assert.equal(f.scope.pasteMessage, pasteIssueText.oversize);
+    const paste = f.paste("🙂\n");
+    const after = f.scope.send(Uint8Array.of(66));
+    keyboard.resolve();
+    const first = await firstCommitEntered.promise;
+    const firstCompletion = {
+      ...readOnly,
+      paste_completion: { incarnation: first.incarnation, operation: first.operation },
+    };
+    await f.consume(firstCompletion);
+    assert(f.browser.terminal.options.disableStdin);
+    firstReceipt.resolve({ result: "committed", receipt: receiptId });
+    await Promise.all([before, paste, after]);
+    assert.deepEqual(f.calls.map(call => call.kind), ["input", "stage", "commit", "ack", "input"]);
+    await f.consume(firstCompletion);
+    assert(!f.browser.terminal.options.disableStdin);
+    await f.paste("unavailable");
+    assert.equal(f.scope.pasteMessage, pasteIssueText.unavailable);
+    await f.scope.send(Uint8Array.of(67));
+    assert.deepEqual(f.calls.slice(-3).map(call => call.kind), ["stage", "commit", "input"]);
+
+    const inFlight = f.paste("✍");
+    const expiredKey = f.scope.send(Uint8Array.of(68));
+    const { incarnation, operation } = await commitEntered.promise;
+    await f.consume(readOnly);
+    knownReceipt.resolve({ result: "committed", receipt: receiptId });
+    await Promise.all([inFlight, expiredKey]);
+    assert.deepEqual(f.calls.slice(-3).map(call => call.kind), ["stage", "commit", "ack"]);
+    assert.deepEqual(f.calls.filter(call => call.kind === "input").map(call => call.data), [[65], [66], [67]]);
+    await f.consume({ ...readOnly, paste_completion: { incarnation, operation } });
+    await f.publish(firstIncarnation);
+    assert(!f.scope.canWrite);
+  } finally {
+    keyboard.resolve();
+    firstReceipt.resolve({ result: "committed", receipt: receiptId });
+    knownReceipt.resolve({ result: "committed", receipt: receiptId });
+    f.dispose();
+  }
+});
+
+test("a confirmed paste can acknowledge after the ordinary queue is disabled", async () => {
+  const submitted = deferred<void>();
+  const receipt = deferred<{ result: "committed"; receipt: string }>();
+  let inputFailures = 0;
+  const f = pasteFixture({
+    commit() { submitted.resolve(); return receipt.promise; },
+    inputFailure() { inputFailures++; },
+  });
+  try {
+    await f.publish(firstIncarnation);
+    const paste = f.paste("draft");
+    await submitted.promise;
+    await f.scope.send(new Uint8Array(TERMINAL_INPUT_BUDGET));
+    assert.equal(inputFailures, 1);
+    assert(!f.scope.canWrite);
+    receipt.resolve({ result: "committed", receipt: receiptId });
+    await paste;
+    assert.deepEqual(f.calls.map(call => call.kind), ["stage", "commit", "ack"]);
+    assert(!f.scope.canWrite);
+  } finally {
+    receipt.resolve({ result: "committed", receipt: receiptId });
+    f.dispose();
+  }
+});
+
+test("a successor snapshot retires the original paste completion binding", async () => {
+  const submitted = deferred<void>();
+  const receipt = deferred<{ result: "committed"; receipt: string }>();
+  const f = pasteFixture({
+    commit() { submitted.resolve(); return receipt.promise; },
+  });
+  try {
+    await f.publish(firstIncarnation);
+    const paste = f.paste("draft");
+    await submitted.promise;
+    f.turnOwner(nextIncarnation);
+    await f.publish(nextIncarnation);
+    await f.consume(readOnly);
+    receipt.resolve({ result: "committed", receipt: receiptId });
+    await paste;
+    assert.deepEqual(f.calls.map(call => call.kind), ["stage", "commit"]);
+    assert.equal(f.scope.pasteMessage, pasteIssueText.unknown);
+  } finally {
+    receipt.resolve({ result: "committed", receipt: receiptId });
+    f.dispose();
+  }
+});
+
+test("lost paste commit reply reports unknown without retry", async () => {
+  const f = pasteFixture({ async commit() { throw Error("IPC response lost"); } });
+  try {
+    await f.publish(firstIncarnation);
+    const sent = f.paste("неповторюваний текст");
+    const queued = f.paste("queued before the reply");
+    const later = f.scope.send(Uint8Array.of(65));
+    await Promise.all([sent, queued, later]);
+    assert.equal(f.scope.pasteMessage, pasteIssueText.unknown);
+    await f.paste("neither retry nor fallback");
+    assert.deepEqual(f.calls.map(call => call.kind), ["stage", "commit"]);
+    f.scope.retire();
+    const reconnect = pasteFixture();
+    try {
+      await reconnect.consume({ ...readOnly, paste_admission: "prior_send_unknown" });
+      assert.equal(reconnect.scope.pasteMessage, pasteIssueText.unknown);
+      await reconnect.scope.send(Uint8Array.of(1));
+      await reconnect.paste("held pane");
+      assert.deepEqual(reconnect.calls, []);
+    } finally {
+      reconnect.dispose();
+    }
+  } finally {
+    f.dispose();
   }
 });

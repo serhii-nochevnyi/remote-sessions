@@ -27,10 +27,13 @@ with Lab() as lab:
     assert received.read_bytes() == payload.replace(b'\r',b'\n')
     assert call('input',token=first,sequence=0,data=[13])['result'] == 'error'
     assert call('input',token=first,sequence=1,data=[65]*4097)['result'] == 'error'
-    assert call('input',token=first,sequence=1,data=list('Вставка з Mac'.encode()),paste=True)['result'] == 'accepted'
-    assert call('input',token=first,sequence=2,data=[13])['result'] == 'accepted'
-    wait_for(lambda: 'Вставка з Mac\n' in received.read_text())
-    assert received.read_bytes() == payload.replace(b'\r',b'\n') + 'Вставка з Mac\n'.encode()
+    assert call('input',token=first,sequence=1,data=list('Вставка з Mac'.encode()),paste=True)['result'] == 'paste_unavailable'
+    assert received.read_bytes() == payload.replace(b'\r',b'\n')
+    ordinary = 'Ручний ввід\r'.encode()
+    assert call('input',token=first,sequence=1,data=list(ordinary),paste=False)['result'] == 'accepted'
+    wait_for(lambda: 'Ручний ввід\n' in received.read_text())
+    expected = (payload + ordinary).replace(b'\r',b'\n')
+    assert received.read_bytes() == expected
     old_pid = lab.call('health')['agent_pid']
     run('launchctl','kickstart','-k',lab.loaded[1])
     wait_for(lambda: lab.call('health')['agent_pid'] != old_pid)
@@ -48,4 +51,5 @@ with Lab() as lab:
     result = run(ROOT/'target/debug/examples/probe',lab.state,runtime['runtime_id'])
     assert 'PASS' in result.stdout
     wait_for(lambda: received.read_text().count('Native bridge — Україна') == 3)
+    assert received.read_bytes() == expected + b'after restart\n' + 'Native bridge — Україна\n'.encode() * 3
     print('PASS Unicode, arrow bytes, Enter, exact input, exclusive writer, duplicate rejection, stale token rejection after restart, same runtime PID, native bridge 3 cycles')

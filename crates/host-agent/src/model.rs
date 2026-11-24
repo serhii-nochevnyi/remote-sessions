@@ -55,6 +55,19 @@ pub enum Request {
         #[serde(default)]
         paste: bool,
     },
+    PasteStage {
+        binding: PasteBinding,
+        offset: usize,
+        data: Vec<u8>,
+    },
+    PasteCommit {
+        binding: PasteBinding,
+        bytes: usize,
+    },
+    PasteAck {
+        binding: PasteBinding,
+        receipt: Uuid,
+    },
     Stop {
         runtime_id: Uuid,
         expected_pane_id: String,
@@ -118,6 +131,40 @@ pub struct TerminalView {
 pub struct ResizeEpoch {
     pub agent: Uuid,
     pub owner: Uuid,
+}
+
+pub const INPUT_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+pub const PASTE_LIMIT: usize = 65536;
+pub const INPUT_CHUNK_LIMIT: usize = 4096;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PasteBinding {
+    pub terminal: TerminalView,
+    pub token: Uuid,
+    pub epoch: ResizeEpoch,
+    pub incarnation: Uuid,
+    pub operation: u64,
+    pub sequence: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PasteAdmission {
+    PriorSendUnknown,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PasteResult {
+    Staged {},
+    Committed { receipt: Uuid },
+    Acknowledged { writable: bool },
+    Stale {},
+    Invalid {},
+    Unavailable {},
+    Unknown {},
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +265,13 @@ pub enum Response {
         status: TerminalStatus,
     },
     TerminalChanged {},
+    ControlRecovering {
+        paste_admission: PasteAdmission,
+    },
+    PasteUnavailable {},
+    Paste {
+        paste: PasteResult,
+    },
     Resize {
         resize: ResizeResult,
     },

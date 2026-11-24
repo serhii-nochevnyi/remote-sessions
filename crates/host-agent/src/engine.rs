@@ -3,7 +3,8 @@ use crate::{
         CatalogLane, Operation, OperationStage, PaneIdentity, ServerGeneration, StoredOutcome,
     },
     model::{
-        CommittedGeometry, CreateState, LaunchOutcome, ObservationState, PaneLiveness,
+        CommittedGeometry, CreateState, INPUT_CHUNK_LIMIT, INPUT_LEASE_TTL, LaunchOutcome,
+        ObservationState, PASTE_LIMIT, PaneLiveness, PasteAdmission, PasteBinding, PasteResult,
         ProductIssue, ProviderProfile, ProviderSample, Request, ResizeEpoch, ResizeIntent,
         ResizeResult, Response, Runtime, RuntimeOrigin, TerminalSize, TerminalStatus,
         TerminalTarget, TerminalView, parse_name, tmux_name,
@@ -30,14 +31,71 @@ pub struct Engine {
     tmux: PathBuf,
     socket: PathBuf,
     agent_epoch: Uuid,
-    ownership: Mutex<crate::ownership::Ownership>,
+    ownership: Arc<Mutex<crate::ownership::Ownership>>,
     lanes: Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<ResizeLane>>>>,
+    #[cfg(test)]
+    paste_test: PasteTest,
 }
 
 #[derive(Default)]
 struct ResizeLane {
     confirmed: Option<(TerminalTarget, ResizeEpoch)>,
     reconcile: bool,
+    pending_paste: Option<PendingPaste>,
+    paste_quarantined: bool,
+}
+
+struct PendingPaste {
+    binding: PasteBinding,
+    expected: GeometryReadback,
+    receipt: Uuid,
+    released: bool,
+}
+
+struct GuardedPaste {
+    pane: String,
+    guard: String,
+    branch: String,
+    otherwise: String,
+    enqueued: String,
+    rejected: String,
+}
+
+fn valid_paste(data: &[u8], expected: usize) -> bool {
+    data.len() == expected
+        && (1..=PASTE_LIMIT).contains(&expected)
+        && std::str::from_utf8(data).is_ok_and(|text| {
+            text.chars()
+                .all(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        })
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct PasteTest {
+    now: Mutex<Option<Instant>>,
+    admission: Mutex<Option<Arc<PasteBarrier>>>,
+    sender_fixture: bool,
+    provider_sample: Option<ProviderSample>,
+    send_watchdog: Option<Duration>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct PasteBarrier {
+    reached: tokio::sync::Notify,
+    proceed: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl PasteTest {
+    async fn pause_before_admission(&self) {
+        let barrier = self.admission.lock().unwrap().take();
+        if let Some(barrier) = barrier {
+            barrier.reached.notify_one();
+            barrier.proceed.notified().await;
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,16 +107,26 @@ struct GeometryReadback {
     tty: PathBuf,
     epoch: Option<ResizeEpoch>,
     committed: CommittedGeometry,
+    paste_launch: String,
+    paste_marker: String,
+    sender_supported: bool,
+    input_enabled: bool,
 }
 
 const EPOCH_OPTION: &str = "@rs_resize_epoch";
 const INTENT_OPTION: &str = "@rs_resize_intent";
+const PASTE_LAUNCH_OPTION: &str = "@rs_paste_launch";
+const PASTE_OPTION: &str = "@rs_paste_admission";
+const PASTE_WATCHDOG: Duration = Duration::from_millis(650);
 const GEOMETRY_FORMAT: &str = concat!(
     "#{pid}|#{start_time}|#{@rs_create_generation}|#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}|",
     "#{session_name}|#{window_index}|#{pane_index}|#{@rs_create_nonce}|#{pane_dead}|",
     "#{session_windows}|#{window_panes}|#{window-size}|#{pane_tty}|",
     "#{pane_width}|#{pane_height}|#{window_width}|#{window_height}|",
-    "#{@rs_resize_epoch}|#{@rs_resize_intent}"
+    "#{@rs_resize_epoch}|#{@rs_resize_intent}|",
+    "#{?#{m/r:^[0-9a-f-]*$,#{@rs_paste_launch}},#{@rs_paste_launch},invalid}|",
+    "#{?#{m/r:^[a-z0-9:~-]*$,#{@rs_paste_admission}},#{@rs_paste_admission},invalid}|",
+    "#{pane_input_off}"
 );
 const MAX_REVISION: u64 = (1 << 53) - 1;
 const GENERATION_OPTION: &str = "@rs_create_generation";
@@ -86,6 +154,14 @@ fn unknown(issue: impl Into<Option<ProductIssue>>) -> CreateState {
 
 fn unavailable() -> ProductIssue {
     ProductIssue::TmuxUnavailable
+}
+
+fn control_hold() -> Response {
+    control_recovering(PasteAdmission::PriorSendUnknown)
+}
+
+fn control_recovering(paste_admission: PasteAdmission) -> Response {
+    Response::ControlRecovering { paste_admission }
 }
 
 fn server_fields(line: &str) -> Option<(u32, u64, &str)> {
@@ -217,7 +293,75 @@ fn format_all(predicates: impl IntoIterator<Item = String>) -> String {
     combine(&values)
 }
 
+fn pane_witness(pane: &str, witness: &str) -> String {
+    format!("display-message -p -l -t {pane} {witness}")
+}
+
+fn rejection_witness(pane: &str, witness: &str) -> String {
+    let guard = format_all([
+        format_equal("pane_id", pane),
+        format_equal("after-display-message", ""),
+        format_equal("command-error", ""),
+    ]);
+    format!(
+        "if-shell -F -t {pane} {} {}",
+        tmux_word(&guard),
+        tmux_word(&pane_witness(pane, witness))
+    )
+}
+
 impl GeometryReadback {
+    fn same_pane(&self, other: &Self) -> bool {
+        self.target == other.target
+            && self.server == other.server
+            && self.name == other.name
+            && self.nonce == other.nonce
+            && self.tty == other.tty
+            && self.paste_launch == other.paste_launch
+    }
+
+    fn paste_prefix(&self, epoch: Option<ResizeEpoch>) -> String {
+        let t = &self.target;
+        let launch = self.nonce.split_once(':').map_or("-", |(nonce, _)| nonce);
+        format!(
+            "v1~{}~{}~{}~{}~{}~{}~{}~{}~{}~{}~{}~{}~",
+            t.runtime_id,
+            t.generation,
+            self.server.pid,
+            self.server.start,
+            &t.session[1..],
+            &t.window[1..],
+            &t.pane[1..],
+            t.pid,
+            t.process_start,
+            launch,
+            self.paste_launch,
+            epoch_text(epoch),
+        )
+    }
+
+    fn ready_marker(&self, epoch: Option<ResizeEpoch>) -> String {
+        format!("{}r~{}", self.paste_prefix(epoch), Uuid::new_v4())
+    }
+
+    fn paste_ready(&self) -> bool {
+        parse_uuid(&self.paste_launch).is_ok()
+            && self
+                .paste_marker
+                .strip_prefix(&format!("{}r~", self.paste_prefix(self.epoch)))
+                .is_some_and(|nonce| parse_uuid(nonce).is_ok())
+    }
+
+    fn paste_admission_hold(&self) -> Option<PasteAdmission> {
+        if self.paste_ready() {
+            return (!self.sender_supported).then_some(PasteAdmission::Unavailable);
+        }
+        if !self.sender_supported && self.paste_launch.is_empty() && self.paste_marker.is_empty() {
+            return Some(PasteAdmission::Unavailable);
+        }
+        Some(PasteAdmission::PriorSendUnknown)
+    }
+
     fn guard(&self, predecessor: Option<ResizeEpoch>) -> String {
         format_all([
             format_equal("pid", self.server.pid),
@@ -352,9 +496,98 @@ impl Engine {
             tmux,
             socket,
             agent_epoch: Uuid::new_v4(),
-            ownership: Mutex::default(),
+            ownership: Arc::default(),
             lanes: Mutex::default(),
+            #[cfg(test)]
+            paste_test: PasteTest::default(),
         }
+    }
+
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = *self.paste_test.now.lock().unwrap() {
+            return now;
+        }
+        Instant::now()
+    }
+
+    fn sender_guard(&self) -> String {
+        let Some(path) = self.socket.to_str().filter(|path| {
+            path.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"/-._ ".contains(&c))
+        }) else {
+            return "0".into();
+        };
+        format_all([
+            format_equal("version", "3.8"),
+            format_equal("socket_path", path),
+            format_equal("after-load-buffer", ""),
+            format_equal("after-paste-buffer", ""),
+            format_equal("after-delete-buffer", ""),
+            format_equal("after-send-keys", ""),
+            format_equal("after-set-option", ""),
+            format_equal("after-display-message", ""),
+            format_equal("command-error", ""),
+        ])
+    }
+
+    fn private_sender_socket(&self) -> bool {
+        #[cfg(test)]
+        if self.paste_test.sender_fixture {
+            return true;
+        }
+        self.socket.is_absolute()
+            && self
+                .socket
+                .file_name()
+                .is_some_and(|name| name == "tmux.sock")
+            && self.socket.parent().is_some_and(|parent| {
+                let uid = nix::unistd::geteuid().as_raw();
+                crate::validate_directory(parent).is_ok()
+                    && fs::symlink_metadata(&self.socket)
+                        .is_ok_and(|meta| meta.file_type().is_socket() && meta.uid() == uid)
+            })
+    }
+
+    fn paste_guard(&self, read: &GeometryReadback) -> String {
+        format_all([
+            read.guard(read.epoch),
+            self.sender_guard(),
+            format_equal(PASTE_LAUNCH_OPTION, &read.paste_launch),
+            format_equal(PASTE_OPTION, &read.paste_marker),
+        ])
+    }
+
+    fn expire_writer(
+        &self,
+        runtime: Uuid,
+        token: Uuid,
+        lane: &Arc<tokio::sync::Mutex<ResizeLane>>,
+    ) {
+        let owners = Arc::downgrade(&self.ownership);
+        let lane = Arc::downgrade(lane);
+        tokio::spawn(async move {
+            let mut deadline = Instant::now() + INPUT_LEASE_TTL;
+            loop {
+                tokio::time::sleep_until(deadline.into()).await;
+                let (Some(owners), Some(lane)) = (owners.upgrade(), lane.upgrade()) else {
+                    break;
+                };
+                let lane = lane.lock().await;
+                let mut owners = owners.lock().unwrap();
+                let Some(current) = owners.deadline(runtime, token) else {
+                    break;
+                };
+                if current <= Instant::now() {
+                    owners.discard_stage(runtime, token);
+                    if lane.pending_paste.is_none() {
+                        owners.release(runtime, token);
+                    }
+                    break;
+                }
+                deadline = current;
+            }
+        });
     }
 
     fn owners(&self) -> std::sync::MutexGuard<'_, crate::ownership::Ownership> {
@@ -370,12 +603,29 @@ impl Engine {
             .clone()
     }
 
+    fn existing_lane(&self, runtime: Uuid) -> Option<Arc<tokio::sync::Mutex<ResizeLane>>> {
+        self.lanes
+            .lock()
+            .expect("runtime lanes poisoned")
+            .get(&runtime)
+            .cloned()
+    }
+
     async fn command(&self, args: &[&str]) -> Result<String> {
         self.bounded_command(args, Duration::from_secs(3)).await
     }
 
     async fn geometry_command(&self, args: &[&str]) -> Result<String> {
-        self.bounded_command(args, Duration::from_millis(650)).await
+        self.bounded_command(args, self.terminal_command_watchdog())
+            .await
+    }
+
+    fn terminal_command_watchdog(&self) -> Duration {
+        #[cfg(test)]
+        if self.paste_test.sender_fixture {
+            return Duration::from_secs(3);
+        }
+        PASTE_WATCHDOG
     }
 
     async fn bounded_command(&self, args: &[&str], wait: Duration) -> Result<String> {
@@ -755,6 +1005,14 @@ impl Engine {
         };
         match self.observe(&operation).await {
             Ok(observed) if observed.identity == receipt => {
+                let _ = self
+                    .stamp_paste(
+                        &observed.runtime,
+                        generation,
+                        &receipt,
+                        Some(operation.nonce),
+                    )
+                    .await;
                 self.finalize_launch(catalog, &operation, observed).await
             }
             _ => unknown(None),
@@ -889,8 +1147,9 @@ impl Engine {
     }
 
     async fn geometry(&self, runtime_id: Uuid, pane: &str) -> Result<GeometryReadback> {
+        let format = format!("{GEOMETRY_FORMAT}|{}", self.sender_guard());
         let output = self
-            .geometry_command(&["display-message", "-p", "-t", pane, GEOMETRY_FORMAT])
+            .geometry_command(&["display-message", "-p", "-t", pane, &format])
             .await?;
         let mut lines = output.lines();
         let fields: Vec<_> = lines
@@ -899,7 +1158,7 @@ impl Engine {
             .split('|')
             .collect();
         ensure!(
-            lines.next().is_none() && fields.len() == 22,
+            lines.next().is_none() && fields.len() == 26,
             "Invalid terminal metadata"
         );
         let server = generation(&fields[..3].join("|")).context("Invalid terminal generation")?;
@@ -964,6 +1223,12 @@ impl Engine {
             tty: tty.into(),
             epoch,
             committed,
+            paste_launch: fields[22].into(),
+            paste_marker: fields[23].into(),
+            input_enabled: fields[24] == "0",
+            sender_supported: matches!(fields[24], "0" | "1")
+                && fields[25] == "1"
+                && self.private_sender_socket(),
         })
     }
 
@@ -1032,15 +1297,400 @@ impl Engine {
     }
 
     async fn sample_provider(&self, before: &GeometryReadback) -> Result<ProviderSample> {
-        let (sample, device) = sample_tty(&before.tty)?;
+        #[cfg(test)]
+        let simulated_sample = self.paste_test.provider_sample;
+        #[cfg(not(test))]
+        let simulated_sample = None;
+        let (sample, device) = match simulated_sample {
+            Some(sample) => (sample, None),
+            None => {
+                let (sample, device) = sample_tty(&before.tty)?;
+                (sample, Some(device))
+            }
+        };
         let after = self
             .geometry(before.target.runtime_id, &before.target.pane)
             .await?;
-        ensure!(
-            *before == after && tty_identity(&fs::symlink_metadata(&after.tty)?)? == device,
-            "Provider sample lost its target identity"
-        );
+        ensure!(*before == after, "Provider sample lost its target identity");
+        if let Some(device) = device {
+            ensure!(
+                tty_identity(&fs::symlink_metadata(&after.tty)?)? == device,
+                "Provider sample lost its target identity"
+            );
+        }
         Ok(sample)
+    }
+
+    async fn stamp_paste(
+        &self,
+        runtime: &Runtime,
+        server: ServerGeneration,
+        identity: &PaneIdentity,
+        managed_nonce: Option<Uuid>,
+    ) -> Result<()> {
+        let mut read = self.geometry(runtime.runtime_id, &identity.pane).await?;
+        let nonce = managed_nonce.map_or_else(String::new, |nonce| {
+            format!(
+                "{nonce}:{}:{}:{}:{}",
+                identity.session, identity.window, identity.pane, identity.pid
+            )
+        });
+        ensure!(
+            read.sender_supported
+                && read.server == server
+                && read.name == runtime.tmux_name
+                && read.target.session == identity.session
+                && read.target.window == identity.window
+                && read.target.pane == identity.pane
+                && read.target.pid == identity.pid
+                && read.nonce == nonce
+                && read.epoch.is_none()
+                && read.paste_launch.is_empty()
+                && read.paste_marker.is_empty(),
+            "Paste launch provenance is unavailable"
+        );
+        let commands = self.geometry_command(&["list-commands"]).await?;
+        ensure!(
+            commands
+                .lines()
+                .any(|line| line.starts_with("paste-buffer ") && line.contains("[-dprS]"))
+                && commands
+                    .lines()
+                    .any(|line| line.starts_with("load-buffer ")),
+            "Exact paste sender is unavailable"
+        );
+        let guard = self.paste_guard(&read);
+        read.paste_launch = Uuid::new_v4().to_string();
+        let ready = read.ready_marker(None);
+        let pane = &read.target.pane;
+        let branch = format!(
+            "set-option -p -o -t {pane} {PASTE_LAUNCH_OPTION} {} ; set-option -p -o -t {pane} {PASTE_OPTION} {ready}",
+            read.paste_launch
+        );
+        self.geometry_command(&["if-shell", "-F", "-t", pane, &guard, &branch])
+            .await?;
+        Ok(())
+    }
+
+    async fn transition_marker(
+        &self,
+        from: &GeometryReadback,
+        next: &str,
+    ) -> Result<Option<GeometryReadback>> {
+        let pane = &from.target.pane;
+        let witness = Uuid::new_v4();
+        let printed = pane_witness(pane, &witness.to_string());
+        let branch = format!("set-option -p -t {pane} {PASTE_OPTION} {next} ; {printed}");
+        let rejected = format!("rs-rejected-{witness}");
+        let else_branch = rejection_witness(pane, &rejected);
+        let reply = self
+            .geometry_command(&[
+                "if-shell",
+                "-F",
+                "-t",
+                pane,
+                &self.paste_guard(from),
+                &branch,
+                &else_branch,
+            ])
+            .await;
+        if reply
+            .as_ref()
+            .is_ok_and(|reply| reply.trim_end() == rejected)
+        {
+            return Ok(None);
+        }
+        // @contract: An exact readback can resolve a lost no-effect transition reply.
+        let after = self.geometry(from.target.runtime_id, pane).await?;
+        ensure!(
+            after.same_pane(from)
+                && after.epoch == from.epoch
+                && after.sender_supported
+                && after.paste_marker == next,
+            "Paste marker transition unconfirmed"
+        );
+        Ok(Some(after))
+    }
+
+    async fn load_paste(&self, name: &str, data: &[u8]) -> Result<()> {
+        tokio::time::timeout(self.terminal_command_watchdog(), async {
+            let mut child = Command::new(&self.tmux)
+                .args(["-N", "-S"])
+                .arg(&self.socket)
+                .args(["load-buffer", "-b", name, "-"])
+                .env_remove("TMUX")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()?;
+            child
+                .stdin
+                .take()
+                .context("Paste buffer stdin unavailable")?
+                .write_all(data)
+                .await?;
+            ensure!(child.wait().await?.success(), "Paste buffer load failed");
+            Ok(())
+        })
+        .await
+        .context("Paste buffer load timed out")?
+    }
+
+    async fn delete_paste(&self, buffer: &str) {
+        let _ = self
+            .geometry_command(&["delete-buffer", "-b", buffer])
+            .await;
+    }
+
+    async fn paste_stage(
+        &self,
+        binding: PasteBinding,
+        offset: usize,
+        data: Vec<u8>,
+    ) -> PasteResult {
+        let runtime = binding.terminal.target.runtime_id;
+        let Some(lock) = self.existing_lane(runtime) else {
+            return PasteResult::Stale {};
+        };
+        let lane = lock.lock().await;
+        if lane.pending_paste.is_some() || lane.paste_quarantined {
+            return PasteResult::Unknown {};
+        }
+        let rejected = match self.scoped_geometry(&binding.terminal).await {
+            Err(_) => Some(PasteResult::Stale {}),
+            Ok(read) => match read.paste_admission_hold() {
+                Some(PasteAdmission::PriorSendUnknown) => Some(PasteResult::Unknown {}),
+                Some(PasteAdmission::Unavailable) => Some(PasteResult::Unavailable {}),
+                None if read.epoch != Some(binding.epoch) => Some(PasteResult::Stale {}),
+                None if !read.input_enabled => Some(PasteResult::Unavailable {}),
+                None => None,
+            },
+        };
+        if let Some(result) = rejected {
+            self.owners()
+                .discard_rejected_stage(&binding, self.now());
+            return result;
+        }
+        self.owners().stage(binding, offset, &data, self.now())
+    }
+
+    fn quarantine(&self, lane: &mut ResizeLane, binding: &PasteBinding) -> PasteResult {
+        lane.paste_quarantined = true;
+        self.owners()
+            .release(binding.terminal.target.runtime_id, binding.token);
+        PasteResult::Unknown {}
+    }
+
+    async fn reject_reserved(
+        &self,
+        lane: &mut ResizeLane,
+        binding: &PasteBinding,
+        held: &GeometryReadback,
+        buffer: &str,
+        result: PasteResult,
+    ) -> PasteResult {
+        let ready = held.ready_marker(held.epoch);
+        let disarmed = self.transition_marker(held, &ready).await;
+        self.delete_paste(buffer).await;
+        if matches!(disarmed, Ok(Some(_))) {
+            result
+        } else {
+            self.quarantine(lane, binding)
+        }
+    }
+
+    async fn paste_commit(&self, binding: PasteBinding, expected: usize) -> PasteResult {
+        let runtime = binding.terminal.target.runtime_id;
+        let Some(lock) = self.existing_lane(runtime) else {
+            return PasteResult::Stale {};
+        };
+        let mut lane = lock.lock().await;
+        if lane.pending_paste.is_some() || lane.paste_quarantined {
+            return PasteResult::Unknown {};
+        }
+        let Some(data) = self.owners().take_stage(&binding) else {
+            return PasteResult::Stale {};
+        };
+        if !self.owners().paste_live(&binding, self.now()) {
+            return PasteResult::Stale {};
+        }
+        if !valid_paste(&data, expected) {
+            return PasteResult::Invalid {};
+        }
+        let Ok(read) = self.scoped_geometry(&binding.terminal).await else {
+            return PasteResult::Stale {};
+        };
+        if read.epoch != Some(binding.epoch) {
+            return PasteResult::Stale {};
+        }
+        match read.paste_admission_hold() {
+            Some(PasteAdmission::PriorSendUnknown) => return self.quarantine(&mut lane, &binding),
+            Some(PasteAdmission::Unavailable) => return PasteResult::Unavailable {},
+            None => {}
+        }
+        if !read.input_enabled {
+            return PasteResult::Unavailable {};
+        }
+        let buffer = format!("rs-paste-{}", Uuid::new_v4().simple());
+        let loaded = self.load_paste(&buffer, &data).await;
+        drop(data);
+        if loaded.is_err() {
+            self.delete_paste(&buffer).await;
+            return PasteResult::Unavailable {};
+        }
+        let nonce = Uuid::new_v4();
+        let prefix = read.paste_prefix(read.epoch);
+        let suffix = format!("{nonce}~{}~{buffer}", binding.operation);
+        let armed = format!("{prefix}a~{suffix}");
+        let spent = format!("{prefix}s~{suffix}");
+        let mut held = match self.transition_marker(&read, &armed).await {
+            Ok(Some(held)) => held,
+            Ok(None) => {
+                self.delete_paste(&buffer).await;
+                return PasteResult::Stale {};
+            }
+            Err(_) => {
+                self.delete_paste(&buffer).await;
+                return self.quarantine(&mut lane, &binding);
+            }
+        };
+        #[cfg(test)]
+        self.paste_test.pause_before_admission().await;
+        let current = self.scoped_geometry(&binding.terminal).await.ok();
+        let exact = current.as_ref().filter(|read| {
+            read.same_pane(&held)
+                && read.epoch == held.epoch
+                && read.paste_marker == armed
+                && read.sender_supported
+        });
+        let send = self.guarded_paste(&held, &spent, &buffer, nonce);
+        // @invariant: The serialized monotonic check is the last admission step before submission.
+        let rejection = match exact {
+            Some(read) if self.owners().paste_live(&binding, self.now()) => {
+                (!read.input_enabled).then_some(PasteResult::Unavailable {})
+            }
+            _ => Some(PasteResult::Stale {}),
+        };
+        if let Some(rejection) = rejection {
+            return self
+                .reject_reserved(&mut lane, &binding, &held, &buffer, rejection)
+                .await;
+        }
+        match self.submit_paste(&send).await {
+            Ok(reply) if reply.trim_end() == send.rejected => {
+                self.reject_reserved(
+                    &mut lane,
+                    &binding,
+                    &held,
+                    &buffer,
+                    PasteResult::Unavailable {},
+                )
+                .await
+            }
+            Ok(reply) if reply.trim_end() == send.enqueued => {
+                if !self.owners().confirm_paste(&binding) {
+                    return self.quarantine(&mut lane, &binding);
+                }
+                let receipt = Uuid::new_v4();
+                held.paste_marker = spent;
+                lane.pending_paste = Some(PendingPaste {
+                    binding,
+                    expected: held,
+                    receipt,
+                    released: false,
+                });
+                PasteResult::Committed { receipt }
+            }
+            _ => self.quarantine(&mut lane, &binding),
+        }
+    }
+
+    fn guarded_paste(
+        &self,
+        held: &GeometryReadback,
+        spent: &str,
+        buffer: &str,
+        nonce: Uuid,
+    ) -> GuardedPaste {
+        let pane = held.target.pane.clone();
+        let guard = format_all([self.paste_guard(held), format_equal("pane_input_off", 0)]);
+        let enqueued = format!("rs-paste-enqueued-{nonce}");
+        let rejected = format!("rs-paste-rejected-{nonce}");
+        let printed = pane_witness(&pane, &enqueued);
+        let branch = format!(
+            "set-option -p -t {pane} {PASTE_OPTION} {spent} ; paste-buffer -p -r -S -d -b {buffer} -t {pane} ; {printed}"
+        );
+        let otherwise = rejection_witness(&pane, &rejected);
+        GuardedPaste {
+            pane,
+            guard,
+            branch,
+            otherwise,
+            enqueued,
+            rejected,
+        }
+    }
+
+    async fn submit_paste(&self, send: &GuardedPaste) -> Result<String> {
+        let watchdog = PASTE_WATCHDOG;
+        #[cfg(test)]
+        let watchdog = self.paste_test.send_watchdog.unwrap_or(watchdog);
+        self.bounded_command(
+            &[
+                "if-shell",
+                "-F",
+                "-t",
+                &send.pane,
+                &send.guard,
+                &send.branch,
+                &send.otherwise,
+            ],
+            watchdog,
+        )
+        .await
+    }
+
+    async fn paste_ack(&self, binding: PasteBinding, receipt: Uuid) -> PasteResult {
+        let runtime = binding.terminal.target.runtime_id;
+        let Some(lock) = self.existing_lane(runtime) else {
+            return PasteResult::Stale {};
+        };
+        let mut lane = lock.lock().await;
+        let Some(pending) = lane.pending_paste.as_ref() else {
+            return if lane.paste_quarantined {
+                PasteResult::Unknown {}
+            } else {
+                PasteResult::Stale {}
+            };
+        };
+        if pending.binding != binding || pending.receipt != receipt {
+            return PasteResult::Stale {};
+        }
+        let pending = lane.pending_paste.take().expect("matched pending paste");
+        let Ok(read) = self.scoped_geometry(&binding.terminal).await else {
+            return self.quarantine(&mut lane, &binding);
+        };
+        if !read.sender_supported
+            || !read.same_pane(&pending.expected)
+            || read.epoch != Some(binding.epoch)
+            || read.paste_marker != pending.expected.paste_marker
+        {
+            return self.quarantine(&mut lane, &binding);
+        }
+        let ready = read.ready_marker(read.epoch);
+        if !matches!(self.transition_marker(&read, &ready).await, Ok(Some(_))) {
+            return self.quarantine(&mut lane, &binding);
+        }
+        let mut owners = self.owners();
+        let writable = !pending.released
+            && owners
+                .deadline(runtime, binding.token)
+                .is_some_and(|deadline| deadline > self.now());
+        if !writable {
+            owners.release(runtime, binding.token);
+        }
+        PasteResult::Acknowledged { writable }
     }
 
     async fn rotate_epoch(
@@ -1049,18 +1699,20 @@ impl Engine {
         successor: ResizeEpoch,
     ) -> Result<GeometryReadback> {
         let conditional_absence = if from.epoch.is_none() { "-o " } else { "" };
+        let ready = from.ready_marker(Some(successor));
+        let pane = &from.target.pane;
+        let witness = pane_witness(pane, "rs-fenced");
         let branch = format!(
-            "set-option -p {conditional_absence}-t {} {EPOCH_OPTION} {} ; display-message -p rs-fenced",
-            from.target.pane,
-            epoch_text(Some(successor))
+            "set-option -p {conditional_absence}-t {pane} {EPOCH_OPTION} {} ; set-option -p -t {pane} {PASTE_OPTION} {ready} ; {witness}",
+            epoch_text(Some(successor)),
         );
         let reply = self
             .geometry_command(&[
                 "if-shell",
                 "-F",
                 "-t",
-                &from.target.pane,
-                &from.guard(from.epoch),
+                pane,
+                &self.paste_guard(from),
                 &branch,
             ])
             .await?;
@@ -1072,7 +1724,11 @@ impl Engine {
             .geometry(from.target.runtime_id, &from.target.pane)
             .await?;
         ensure!(
-            after.target == from.target && after.epoch == Some(successor) && after.tty == from.tty,
+            after.same_pane(from)
+                && after.epoch == Some(successor)
+                && after.paste_marker == ready
+                && after.paste_ready()
+                && after.sender_supported,
             "Engine epoch transition is unconfirmed"
         );
         Ok(after)
@@ -1084,17 +1740,32 @@ impl Engine {
         terminal: Option<TerminalView>,
         catalog: Option<&CatalogLane>,
     ) -> Result<Response> {
-        self.owners().unowned(runtime_id, Instant::now())?;
-        let read = match &terminal {
-            Some(terminal) => self.scoped_geometry(terminal).await?,
+        let read_scope = async || match &terminal {
+            Some(terminal) => self.scoped_geometry(terminal).await,
             None => {
                 self.geometry_for_runtime(&self.find(runtime_id).await?, catalog)
-                    .await?
+                    .await
             }
         };
-        let lane = self.lane(runtime_id);
-        let mut lane = lane.try_lock().context("Terminal mutation in progress")?;
-        self.owners().unowned(runtime_id, Instant::now())?;
+        let (lock, first_read) = match self.existing_lane(runtime_id) {
+            Some(lock) => (lock, None),
+            None => {
+                let read = read_scope().await?;
+                (self.lane(runtime_id), Some(read))
+            }
+        };
+        let mut lane = lock.try_lock().context("Terminal mutation in progress")?;
+        if lane.pending_paste.is_some() || lane.paste_quarantined {
+            return Ok(control_hold());
+        }
+        let read = match first_read {
+            Some(read) => read,
+            None => read_scope().await?,
+        };
+        if let Some(hold) = read.paste_admission_hold() {
+            return Ok(control_recovering(hold));
+        }
+        self.owners().unowned(runtime_id, self.now())?;
         let recover = lane.reconcile
             || lane
                 .confirmed
@@ -1114,7 +1785,8 @@ impl Engine {
         let native = terminal.is_some();
         let token = self
             .owners()
-            .grant(runtime_id, terminal, Some(epoch), Instant::now())?;
+            .grant(runtime_id, terminal, Some(epoch), self.now())?;
+        self.expire_writer(runtime_id, token, &lock);
         lane.confirmed = Some((after.target, epoch));
         lane.reconcile = false;
         if native {
@@ -1188,6 +1860,10 @@ impl Engine {
         let epoch = read.epoch.context("Engine epoch unavailable")?;
         ensure!(
             !lane.reconcile
+                && lane.pending_paste.is_none()
+                && !lane.paste_quarantined
+                && read.paste_ready()
+                && read.sender_supported
                 && lane
                     .confirmed
                     .as_ref()
@@ -1199,7 +1875,7 @@ impl Engine {
         let revision = read.committed.revision + 1;
         ensure!(revision <= MAX_REVISION, "Terminal revision exhausted");
         self.owners()
-            .resize(&terminal, token, epoch, sequence, Instant::now())?;
+            .resize(&terminal, token, epoch, sequence, self.now())?;
         lane.reconcile = true;
         let intent = ResizeIntent {
             epoch,
@@ -1240,6 +1916,25 @@ impl Engine {
             .context("managed runtime not found; it may have ended with the tmux service")
     }
 
+    async fn writer_geometry(
+        &self,
+        lane: &ResizeLane,
+        runtime: Uuid,
+        token: Uuid,
+    ) -> Result<GeometryReadback> {
+        let (target, epoch) = lane.confirmed.as_ref().context("Керування втрачено")?;
+        ensure!(
+            self.owners().epoch(runtime, token, self.now()) == Some(*epoch),
+            "Керування втрачено"
+        );
+        let read = self.geometry(runtime, &target.pane).await?;
+        ensure!(
+            read.target == *target && read.epoch == Some(*epoch),
+            "Input target changed"
+        );
+        Ok(read)
+    }
+
     pub(crate) async fn handle(
         &self,
         request: Request,
@@ -1274,10 +1969,14 @@ impl Engine {
                 self.owners().revoke(runtime_id);
                 let cwd = cwd.canonicalize()?;
                 let name = tmux_name(session_id, runtime_id);
+                let server = self.generation().await?;
                 // More than one command argument makes tmux use direct exec, not sh -c.
                 let mut args = vec![
                     "new-session",
                     "-d",
+                    "-P",
+                    "-F",
+                    RECEIPT_FORMAT,
                     "-s",
                     &name,
                     "-c",
@@ -1290,7 +1989,7 @@ impl Engine {
                     "/usr/bin/env",
                 ];
                 args.extend(argv.iter().map(String::as_str));
-                self.command(&args).await?;
+                let receipt = self.command(&args).await?;
                 let label = Path::new(&argv[0])
                     .file_name()
                     .and_then(|s| s.to_str())
@@ -1298,9 +1997,12 @@ impl Engine {
                 let target = format!("={name}:0.0");
                 self.command(&["set-option", "-t", &target, "@rs_command", label])
                     .await?;
-                Ok(Response::Created {
-                    runtime: self.find(runtime_id).await?,
-                })
+                let runtime = self.find(runtime_id).await?;
+                let fields: Vec<_> = receipt.trim_end().split('|').collect();
+                if let Some(identity) = pane_identity(&fields) {
+                    let _ = self.stamp_paste(&runtime, server, &identity, None).await;
+                }
+                Ok(Response::Created { runtime })
             }
             Request::Snapshot { runtime_id } => {
                 let runtime = self.find(runtime_id).await?;
@@ -1367,13 +2069,59 @@ impl Engine {
                 size,
             } => self.resize_terminal(terminal, token, sequence, size).await,
             Request::Renew { runtime_id, token } => {
-                self.owners().renew(runtime_id, token, Instant::now())?;
+                let lock = self
+                    .existing_lane(runtime_id)
+                    .context("Керування втрачено")?;
+                let lane = lock.lock().await;
+                if lane.pending_paste.is_some() || lane.paste_quarantined {
+                    return Ok(control_hold());
+                }
+                let checked = self.writer_geometry(&lane, runtime_id, token).await;
+                if let Err(error) = checked {
+                    self.owners().release(runtime_id, token);
+                    return Err(error);
+                }
+                let read = checked?;
+                if let Some(hold) = read.paste_admission_hold() {
+                    self.owners().release(runtime_id, token);
+                    return Ok(control_recovering(hold));
+                }
+                let mut owners = self.owners();
+                if let Err(error) = owners.renew(runtime_id, token, self.now()) {
+                    owners.release(runtime_id, token);
+                    return Err(error);
+                }
                 Ok(Response::Accepted {})
             }
             Request::Release { runtime_id, token } => {
-                self.owners().release(runtime_id, token);
+                let Some(lock) = self.existing_lane(runtime_id) else {
+                    return Ok(Response::Accepted {});
+                };
+                let mut lane = lock.lock().await;
+                if let Some(pending) = lane
+                    .pending_paste
+                    .as_mut()
+                    .filter(|pending| pending.binding.token == token)
+                {
+                    pending.released = true;
+                } else {
+                    self.owners().release(runtime_id, token);
+                }
                 Ok(Response::Accepted {})
             }
+            Request::PasteStage {
+                binding,
+                offset,
+                data,
+            } => Ok(Response::Paste {
+                paste: self.paste_stage(binding, offset, data).await,
+            }),
+            Request::PasteCommit { binding, bytes } => Ok(Response::Paste {
+                paste: self.paste_commit(binding, bytes).await,
+            }),
+            Request::PasteAck { binding, receipt } => Ok(Response::Paste {
+                paste: self.paste_ack(binding, receipt).await,
+            }),
             Request::Input {
                 runtime_id,
                 token,
@@ -1381,63 +2129,47 @@ impl Engine {
                 data,
                 paste,
             } => {
+                if paste {
+                    return Ok(Response::PasteUnavailable {});
+                }
                 ensure!(
-                    !data.is_empty() && data.len() <= 4096,
+                    (1..=INPUT_CHUNK_LIMIT).contains(&data.len()),
                     "Input must contain 1..4096 bytes"
                 );
-                let lane = self.lane(runtime_id);
-                let _mutation = lane.lock().await;
-                let runtime = self.find(runtime_id).await?;
-                ensure!(!runtime.exited, "Runtime has exited");
-                if let Some(terminal) = self.owners().terminal(runtime_id, token) {
-                    ensure!(
-                        runtime.pane_id == terminal.target.pane
-                            && runtime.pane_pid == Some(terminal.target.pid)
-                            && process_start(terminal.target.pid)? == terminal.target.process_start,
-                        "Input target changed"
-                    );
+                let lock = self
+                    .existing_lane(runtime_id)
+                    .context("Керування втрачено")?;
+                let lane = lock.lock().await;
+                if lane.pending_paste.is_some() || lane.paste_quarantined {
+                    return Ok(control_hold());
                 }
-                self.owners()
-                    .input(runtime_id, token, sequence, Instant::now())?;
-                // Hex arguments cannot become tmux keys, command separators or shell code.
-                let target = format!("={}:0.0", runtime.tmux_name);
-                if paste {
-                    let buffer = format!("rs-input-{}", Uuid::new_v4().simple());
-                    let loaded: Result<()> = tokio::time::timeout(Duration::from_secs(3), async {
-                        let mut child = Command::new(&self.tmux)
-                            .args(["-N", "-S"])
-                            .arg(&self.socket)
-                            .args(["load-buffer", "-b", &buffer, "-"])
-                            .env_remove("TMUX")
-                            .stdin(Stdio::piped())
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .kill_on_drop(true)
-                            .spawn()?;
-                        child
-                            .stdin
-                            .take()
-                            .context("buffer stdin unavailable")?
-                            .write_all(&data)
-                            .await?;
-                        ensure!(child.wait().await?.success(), "paste buffer load failed");
-                        self.command(&["paste-buffer", "-p", "-d", "-b", &buffer, "-t", &target])
-                            .await?;
-                        Ok(())
-                    })
-                    .await
-                    .context("paste timed out; do not retry")
-                    .and_then(|result| result);
-                    if loaded.is_err() {
-                        let _ = self.command(&["delete-buffer", "-b", &buffer]).await;
-                    }
-                    loaded?;
-                    return Ok(Response::Accepted {});
+                let read = self.writer_geometry(&lane, runtime_id, token).await?;
+                if let Some(hold) = read.paste_admission_hold() {
+                    return Ok(control_recovering(hold));
                 }
-                let hex: Vec<String> = data.iter().map(|byte| format!("{byte:02x}")).collect();
-                let mut args = vec!["send-keys", "-H", "-t", &target];
-                args.extend(hex.iter().map(String::as_str));
-                self.command(&args).await?;
+                ensure!(read.input_enabled, "Terminal input is disabled");
+                let guard =
+                    format_all([self.paste_guard(&read), format_equal("pane_input_off", 0)]);
+                let pane = &read.target.pane;
+                let mut branch = format!("send-keys -H -t {pane}");
+                for byte in data {
+                    use std::fmt::Write;
+                    write!(branch, " {byte:02x}").expect("write to string");
+                }
+                branch.push_str(" ; ");
+                branch.push_str(&pane_witness(pane, "rs-input-accepted"));
+                {
+                    let mut owners = self.owners();
+                    owners.input(runtime_id, token, sequence, self.now())?;
+                    owners.discard_stage(runtime_id, token);
+                }
+                let reply = self
+                    .command(&["if-shell", "-F", "-t", pane, &guard, &branch])
+                    .await?;
+                ensure!(
+                    reply.trim_end() == "rs-input-accepted",
+                    "Input target changed"
+                );
                 Ok(Response::Accepted {})
             }
             Request::Stop {
@@ -1492,7 +2224,902 @@ fn validate_launch(cwd: &Path, argv: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::w1_resize_tests::Fixture;
     use super::*;
+
+    const DRAFT: &[u8] = "Україна\n日本語\t🙂".as_bytes();
+    fn file(f: &Fixture, name: &str) -> Vec<u8> {
+        fs::read(f.temp.path().join(name)).unwrap_or_default()
+    }
+
+    fn text(f: &Fixture, name: &str) -> String {
+        String::from_utf8(file(f, name)).unwrap()
+    }
+
+    fn set(f: &Fixture, name: &str, value: &str) {
+        fs::write(f.temp.path().join(name), value).unwrap();
+    }
+
+    async fn witness(f: &Fixture, name: &str) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while file(f, name).is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("missing pane fixture witness {name}"));
+    }
+
+    fn set_clock(engine: &Engine, now: Instant) {
+        *engine.paste_test.now.lock().unwrap() = Some(now);
+    }
+
+    async fn writer(f: &Fixture) -> PasteBinding {
+        f.engine
+            .paste_test
+            .now
+            .lock()
+            .unwrap()
+            .get_or_insert_with(Instant::now);
+        let (token, epoch) = f.acquire(f.terminal.clone()).await;
+        PasteBinding {
+            terminal: f.terminal.clone(),
+            token,
+            epoch,
+            incarnation: Uuid::new_v4(),
+            operation: 1,
+            sequence: 0,
+        }
+    }
+
+    async fn paste_reply(engine: &Engine, request: Request) -> PasteResult {
+        match engine.handle(request, None).await.unwrap() {
+            Response::Paste { paste } => paste,
+            response => panic!("Expected a paste result, got {response:?}"),
+        }
+    }
+
+    async fn stage(f: &Fixture, binding: &PasteBinding, data: &[u8]) {
+        for (chunk, bytes) in data.chunks(INPUT_CHUNK_LIMIT).enumerate() {
+            assert_eq!(
+                paste_reply(
+                    &f.engine,
+                    Request::PasteStage {
+                        binding: binding.clone(),
+                        offset: chunk * INPUT_CHUNK_LIMIT,
+                        data: bytes.into(),
+                    }
+                )
+                .await,
+                PasteResult::Staged {}
+            );
+        }
+    }
+
+    fn commit(binding: &PasteBinding, bytes: usize) -> Request {
+        Request::PasteCommit {
+            binding: binding.clone(),
+            bytes,
+        }
+    }
+
+    fn ack(binding: &PasteBinding, receipt: Uuid) -> Request {
+        Request::PasteAck {
+            binding: binding.clone(),
+            receipt,
+        }
+    }
+
+    fn receipt(result: PasteResult) -> Uuid {
+        match result {
+            PasteResult::Committed { receipt } => receipt,
+            other => panic!("Expected enqueue witness, got {other:?}"),
+        }
+    }
+
+    fn ordinary(binding: &PasteBinding, sequence: u64) -> Request {
+        Request::Input {
+            runtime_id: binding.terminal.target.runtime_id,
+            token: binding.token,
+            sequence,
+            data: vec![b'K'],
+            paste: false,
+        }
+    }
+
+    fn release(binding: &PasteBinding) -> Request {
+        Request::Release {
+            runtime_id: binding.terminal.target.runtime_id,
+            token: binding.token,
+        }
+    }
+
+    fn acquire_requests(terminal: &TerminalView) -> [Request; 2] {
+        [
+            Request::Acquire {
+                runtime_id: terminal.target.runtime_id,
+            },
+            Request::AcquireTerminal {
+                terminal: terminal.clone(),
+            },
+        ]
+    }
+
+    fn spawn_request(
+        engine: &Arc<Engine>,
+        request: Request,
+    ) -> tokio::task::JoinHandle<Result<Response>> {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.handle(request, None).await })
+    }
+
+    fn spawn_commit(f: &Fixture, binding: &PasteBinding) -> tokio::task::JoinHandle<PasteResult> {
+        let engine = f.engine.clone();
+        let request = commit(binding, DRAFT.len());
+        tokio::spawn(async move { paste_reply(&engine, request).await })
+    }
+
+    async fn park_at_admission(
+        f: &Fixture,
+        binding: &PasteBinding,
+    ) -> (Arc<PasteBarrier>, tokio::task::JoinHandle<PasteResult>) {
+        stage(f, binding, DRAFT).await;
+        let barrier = Arc::new(PasteBarrier::default());
+        *f.engine.paste_test.admission.lock().unwrap() = Some(barrier.clone());
+        let committed = spawn_commit(f, binding);
+        tokio::time::timeout(Duration::from_secs(3), barrier.reached.notified())
+            .await
+            .unwrap();
+        assert!(text(f, "marker").contains("~a~"));
+        assert!(file(f, "submissions").is_empty());
+        (barrier, committed)
+    }
+
+    async fn assert_held(engine: &Engine, binding: &PasteBinding) {
+        for request in acquire_requests(&binding.terminal) {
+            assert!(matches!(
+                engine.handle(request, None).await.unwrap(),
+                Response::ControlRecovering {
+                    paste_admission: PasteAdmission::PriorSendUnknown
+                }
+            ));
+        }
+        assert!(matches!(
+            engine
+                .handle(ordinary(binding, binding.sequence), None)
+                .await,
+            Ok(Response::ControlRecovering { .. }) | Err(_)
+        ));
+        let next = PasteBinding {
+            operation: binding.operation + 1,
+            ..binding.clone()
+        };
+        assert_eq!(
+            paste_reply(
+                engine,
+                Request::PasteStage {
+                    binding: next.clone(),
+                    offset: 0,
+                    data: DRAFT.into(),
+                }
+            )
+            .await,
+            PasteResult::Unknown {}
+        );
+        assert!(matches!(
+            paste_reply(engine, commit(&next, DRAFT.len())).await,
+            PasteResult::Unknown {} | PasteResult::Stale {}
+        ));
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_paste_staged_contract() {
+        let f = Fixture::paste();
+        let mut b = writer(&f).await;
+        let mut expected = Vec::new();
+        for bracketed in [false, true] {
+            set(&f, "bracketed", if bracketed { "1" } else { "" });
+            for data in [
+                DRAFT.to_vec(),
+                [vec![b'x'; INPUT_CHUNK_LIMIT - 1], DRAFT.into()].concat(),
+            ] {
+                stage(&f, &b, &data).await;
+                let r = receipt(paste_reply(&f.engine, commit(&b, data.len())).await);
+                if bracketed {
+                    expected.extend_from_slice(b"\x1b[200~");
+                }
+                expected.extend_from_slice(&data);
+                if bracketed {
+                    expected.extend_from_slice(b"\x1b[201~");
+                }
+                assert_eq!(file(&f, "pane0-bytes"), expected);
+                assert_eq!(f.engine.owners().input_sequence(&b), Some(b.sequence + 1));
+                assert!(text(&f, "marker").contains("~s~"));
+                assert!(!f.temp.path().join(text(&f, "last-load")).exists());
+                assert!(!text(&f, "last-effect-command").contains("Україна"));
+                let held = text(&f, "marker");
+                for stale in [
+                    PasteBinding {
+                        incarnation: Uuid::new_v4(),
+                        ..b.clone()
+                    },
+                    PasteBinding {
+                        operation: b.operation + 1,
+                        ..b.clone()
+                    },
+                ] {
+                    assert_eq!(
+                        paste_reply(&f.engine, ack(&stale, r)).await,
+                        PasteResult::Stale {}
+                    );
+                }
+                assert_eq!(
+                    paste_reply(&f.engine, ack(&b, Uuid::new_v4())).await,
+                    PasteResult::Stale {}
+                );
+                assert_eq!(text(&f, "marker"), held);
+                assert_eq!(
+                    paste_reply(&f.engine, ack(&b, r)).await,
+                    PasteResult::Acknowledged { writable: true }
+                );
+                assert!(text(&f, "marker").contains("~r~"));
+                assert_ne!(text(&f, "marker"), held);
+                b.operation += 1;
+                b.sequence += 1;
+            }
+        }
+        set(&f, "last-load", "");
+        for invalid in [
+            b"\xff".as_slice(),
+            b"[draft]\x1b".as_slice(),
+            b"\r".as_slice(),
+        ] {
+            stage(&f, &b, invalid).await;
+            assert_eq!(
+                paste_reply(&f.engine, commit(&b, invalid.len())).await,
+                PasteResult::Invalid {}
+            );
+            assert_eq!(
+                paste_reply(&f.engine, commit(&b, invalid.len())).await,
+                PasteResult::Stale {}
+            );
+            b.operation += 1;
+        }
+        for bad in [
+            (INPUT_CHUNK_LIMIT + 1, vec![b'a']),
+            (1, vec![b'a'; INPUT_CHUNK_LIMIT + 1]),
+            (1, Vec::new()),
+        ] {
+            stage(&f, &b, b"x").await;
+            assert_eq!(
+                paste_reply(
+                    &f.engine,
+                    Request::PasteStage {
+                        binding: b.clone(),
+                        offset: bad.0,
+                        data: bad.1,
+                    }
+                )
+                .await,
+                PasteResult::Invalid {}
+            );
+            assert_eq!(
+                paste_reply(&f.engine, commit(&b, 1)).await,
+                PasteResult::Stale {}
+            );
+            b.operation += 1;
+        }
+        for (offset, expected) in [(1, PasteResult::Invalid {}), (0, PasteResult::Stale {})] {
+            assert_eq!(
+                paste_reply(
+                    &f.engine,
+                    Request::PasteStage {
+                        binding: b.clone(),
+                        offset,
+                        data: DRAFT.into(),
+                    }
+                )
+                .await,
+                expected
+            );
+        }
+        assert_eq!(
+            paste_reply(&f.engine, commit(&b, DRAFT.len())).await,
+            PasteResult::Stale {}
+        );
+        b.operation += 1;
+        stage(&f, &b, &vec![b'x'; PASTE_LIMIT]).await;
+        assert_eq!(
+            paste_reply(
+                &f.engine,
+                Request::PasteStage {
+                    binding: b.clone(),
+                    offset: PASTE_LIMIT,
+                    data: vec![b'y'],
+                }
+            )
+            .await,
+            PasteResult::Invalid {}
+        );
+        b.operation += 1;
+        set(&f, "unsupported", "1");
+        assert_eq!(
+            paste_reply(
+                &f.engine,
+                Request::PasteStage {
+                    binding: b.clone(),
+                    offset: 0,
+                    data: DRAFT.into(),
+                }
+            )
+            .await,
+            PasteResult::Unavailable {}
+        );
+        assert_eq!(
+            paste_reply(&f.engine, commit(&b, DRAFT.len())).await,
+            PasteResult::Stale {}
+        );
+
+        set(&f, "unsupported", "");
+        assert_eq!(
+            paste_reply(
+                &f.engine,
+                Request::PasteStage {
+                    binding: b.clone(),
+                    offset: 0,
+                    data: DRAFT.into(),
+                }
+            )
+            .await,
+            PasteResult::Stale {}
+        );
+        assert_eq!(
+            paste_reply(&f.engine, commit(&b, DRAFT.len())).await,
+            PasteResult::Stale {}
+        );
+        assert_eq!(f.engine.owners().input_sequence(&b), Some(b.sequence));
+        b.operation += 1;
+        stage(&f, &b, &DRAFT[..1]).await;
+        let mut wrong_target = b.clone();
+        wrong_target.terminal.target.process_start += 1;
+        assert_eq!(
+            paste_reply(
+                &f.engine,
+                Request::PasteStage {
+                    binding: wrong_target,
+                    offset: 1,
+                    data: DRAFT[1..].into(),
+                }
+            )
+            .await,
+            PasteResult::Stale {}
+        );
+        assert_eq!(
+            paste_reply(
+                &f.engine,
+                Request::PasteStage {
+                    binding: b.clone(),
+                    offset: 1,
+                    data: DRAFT[1..].into(),
+                }
+            )
+            .await,
+            PasteResult::Staged {}
+        );
+        let wrong_sequence = PasteBinding {
+            sequence: b.sequence + 1,
+            ..b.clone()
+        };
+        let unrelated = PasteBinding {
+            incarnation: Uuid::new_v4(),
+            ..wrong_sequence.clone()
+        };
+        assert_eq!(
+            paste_reply(&f.engine, commit(&unrelated, DRAFT.len())).await,
+            PasteResult::Stale {}
+        );
+        assert_eq!(f.engine.owners().input_sequence(&b), Some(b.sequence));
+        assert_eq!(
+            paste_reply(&f.engine, commit(&wrong_sequence, DRAFT.len())).await,
+            PasteResult::Stale {}
+        );
+        assert_eq!(f.engine.owners().input_sequence(&b), None);
+        assert!(f.engine.owners().take_stage(&b).is_none());
+        assert!(
+            f.engine
+                .handle(ordinary(&b, b.sequence), None)
+                .await
+                .is_err()
+        );
+        assert!(file(&f, "last-load").is_empty());
+        assert_eq!(file(&f, "submissions"), b"1111");
+        assert_eq!(file(&f, "effects"), b"1111");
+        assert_eq!(file(&f, "pane0-bytes"), expected);
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_paste_expiry_before_admission() {
+        for over in [Duration::ZERO, Duration::from_millis(1)] {
+            let f = Fixture::paste();
+            let now = Instant::now();
+            set_clock(&f.engine, now);
+            let b = writer(&f).await;
+            let (barrier, task) = park_at_admission(&f, &b).await;
+            set_clock(&f.engine, now + INPUT_LEASE_TTL + over);
+            barrier.proceed.notify_one();
+            assert_eq!(task.await.unwrap(), PasteResult::Stale {});
+            assert!(text(&f, "marker").contains("~r~"));
+            assert!(file(&f, "submissions").is_empty());
+            assert!(file(&f, "pane0-bytes").is_empty());
+            assert_eq!(f.engine.owners().input_sequence(&b), Some(0));
+            assert!(f.engine.owners().take_stage(&b).is_none());
+            assert_eq!(
+                paste_reply(&f.engine, commit(&b, DRAFT.len())).await,
+                PasteResult::Stale {}
+            );
+            assert!(matches!(
+                f.engine.handle(release(&b), None).await.unwrap(),
+                Response::Accepted {}
+            ));
+            let successor = writer(&f).await;
+            assert!(matches!(
+                f.engine
+                    .handle(ordinary(&successor, 0), None)
+                    .await
+                    .unwrap(),
+                Response::Accepted {}
+            ));
+            assert_eq!(file(&f, "pane0-bytes"), b"K");
+        }
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_paste_pre_submission_rejection() {
+        for (field, value) in [
+            ("scope", "wrong".into()),
+            (
+                "epoch",
+                epoch_text(Some(ResizeEpoch {
+                    agent: Uuid::new_v4(),
+                    owner: Uuid::new_v4(),
+                })),
+            ),
+            ("marker", "wrong nonce".into()),
+        ] {
+            let f = Fixture::paste();
+            let b = writer(&f).await;
+            let (barrier, task) = park_at_admission(&f, &b).await;
+            set(&f, field, &value);
+            barrier.proceed.notify_one();
+            assert_eq!(task.await.unwrap(), PasteResult::Unknown {});
+            assert!(file(&f, "submissions").is_empty());
+            assert!(file(&f, "pane0-bytes").is_empty());
+        }
+        let f = Fixture::paste();
+        let b = writer(&f).await;
+        let (barrier, task) = park_at_admission(&f, &b).await;
+        set(&f, "input-off", "1");
+        barrier.proceed.notify_one();
+        assert_eq!(task.await.unwrap(), PasteResult::Unavailable {});
+        assert!(file(&f, "submissions").is_empty());
+        assert!(file(&f, "pane0-bytes").is_empty());
+        assert!(text(&f, "marker").contains("~r~"));
+        assert_eq!(f.engine.owners().input_sequence(&b), Some(0));
+        assert!(f.engine.owners().take_stage(&b).is_none());
+        set(&f, "input-off", "");
+        assert!(matches!(
+            f.engine.handle(ordinary(&b, 0), None).await.unwrap(),
+            Response::Accepted {}
+        ));
+        assert_eq!(file(&f, "pane0-bytes"), b"K");
+
+        let f = Fixture::paste();
+        let b = writer(&f).await;
+        stage(&f, &b, DRAFT).await;
+        set(&f, "paste-mode", "reject");
+        assert_eq!(
+            paste_reply(&f.engine, commit(&b, DRAFT.len())).await,
+            PasteResult::Unavailable {}
+        );
+        assert_eq!(file(&f, "submissions"), b"1");
+        assert!(file(&f, "effects").is_empty());
+        assert!(file(&f, "pane0-bytes").is_empty());
+        assert!(matches!(
+            f.engine.handle(ordinary(&b, 0), None).await.unwrap(),
+            Response::Accepted {}
+        ));
+        f.engine.handle(release(&b), None).await.unwrap();
+        let successor = writer(&f).await;
+        assert!(matches!(
+            f.engine
+                .handle(ordinary(&successor, 0), None)
+                .await
+                .unwrap(),
+            Response::Accepted {}
+        ));
+        assert_eq!(file(&f, "pane0-bytes"), b"KK");
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_paste_expiry_in_flight() {
+        for (mode, parked, gate) in [
+            ("late", "server-parked", "allow-effect"),
+            ("hold-reply", "effects", "allow-reply"),
+        ] {
+            let f = Fixture::paste();
+            let now = Instant::now();
+            set_clock(&f.engine, now);
+            let b = writer(&f).await;
+            stage(&f, &b, DRAFT).await;
+            set(&f, "paste-mode", mode);
+            let task = spawn_commit(&f, &b);
+            witness(&f, parked).await;
+            assert!(!task.is_finished());
+            if mode == "late" {
+                assert!(file(&f, "pane0-bytes").is_empty());
+            }
+            set_clock(&f.engine, now + INPUT_LEASE_TTL + Duration::from_secs(1));
+            set(&f, gate, "1");
+            let r = receipt(task.await.unwrap());
+            assert_eq!(file(&f, "pane0-bytes"), DRAFT);
+            assert!(file(&f, "pane1-bytes").is_empty());
+            assert_eq!(file(&f, "submissions"), b"1");
+            assert_held(&f.engine, &b).await;
+            assert_eq!(
+                paste_reply(&f.engine, ack(&b, r)).await,
+                PasteResult::Acknowledged { writable: false }
+            );
+            assert!(f.engine.handle(ordinary(&b, 1), None).await.is_err());
+            let successor = writer(&f).await;
+            assert_ne!(successor.epoch, b.epoch);
+        }
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_paste_handoff_serialization() {
+        for mode in ["late", "reject", "timeout-after"] {
+            let f = Fixture::paste();
+            let now = Instant::now();
+            set_clock(&f.engine, now);
+            let b = writer(&f).await;
+            stage(&f, &b, DRAFT).await;
+            set(
+                &f,
+                "paste-mode",
+                if mode == "reject" { "late" } else { mode },
+            );
+            let task = spawn_commit(&f, &b);
+            let parked = if mode == "timeout-after" {
+                "effects"
+            } else {
+                "server-parked"
+            };
+            witness(&f, parked).await;
+            assert_eq!(file(&f, "submissions"), b"1");
+            set_clock(&f.engine, now + INPUT_LEASE_TTL + Duration::from_millis(1));
+            let first = text(&f, "epoch");
+            for request in acquire_requests(&b.terminal) {
+                assert!(f.engine.handle(request, None).await.is_err());
+            }
+            let releasing = spawn_request(&f.engine, release(&b));
+            let renewing = spawn_request(
+                &f.engine,
+                Request::Renew {
+                    runtime_id: b.terminal.target.runtime_id,
+                    token: b.token,
+                },
+            );
+            let writing = spawn_request(&f.engine, ordinary(&b, 0));
+            let pasting = spawn_request(
+                &f.engine,
+                Request::PasteStage {
+                    binding: PasteBinding {
+                        operation: 2,
+                        ..b.clone()
+                    },
+                    offset: 0,
+                    data: DRAFT.into(),
+                },
+            );
+            tokio::task::yield_now().await;
+            assert!(
+                !releasing.is_finished()
+                    && !renewing.is_finished()
+                    && !writing.is_finished()
+                    && !pasting.is_finished()
+            );
+            assert_eq!(text(&f, "epoch"), first);
+            if mode == "reject" {
+                set(&f, "paste-mode", "reject");
+            }
+            set(&f, "allow-effect", "1");
+            let outcome = task.await.unwrap();
+            assert!(matches!(
+                releasing.await.unwrap().unwrap(),
+                Response::Accepted {}
+            ));
+            assert!(matches!(
+                writing.await.unwrap(),
+                Ok(Response::ControlRecovering { .. }) | Err(_)
+            ));
+            assert!(matches!(
+                renewing.await.unwrap(),
+                Ok(Response::ControlRecovering { .. }) | Err(_)
+            ));
+            assert!(matches!(
+                pasting.await.unwrap().unwrap(),
+                Response::Paste {
+                    paste: PasteResult::Unknown {} | PasteResult::Stale {}
+                }
+            ));
+            assert_eq!(text(&f, "epoch"), first);
+            if mode == "timeout-after" {
+                assert_eq!(outcome, PasteResult::Unknown {});
+                assert_held(&f.engine, &b).await;
+                assert_eq!(file(&f, "pane0-bytes"), DRAFT);
+                continue;
+            }
+            let expected = if mode == "reject" {
+                assert_eq!(outcome, PasteResult::Unavailable {});
+                b"K".to_vec()
+            } else {
+                assert_held(&f.engine, &b).await;
+                assert_eq!(
+                    paste_reply(&f.engine, ack(&b, receipt(outcome))).await,
+                    PasteResult::Acknowledged { writable: false }
+                );
+                [DRAFT, b"K"].concat()
+            };
+            let successor = writer(&f).await;
+            assert!(matches!(
+                f.engine
+                    .handle(ordinary(&successor, 0), None)
+                    .await
+                    .unwrap(),
+                Response::Accepted {}
+            ));
+            assert_eq!(file(&f, "pane0-bytes"), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_paste_timeout_quarantine() {
+        for mode in ["timeout-before", "timeout-after"] {
+            let f = Fixture::with_paste_watchdog(Duration::from_secs(2));
+            let b = writer(&f).await;
+            stage(&f, &b, DRAFT).await;
+            set(&f, "paste-mode", mode);
+            let task = spawn_commit(&f, &b);
+            let parked = if mode == "timeout-before" {
+                "server-parked"
+            } else {
+                "effects"
+            };
+            let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+                witness(&f, parked).await;
+                task.await.unwrap()
+            })
+            .await
+            .unwrap();
+            assert_eq!(outcome, PasteResult::Unknown {});
+            assert_held(&f.engine, &b).await;
+            assert_eq!(file(&f, "submissions"), b"1");
+            let held = text(&f, "marker");
+            if mode == "timeout-before" {
+                assert!(held.contains("~a~"));
+                assert!(file(&f, "pane0-bytes").is_empty());
+                assert!(f.temp.path().join(text(&f, "last-load")).exists());
+                set(&f, "allow-effect", "1");
+                witness(&f, "late-result").await;
+            } else {
+                assert!(held.contains("~s~"));
+                set(&f, "allow-reply", "1");
+            }
+            assert_eq!(file(&f, "pane0-bytes"), DRAFT);
+            assert!(text(&f, "marker").contains("~s~"));
+            assert_held(&f.engine, &b).await;
+            assert_eq!(file(&f, "submissions"), b"1");
+        }
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_paste_restart_quarantine() {
+        for (mode, parked) in [("late", "server-parked"), ("hold-reply", "effects")] {
+            let f = Fixture::paste();
+            let now = Instant::now();
+            set_clock(&f.engine, now);
+            let b = writer(&f).await;
+            stage(&f, &b, DRAFT).await;
+            set(&f, "paste-mode", mode);
+            let task = spawn_commit(&f, &b);
+            witness(&f, parked).await;
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            let (engine, terminal) = f.restart();
+            set_clock(&engine, now + INPUT_LEASE_TTL + Duration::from_secs(1));
+            let successor = PasteBinding {
+                terminal,
+                ..b.clone()
+            };
+            assert!(text(&f, "marker").contains(if mode == "late" { "~a~" } else { "~s~" }));
+            let held = text(&f, "marker");
+            set(&f, "unsupported", "1");
+            assert_held(&engine, &successor).await;
+            assert_eq!(text(&f, "marker"), held);
+            assert_eq!(file(&f, "submissions"), b"1");
+            set(&f, "unsupported", "");
+            assert_held(&engine, &successor).await;
+            assert!(
+                engine
+                    .handle(
+                        Request::ResizeTerminal {
+                            terminal: successor.terminal.clone(),
+                            token: successor.token,
+                            sequence: 0,
+                            size: TerminalSize {
+                                cols: 104,
+                                rows: 24
+                            },
+                        },
+                        None
+                    )
+                    .await
+                    .is_err()
+            );
+            engine.handle(release(&successor), None).await.unwrap();
+            if mode == "late" {
+                set(&f, "allow-effect", "1");
+                witness(&f, "late-result").await;
+            }
+            assert_eq!(file(&f, "pane0-bytes"), DRAFT);
+            assert!(file(&f, "pane1-bytes").is_empty());
+            assert!(text(&f, "marker").contains("~s~"));
+            assert_held(&engine, &successor).await;
+        }
+
+        let fresh = Fixture::paste();
+        let b = writer(&fresh).await;
+        stage(&fresh, &b, DRAFT).await;
+        let r = receipt(paste_reply(&fresh.engine, commit(&b, DRAFT.len())).await);
+        set(&fresh, "ack-reply", "after");
+        assert_eq!(
+            paste_reply(&fresh.engine, ack(&b, r)).await,
+            PasteResult::Acknowledged { writable: true }
+        );
+        let (engine, terminal) = fresh.restart();
+        let Response::TerminalControl { token, epoch } = engine
+            .handle(
+                Request::AcquireTerminal {
+                    terminal: terminal.clone(),
+                },
+                None,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("acknowledged pane should admit a restart grant");
+        };
+        let successor = PasteBinding {
+            terminal: terminal.clone(),
+            token,
+            epoch,
+            ..b.clone()
+        };
+        assert!(matches!(
+            engine.handle(ordinary(&successor, 0), None).await.unwrap(),
+            Response::Accepted {}
+        ));
+        assert_eq!(file(&fresh, "pane0-bytes"), [DRAFT, b"K"].concat());
+        let ready = text(&fresh, "marker");
+        for marker in [
+            String::new(),
+            "v1~bad".into(),
+            ready.replace(
+                &b.terminal.target.runtime_id.to_string(),
+                &Uuid::new_v4().to_string(),
+            ),
+            ready.replace(&epoch.owner.to_string(), &b.epoch.owner.to_string()),
+        ] {
+            set(&fresh, "marker", &marker);
+            let (engine, terminal) = fresh.restart();
+            for request in acquire_requests(&terminal) {
+                assert!(matches!(
+                    engine.handle(request, None).await.unwrap(),
+                    Response::ControlRecovering {
+                        paste_admission: PasteAdmission::PriorSendUnknown
+                    }
+                ));
+            }
+        }
+        let unresolved = Fixture::paste();
+        let b = writer(&unresolved).await;
+        stage(&unresolved, &b, DRAFT).await;
+        let r = receipt(paste_reply(&unresolved.engine, commit(&b, DRAFT.len())).await);
+        set(&unresolved, "ack-reply", "before");
+        assert_eq!(
+            paste_reply(&unresolved.engine, ack(&b, r)).await,
+            PasteResult::Unknown {}
+        );
+        let (engine, terminal) = unresolved.restart();
+        assert_held(&engine, &PasteBinding { terminal, ..b }).await;
+        assert_eq!(file(&unresolved, "pane0-bytes"), DRAFT);
+
+        let changed = Fixture::paste();
+        let b = writer(&changed).await;
+        stage(&changed, &b, DRAFT).await;
+        let r = receipt(paste_reply(&changed.engine, commit(&b, DRAFT.len())).await);
+        let marker = text(&changed, "marker");
+        let launch = text(&changed, "launch");
+        set(&changed, "launch", &Uuid::new_v4().to_string());
+        assert_eq!(
+            paste_reply(&changed.engine, ack(&b, r)).await,
+            PasteResult::Unknown {}
+        );
+        assert_eq!(text(&changed, "marker"), marker);
+        set(&changed, "launch", &launch);
+        let (engine, terminal) = changed.restart();
+        assert_held(&engine, &PasteBinding { terminal, ..b }).await;
+        assert_eq!(file(&changed, "pane0-bytes"), DRAFT);
+        assert_eq!(file(&changed, "submissions"), b"1");
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_paste_no_replay() {
+        let f = Fixture::paste();
+        let b = writer(&f).await;
+        stage(&f, &b, DRAFT).await;
+        let r = receipt(paste_reply(&f.engine, commit(&b, DRAFT.len())).await);
+        let args: Vec<String> = serde_json::from_str(&text(&f, "last-effect-command")).unwrap();
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let reply = f.engine.geometry_command(&args).await.unwrap();
+        assert_eq!(
+            reply.trim(),
+            args[5]
+                .split_whitespace()
+                .last()
+                .unwrap()
+                .replace("enqueued", "rejected")
+        );
+        assert_eq!(file(&f, "effects"), b"1");
+        assert_eq!(
+            paste_reply(&f.engine, ack(&b, r)).await,
+            PasteResult::Acknowledged { writable: true }
+        );
+        assert_eq!(
+            paste_reply(&f.engine, commit(&b, DRAFT.len())).await,
+            PasteResult::Stale {}
+        );
+        assert_eq!(
+            paste_reply(&f.engine, ack(&b, r)).await,
+            PasteResult::Stale {}
+        );
+        f.engine.handle(release(&b), None).await.unwrap();
+        let successor = writer(&f).await;
+        assert_eq!(
+            paste_reply(&f.engine, commit(&b, DRAFT.len())).await,
+            PasteResult::Stale {}
+        );
+        let mut next = successor.clone();
+        next.operation += 1;
+        stage(&f, &next, b"other").await;
+        set(&f, "paste-mode", "timeout-before");
+        assert_eq!(
+            paste_reply(&f.engine, commit(&next, 5)).await,
+            PasteResult::Unknown {}
+        );
+        let (engine, terminal) = f.restart();
+        let restarted = PasteBinding { terminal, ..next };
+        assert_held(&engine, &restarted).await;
+        assert_eq!(
+            paste_reply(&engine, commit(&restarted, 5)).await,
+            PasteResult::Stale {}
+        );
+        assert_eq!(file(&f, "pane0-bytes"), DRAFT);
+        assert!(file(&f, "pane1-bytes").is_empty());
+        assert_eq!(file(&f, "submissions"), b"111");
+        assert_eq!(file(&f, "effects"), b"1");
+    }
+
     #[test]
     fn launch_validation_rejects_tmux_command_separators() {
         assert!(
