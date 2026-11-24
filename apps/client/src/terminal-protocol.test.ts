@@ -53,7 +53,7 @@ function leasedTerminal(terminal: Emulator, view = "current", deliver?: (frame: 
     }
   }
   return {
-    scope, protocol, leased, emitted, consume, write, output,
+    scope, leased, emitted, consume, write, output,
     setWritable: (writable: boolean) => consume({ closed: false, writable, data: [] }, async () => {}),
     sent: () => sent,
     dispose: () => { scope.retire(); terminal.dispose(); },
@@ -137,6 +137,7 @@ test("fragmented negotiation emits no leased bytes and real key and binary input
   terminal.focus();
   assert.equal(browser.focused(), true);
   await fixture.output("\x1b[?1004;1;1000h" + query);
+  terminal.input("ordinary-looking generated data", false);
   assert.equal(terminal.modes.sendFocusMode, true);
   assert.equal(terminal.modes.applicationCursorKeysMode, true);
   terminal.blur();
@@ -285,24 +286,34 @@ test("parse completion orders the grid and target redraw while genuine input rem
   await consume([0xa2, ...encode("\x1bP$q")], true);
   await consume(encode("m\x1b\\\x1b]11;"), true);
   await consume(encode("?\x07\x1b[6"), true);
-  const pending = consume(encode("n"), true);
+  const pending = consume(encode("n\x1b]11;?;#456789\x07"), true);
   await parserEntered.promise;
   assert.equal(order.length, 5);
   assert.equal(terminal.buffer.active.type, "alternate");
   assert.equal(terminal.buffer.active.getLine(0)?.translateToString(true), "漢");
   assert.equal(terminal.modes.sendFocusMode, true);
+  assert.equal(browser.colors.cursor.rgba, 0x000000ff);
   browser.arrowUp();
-  await Promise.resolve();
-  assert.equal(browser.insertText("ї漢"), true);
+  assert.equal(browser.insertText("ї"), true);
+  // @contract: Deferred IME commits enter the same xterm source with wasUserInput=true.
+  await new Promise<void>(resolve => setImmediate(() => {
+    terminal.input("漢", true);
+    resolve();
+  }));
   terminal.blur();
   assert.equal(browser.focused(), false);
   terminal.focus();
   assert.equal(browser.focused(), true);
   await fixture.sent();
-  assert.deepEqual(fixture.leased.map(frame => frame.bytes), [[27, 91, 65], encode("ї漢")]);
+  const duringParse = [[27, 91, 65], encode("ї"), encode("漢")];
+  assert.deepEqual(fixture.leased.map(frame => frame.bytes), duringParse);
 
   resumeParser.resolve(false);
   await pending;
+  assert.equal(browser.colors.background.rgba, 0x000000ff);
+  assert.equal(browser.colors.cursor.rgba, 0x456789ff);
+  assert.deepEqual(fixture.emitted, ["\x1b[A", "ї", "漢"]);
+  assert.deepEqual(fixture.leased.map(frame => frame.bytes), duringParse);
   delayed.dispose();
   assert.equal(browser.insertText("x"), true);
   await inputEntered.promise;
@@ -315,7 +326,7 @@ test("parse completion orders the grid and target redraw while genuine input rem
   assert.equal(browser.insertText("blocked"), true);
   completeInput.resolve();
   await fixture.sent();
-  const accepted = [[27, 91, 65], encode("ї漢"), encode("x")];
+  const accepted = [...duringParse, encode("x")];
   assert.deepEqual(fixture.leased.map(frame => frame.bytes), accepted);
   acknowledge.resolve(event);
   await resizing;
@@ -378,8 +389,8 @@ test("a fresh attachment drops old parser completion and queued input", { timeou
   const pending = old.consume({ closed: false, writable: true, data }, () => old.write(data));
   await parserEntered.promise;
   old.scope.retire();
-  old.protocol.setWritable(true);
   assert.equal(terminal.options.disableStdin, true);
+  assert.equal(await old.setWritable(true), false);
 
   const replacement = browserFixture();
   const nextTerminal = replacement.terminal;
@@ -394,6 +405,7 @@ test("a fresh attachment drops old parser completion and queued input", { timeou
   resumeParser.resolve(true);
   inFlight.resolve();
   assert.equal(await pending, false);
+  assert.equal(terminal.options.disableStdin, true);
   await old.sent();
   assert.deepEqual(old.leased, [{ view: "old", bytes: encode("first"), paste: false }]);
   assert.deepEqual(fresh.leased, []);
@@ -413,20 +425,33 @@ test("a fresh attachment drops old parser completion and queued input", { timeou
   ]);
 });
 
-test("an unknown xterm input source leaves the leased route disconnected", () => {
+test("an unavailable xterm input hook leaves the leased route disconnected after a writable read", async t => {
   const headlessTerminal = new headless.Terminal({ allowProposedApi: true });
-  const terminal = {
-    parser: headlessTerminal.parser,
-    options: { disableStdin: false },
-    onBinary: () => assert.fail("binary input subscribed without a compatible source"),
-  };
-  const protocol = bindTerminalProtocol(terminal, () => assert.fail("unexpected leased input"));
-  try {
-    assert.equal(protocol.inputAvailable, false);
-    protocol.setWritable(true);
-    assert.equal(terminal.options.disableStdin, true);
-  } finally {
-    protocol.dispose();
-    headlessTerminal.dispose();
+  t.after(() => headlessTerminal.dispose());
+  for (const coreService of [undefined, Object.freeze({ triggerDataEvent() {} })]) {
+    const terminal = {
+      _core: { coreService },
+      parser: headlessTerminal.parser,
+      options: { disableStdin: false },
+      onBinary: () => assert.fail("binary input subscribed without a compatible source"),
+    };
+    const scope = new TerminalViewScope({
+      input: () => assert.fail("unexpected leased input"),
+      inputFailure: () => assert.fail("input failed"),
+      retire: () => protocol.dispose(),
+      reconnect: () => {},
+    });
+    const protocol = bindTerminalProtocol(terminal, () => assert.fail("unexpected user input"));
+    try {
+      assert.equal(protocol.inputAvailable, false);
+      assert.equal(scope.bind("current"), true);
+      let rendered = false;
+      const chunk = { closed: false, writable: true, data: [0x78] };
+      assert.equal(await protocol.consume(scope, "current", chunk, async () => { rendered = true; }), true);
+      assert.equal(rendered, true);
+      assert.equal(terminal.options.disableStdin, true);
+    } finally {
+      scope.retire();
+    }
   }
 });

@@ -109,7 +109,7 @@ export function TerminalView({ runtimeId, epoch, label, fontSize }: { runtimeId:
       input: localClient.input,
       inputFailure(error) {
         proposals.close();
-        protocol.setWritable(false);
+        protocol.pauseInput();
         setStatus(error === undefined
           ? "Ввід завеликий. Перепідключіть термінал перед продовженням."
           : `Ввід перервано; автоматично не повторюємо. ${String(error)}`);

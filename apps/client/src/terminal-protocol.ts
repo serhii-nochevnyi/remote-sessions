@@ -39,13 +39,14 @@ function routeTerminalInput(
   const triggerDataEvent = core.triggerDataEvent;
   const encoder = new TextEncoder();
   let active = true;
-  core.triggerDataEvent = (data, wasUserInput) => {
+  const routeUserData: XtermInputSource["triggerDataEvent"] = (data, wasUserInput) => {
     if (!active || wasUserInput !== true || terminal.options.disableStdin) return;
     triggerDataEvent.call(core, data, true);
     if (!active || terminal.options.disableStdin) return;
     const paste = data.startsWith("\x1b[200~") && data.endsWith("\x1b[201~");
     send(encoder.encode(paste ? data.slice(6, -6) : data), paste);
   };
+  if (!Reflect.set(core, "triggerDataEvent", routeUserData) || core.triggerDataEvent !== routeUserData) return;
   const binaryInput = terminal.onBinary(data => {
     if (active && !terminal.options.disableStdin) send(Uint8Array.from(data, char => char.charCodeAt(0)), false);
   });
@@ -53,7 +54,7 @@ function routeTerminalInput(
     dispose() {
       active = false;
       binaryInput.dispose();
-      core.triggerDataEvent = triggerDataEvent;
+      if (core.triggerDataEvent === routeUserData) core.triggerDataEvent = triggerDataEvent;
     },
   };
 }
@@ -62,33 +63,35 @@ export function bindTerminalProtocol(
   terminal: Pick<Terminal, "parser" | "options" | "onBinary">,
   send: (bytes: Uint8Array, paste: boolean) => void,
 ) {
-  terminal.options.disableStdin = true;
-  const queryHandlers = suppressViewerQueries(terminal);
-  let input = routeTerminalInput(terminal, send);
-
-  function setWritable(writable: boolean) {
-    terminal.options.disableStdin = !input || !writable;
+  function pauseInput() {
+    terminal.options.disableStdin = true;
   }
+
+  pauseInput();
+  const queryHandlers = suppressViewerQueries(terminal);
+  const input = routeTerminalInput(terminal, send);
+  let disposed = false;
 
   return {
     inputAvailable: input !== undefined,
-    setWritable,
+    pauseInput,
     async consume(scope: TerminalViewScope, view: string, chunk: Chunk, render: () => Promise<void>) {
+      if (disposed || !scope.owns(view)) return false;
       if (!chunk.writable) {
-        if (!scope.owns(view)) return false;
-        setWritable(false);
-        await scope.consume(view, chunk, async () => {});
-        if (scope.owns(view)) await render();
-        return scope.owns(view);
+        pauseInput();
+        if (!await scope.consume(view, chunk, async () => {}) || disposed) return false;
+        await render();
+        return !disposed && scope.owns(view);
       }
-      if (!await scope.consume(view, chunk, render)) return false;
-      setWritable(scope.canWrite);
+      if (!await scope.consume(view, chunk, render) || disposed) return false;
+      terminal.options.disableStdin = !input || !scope.canWrite;
       return true;
     },
     dispose() {
-      terminal.options.disableStdin = true;
+      if (disposed) return;
+      disposed = true;
+      pauseInput();
       input?.dispose();
-      input = undefined;
       queryHandlers.forEach(handler => handler.dispose());
     },
   };
