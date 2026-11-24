@@ -230,6 +230,10 @@ if command == "list-sessions":
     print("RUNTIME_NAME")
 elif command == "list-panes":
     print("RUNTIME_NAME", "%0", "PANE_PID", 0, cols, rows, "fixture", sep="\t")
+elif command == "list-commands":
+    print("load-buffer (loadb) [-w] [-b buffer-name] path")
+    flags = "dpr" if read("probe-mode") == "missing-flag" else "dprS"
+    print(f"paste-buffer (pasteb) [-{flags}] [-b buffer-name] [-t target-pane]")
 elif command == "display-message":
     if args[-1] == "#{pid}|#{start_time}|#{@rs_create_generation}":
         print("987|123456|GENERATION")
@@ -239,9 +243,14 @@ elif command == "display-message":
               read("marker"), int(bool(read("input-off"))), int(not read("unsupported")), sep="|")
 elif command == "load-buffer":
     assert args[1] == "-b" and args[2].startswith("rs-paste-") and args[3:] == ["-"]
-    assert len(args[2]) == len("rs-paste-") + 32
+    identifier = args[2].removeprefix("rs-paste-").removeprefix("probe-")
+    assert re.fullmatch("[0-9a-f]{32}", identifier)
     (root / args[2]).write_bytes(sys.stdin.buffer.read())
     write("last-load", args[2])
+elif command == "save-buffer":
+    assert args[1] == "-b" and args[2].startswith("rs-paste-probe-") and args[3:] == ["-"]
+    data = (root / args[2]).read_bytes()
+    sys.stdout.buffer.write(data[:-1] if read("probe-mode") == "truncated" else data)
 elif command == "delete-buffer":
     assert args[1] == "-b"
     (root / args[2]).unlink(missing_ok=True)
@@ -295,6 +304,8 @@ elif command == "if-shell":
                 print(words[-1])
             elif words[-2] == "@rs_resize_epoch":
                 write("epoch", words[-1])
+            elif words[-2] == "@rs_paste_launch":
+                write("launch", words[-1])
             elif words[-2] == "@rs_paste_admission":
                 ack_reply = read("ack-reply") if "~s~" in read("marker") and "~r~" in words[-1] else ""
                 if ack_reply == "before":

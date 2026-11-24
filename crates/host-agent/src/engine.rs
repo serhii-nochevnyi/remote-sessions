@@ -522,6 +522,7 @@ impl Engine {
             format_equal("version", "3.8"),
             format_equal("socket_path", path),
             format_equal("after-load-buffer", ""),
+            format_equal("after-save-buffer", ""),
             format_equal("after-paste-buffer", ""),
             format_equal("after-delete-buffer", ""),
             format_equal("after-send-keys", ""),
@@ -1328,7 +1329,7 @@ impl Engine {
         identity: &PaneIdentity,
         managed_nonce: Option<Uuid>,
     ) -> Result<()> {
-        let mut read = self.geometry(runtime.runtime_id, &identity.pane).await?;
+        let read = self.geometry(runtime.runtime_id, &identity.pane).await?;
         let nonce = managed_nonce.map_or_else(String::new, |nonce| {
             format!(
                 "{nonce}:{}:{}:{}:{}",
@@ -1337,6 +1338,8 @@ impl Engine {
         });
         ensure!(
             read.sender_supported
+                && read.input_enabled
+                && !runtime.exited
                 && read.server == server
                 && read.name == runtime.tmux_name
                 && read.target.session == identity.session
@@ -1349,6 +1352,31 @@ impl Engine {
                 && read.paste_marker.is_empty(),
             "Paste launch provenance is unavailable"
         );
+        self.prove_paste_buffer_io().await?;
+
+        let guard = format_all([self.paste_guard(&read), format_equal("pane_input_off", 0)]);
+        let launch = Uuid::new_v4().to_string();
+        let mut stamped = read.clone();
+        stamped.paste_launch.clone_from(&launch);
+        let ready = stamped.ready_marker(None);
+        let pane = &read.target.pane;
+        let branch = format!(
+            "set-option -p -o -t {pane} {PASTE_LAUNCH_OPTION} {launch} ; set-option -p -o -t {pane} {PASTE_OPTION} {ready}",
+        );
+        self.geometry_command(&["if-shell", "-F", "-t", pane, &guard, &branch])
+            .await?;
+        let after = self.geometry(runtime.runtime_id, pane).await?;
+        ensure!(
+            after.same_pane(&stamped)
+                && after.epoch.is_none()
+                && after.sender_supported
+                && after.paste_marker == ready,
+            "Paste launch provenance is unconfirmed"
+        );
+        Ok(())
+    }
+
+    async fn prove_paste_buffer_io(&self) -> Result<()> {
         let commands = self.geometry_command(&["list-commands"]).await?;
         ensure!(
             commands
@@ -1359,16 +1387,19 @@ impl Engine {
                     .any(|line| line.starts_with("load-buffer ")),
             "Exact paste sender is unavailable"
         );
-        let guard = self.paste_guard(&read);
-        read.paste_launch = Uuid::new_v4().to_string();
-        let ready = read.ready_marker(None);
-        let pane = &read.target.pane;
-        let branch = format!(
-            "set-option -p -o -t {pane} {PASTE_LAUNCH_OPTION} {} ; set-option -p -o -t {pane} {PASTE_OPTION} {ready}",
-            read.paste_launch
-        );
-        self.geometry_command(&["if-shell", "-F", "-t", pane, &guard, &branch])
-            .await?;
+        let name = format!("rs-paste-probe-{}", Uuid::new_v4().simple());
+        let sample = format!("{}\n\t\u{2603}", Uuid::new_v4());
+        let loaded = self.load_paste(&name, sample.as_bytes()).await;
+        let returned = match loaded {
+            Ok(()) => {
+                self.geometry_command(&["save-buffer", "-b", &name, "-"])
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        let deleted = self.geometry_command(&["delete-buffer", "-b", &name]).await;
+        ensure!(returned? == sample, "Paste sender stdin readback differs");
+        deleted?;
         Ok(())
     }
 
@@ -1468,8 +1499,7 @@ impl Engine {
             },
         };
         if let Some(result) = rejected {
-            self.owners()
-                .discard_rejected_stage(&binding, self.now());
+            self.owners().discard_rejected_stage(&binding, self.now());
             return result;
         }
         self.owners().stage(binding, offset, &data, self.now())
@@ -2410,6 +2440,57 @@ mod tests {
             paste_reply(engine, commit(&next, DRAFT.len())).await,
             PasteResult::Unknown {} | PasteResult::Stale {}
         ));
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_paste_sender_proof() {
+        let f = Fixture::paste();
+        let target = &f.terminal.target;
+        let read = f
+            .engine
+            .geometry(target.runtime_id, &target.pane)
+            .await
+            .unwrap();
+        let runtime = f.engine.find(target.runtime_id).await.unwrap();
+        let pane = PaneIdentity {
+            session: target.session.clone(),
+            window: target.window.clone(),
+            pane: target.pane.clone(),
+            pid: target.pid,
+        };
+        set(&f, "launch", "");
+        set(&f, "marker", "");
+
+        for mode in ["missing-flag", "truncated", ""] {
+            set(&f, "probe-mode", mode);
+            let stamped = f
+                .engine
+                .stamp_paste(&runtime, read.server, &pane, None)
+                .await;
+            let buffer = text(&f, "last-load");
+            if mode == "missing-flag" {
+                assert!(buffer.is_empty());
+            } else {
+                assert!(buffer.starts_with("rs-paste-probe-"));
+                assert!(!f.temp.path().join(buffer).exists());
+            }
+            if mode.is_empty() {
+                stamped.unwrap();
+                let after = f
+                    .engine
+                    .geometry(target.runtime_id, &target.pane)
+                    .await
+                    .unwrap();
+                assert!(after.paste_ready());
+                assert_eq!(after.target, *target);
+            } else {
+                assert!(stamped.is_err());
+                assert!(file(&f, "launch").is_empty());
+                assert!(file(&f, "marker").is_empty());
+            }
+            assert!(file(&f, "submissions").is_empty());
+            assert!(file(&f, "pane0-bytes").is_empty());
+        }
     }
 
     #[tokio::test]
