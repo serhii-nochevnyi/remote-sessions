@@ -45,8 +45,11 @@ async function mountRecorder() {
   });
   const readout = fixture.document.getElementById("snapshot");
   assert(readout);
+  const terminal = fixture.terminal;
+  assert(terminal, "production entry creates an xterm");
   return {
     ...fixture,
+    terminal,
     appends,
     readout,
     alert: () => fixture.container.find(node => node.getAttribute("role") === "alert")?.textContent ?? "",

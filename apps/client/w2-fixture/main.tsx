@@ -82,6 +82,7 @@ function mountTerminal(
   const stopLayout = observeTerminalLayout(host, textarea, fit, publishLayout);
   let current: Attempt | null = null;
   let nextId = 0;
+  let lifecycleEpoch = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let checkpointRead: Promise<Snapshot> | undefined;
   let pollEpoch = 0;
@@ -113,7 +114,13 @@ function mountTerminal(
       return;
     }
     const sequence = attempt.trace.length + 1;
-    attempt.trace.push({ sequence, event, elapsedMs: performance.now() - attempt.startedAt, bytes, nativeSequence });
+    attempt.trace.push({
+      sequence,
+      event,
+      elapsedMs: performance.now() - attempt.startedAt,
+      ...(bytes === undefined ? {} : { bytes }),
+      ...(nativeSequence === undefined ? {} : { nativeSequence }),
+    });
     publish(attempt);
     return sequence;
   }
@@ -226,7 +233,10 @@ function mountTerminal(
     const frozen = { ...attempt, held: true };
     publishInterrupted({ attempt: frozen });
     void readback.then(result => {
-      if (!disposed) publishInterrupted({ attempt: frozen, result: result ?? { uncertain: true } });
+      if (!disposed) publishInterrupted({
+        attempt: frozen,
+        result: result ?? { uncertain: true },
+      });
     });
   }
 
@@ -263,10 +273,11 @@ function mountTerminal(
     if (command !== "w2_append_input") return invoke<T>(command, args, options);
     const request = args as { generation: number; sequence: number; events: number[][] };
     const attempt = current;
+    const requestEvent = request.events[0];
     if (!attempt || document.visibilityState !== "visible" || request.generation !== attempt.generation || attempt.held
       || (attempt.composition && (attempt.phase !== "ended" || !attempt.admitted || composing
         || request.sequence !== 1 || request.events.length !== 1
-        || hex(request.events[0]) !== attempt.selected.expected.afterHex))) {
+        || requestEvent === undefined || hex(requestEvent) !== attempt.selected.expected.afterHex))) {
       throw new Error("Blocked append");
     }
     const bytes = request.events.reduce((total, event) => total + event.length, 0);
@@ -303,6 +314,7 @@ function mountTerminal(
   publishVisibility(document.visibilityState === "visible");
 
   function detach() {
+    lifecycleEpoch++;
     current = null;
     checkpointRead = undefined;
     stopPolling();
@@ -323,14 +335,17 @@ function mountTerminal(
         return false;
       }
       detach();
+      const startEpoch = lifecycleEpoch;
       terminal.scrollToBottom();
       const id = ++nextId;
       if (refocus) {
         textarea.value = "";
         terminal.focus();
       }
-      const generation = await recorder.start(selected.id);
-      if (generation === undefined || disposed || id !== nextId || document.visibilityState !== "visible") return false;
+      const generation = await recorder.start(selected.id, () =>
+        lifecycleEpoch === startEpoch && !disposed && document.visibilityState === "visible");
+      if (generation === undefined || disposed || id !== nextId || lifecycleEpoch !== startEpoch
+        || document.visibilityState !== "visible") return false;
       const attempt: Attempt = {
         id, selected, generation, startedAt: performance.now(), composition: selected.id.startsWith("composition-"),
         phase: "waiting", preedit: false, held: false, admitted: false, acknowledged: false, pending: 0, trace: [],

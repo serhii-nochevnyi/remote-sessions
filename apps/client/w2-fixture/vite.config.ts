@@ -1,15 +1,23 @@
 import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { createRequire } from "node:module";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import react from "@vitejs/plugin-react";
+import * as ts from "typescript";
 import { defineConfig, type Plugin } from "vite";
 
 const fixtureRoot = fileURLToPath(new URL("./", import.meta.url));
 const repoRoot = resolve(fixtureRoot, "../../..");
+const resolveModule = createRequire(import.meta.url);
 const lock = JSON.parse(readFileSync(resolve(repoRoot, "package-lock.json"), "utf8")) as {
   packages: Record<string, { version?: string }>;
 };
 const runtimeModules = ["@tauri-apps/api", "@xterm/xterm", "@xterm/addon-fit", "react", "react-dom", "scheduler"];
+const assetAttributes = new Set([
+  "src", "href", "xlink:href", "srcset", "imagesrcset", "poster", "data", "action",
+  "formaction", "background", "style",
+]);
+const srcSetAttributes = new Set(["srcset", "imagesrcset"]);
 const virtualModules = new Set([
   "\0rolldown/runtime.js",
   "\0vite/modulepreload-polyfill.js",
@@ -35,7 +43,21 @@ function inside(root: string, path: string) {
 }
 
 function assertLocal(reference: string) {
-  if (/^(?:[a-z][a-z\d+.-]*:|\/\/)|[\\&\u0000-\u0020]/i.test(reference.trim())) {
+  const decoded = reference.replace(/&(?:#(?:x([\da-f]+)|(\d+))|(colon|sol|tab|newline));?/gi,
+    (entity, hex: string | undefined, decimal: string | undefined, named: string | undefined) => {
+      if (hex !== undefined || decimal !== undefined) {
+        const codePoint = Number.parseInt(hex ?? decimal ?? "", hex === undefined ? 10 : 16);
+        return codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : "\ufffd";
+      }
+      switch (named?.toLowerCase()) {
+        case "colon": return ":";
+        case "sol": return "/";
+        case "tab": return "\t";
+        case "newline": return "\n";
+        default: return entity;
+      }
+    });
+  if (/^(?:[a-z][a-z\d+.-]*:|\/\/)|[\\&\u0000-\u0020]/i.test(decoded.trim())) {
     throw new Error(`External asset is forbidden in the fixture: ${reference}`);
   }
 }
@@ -52,9 +74,64 @@ function assertCss(css: string) {
   for (const match of source.matchAll(/url\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*))\s*\)|@import\s+(?:"([^"]*)"|'([^']*)')/gi)) {
     assertLocal(match.slice(1).find(value => value !== undefined) ?? "");
   }
-  for (const [imageSet] of source.matchAll(/(?:-webkit-)?image-set\([^;{}]*/gi)) {
-    for (const [, quoted] of imageSet.matchAll(/["']([^"']*)["']/g)) assertLocal(quoted);
+  for (const imageSetMatch of source.matchAll(/(?:-webkit-)?image-set\([^;{}]*/gi)) {
+    const imageSet = imageSetMatch[0] ?? "";
+    for (const quotedMatch of imageSet.matchAll(/["']([^"']*)["']/g)) {
+      const quoted = quotedMatch[1];
+      if (quoted !== undefined) assertLocal(quoted);
+    }
   }
+}
+
+function assertAssetAttribute(name: string, value: string) {
+  if (name === "style") {
+    assertCss(value);
+  } else if (srcSetAttributes.has(name)) {
+    for (const candidate of value.split(",")) {
+      const reference = candidate.trim().split(/\s+/, 1)[0];
+      if (reference) assertLocal(reference);
+    }
+  } else {
+    assertLocal(value);
+  }
+}
+
+function assertJsxAssets(source: string, id: string) {
+  const scriptKind = /\.(?:m|c)?tsx$/i.test(id) ? ts.ScriptKind.TSX
+    : /\.(?:m|c)?jsx$/i.test(id) ? ts.ScriptKind.JSX
+      : /\.(?:m|c)?ts$/i.test(id) ? ts.ScriptKind.TS : ts.ScriptKind.JS;
+  const file = ts.createSourceFile(id, source, ts.ScriptTarget.Latest, true, scriptKind);
+
+  function visit(node: ts.Node) {
+    if (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) {
+      for (const attribute of node.attributes.properties) {
+        if (ts.isJsxSpreadAttribute(attribute)) {
+          throw new Error("Opaque JSX props are forbidden in the offline fixture");
+        }
+        if (!ts.isJsxAttribute(attribute)) continue;
+        const name = attribute.name.getText(file).toLowerCase();
+        if (!assetAttributes.has(name) || attribute.initializer === undefined) continue;
+
+        const value = attribute.initializer;
+        if (ts.isStringLiteralLike(value)) {
+          assertAssetAttribute(name, value.text);
+        } else if (ts.isJsxExpression(value)) {
+          const expression = value.expression;
+          if (expression === undefined) continue;
+          if (ts.isStringLiteralLike(expression)) {
+            assertAssetAttribute(name, expression.text);
+          } else {
+            throw new Error(`Dynamic JSX asset reference is forbidden in the offline fixture: ${name}`);
+          }
+        } else {
+          throw new Error(`Unsupported JSX asset reference is forbidden in the offline fixture: ${name}`);
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  }
+
+  visit(file);
 }
 
 function assertHtml(html: string) {
@@ -63,17 +140,22 @@ function assertHtml(html: string) {
     if (/^<base\b|\s(?:http-equiv|srcdoc)\s*=/i.test(tag)) {
       throw new Error("Document redirects, base URLs and embedded HTML are forbidden in the fixture");
     }
-    for (const [, name, double, single, bare] of tag.matchAll(
+    for (const match of tag.matchAll(
       /\s(src|href|xlink:href|srcset|imagesrcset|poster|data|action|formaction|background|style)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi,
     )) {
+      const name = match[1];
+      if (name === undefined) continue;
+      const double = match[2];
+      const single = match[3];
+      const bare = match[4];
       const value = double ?? single ?? bare;
-      if (name.toLowerCase() === "style") assertCss(value);
-      else if (name.toLowerCase().endsWith("srcset")) {
-        for (const candidate of value.split(",")) assertLocal(candidate.trim().split(/\s+/, 1)[0]);
-      } else assertLocal(value);
+      if (value !== undefined) assertAssetAttribute(name.toLowerCase(), value);
     }
   }
-  for (const [, css] of source.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style\s*>/gi)) assertCss(css);
+  for (const styleMatch of source.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style\s*>/gi)) {
+    const css = styleMatch[1];
+    if (css !== undefined) assertCss(css);
+  }
 }
 
 function guardFixtureBundle(): Plugin {
@@ -82,7 +164,14 @@ function guardFixtureBundle(): Plugin {
 
   function assertModule(id: string) {
     if (virtualModules.has(id)) return;
-    const file = id.split("?", 1)[0];
+    let file = id.split("?", 1)[0] ?? id;
+    if (!isAbsolute(file)) {
+      try {
+        file = resolveModule.resolve(file);
+      } catch {
+        throw new Error(`Module is outside the fixture and its locked packages: ${id}`);
+      }
+    }
     if (isAbsolute(file) && existsSync(file)) {
       const actual = realpathSync(file);
       if (inside(appRoot, actual) || packageRoots.some(root => inside(root, actual))) return;
@@ -100,7 +189,7 @@ function guardFixtureBundle(): Plugin {
     resolveId: {
       order: "pre",
       handler(source) {
-        if (!source.startsWith("\0")) assertLocal(source.split("?", 1)[0]);
+        if (!source.startsWith("\0")) assertLocal(source.split("?", 1)[0] ?? source);
       },
     },
     transform: {
@@ -108,17 +197,25 @@ function guardFixtureBundle(): Plugin {
       handler(source, id) {
         if (/\.css(?:$|\?)/i.test(id)) {
           assertCss(source);
-          for (const [, double, single, bare] of source.matchAll(
+          for (const match of source.matchAll(
             /@import\s+(?:url\(\s*)?(?:"([^"]*)"|'([^']*)'|([^\s);]+))/gi,
           )) {
+            const double = match[1];
+            const single = match[2];
+            const bare = match[3];
             const path = double ?? single ?? bare;
-            if (path.startsWith(".")) assertModule(resolve(dirname(id.split("?", 1)[0]), path));
+            if (path === undefined) continue;
+            if (path.startsWith(".")) assertModule(resolve(dirname(id.split("?", 1)[0] ?? id), path));
             else if (path.startsWith("/")) assertModule(resolve(appRoot, `.${path}`));
           }
         } else if (/\.[cm]?[jt]sx?(?:$|\?)/i.test(id) && isAbsolute(id)) {
           const file = id.split("?", 1)[0];
-          if (!existsSync(file) || !inside(appRoot, realpathSync(file))) return;
-          for (const [, , url] of source.matchAll(/\bnew\s+URL\s*\(\s*(["'`])([^"'`]*)\1/g)) assertLocal(url);
+          if (file === undefined || !existsSync(file) || !inside(appRoot, realpathSync(file))) return;
+          assertJsxAssets(source, file);
+          for (const match of source.matchAll(/\bnew\s+URL\s*\(\s*(["'`])([^"'`]*)\1/g)) {
+            const url = match[2];
+            if (url !== undefined) assertLocal(url);
+          }
         }
       },
     },
@@ -151,6 +248,6 @@ export default defineConfig({
   root: fixtureRoot,
   base: "./",
   publicDir: false,
-  plugins: [react(), guardFixtureBundle()],
+  plugins: [guardFixtureBundle(), react()],
   build: { assetsInlineLimit: 0 },
 });

@@ -141,7 +141,7 @@ class Element {
   get disabled() { return this.attributes.has("disabled"); }
   get tagName() { return this.localName.toUpperCase(); }
   get nodeName() { return this.tagName; }
-  get firstChild() { return this.childNodes[0] ?? null; }
+  get firstChild(): Element | null { return this.childNodes[0] ?? null; }
   get textContent(): string {
     return this.text + this.childNodes.map(child => child.textContent).join("");
   }
@@ -393,10 +393,14 @@ function entryFromHtml() {
   const scripts = [...html.matchAll(/<script\s+type="module"\s+src="([^"]+)"\s*>\s*<\/script>/g)];
   assert(root, "fixture HTML declares a mount root");
   assert.equal(scripts.length, 1, "fixture HTML declares a single module entry");
-  assert(scripts[0][1].startsWith("./"), "fixture HTML loads a local module entry");
-  const entry = new URL(scripts[0][1], fixtureDir);
+  const id = root[1];
+  assert(id !== undefined, "fixture HTML declares a mount root id");
+  const entryPath = scripts[0]?.[1];
+  assert(entryPath !== undefined, "fixture HTML declares a module entry path");
+  assert(entryPath.startsWith("./"), "fixture HTML loads a local module entry");
+  const entry = new URL(entryPath, fixtureDir);
   assert(entry.href.startsWith(fixtureDir.href), "module entry belongs to the fixture directory");
-  return { id: root[1], entry };
+  return { id, entry };
 }
 
 export async function mountFixture(options: MountOptions = {}) {
@@ -555,6 +559,7 @@ export async function mountFixture(options: MountOptions = {}) {
     assert.equal(roots.length, 1, "production entry creates one React root");
     assert.equal(terminals.length, 1, "production entry creates one xterm");
     const terminal = terminals[0];
+    assert(terminal, "production entry creates an xterm");
     await act(async () => { await terminal.afterWrite(); });
 
     function button(label: string) {
@@ -718,7 +723,10 @@ async function assertMountedInput(
   const native = connectNative(executable, mode);
   let fixture: Awaited<ReturnType<typeof mountFixture>> | undefined;
   try {
-    const mounted = await mountFixture({ invoke: native.invoke, transformEntry });
+    const mounted = await mountFixture({
+      invoke: native.invoke,
+      ...(transformEntry === undefined ? {} : { transformEntry }),
+    });
     fixture = mounted;
     assert.deepEqual(mounted.ipc, [], "startup transcript emits no IPC or input");
     assert.deepEqual(mounted.terminal.data, [], "startup transcript emits no xterm input");
@@ -740,6 +748,8 @@ async function assertMountedInput(
 
     const events = mode === "combined" ? [[0xd1, 0x97, 0x0d]] : [[0xd1, 0x97], [0x0d]];
     assert.equal(mounted.registrations.length, 1, "production recorder registration");
+    const registration = mounted.registrations[0];
+    assert(registration, "production recorder registration exists");
     assert.equal(mounted.terminal.subscriptions, 1, "one xterm onData subscription");
     assert.deepEqual(mounted.terminal.data, mode === "combined" ? ["ї\r"] : ["ї", "\r"], "actual xterm input events");
     assert.deepEqual(mounted.ipc, [
@@ -750,7 +760,7 @@ async function assertMountedInput(
       })),
       { command: "w2_read_attempt", args: { generation: 1 } },
     ], "actual IPC trace");
-    assert.deepEqual(mounted.registrations[0].calls, mounted.ipc, "registered invoke trace matches actual IPC");
+    assert.deepEqual(registration.calls, mounted.ipc, "registered invoke trace matches actual IPC");
     assert.deepEqual(native.snapshot(), {
       caseId: syntheticCase,
       generation: 1,
@@ -832,7 +842,7 @@ function disconnectedWrapperControls() {
   const scratch = mkdtempSync(join(tmpdir(), "w2-wrapper-controls-"));
   try {
     const source = readFileSync(nativeSource, "utf8");
-    const controls = [
+    const controls: [string, string, string][] = [
       ["w2_begin_attempt", "let _ = (state, case_id); Ok(0)", "begin wrapper must start generation 1"],
       ["w2_append_input", "let _ = (state, generation, sequence, events); Ok(())", "append wrapper must commit the event"],
       ["w2_read_attempt", 'let _ = (state, generation); Err("disconnected read control")', "read wrapper must return the active snapshot"],
@@ -845,7 +855,9 @@ function disconnectedWrapperControls() {
       const signature = new RegExp(`(^    fn ${command}\\([^]*? \\{\\n)[^]*?^    \\}`, "m");
       const original = source.match(signature);
       assert(original, `wrapper to disconnect: ${command}`);
-      const mutated = replaceOnce(source, signature, `${original[1]}        ${replacement}\n    }`);
+      const prefix = original[1];
+      assert(prefix !== undefined, `wrapper to disconnect: ${command}`);
+      const mutated = replaceOnce(source, signature, `${prefix}        ${replacement}\n    }`);
       const path = join(scratch, `${command}.rs`);
       const executable = join(scratch, command);
       try {
@@ -1175,8 +1187,11 @@ async function exerciseCases(
       const usingPaste = "paste" in vector;
       const generation = index + 1;
       const fixture = await mountFixture({
-        invoke: native.invoke, transformEntry, browserPaste: usingPaste || id.startsWith("composition-"),
-        suppressCompositionEnd: controls.suppressCompositionEnd, traceRegistration: false,
+        invoke: native.invoke,
+        ...(transformEntry === undefined ? {} : { transformEntry }),
+        browserPaste: usingPaste || id.startsWith("composition-"),
+        ...(controls.suppressCompositionEnd === undefined ? {} : { suppressCompositionEnd: controls.suppressCompositionEnd }),
+        traceRegistration: false,
       });
       try {
         assert.equal(fixture.ipc.length, 0, "transcript generates no IPC");
@@ -1200,7 +1215,8 @@ async function exerciseCases(
         assert.deepEqual(fixture.ipc, [{ command: "w2_begin_attempt", args: { caseId: id } }], "one selected begin");
         if (id.startsWith("composition-")) {
           await fixture.waitFor(() => Boolean(fixture.container.find(node => node.localName === "button" && node.textContent === "Restart" && !node.disabled)), "Start completes");
-          await compositionVector(fixture, native, id, generation, { keepPreedit: controls.keepPreedit });
+          await compositionVector(fixture, native, id, generation,
+            controls.keepPreedit === undefined ? {} : { keepPreedit: controls.keepPreedit });
           continue;
         }
         await fixture.waitFor(() => !fixture.button("Read").disabled, "Start enables Read");
@@ -1345,7 +1361,10 @@ async function viewportUpdates() {
 }
 
 async function checkMountedLayout(transformEntry?: MountOptions["transformEntry"]) {
-  const fixture = await mountFixture({ transformEntry, browserPaste: true });
+  const fixture = await mountFixture({
+    ...(transformEntry === undefined ? {} : { transformEntry }),
+    browserPaste: true,
+  });
   const { terminal, window, document } = fixture;
   try {
     const host = field(fixture, "terminal");
@@ -1454,7 +1473,7 @@ async function checkCheckpoint(executable: string, transformEntry?: MountOptions
   let delayRead = true;
   const fixture = await mountFixture({
     browserPaste: true,
-    transformEntry,
+    ...(transformEntry === undefined ? {} : { transformEntry }),
     async invoke(command, args) {
       const result = await native.invoke(command, args);
       if (delayRead && command === "w2_read_attempt") await gate.promise;
@@ -1681,13 +1700,14 @@ async function checkForegroundRecovery(
   const after = [...Buffer.from(vector.afterHex, "hex")];
   const fixture = await mountFixture({
     browserPaste: true,
-    transformEntry,
+    ...(transformEntry === undefined ? {} : { transformEntry }),
     async invoke(command, args) {
-      if (failRead && command === "w2_read_attempt" && args?.generation === 1) {
+      const generation = args && typeof args === "object" && "generation" in args ? args.generation : undefined;
+      if (failRead && command === "w2_read_attempt" && generation === 1) {
         throw new Error("Interrupted read unavailable");
       }
       const reply = await native.invoke(command, args);
-      if (delayAppend && command === "w2_append_input" && args?.generation === 1) {
+      if (delayAppend && command === "w2_append_input" && generation === 1) {
         await late.promise;
         if (readback === "cached") throw new Error("Interrupted append acknowledgment unavailable");
       }
@@ -1768,8 +1788,67 @@ async function checkForegroundRecovery(
   assert.equal(fixture.document.listenerCount("visibilitychange"), 0, "visibility listeners are disposed");
 }
 
+async function checkLateBegin(executable: string) {
+  const native = connectNative(executable, "requests");
+  const late = deferred();
+  let delayBegin = true;
+  const fixture = await mountFixture({
+    async invoke(command, args) {
+      const reply = await native.invoke(command, args);
+      if (delayBegin && command === "w2_begin_attempt") {
+        delayBegin = false;
+        await late.promise;
+      }
+      return reply;
+    },
+  });
+  async function visibility(state: string) {
+    await fixture.act(async () => {
+      fixture.document.visibilityState = state;
+      fixture.document.dispatch("visibilitychange");
+    });
+  }
+  try {
+    await fixture.waitFor(() => {
+      const start = fixture.container.find(node => node.localName === "button" && node.textContent === "Start");
+      return Boolean(start && !start.disabled);
+    }, "fixture becomes ready before a delayed start");
+    await fixture.click("Start");
+    await fixture.waitFor(() => fixture.ipc.some(call => call.command === "w2_begin_attempt"), "native start is pending");
+    await visibility("hidden");
+    await visibility("visible");
+    late.resolve();
+    await fixture.waitFor(() => {
+      const start = fixture.container.find(node => node.localName === "button" && node.textContent === "Start");
+      return Boolean(start && !start.disabled);
+    }, "visibility change retires the delayed start");
+    assert.equal(Boolean(fixture.container.find(node => node.localName === "button" && node.textContent === "Restart")), false,
+      "a pre-background start cannot activate after foregrounding");
+    assert.equal(fixture.button("Read").disabled, true);
+    await fixture.input("abandoned");
+    assert.equal(appends(fixture).length, 0, "the retired start admits no input");
+
+    await fixture.click("Start");
+    await fixture.waitFor(() => Boolean(fixture.container.find(node =>
+      node.localName === "button" && node.textContent === "Restart" && !node.disabled)), "a deliberate new start completes");
+    await fixture.input("ї");
+    await fixture.waitFor(() => appends(fixture).length === 1, "fresh input reaches the native recorder");
+    assert.deepEqual(appends(fixture), [
+      { command: "w2_append_input", args: { generation: 2, sequence: 1, events: [[0xd1, 0x97]] } },
+    ], "only the deliberate foreground generation records input");
+    await native.finish();
+  } catch (error) {
+    await native.abort();
+    throw error;
+  } finally {
+    late.resolve();
+    await fixture.dispose();
+  }
+}
+
 async function foregroundRecovery() {
   await withNativeExecutable(async executable => {
+    await checkLateBegin(executable);
     await checkForegroundRecovery(executable, "app-switch");
     await checkForegroundRecovery(executable, "lock-foreground");
     await checkForegroundRecovery(executable, "lock-foreground", undefined, "unavailable");
@@ -1950,8 +2029,8 @@ function assertLibraryBoundary(source: string) {
   assert.deepEqual(attributesBefore(tokens, recorder),
     [rustTokens('#[cfg(any(target_os = "ios", test))]').join(" ")], "recorder module target guard");
   const module = bodyAt(tokens, recorder, recorderDecl);
-  const wrappers = positions(module, "fn", true).filter(index => module[index + 1].startsWith("w2_"));
-  assert.deepEqual(wrappers.map(index => module[index + 1]), commands, "exact command wrapper declarations");
+  const wrappers = positions(module, "fn", true).filter(index => module[index + 1]?.startsWith("w2_") ?? false);
+  assert.deepEqual(wrappers.map(index => module[index + 1] ?? ""), commands, "exact command wrapper declarations");
   for (const wrapper of wrappers) {
     assert.deepEqual(attributesBefore(module, wrapper), [rustTokens(commandAttribute).join(" ")],
       `iOS command attribute belongs to ${module[wrapper + 1]}`);
@@ -1982,7 +2061,9 @@ function assertLibraryBoundary(source: string) {
   const exports = positions(tokens, "pub use", true);
   assert.deepEqual(exports, positions(tokens, "pub use recorder::run;", true), "standalone run re-export");
   assert.equal(exports.length, 1, "standalone run re-export");
-  assert.deepEqual(attributesBefore(tokens, exports[0]), [rustTokens(iosCfg).join(" ")], "iOS cfg belongs to the run re-export");
+  const runExport = exports[0];
+  assert(runExport !== undefined, "standalone run export exists");
+  assert.deepEqual(attributesBefore(tokens, runExport), [rustTokens(iosCfg).join(" ")], "iOS cfg belongs to the run re-export");
   for (const declaration of ["fn start_app", "#[unsafe(export_name =", "#[export_name ="]) {
     assert.equal(positions(tokens, declaration).length, 0, "handwritten C ABI entry");
   }
@@ -1998,6 +2079,7 @@ function assertPermissions(entries: ReturnType<typeof readEntries>) {
   for (const file of files) {
     assert.equal(file.kind, "file", "generated permission is a regular file");
     const command = commands[paths.indexOf(file.path)];
+    assert(command !== undefined, `generated permission matches a command: ${file.path}`);
     const slug = command.replaceAll("_", "-");
     assert.deepEqual(parseToml(file.source), {
       permission: [
@@ -2123,7 +2205,9 @@ function declarationControls() {
     }],
     ["broadened generated permission", /exact generated permission definitions/, b => {
       b.permissions = structuredClone(permissions);
-      b.permissions[1].source = b.permissions[1].source.replace('commands.allow = ["w2_begin_attempt"]',
+      const begin = b.permissions[1];
+      assert(begin !== undefined, "begin permission exists");
+      begin.source = begin.source.replace('commands.allow = ["w2_begin_attempt"]',
         'commands.allow = ["w2_begin_attempt", "arbitrary"]');
     }],
     ["host dependency", /only iOS recorder dependencies/, b => {
