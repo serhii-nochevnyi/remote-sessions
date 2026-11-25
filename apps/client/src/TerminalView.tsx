@@ -49,6 +49,8 @@ export function TerminalView({ runtimeId, epoch, label, fontSize }: { runtimeId:
       theme: { background: "#111a21", foreground: "#d9e6e2" } });
     const fit = new FitAddon();
     terminal.loadAddon(fit);
+    terminal.open(container);
+    if (document.activeElement === container) terminal.focus();
 
     const proposals = new ResizeProposals();
     let routing: OrderedGeometry | undefined;
@@ -107,7 +109,12 @@ export function TerminalView({ runtimeId, epoch, label, fontSize }: { runtimeId:
       frame = requestAnimationFrame(layout);
     }
 
+    updateFont.current = size => {
+      terminal.options.fontSize = size;
+      layoutSoon();
+    };
     const observer = new ResizeObserver(layoutSoon);
+    observer.observe(container);
 
     let streamStage: TerminalStreamFailure = "attachment_setup";
     let failure: TerminalStreamFailure | undefined;
@@ -152,13 +159,6 @@ export function TerminalView({ runtimeId, epoch, label, fontSize }: { runtimeId:
     });
     const protocol = bindTerminalProtocol(terminal, bytes => { void scope.send(bytes); });
     const clipboard = bindTerminalPaste(container, bytes => { void scope.paste(bytes); });
-    terminal.open(container);
-    if (document.activeElement === container) terminal.focus();
-    updateFont.current = size => {
-      terminal.options.fontSize = size;
-      layoutSoon();
-    };
-    observer.observe(container);
     const sink = {
       write: (data: readonly number[]) => new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => {
