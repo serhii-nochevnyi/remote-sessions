@@ -589,13 +589,26 @@ class CaseRecord:
 
 def native_keys(attempt):
     """The fixture counters can reset only on a separately identified app launch."""
-    pairs = [(attempt.get("attemptId"), attempt.get("generation"))]
+    pairs = []
     if isinstance(attempt.get("recovery"), dict) and isinstance(attempt["recovery"].get("before"), dict):
         _, native_id, generation = attempt_identity(attempt["recovery"]["before"])
         pairs.append((native_id, generation))
+    pairs.append((attempt.get("attemptId"), attempt.get("generation")))
     for native_id, generation in pairs:
         if number(native_id, 1) and number(generation, 1) and named(attempt, "launch_id"):
             yield attempt["launch_id"], native_id, generation
+
+
+def out_of_order_attempts(attempts):
+    latest = {}
+    out_of_order = set()
+    for attempt in attempts:
+        for launch, native_id, generation in native_keys(attempt):
+            last_id, last_generation = latest.get(launch, (0, 0))
+            if native_id <= last_id or generation <= last_generation:
+                out_of_order.add(attempt["id"])
+            latest[launch] = (max(last_id, native_id), max(last_generation, generation))
+    return out_of_order
 
 
 def assess_cohort(cohort, role, cases, ids):
@@ -615,6 +628,7 @@ def assess_cohort(cohort, role, cases, ids):
     keys = [key for attempt in attempts for key in native_keys(attempt)]
     attempt_ids = Counter((launch, attempt_id) for launch, attempt_id, _ in keys)
     generations = Counter((launch, generation) for launch, _, generation in keys)
+    out_of_order = out_of_order_attempts(attempts)
     for attempt in attempts:
         case_id = attempt["case_id"]
         if readiness.status != "pass":
@@ -622,6 +636,8 @@ def assess_cohort(cohort, role, cases, ids):
         elif any(attempt_ids[launch, native_id] > 1 or generations[launch, generation] > 1
                  for launch, native_id, generation in native_keys(attempt)):
             result = Result("inconclusive", "native attempt or generation is reused within an app launch")
+        elif attempt["id"] in out_of_order:
+            result = Result("inconclusive", "native attempt or generation is out of order within an app launch")
         else:
             result = evaluate_attempt(attempt, cases[case_id], cohort, recipes.get(case_id))
         need(attempt.get("status") == result.status,

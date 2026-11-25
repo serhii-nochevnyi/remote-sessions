@@ -467,6 +467,28 @@ class EvidenceTest(unittest.TestCase):
         support.extend(row["id"] for row in self.baseline["attempts"][-2:])
         self.validate(report_for(self.baseline, support=support), "pass")
 
+    def test_older_native_attempts_cannot_be_reordered_as_fresh_passes(self):
+        report = self.complete(self.baseline)
+        case = self.cases["english-return"]
+        failure = add_attempt(self.baseline, case, "failure")
+        failure["observations"]["cursor_visible"] = False
+        failure_id = mark(failure, "failing")
+        attempts = self.baseline["attempts"]
+        first, second = attempts[:2]
+        attempts[:] = [*attempts[2:], first, second]
+        self.reject(report, "native attempt or generation is out of order")
+        mark(first, "inconclusive")
+        mark(second, "inconclusive")
+        held = report_for(self.baseline, "failing", "mandatory-failure", [failure_id])
+        self.validate(held, "failing")
+
+    def test_native_counters_can_restart_on_a_separate_app_launch(self):
+        report = self.complete(self.baseline)
+        first, second = self.baseline["attempts"][:2]
+        second.update(launch_id="synthetic relaunch", attemptId=first["attemptId"], generation=first["generation"])
+        second["final"].update(attemptId=first["attemptId"], generation=first["generation"])
+        self.validate(report, "pass")
+
     def test_truthful_setup_hold_and_inconclusive_cli_modes(self):
         hold = report_for(None, "setup-hold", "inconclusive", [])
         self.validate(hold, "setup-hold")
