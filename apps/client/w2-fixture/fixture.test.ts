@@ -14,6 +14,7 @@ import type { Terminal as BrowserTerminal } from "@xterm/xterm";
 import { act } from "react";
 import ts from "typescript";
 import type { Root } from "react-dom/client";
+import { observeTerminalLayout, type LayoutEvent } from "./terminal-layout.ts";
 import type { Invoke, Snapshot, registerRecorder } from "./recorder.ts";
 
 const fixtureDir = new URL("./", import.meta.url);
@@ -31,6 +32,7 @@ type MountOptions = {
   invoke?: (command: string, args?: InvokeArgs, options?: unknown) => unknown;
   transformEntry?: (source: string) => string;
   browserPaste?: boolean;
+  suppressCompositionEnd?: boolean;
   traceRegistration?: boolean;
 };
 type Listener = (event: {
@@ -48,13 +50,63 @@ class Element {
   attributes = new Map<string, string>();
   private listeners = new Map<string, { capture: boolean; callback: Listener }[]>();
   private text = "";
+  private classes = new Set<string>();
+  classList = {
+    add: (...names: string[]) => names.forEach(name => this.classes.add(name)),
+    remove: (...names: string[]) => names.forEach(name => this.classes.delete(name)),
+    contains: (name: string) => this.classes.has(name),
+    toggle: (name: string, enabled = !this.classes.has(name)) => {
+      if (enabled) this.classes.add(name);
+      else this.classes.delete(name);
+      return enabled;
+    },
+  };
+  selectionStart = 0;
+  selectionEnd = 0;
+  focusCount = 0;
+  scrollTop = 0;
+  get parentElement(): Element | null { return this.parentNode?.nodeType === 1 ? this.parentNode : null; }
+  get children() { return this.childNodes; }
+  get childElementCount() { return this.children.length; }
+  get lastChild(): Element | null { return this.childNodes.at(-1) ?? null; }
+  get isConnected(): boolean { return this.nodeType === 9 || Boolean(this.parentNode?.isConnected); }
+  get offsetWidth() { return this.classList.contains("xterm-char-measure-element") ? this.textContent.length * 8 : this.clientWidth; }
+  get offsetHeight() { return this.classList.contains("xterm-char-measure-element") ? 16 : this.clientHeight; }
+  getBoundingClientRect() {
+    return { width: 8, height: 16, left: 0, top: 0, right: 8, bottom: 16 };
+  }
+
+  getContext() {
+    return {
+      fillRect() {}, clearRect() {},
+      getImageData: () => ({ data: new Uint8ClampedArray(4) }),
+      measureText: () => ({ width: 8, fontBoundingBoxAscent: 12, fontBoundingBoxDescent: 4 }),
+    };
+  }
+
+  contains(element: Element | null): boolean {
+    return element !== null && (element === this || this.childNodes.some(child => child.contains(element)));
+  }
+
+  setSelectionRange(start: number, end: number) {
+    this.selectionStart = start;
+    this.selectionEnd = end;
+  }
+  select() { this.setSelectionRange(0, this.value.length); }
+  remove() { this.parentNode?.removeChild(this); }
+  append(...children: Element[]) { children.forEach(child => this.appendChild(child)); }
+  replaceChildren(...children: Element[]) {
+    this.textContent = "";
+    this.append(...children);
+  }
+  listenerCount(type: string) { return this.listeners.get(type)?.length ?? 0; }
 
   readonly localName: string;
   readonly ownerDocument: FixtureDocument | null;
   readonly nodeType: number;
   readonly namespaceURI: string;
-  readonly clientWidth = 360;
-  readonly clientHeight = 160;
+  clientWidth = 360;
+  clientHeight = 160;
 
   constructor(localName: string, ownerDocument: FixtureDocument | null, nodeType = 1, namespaceURI = "http://www.w3.org/1999/xhtml") {
     this.localName = localName;
@@ -70,7 +122,21 @@ class Element {
   defaultSelected = false;
 
   get options() { return this.localName === "select" ? this.childNodes : undefined; }
-  focus() {}
+  focus() {
+    this.focusCount++;
+    const document = this.ownerDocument!;
+    if (document.activeElement === this) return;
+    document.activeElement.blur();
+    document.activeElement = this;
+    this.dispatch("focus");
+  }
+
+  blur() {
+    const document = this.ownerDocument!;
+    if (document.activeElement !== this || this === document.body) return;
+    document.activeElement = document.body;
+    this.dispatch("blur");
+  }
 
   get disabled() { return this.attributes.has("disabled"); }
   get tagName() { return this.localName.toUpperCase(); }
@@ -91,6 +157,10 @@ class Element {
   appendChild(child: Element) { this.insertBefore(child, null); }
 
   insertBefore(child: Element, before: Element | null) {
+    if (child.nodeType === 11) {
+      for (const node of [...child.childNodes]) this.insertBefore(node, before);
+      return;
+    }
     child.parentNode?.removeChild(child);
     const index = before === null ? this.childNodes.length : this.childNodes.indexOf(before);
     assert(index >= 0, "insertBefore target belongs to this element");
@@ -132,24 +202,27 @@ class Element {
     if (!this.disabled) this.dispatch("click");
   }
 
-  dispatch(type: string) {
+  dispatch(type: string) { this.dispatchEvent(new Event(type, { bubbles: true, cancelable: true })); }
+
+  dispatchEvent(event: Event) {
     const path: Element[] = [];
     for (let node: Element | null = this; node; node = node.parentNode) path.push(node);
     let stopped = false;
-    const event = {
-      type,
-      target: this,
-      stopPropagation() { stopped = true; },
-      preventDefault() {},
-    };
+    Object.defineProperties(event, {
+      target: { value: this },
+      stopPropagation: { value: () => { stopped = true; } },
+    });
     for (const capture of [true, false]) {
-      for (const element of capture ? path.toReversed() : path) {
-        if (stopped) return;
-        for (const listener of element.listeners.get(type) ?? []) {
-          if (listener.capture === capture) listener.callback(event);
+      for (const element of capture ? path.toReversed() : event.bubbles ? path : [this]) {
+        if (stopped) return !event.defaultPrevented;
+        for (const listener of element.listeners.get(event.type) ?? []) {
+          if (listener.capture !== capture) continue;
+          if (!capture && event.type === "compositionend" && this.ownerDocument?.suppressCompositionEnd) continue;
+          listener.callback(event as unknown as Parameters<Listener>[0]);
         }
       }
     }
+    return !event.defaultPrevented;
   }
 
   find(predicate: (element: Element) => boolean): Element | undefined {
@@ -161,10 +234,34 @@ class Element {
   }
 }
 
+class FixtureEventTarget extends EventTarget {
+  private counts = new Map<string, Set<EventListenerOrEventListenerObject>>();
+
+  override addEventListener(type: string, callback: EventListenerOrEventListenerObject | null, options?: AddEventListenerOptions | boolean) {
+    if (callback) {
+      const listeners = this.counts.get(type) ?? new Set();
+      listeners.add(callback);
+      this.counts.set(type, listeners);
+    }
+    super.addEventListener(type, callback, options);
+  }
+
+  override removeEventListener(type: string, callback: EventListenerOrEventListenerObject | null, options?: EventListenerOptions | boolean) {
+    if (callback) this.counts.get(type)?.delete(callback);
+    super.removeEventListener(type, callback, options);
+  }
+
+  listenerCount(type: string) { return this.counts.get(type)?.size ?? 0; }
+}
+
 class FixtureDocument extends Element {
   readonly documentElement = this.createElement("html");
   readonly body = this.createElement("body");
-  readonly activeElement = this.body;
+  activeElement = this.body;
+  visibilityState = "visible";
+  hasFocus() { return true; }
+  suppressCompositionEnd = false;
+  createDocumentFragment() { return new Element("#fragment", this, 11); }
   defaultView?: object;
 
   constructor() {
@@ -191,6 +288,14 @@ class FixtureTerminal {
   readonly backend: InstanceType<typeof headless.Terminal> | BrowserTerminal;
   readonly browserTerminal?: BrowserTerminal;
   subscriptions = 0;
+  opens: Element[] = [];
+  fits = 0;
+  addons: object[] = [];
+  pastes: string[] = [];
+  focuses = 0;
+  disposals = 0;
+  private observer?: { dispose(): void };
+  private fallbackTextarea?: Element;
   readonly data: string[] = [];
   private lastWrite = Promise.resolve();
 
@@ -198,6 +303,7 @@ class FixtureTerminal {
     if (browserPaste) {
       this.browserTerminal = new browser.Terminal(options);
       this.backend = this.browserTerminal;
+      this.observer = this.browserTerminal.onData(text => this.data.push(text));
     } else {
       this.backend = new headless.Terminal(options);
     }
@@ -206,19 +312,37 @@ class FixtureTerminal {
   get options() { return this.backend.options; }
   get cols() { return this.backend.cols; }
   get rows() { return this.backend.rows; }
-  open(container: Element) {
-    if (!this.browserTerminal) return;
-    const terminal = this.browserTerminal as unknown as { _core: { textarea: Element } };
-    const textarea = container.ownerDocument!.createElement("textarea");
-    container.appendChild(textarea);
-    terminal._core.textarea = textarea;
+  get textarea() { return this.browserTerminal?.textarea ?? this.fallbackTextarea; }
+
+  loadAddon(addon: { activate(terminal: BrowserTerminal): void; dispose(): void; fit(): void }) {
+    this.addons.push(addon);
+    const fit = addon.fit.bind(addon);
+    addon.fit = () => {
+      this.fits++;
+      if (this.browserTerminal) fit();
+    };
+    this.browserTerminal?.loadAddon(addon);
   }
 
-  focus() { this.browserTerminal?.focus(); }
+  open(container: Element) {
+    this.opens.push(container);
+    if (this.browserTerminal) this.browserTerminal.open(container as unknown as HTMLElement);
+    else {
+      this.fallbackTextarea = container.ownerDocument!.createElement("textarea");
+      container.appendChild(this.fallbackTextarea);
+    }
+  }
+
+  focus() {
+    this.focuses++;
+    if (this.browserTerminal) this.browserTerminal.focus();
+    else this.fallbackTextarea?.focus();
+  }
   scrollToBottom() { this.backend.scrollToBottom(); }
 
   paste(text: string) {
     assert(this.browserTerminal, "paste must use the browser Terminal");
+    this.pastes.push(text);
     this.browserTerminal.paste(text);
   }
 
@@ -240,12 +364,16 @@ class FixtureTerminal {
   onData(callback: (data: string) => void) {
     this.subscriptions += 1;
     return this.backend.onData(text => {
-      this.data.push(text);
+      if (!this.browserTerminal) this.data.push(text);
       callback(text);
     });
   }
 
-  dispose() { this.backend.dispose(); }
+  dispose() {
+    this.disposals++;
+    this.observer?.dispose();
+    this.backend.dispose();
+  }
 }
 
 let mountNumber = 0;
@@ -274,6 +402,21 @@ function entryFromHtml() {
 export async function mountFixture(options: MountOptions = {}) {
   const { id, entry } = entryFromHtml();
   const document = new FixtureDocument();
+  document.suppressCompositionEnd = options.suppressCompositionEnd ?? false;
+  const styles: string[] = [];
+  const observers: ControlledObserver[] = [];
+  class ControlledObserver {
+    target?: Element;
+    disconnected = false;
+    notify: () => void;
+    constructor(notify: () => void) { this.notify = notify; observers.push(this); }
+    observe(target: Element) { this.target = target; }
+    disconnect() { this.disconnected = true; }
+  }
+  let frameId = 0;
+  const frames = new Map<number, FrameRequestCallback>();
+  const cancelledFrames: number[] = [];
+  const visualViewport = Object.assign(new FixtureEventTarget(), { width: 360, height: 300 });
   const container = document.createElement("div");
   container.id = id;
   document.body.appendChild(container);
@@ -281,8 +424,34 @@ export async function mountFixture(options: MountOptions = {}) {
   const registrations: Registration[] = [];
   const roots: Root[] = [];
   const terminals: FixtureTerminal[] = [];
-  const window = Object.assign(new EventTarget(), {
+  const window = Object.assign(new FixtureEventTarget(), {
     document,
+    visualViewport,
+    innerWidth: 360,
+    innerHeight: 640,
+    devicePixelRatio: 1,
+    getComputedStyle: (element: Element) => ({
+      width: `${element.clientWidth}px`, height: `${element.clientHeight}px`,
+      paddingLeft: "0", paddingRight: "0", paddingTop: "0", paddingBottom: "0",
+      getPropertyValue: (name: string) => {
+        if (name === "width") return `${element.clientWidth}px`;
+        if (name === "height") return `${element.clientHeight}px`;
+        return "0";
+      },
+    }),
+    matchMedia: () => ({ addListener() {}, removeListener() {} }),
+    requestAnimationFrame(callback: FrameRequestCallback) {
+      frames.set(++frameId, callback);
+      return frameId;
+    },
+    cancelAnimationFrame(id: number) {
+      cancelledFrames.push(id);
+      frames.delete(id);
+    },
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
     HTMLElement: Element,
     HTMLIFrameElement: class extends Element {},
     __TAURI_INTERNALS__: {
@@ -298,8 +467,10 @@ export async function mountFixture(options: MountOptions = {}) {
     installGlobal("window", window),
     installGlobal("document", document),
     installGlobal("IS_REACT_ACT_ENVIRONMENT", true),
-    installGlobal("ResizeObserver", class { observe() {} disconnect() {} }),
-    installGlobal("getComputedStyle", () => ({ paddingLeft: "0", paddingRight: "0", paddingTop: "0", paddingBottom: "0" })),
+    installGlobal("ResizeObserver", ControlledObserver),
+    installGlobal("getComputedStyle", window.getComputedStyle),
+    installGlobal("requestAnimationFrame", window.requestAnimationFrame),
+    installGlobal("cancelAnimationFrame", window.cancelAnimationFrame),
   ];
   let disposed = false;
   async function dispose() {
@@ -358,6 +529,7 @@ export async function mountFixture(options: MountOptions = {}) {
         if (context.parentURL === entry.href) {
           const adapter = adapters.get(specifier) ?? (specifier.endsWith(".css") ? "export {};" : undefined);
           if (adapter !== undefined) {
+            if (specifier.endsWith(".css")) styles.push(specifier);
             const url = new URL(`?mount=${scope}#${encodeURIComponent(specifier)}`, entry).href;
             virtual.set(url, adapter);
             return { url, shortCircuit: true };
@@ -397,6 +569,17 @@ export async function mountFixture(options: MountOptions = {}) {
       ipc,
       registrations,
       terminal,
+      terminals,
+      styles,
+      observers,
+      window,
+      frames,
+      cancelledFrames,
+      runFrames() {
+        for (const [id, callback] of [...frames]) {
+          if (frames.delete(id)) callback(0);
+        }
+      },
       act,
       button,
       async click(label: string) { await act(async () => { button(label).click(); }); },
@@ -593,13 +776,13 @@ function replaceOnce(source: string, original: string | RegExp, replacement: str
   return source.replace(original, () => replacement);
 }
 
-const registration = "const recorder = registerRecorder(terminal, invoke, onCaptureError);";
+const registration = "const recorder = registerRecorder(input, transport, onCaptureError);";
 
 function skipRegistration(source: string) {
   return replaceOnce(source, registration, `
     const recorder = {
       start: async () => 1,
-      read: async () => ({ bytes: [] }),
+      read: async () => ({ bytes: [], eventLengths: [] }),
       dispose() {},
     };
   `);
@@ -636,7 +819,7 @@ async function mountedTracer() {
   try {
     const executable = join(scratch, "recorder");
     compileNative(nativeSource, executable);
-    await assert.rejects(assertMountedInput(executable, "combined", skipRegistration), /production recorder registration/);
+    await assert.rejects(assertMountedInput(executable, "combined", skipRegistration), /production recorder registration|rendered native snapshot/);
     await assert.rejects(assertMountedInput(executable, "combined", bypassRegistrationTransport), /registered invoke trace matches actual IPC/);
     await assertMountedInput(executable, "combined");
     await assertMountedInput(executable, "split");
@@ -757,10 +940,230 @@ function assertManifestVectors() {
   });
 }
 
+type Mounted = Awaited<ReturnType<typeof mountFixture>>;
+
+function field(fixture: Mounted, id: string) {
+  const element = fixture.document.getElementById(id);
+  assert(element, `missing rendered field ${id}`);
+  return element;
+}
+
+function controlledClock() {
+  const realSet = globalThis.setTimeout;
+  const realClear = globalThis.clearTimeout;
+  let now = 0;
+  let order = 0;
+  const work = new Map<object, { run: () => void; due: number; order: number }>();
+  const restoreSet = installGlobal("setTimeout", (callback: () => void, ms = 0) => {
+    if (ms !== 0 && ms !== 250) return realSet(callback, ms);
+    const handle = {};
+    work.set(handle, { run: callback, due: now + ms, order: ++order });
+    return handle;
+  });
+  const restoreClear = installGlobal("clearTimeout", (handle: ReturnType<typeof setTimeout>) => {
+    if (!work.delete(handle)) realClear(handle);
+  });
+  return {
+    advance(ms: number) {
+      const target = now + ms;
+      for (;;) {
+        const next = [...work].filter(([, task]) => task.due <= target)
+          .sort(([, a], [, b]) => a.due - b.due || a.order - b.order)[0];
+        if (!next) break;
+        work.delete(next[0]);
+        now = next[1].due;
+        next[1].run();
+      }
+      now = target;
+    },
+    dispose() { restoreClear(); restoreSet(); },
+  };
+}
+
+class FixtureInputEvent extends Event {
+  inputType: string;
+  data: string;
+  isComposing: boolean;
+  constructor(inputType: string, data: string, isComposing: boolean) {
+    super("input", { bubbles: true, composed: true, cancelable: true });
+    this.inputType = inputType;
+    this.data = data;
+    this.isComposing = isComposing;
+  }
+}
+
+async function compositionDriver(fixture: Mounted) {
+  await fixture.click("Focus");
+  const textarea = fixture.terminal.textarea as unknown as Element;
+  assert.equal(fixture.document.activeElement, textarea);
+  const clock = controlledClock();
+  function change(value: string, type: string, isComposing: boolean) {
+    textarea.value = value;
+    textarea.setSelectionRange(value.length, value.length);
+    textarea.dispatchEvent(new FixtureInputEvent(type, value, isComposing));
+  }
+  function composition(type: string, data: string) {
+    textarea.dispatchEvent(Object.assign(new Event(type, { bubbles: true, composed: true }), { data }));
+  }
+  return {
+    textarea,
+    clock,
+    start() {
+      textarea.value = "";
+      textarea.setSelectionRange(0, 0);
+      composition("compositionstart", "");
+    },
+    update(text: string) {
+      composition("compositionupdate", text);
+      change(text, "insertCompositionText", true);
+    },
+    premature(text: string) {
+      textarea.dispatchEvent(new FixtureInputEvent("insertText", text, true));
+    },
+    end(value: string) {
+      composition("compositionend", "end event data is not the committed value");
+      change(value, value ? "insertFromComposition" : "deleteCompositionText", false);
+    },
+  };
+}
+
+function trace(fixture: Mounted) {
+  return JSON.parse(field(fixture, "composition-trace").textContent) as {
+    caseId: string;
+    attemptId: number;
+    generation: number;
+    events: { event: string; sequence: number; bytes?: number; nativeSequence?: number }[];
+  };
+}
+
+function appends(fixture: Mounted) {
+  return fixture.ipc.filter(call => call.command === "w2_append_input");
+}
+
+function reads(fixture: Mounted) {
+  return fixture.ipc.filter(call => call.command === "w2_read_attempt");
+}
+
+async function startCase(fixture: Mounted, id: CaseId) {
+  const focuses = fixture.terminal.focuses;
+  await fixture.selectCase(id);
+  await fixture.click("Start");
+  await fixture.waitFor(() => Boolean(fixture.container.find(node => node.localName === "button" && node.textContent === "Restart" && !node.disabled)), "Start completes");
+  assert.equal(fixture.terminal.focuses, focuses, "starting a case does not request focus");
+}
+
+async function finalRead(fixture: Mounted) {
+  await fixture.click("Read");
+  await fixture.waitFor(() => field(fixture, "snapshot").textContent !== "—", "Read completes");
+}
+
+function assertTrace(fixture: Mounted, caseId: CaseId, generation: number, events: string[], attemptId = 1) {
+  const actual = trace(fixture);
+  assert.deepEqual([actual.caseId, actual.attemptId, actual.generation], [caseId, attemptId, generation]);
+  assert.deepEqual(actual.events.map(entry => entry.event), events, "composition trace phases");
+  assert.deepEqual(actual.events.map(entry => entry.sequence), events.map((_, i) => i + 1));
+  return actual.events;
+}
+
+async function compositionVector(
+  fixture: Mounted,
+  native: ReturnType<typeof connectNative>,
+  id: CaseId,
+  generation: number,
+  options: { hostile?: boolean; keepPreedit?: boolean; overlap?: () => void; repeat?: boolean; attemptId?: number } = {},
+) {
+  const vector = requiredVectors[id];
+  const driver = await compositionDriver(fixture);
+  const initialFocuses = driver.textarea.focusCount;
+  const initialReads = reads(fixture).length;
+  const initialAppends = appends(fixture).length;
+  const initialData = fixture.terminal.data.length;
+  try {
+    await act(async () => {
+      driver.start();
+      driver.clock.advance(250);
+    });
+    assert.equal(reads(fixture).length, initialReads, "no read before preedit");
+    await act(async () => {
+      driver.update("draft");
+      if (id === "composition-replacement") driver.update("replaced draft");
+      driver.clock.advance(250);
+    });
+    if (options.overlap) {
+      await act(async () => { driver.clock.advance(250); });
+      assert.equal(reads(fixture).length, initialReads + 1, "checkpoint read must not overlap");
+      options.overlap();
+    }
+    await fixture.waitFor(() => field(fixture, "checkpoint").textContent.includes("active and focused"), "focused checkpoint");
+    if (options.repeat) {
+      const first = field(fixture, "checkpoint").textContent;
+      await act(async () => { driver.clock.advance(250); });
+      await fixture.waitFor(() => field(fixture, "checkpoint").textContent !== first, "a later tick refreshes the checkpoint");
+    }
+    const checkpoint = field(fixture, "checkpoint").textContent;
+    assert.match(checkpoint, new RegExp(`generation ${generation} .*active and focused .*· [(]empty[)]$`));
+    assert.equal(fixture.document.activeElement, driver.textarea);
+    assert.equal(driver.textarea.focusCount, initialFocuses, "checkpoint does not request focus");
+    assert.equal(fixture.terminal.textarea, driver.textarea);
+    assert.deepEqual(native.snapshot(), {
+      caseId: id, generation, nextSequence: 1, bytes: [], eventLengths: [], rejected: 0, invalid: false,
+    });
+    assert.equal(fixture.terminal.data.length, initialData);
+    assert.equal(appends(fixture).length, initialAppends);
+
+    await act(async () => {
+      if (options.hostile) {
+        driver.premature("unexpected");
+        assert.deepEqual(fixture.terminal.data.slice(initialData), ["unexpected"]);
+        assert.equal(appends(fixture).length, initialAppends);
+      }
+      driver.end(options.keepPreedit ? driver.textarea.value : vector.text);
+      assert.equal(fixture.terminal.data.length, initialData + Number(Boolean(options.hostile)));
+      assert.equal(appends(fixture).length, initialAppends);
+      driver.clock.advance(0);
+    });
+
+    assert.deepEqual(fixture.terminal.data.slice(initialData),
+      [...(options.hostile ? ["unexpected"] : []), ...(vector.text ? [vector.text] : [])], "public composition emissions");
+    await finalRead(fixture);
+    const accepted = vector.text && !options.hostile;
+    const bytes = accepted ? [...Buffer.from(vector.afterHex, "hex")] : [];
+    assert.deepEqual(appends(fixture).slice(initialAppends), accepted ? [
+      { command: "w2_append_input", args: { generation, sequence: 1, events: [bytes] } },
+    ] : [], "guarded composition appends");
+    assert.deepEqual(reads(fixture).slice(initialReads), Array.from({ length: options.repeat ? 3 : 2 }, () => ({
+      command: "w2_read_attempt", args: { generation },
+    })));
+    assert.deepEqual(native.snapshot(), {
+      caseId: id, generation, nextSequence: accepted ? 2 : 1, bytes,
+      eventLengths: accepted ? [bytes.length] : [], rejected: 0, invalid: false,
+    });
+    assert.equal(field(fixture, "snapshot").textContent, accepted ? vector.afterHex : "(empty)");
+    assert.equal(field(fixture, "checkpoint").textContent, checkpoint);
+    const held = fixture.container.find(node => node.getAttribute("role") === "alert");
+    assert.equal(Boolean(held?.textContent.startsWith("Held:")), Boolean(options.hostile), "unexpected input holds the attempt");
+    const events = assertTrace(fixture, id, generation, [
+      "start", "update", ...(id === "composition-replacement" ? ["update"] : []), "active checkpoint",
+      ...(options.repeat ? ["active checkpoint"] : []), ...(options.hostile ? ["rejection"] : []), "end",
+      ...(options.hostile ? ["rejection"] : accepted ? ["admission", "append dispatch", "append acknowledgment"] : []),
+      "final snapshot",
+    ], options.attemptId);
+    if (accepted) {
+      for (const event of events.filter(entry => entry.event.startsWith("append"))) {
+        assert.equal(event.bytes, bytes.length);
+        assert.equal(event.nativeSequence, 1);
+      }
+    }
+  } finally {
+    driver.clock.dispose();
+  }
+}
+
 async function exerciseCases(
   executable: string,
   ids: readonly CaseId[],
   transformEntry?: MountOptions["transformEntry"],
+  controls: { suppressCompositionEnd?: boolean; keepPreedit?: boolean } = {},
 ) {
   const native = connectNative(executable, "requests");
   const manifest = readManifest();
@@ -772,7 +1175,8 @@ async function exerciseCases(
       const usingPaste = "paste" in vector;
       const generation = index + 1;
       const fixture = await mountFixture({
-        invoke: native.invoke, transformEntry, browserPaste: usingPaste, traceRegistration: false,
+        invoke: native.invoke, transformEntry, browserPaste: usingPaste || id.startsWith("composition-"),
+        suppressCompositionEnd: controls.suppressCompositionEnd, traceRegistration: false,
       });
       try {
         assert.equal(fixture.ipc.length, 0, "transcript generates no IPC");
@@ -794,6 +1198,11 @@ async function exerciseCases(
 
         await fixture.click("Start");
         assert.deepEqual(fixture.ipc, [{ command: "w2_begin_attempt", args: { caseId: id } }], "one selected begin");
+        if (id.startsWith("composition-")) {
+          await fixture.waitFor(() => Boolean(fixture.container.find(node => node.localName === "button" && node.textContent === "Restart" && !node.disabled)), "Start completes");
+          await compositionVector(fixture, native, id, generation, { keepPreedit: controls.keepPreedit });
+          continue;
+        }
         await fixture.waitFor(() => !fixture.button("Read").disabled, "Start enables Read");
 
         const snapshot = (bytes: number[]): Snapshot => ({
@@ -814,7 +1223,8 @@ async function exerciseCases(
         const hex = vector.beforeHex || vector.afterHex;
         const bytes = [...Buffer.from(hex, "hex")];
         if (usingPaste) {
-          await act(async () => { fixture.terminal.paste(vector.text); });
+          await fixture.click("Paste sample");
+          assert.deepEqual(fixture.terminal.pastes, [vector.text], "paste control delivers the raw vector");
         } else if (vector.text) {
           await fixture.input(vector.text);
         }
@@ -858,7 +1268,377 @@ function productionCaseControls() {
       "onClick={() => {}}")), /one selected begin/);
     await assert.rejects(exerciseCases(executable, requiredIds, source => replaceOnce(source,
       "selected.expected.afterHex || emptyHex", "manifest.cases[1].expected.afterHex || emptyHex")), /6f6b0d/);
+    await assert.rejects(exerciseCases(executable, ["composition-commit"], undefined,
+      { suppressCompositionEnd: true }), /public composition emissions/);
+    await assert.rejects(exerciseCases(executable, ["composition-cancel"], undefined,
+      { keepPreedit: true }), /public composition emissions/);
     await exerciseCases(executable, requiredIds);
+  });
+}
+
+async function viewportUpdates() {
+  const document = new FixtureDocument();
+  const host = document.createElement("div");
+  const textarea = document.createElement("textarea");
+  host.appendChild(textarea);
+  document.body.appendChild(host);
+  const visualViewport = Object.assign(new EventTarget(), { width: 360, height: 200 });
+  const frames = new Map<number, FrameRequestCallback>();
+  let nextFrame = 0;
+  document.defaultView = Object.assign(new EventTarget(), {
+    visualViewport,
+    requestAnimationFrame(callback: FrameRequestCallback) {
+      frames.set(++nextFrame, callback);
+      return nextFrame;
+    },
+    cancelAnimationFrame(id: number) { frames.delete(id); },
+  });
+  let notify = () => {};
+  let disconnected = false;
+  const restore = installGlobal("ResizeObserver", class {
+    constructor(update: () => void) { notify = update; }
+    observe(target: Element) { assert.equal(target, host); }
+    disconnect() { disconnected = true; }
+  });
+  const fitted: object[] = [];
+  const terminal = { fit() { fitted.push(this); } };
+  let diagnostics: readonly LayoutEvent[] = [];
+  const stop = observeTerminalLayout(host as unknown as HTMLElement, textarea as unknown as HTMLTextAreaElement,
+    terminal, events => { diagnostics = events; });
+  function flush() {
+    assert.equal(frames.size, 1);
+    for (const [id, callback] of [...frames]) {
+      frames.delete(id);
+      callback(0);
+    }
+  }
+  try {
+    host.clientWidth = 0;
+    notify();
+    visualViewport.dispatchEvent(new Event("resize"));
+    flush();
+    assert.deepEqual(fitted, []);
+    host.clientWidth = 360;
+    for (let i = 0; i < 30; i++) {
+      notify();
+      visualViewport.dispatchEvent(Object.assign(new Event("scroll"), { data: "secret payload" }));
+    }
+    flush();
+    assert.deepEqual(fitted, [terminal]);
+    assert.equal(textarea.focusCount, 0);
+    assert.equal(diagnostics.length, 24);
+    assert(diagnostics.every(event => !event.focused && event.visible && event.height === 200));
+    assert(!JSON.stringify(diagnostics).includes("secret payload"));
+    notify();
+    assert.equal(frames.size, 1);
+  } finally {
+    stop();
+    restore();
+  }
+  assert(disconnected);
+  const last = diagnostics;
+  notify();
+  visualViewport.dispatchEvent(new Event("resize"));
+  (document.defaultView as EventTarget).dispatchEvent(new Event("orientationchange"));
+  assert.equal(diagnostics, last);
+  assert.equal(frames.size, 0);
+}
+
+async function checkMountedLayout(transformEntry?: MountOptions["transformEntry"]) {
+  const fixture = await mountFixture({ transformEntry, browserPaste: true });
+  const { terminal, window, document } = fixture;
+  try {
+    const host = field(fixture, "terminal");
+    assert(fixture.styles.includes("./fixture.css"), "fixture loads its layout stylesheet");
+    assert.match(readFileSync(new URL("fixture.css", fixtureDir), "utf8"), /[.]terminal-host\s*\{/);
+    assert.equal(host.getAttribute("class"), "terminal-host");
+    assert(terminal.opens.length === 1 && terminal.opens[0] === host, "terminal opened in the rendered host");
+    assert.equal(terminal.browserTerminal?.element?.parentElement, host);
+    assert.equal(terminal.addons.length, 1, "terminal has a fit addon");
+    const observer = fixture.observers.find(entry => entry.target === host);
+    assert(observer, "layout observes the rendered host");
+    const notify = observer.notify;
+    const rows = () => {
+      const buffer = terminal.backend.buffer.active;
+      return Array.from({ length: buffer.length }, (_, index) => buffer.getLine(index)?.translateToString(true))
+        .filter(Boolean).join("\n");
+    };
+    const transcript = rows();
+    assert.match(transcript, /COPY-Ї/);
+    const textarea = terminal.textarea as unknown as Element;
+    async function resize() {
+      await act(async () => {
+        notify();
+        window.visualViewport.dispatchEvent(new Event("resize"));
+        window.dispatchEvent(new Event("resize"));
+        window.dispatchEvent(new Event("orientationchange"));
+        fixture.runFrames();
+      });
+    }
+    host.clientWidth = 0;
+    await resize();
+    assert.equal(terminal.fits, 0);
+    host.clientWidth = 360;
+    await resize();
+    assert.equal(terminal.fits, 1);
+    assert(terminal.cols > 36, "fit addon resized the attached terminal");
+    await fixture.selectCase("rotation");
+    window.visualViewport.height = 240;
+    await resize();
+    assert.equal(terminal.fits, 2);
+    assert.match(field(fixture, "layout-events").textContent, /orientation change/);
+    assert.equal(field(fixture, "terminal"), host);
+    assert.equal(fixture.terminals.length, 1, "layout and case updates keep one mounted terminal");
+    assert.equal(terminal.opens.length, 1);
+    assert.equal(terminal.subscriptions, 1);
+    assert.equal(terminal.disposals, 0);
+    assert.equal(terminal.focuses, 0);
+    assert.equal(rows(), transcript);
+    await fixture.click("Focus");
+    assert.equal(terminal.focuses, 1);
+    assert.equal(document.activeElement, textarea);
+    assert.equal(textarea.focusCount, 1);
+    await resize();
+    assert.equal(terminal.fits, 3);
+    assert.equal(document.activeElement, textarea);
+    assert.equal(textarea.focusCount, 1);
+
+    fixture.runFrames();
+    await act(async () => { observer.notify(); });
+    const pending = [...fixture.frames.keys()];
+    assert(pending.length > 0);
+    await fixture.dispose();
+    assert(observer.disconnected);
+    assert(pending.every(id => fixture.cancelledFrames.includes(id)));
+    assert.equal(window.listenerCount("resize"), 0);
+    assert.equal(window.listenerCount("orientationchange"), 0);
+    assert.equal(window.visualViewport.listenerCount("resize"), 0);
+    assert.equal(window.visualViewport.listenerCount("scroll"), 0);
+    const pendingAfterDispose = fixture.frames.size;
+    observer.notify();
+    window.visualViewport.dispatchEvent(new Event("resize"));
+    window.dispatchEvent(new Event("resize"));
+    window.dispatchEvent(new Event("orientationchange"));
+    assert.equal(fixture.frames.size, pendingAfterDispose);
+    assert.equal(terminal.disposals, 1);
+    assert.equal(textarea.listenerCount("compositionstart"), 0);
+    assert.equal(textarea.listenerCount("blur"), 0);
+
+  } finally {
+    await fixture.dispose();
+  }
+}
+
+async function mountedLayout() {
+  await assert.rejects(checkMountedLayout(source => replaceOnce(source,
+    "observeTerminalLayout(host, textarea, fit, publishLayout)", "() => {}")), /layout observes the rendered host/);
+  await assert.rejects(checkMountedLayout(source => replaceOnce(source,
+    "const host = viewport.current;", "const host = document.getElementById('root') as HTMLDivElement;")),
+  /terminal opened in the rendered host/);
+  for (const dependency of ["caseId", "layout.length > 1"]) {
+    await assert.rejects(checkMountedLayout(source => replaceOnce(source, "}, []);", `}, [${dependency}]);`)),
+      /mounted terminal|one xterm|terminal opened|transcript|found|fits|Expected values|fit addon resized/);
+  }
+  await checkMountedLayout();
+}
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>(done => { resolve = done; });
+  return { promise, resolve };
+}
+
+async function checkCheckpoint(executable: string, transformEntry?: MountOptions["transformEntry"]) {
+  const native = connectNative(executable, "requests");
+  const gate = deferred();
+  let delayRead = true;
+  const fixture = await mountFixture({
+    browserPaste: true,
+    transformEntry,
+    async invoke(command, args) {
+      const result = await native.invoke(command, args);
+      if (delayRead && command === "w2_read_attempt") await gate.promise;
+      return result;
+    },
+  });
+  try {
+    await startCase(fixture, "composition-commit");
+    await compositionVector(fixture, native, "composition-commit", 1, {
+      overlap() { delayRead = false; gate.resolve(); },
+    });
+    await startCase(fixture, "composition-cancel");
+    await compositionVector(fixture, native, "composition-cancel", 2, { attemptId: 2, repeat: true });
+    await startCase(fixture, "composition-commit");
+    await compositionVector(fixture, native, "composition-commit", 3, { hostile: true, attemptId: 3 });
+    await startCase(fixture, "composition-commit");
+    await compositionVector(fixture, native, "composition-commit", 4, { attemptId: 4 });
+    await native.finish();
+  } catch (error) {
+    await native.abort();
+    throw error;
+  } finally {
+    gate.resolve();
+    await fixture.dispose();
+  }
+}
+
+async function checkLateRead(executable: string, stop: "end" | "blur" | "hide" | "case" | "restart" | "unmount") {
+  const native = connectNative(executable, "requests");
+  const gate = deferred();
+  const returned = deferred();
+  const fixture = await mountFixture({
+    browserPaste: true,
+    async invoke(command, args) {
+      const result = await native.invoke(command, args);
+      if (command === "w2_read_attempt") {
+        await gate.promise;
+        returned.resolve();
+      }
+      return result;
+    },
+  });
+  await startCase(fixture, "composition-commit");
+  const driver = await compositionDriver(fixture);
+  try {
+    await act(async () => {
+      driver.start();
+      driver.update("draft");
+      driver.clock.advance(250);
+    });
+    assert.equal(reads(fixture).length, 1);
+    if (stop === "unmount") await fixture.dispose();
+    else if (stop === "case") await fixture.selectCase("rotation");
+    else if (stop === "restart") {
+      await fixture.click("Restart");
+      await fixture.waitFor(() => fixture.ipc.filter(call => call.command === "w2_begin_attempt").length === 2, "fresh attempt starts");
+    } else await act(async () => {
+      if (stop === "end") driver.end("é");
+      if (stop === "blur") driver.textarea.blur();
+      if (stop === "hide") {
+        fixture.document.visibilityState = "hidden";
+        fixture.document.dispatch("visibilitychange");
+      }
+    });
+    const checkpoint = fixture.document.getElementById("checkpoint");
+    const prior = checkpoint?.textContent;
+    const priorTrace = fixture.document.getElementById("composition-trace")?.textContent;
+    await act(async () => {
+      gate.resolve();
+      await returned.promise;
+    });
+    assert.equal(checkpoint?.textContent, prior, "stale checkpoint cannot publish");
+    assert.equal(fixture.document.getElementById("composition-trace")?.textContent, priorTrace, "stale read cannot change the trace");
+    await act(async () => { driver.clock.advance(1000); });
+    assert.equal(reads(fixture).length, 1, "stale read cannot schedule another poll");
+    assert.equal(appends(fixture).length, 0);
+    await native.finish();
+  } catch (error) {
+    await native.abort();
+    throw error;
+  } finally {
+    gate.resolve();
+    await fixture.dispose();
+    driver.clock.dispose();
+  }
+}
+
+async function checkPrematureBeforePoll(executable: string) {
+  const native = connectNative(executable, "requests");
+  const fixture = await mountFixture({ browserPaste: true, invoke: native.invoke });
+  await startCase(fixture, "composition-commit");
+  const driver = await compositionDriver(fixture);
+  try {
+    await act(async () => {
+      driver.start();
+      driver.update("draft");
+      driver.premature("before first poll");
+      driver.end("é");
+      driver.clock.advance(500);
+    });
+    assert.deepEqual(fixture.terminal.data, ["before first poll", "é"]);
+    assert.deepEqual(reads(fixture), []);
+    assert.deepEqual(appends(fixture), []);
+    await finalRead(fixture);
+    assert.equal(field(fixture, "snapshot").textContent, "(empty)");
+    assert.match(fixture.container.find(node => node.getAttribute("role") === "alert")?.textContent ?? "", /^Held:/);
+    assertTrace(fixture, "composition-commit", 1, ["start", "update", "rejection", "end", "rejection", "final snapshot"]);
+    await native.finish();
+  } catch (error) {
+    await native.abort();
+    throw error;
+  } finally {
+    await fixture.dispose();
+    driver.clock.dispose();
+  }
+}
+
+async function checkUnexpectedCompositionWithAppend(executable: string) {
+  const native = connectNative(executable, "requests");
+  const gate = deferred();
+  const fixture = await mountFixture({
+    browserPaste: true,
+    async invoke(command, args) {
+      const result = await native.invoke(command, args);
+      if (command === "w2_append_input") await gate.promise;
+      return result;
+    },
+  });
+  await startCase(fixture, "english-return");
+  const driver = await compositionDriver(fixture);
+  try {
+    await act(async () => {
+      driver.premature("ok");
+      driver.start();
+      driver.update("draft");
+      driver.premature("unexpected");
+      driver.end("é");
+      driver.clock.advance(250);
+    });
+    assert.deepEqual(fixture.terminal.data, ["ok", "unexpected", "é"]);
+    assert.deepEqual(appends(fixture), [
+      { command: "w2_append_input", args: { generation: 1, sequence: 1, events: [[111, 107]] } },
+    ]);
+    assertTrace(fixture, "english-return", 1, ["in-flight append uncertain"]);
+    assert.match(fixture.container.find(node => node.getAttribute("role") === "alert")?.textContent ?? "", /^Held:/);
+    gate.resolve();
+    await finalRead(fixture);
+    assertTrace(fixture, "english-return", 1, ["in-flight append uncertain", "append acknowledgment"]);
+    assert.equal(field(fixture, "snapshot").textContent, "6f6b");
+    assert.deepEqual((native.snapshot() as Snapshot).bytes, [111, 107]);
+    await native.finish();
+  } catch (error) {
+    await native.abort();
+    throw error;
+  } finally {
+    gate.resolve();
+    await fixture.dispose();
+    driver.clock.dispose();
+  }
+}
+
+async function checkpointControls() {
+  await withNativeExecutable(async executable => {
+    for (const bypass of ["return;", "return deliver(text);"]) {
+      await assert.rejects(checkCheckpoint(executable, source => replaceOnce(source,
+        "const bytes = encoder.encode(text);", `if (attempt.phase === "active") ${bypass}\n          const bytes = encoder.encode(text);`)),
+      /unexpected input holds|guarded composition appends|composition trace phases/);
+    }
+    await assert.rejects(checkCheckpoint(executable, source => replaceOnce(source,
+      'const recorder = registerRecorder(input, transport, onCaptureError);',
+      'const recorder = registerRecorder({ onData: () => ({ dispose() {} }) }, transport, onCaptureError);')),
+    /guarded composition appends/);
+    await assert.rejects(checkCheckpoint(executable, source => replaceOnce(source,
+      'checkpointRead = recorder.read();', 'checkpointRead = Promise.reject(new Error("disconnected read"));')),
+    /checkpoint read must not overlap/);
+    await assert.rejects(checkCheckpoint(executable, source => replaceOnce(source,
+      'const sequence = record(attempt, "active checkpoint"', 'textarea.focus(); const sequence = record(attempt, "active checkpoint"')),
+    /checkpoint does not request focus/);
+    await checkPrematureBeforePoll(executable);
+    await checkUnexpectedCompositionWithAppend(executable);
+    await checkCheckpoint(executable);
+    for (const stop of ["end", "blur", "hide", "case", "restart", "unmount"] as const) {
+      await checkLateRead(executable, stop);
+    }
   });
 }
 
@@ -1259,6 +2039,9 @@ if (import.meta.main) {
   test("mandatory cases use independent vectors and exact native case IDs", assertManifestVectors);
   test("paste vectors match xterm newline normalization", pasteVectorsMatch);
   test("production case controls launch every mandatory manifest vector", productionCaseControls);
+  test("viewport updates keep one terminal and dispose listeners", viewportUpdates);
+  test("mounted fixture wires layout without remounting its terminal", mountedLayout);
+  test("mounted composition checkpoint reads native bytes before commit without moving focus", checkpointControls);
   test("native tracer rejects disconnected command wrappers", disconnectedWrapperControls);
   test("declared fixture boundary matches the iOS-only contract", () => assertBoundary(readBoundary()));
   test("declared fixture boundary rejects broadened declarations", declarationControls);

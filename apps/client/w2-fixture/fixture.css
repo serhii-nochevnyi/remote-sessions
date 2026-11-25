@@ -1,0 +1,62 @@
+body {
+  margin: 0;
+  font-family: system-ui, sans-serif;
+}
+
+main {
+  box-sizing: border-box;
+  padding: max(0.5rem, env(safe-area-inset-top)) max(0.5rem, env(safe-area-inset-right))
+    max(0.5rem, env(safe-area-inset-bottom)) max(0.5rem, env(safe-area-inset-left));
+}
+
+h1 {
+  font-size: 1rem;
+  margin: 0 0 0.25rem;
+}
+
+select, button {
+  font-size: 1rem;
+  max-width: 100%;
+}
+
+.terminal-host {
+  width: 100%;
+  height: clamp(64px, calc(var(--visible-height, 100dvh) * 0.48), 24rem);
+  overflow: hidden;
+  background: #111a21;
+}
+
+output {
+  overflow-wrap: anywhere;
+}
+
+pre {
+  max-height: 8rem;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
+.terminal-host, .checkpoint {
+  min-width: 0;
+}
+
+.checkpoint label {
+  display: block;
+  font-weight: 600;
+}
+
+@media (orientation: landscape) and (min-width: 32rem) {
+  .terminal-region {
+    display: flex;
+    align-items: start;
+    gap: 0.5rem;
+  }
+
+  .terminal-host {
+    flex: 1 1 auto;
+  }
+
+  .checkpoint {
+    flex: 0 0 min(38%, 20rem);
+  }
+}
