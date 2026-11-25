@@ -82,7 +82,8 @@ def make_recipes(cohort, cases):
         recipe["id"] = evidence.fingerprint(recipe)
         recipe["rehearsals"] = [
             {"id": f"{cohort['tuple']['source_revision']}-{case_id}-rehearsal-{i}", "ref": "synthetic rehearsal",
-             "recipe_id": recipe["id"], "preedit": preedit.copy(), "end_state": recipe["end_state"]}
+             "cohort_fingerprint": cohort["fingerprint"], "recipe_id": recipe["id"],
+             "preedit": preedit.copy(), "end_state": recipe["end_state"]}
             for i in range(2)
         ]
         cohort["recipes"][case_id] = recipe
@@ -305,6 +306,21 @@ class EvidenceTest(unittest.TestCase):
         recipe["steps"].pop()
         row["recipe_id"] = "f" * 64
         self.reject(report, "frozen qualified recipe")
+
+    def test_rehearsals_must_come_from_the_signed_cohort(self):
+        row = self.sample()
+        other = bound_cohort("3", "4")
+        make_recipes(other, self.cases)
+        recipe = self.baseline["recipes"][row["case_id"]]
+        recipe["rehearsals"] = other["recipes"][row["case_id"]]["rehearsals"]
+        self.reject(report_for(self.baseline), "different signed cohort")
+
+    def test_replacement_checkpoint_follows_both_nonempty_updates(self):
+        row = self.sample("composition-replacement")
+        trace = row["trace"]["events"]
+        row["trace"]["events"] = events(*trace[:4], *trace[5:])
+        row["checkpoint"]["sequence"] = 3
+        self.reject(report_for(self.baseline), "checkpoint precedes the replacement update")
 
     def test_checkpoint_required_active_focused_in_order_and_empty(self):
         row = self.sample()

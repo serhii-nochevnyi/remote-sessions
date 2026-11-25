@@ -256,7 +256,7 @@ def cohort_readiness(cohort, role):
     return Result("pass")
 
 
-def qualify(recipe, case, data):
+def qualify(recipe, case, data, cohort_fingerprint):
     preedit, end_action = COMPOSITION[case["id"]]
     language = recipe.get("keyboard_language")
     need(language == data["keyboard"]["scenario_languages"][case["id"]] and recipe.get("keyboard") == data["keyboard"],
@@ -274,6 +274,8 @@ def qualify(recipe, case, data):
     seen = set()
     for rehearsal in rehearsals:
         rehearsal = obj(rehearsal, "rehearsal")
+        need(rehearsal.get("cohort_fingerprint") == cohort_fingerprint,
+             "recipe rehearsal belongs to a different signed cohort")
         need(named(rehearsal, "id", "ref") and rehearsal["id"] not in seen
              and rehearsal.get("recipe_id") == recipe["id"]
              and rehearsal.get("preedit") == preedit and rehearsal.get("end_state") == recipe["end_state"],
@@ -362,6 +364,9 @@ def check_composition(attempt, final, identity, expected):
         prior = [active for seq, active in updates if seq < sample["sequence"]]
         need(sample["sequence"] < end and prior and prior[-1], "checkpoint outside nonempty preedit")
     last_sample = samples[-1]
+    if identity[0] == "composition-replacement":
+        need(sum(active for seq, active in updates if seq < last_sample["sequence"]) >= 2,
+             "active checkpoint precedes the replacement update")
     need(last_sample["bytes"] * 2 == len(checkpoint["hex"])
          and number(checkpoint.get("nextSequence"), 1)
          and last_sample["nativeSequence"] == checkpoint.get("nextSequence"),
@@ -370,8 +375,6 @@ def check_composition(attempt, final, identity, expected):
     need(all(event["bytes"] > 0 for name in ("admission", "rejection", "append dispatch", "append acknowledgment")
              for event in events[name]), "input or append evidence must identify nonempty data")
 
-    # Preserve accepted pre-end input as a failure even when the last sample was
-    # empty and the eventual final vector is exactly the intended one.
     admissions = events["admission"]
     dispatches = events["append dispatch"]
     acks = events["append acknowledgment"]
@@ -520,7 +523,7 @@ def qualifications(cohort, cases):
     for case_id in COMPOSITION:
         try:
             recipe = obj(recipes.get(case_id), f"{case_id} recipe")
-            rehearsals = qualify(recipe, cases[case_id], cohort["tuple"])
+            rehearsals = qualify(recipe, cases[case_id], cohort["tuple"], cohort["fingerprint"])
             need(not (rehearsals & all_rehearsals), "rehearsal ID is reused across recipes")
             all_rehearsals.update(rehearsals)
             result[case_id] = Qualification(rehearsals)
@@ -588,7 +591,6 @@ def assess_cohort(cohort, role, cases, ids):
             for case_id in cases}
     attempts = [obj(value, "attempt") for value in items(cohort.get("attempts", []), "cohort attempts")]
     rehearsal_ids = {key for recipe in recipes.values() for key in recipe.rehearsals}
-    # Validate report IDs before native counters so a copied row cannot mask a duplicate report ID.
     for attempt in attempts:
         need(named(attempt, "id") and attempt["id"] not in ids and attempt["id"] not in rehearsal_ids,
              "duplicate measured attempt ID or reused rehearsal")
@@ -676,6 +678,8 @@ def validate(report, cases):
     report = obj(report, "report")
     need(type(report.get("schema_version")) is int and report["schema_version"] == 1, "unknown report schema version")
     need(report.get("fixture_sha256") == MANIFEST_SHA256, "report fixture digest differs from the shipped matrix")
+    for execution in items(report.get("previous_executions", []), "previous checkout observations"):
+        check_execution(obj(execution, "previous checkout observation"))
     if "execution" in report:
         check_execution(obj(report["execution"], "checkout observations"))
     entries = obj(report.get("cohorts"), "cohorts")
