@@ -648,11 +648,26 @@ def assess_cohort(cohort, role, cases, ids):
     return readiness, rows
 
 
-def matching_conditions(original, updated):
+def matching_conditions(original, updated, allow_shell_change=False):
     before, after = original["tuple"], updated["tuple"]
-    return all(before[key] == after[key] for key in (
-        "device_alias", "device_model", "ios_version", "ios_build", "keyboard", "orientation", "fixture_sha256",
-    )) and before["bundle_sha256"] != after["bundle_sha256"]
+    if before["bundle_sha256"] == after["bundle_sha256"]:
+        return False
+
+    def stable_conditions(value):
+        stable = dict(value)
+        stable.pop("source_revision", None)
+        stable.pop("bundle_sha256", None)
+        if allow_shell_change:
+            stable.pop("shell", None)
+            stable.pop("app", None)
+        else:
+            app = dict(stable.get("app", {}))
+            app.pop("version", None)
+            app.pop("build", None)
+            stable["app"] = app
+        return stable
+
+    return stable_conditions(before) == stable_conditions(after)
 
 
 def matching_recipes(original, updated):
@@ -724,8 +739,8 @@ def validate(report, cases):
         need(eligible, "comparison requires a persistent corrected-build mandatory failure")
         if assessed["comparison"][0].status == "pass":
             comparison = cohorts["comparison"]
-            need(matching_conditions(cohorts["baseline"], comparison)
-                 and matching_conditions(cohorts["corrected"], comparison),
+            need(matching_conditions(cohorts["baseline"], comparison, allow_shell_change=True)
+                 and matching_conditions(cohorts["corrected"], comparison, allow_shell_change=True),
                  "comparison must reuse the fixture and physical conditions on a different signed shell build")
             matching_recipes(cohorts["baseline"], comparison)
             matching_recipes(cohorts["corrected"], comparison)

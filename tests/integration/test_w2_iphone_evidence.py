@@ -511,6 +511,10 @@ class EvidenceTest(unittest.TestCase):
             row["observations"]["cursor_visible"] = False
             baseline_ids.append(mark(row, "failing"))
         corrected = bound_cohort("3", "4")
+        corrected["tuple"]["app"]["version"] = "0.1.1"
+        corrected["tuple"]["app"]["build"] = "2"
+        corrected["build"]["installation"]["app"] = copy.deepcopy(corrected["tuple"]["app"])
+        corrected["fingerprint"] = evidence.fingerprint(corrected["tuple"])
         make_recipes(corrected, self.cases)
         row = add_attempt(corrected, case, "corrected")
         row["observations"]["cursor_visible"] = False
@@ -558,6 +562,30 @@ class EvidenceTest(unittest.TestCase):
         other["cohort_fingerprint"] = corrected["fingerprint"]
         self.reject(report, "same physical conditions")
 
+    def test_correction_gate_rejects_mixed_toolchain_or_locked_inputs(self):
+        original_baseline = copy.deepcopy(self.baseline)
+        mutations = [
+            ("deployment target", lambda tuple_: tuple_.__setitem__("deployment_target", "17.0")),
+            ("Xcode build", lambda tuple_: tuple_["xcode"].__setitem__("build", "different Xcode build")),
+            ("SDK root", lambda tuple_: tuple_["sdk"].__setitem__("root", "different SDK root")),
+            ("lockfile", lambda tuple_: tuple_["locks"].__setitem__("Cargo.lock", "f" * 64)),
+            ("tool version", lambda tuple_: tuple_["tools"].__setitem__("vite", "different Vite version")),
+        ]
+        for condition, mutate in mutations:
+            with self.subTest(condition=condition):
+                self.baseline = copy.deepcopy(original_baseline)
+                report, corrected = self.correction_fixture()
+                tuple_ = corrected["tuple"]
+                mutate(tuple_)
+                if tuple_["deployment_target"] != "16.0":
+                    corrected["build"]["generated_settings"]["deployment_target"] = tuple_["deployment_target"]
+                    corrected["build"]["generated_settings"]["minimum_os_version"] = tuple_["deployment_target"]
+                corrected["build"]["generated_settings"]["sdkroot"] = tuple_["sdk"]["root"]
+                corrected["fingerprint"] = evidence.fingerprint(tuple_)
+                for attempt in corrected["attempts"]:
+                    attempt["cohort_fingerprint"] = corrected["fingerprint"]
+                self.reject(report, "same physical conditions")
+
     def test_successful_correction_supports_continued_tauri_evaluation(self):
         report, corrected = self.correction_fixture()
         corrected["attempts"].clear()
@@ -569,6 +597,8 @@ class EvidenceTest(unittest.TestCase):
         report, _ = self.correction_fixture()
         alternative = bound_cohort("5", "6")
         alternative["tuple"]["shell"] = "synthetic comparison shell"
+        alternative["tuple"]["app"]["identifier"] = "dev.synthetic.comparison"
+        alternative["build"]["installation"]["app"] = copy.deepcopy(alternative["tuple"]["app"])
         alternative["fingerprint"] = evidence.fingerprint(alternative["tuple"])
         make_recipes(alternative, self.cases)
         compared = self.complete(alternative)
@@ -579,6 +609,22 @@ class EvidenceTest(unittest.TestCase):
         self.validate(report, "failing")
         report["decision"]["minimum_ios"] = "16.0"
         self.reject(report, "minimum iOS stay open")
+
+    def test_comparison_rejects_a_different_toolchain(self):
+        report, _ = self.correction_fixture()
+        alternative = bound_cohort("5", "6")
+        alternative["tuple"]["shell"] = "synthetic comparison shell"
+        alternative["tuple"]["sdk"]["build"] = "different SDK build"
+        alternative["fingerprint"] = evidence.fingerprint(alternative["tuple"])
+        make_recipes(alternative, self.cases)
+        compared = self.complete(alternative)
+        for attempt in alternative["attempts"]:
+            attempt["cohort_fingerprint"] = alternative["fingerprint"]
+        report["cohorts"]["comparison"] = alternative
+        report["decision"]["disposition"] = "review-comparison"
+        report["decision"]["rationale"] = "Synthetic comparison restored the visible cursor in the affected layer."
+        report["decision"]["supporting_attempt_ids"].extend(compared["decision"]["supporting_attempt_ids"])
+        self.reject(report, "comparison must reuse the fixture and physical conditions")
 
 
 if __name__ == "__main__":
