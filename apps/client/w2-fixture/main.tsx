@@ -107,7 +107,13 @@ function mountTerminal(
       return;
     }
     const sequence = attempt.trace.length + 1;
-    attempt.trace.push({ sequence, event, elapsedMs: performance.now() - attempt.startedAt, bytes, nativeSequence });
+    attempt.trace.push({
+      sequence,
+      event,
+      elapsedMs: performance.now() - attempt.startedAt,
+      ...(bytes === undefined ? {} : { bytes }),
+      ...(nativeSequence === undefined ? {} : { nativeSequence }),
+    });
     publish(attempt);
     return sequence;
   }
@@ -246,10 +252,11 @@ function mountTerminal(
     }
     const request = args as { generation: number; sequence: number; events: number[][] };
     const attempt = current;
+    const requestEvent = request.events[0];
     if (!attempt || request.generation !== attempt.generation || attempt.held
       || (attempt.composition && (attempt.phase !== "ended" || !attempt.admitted || composing
         || request.sequence !== 1 || request.events.length !== 1
-        || hex(request.events[0]) !== attempt.selected.expected.afterHex))) {
+        || requestEvent === undefined || hex(requestEvent) !== attempt.selected.expected.afterHex))) {
       throw new Error("Blocked append");
     }
     const bytes = request.events.reduce((total, event) => total + event.length, 0);
