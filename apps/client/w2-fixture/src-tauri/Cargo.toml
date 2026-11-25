@@ -1,0 +1,19 @@
+[package]
+name = "remote-sessions-w2-fixture"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+
+[workspace]
+resolver = "3"
+
+[lib]
+name = "remote_sessions_w2_fixture"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = "=2.7.6"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+serde = { version = "1", features = ["derive"] }
+tauri = "=2.12.7"
