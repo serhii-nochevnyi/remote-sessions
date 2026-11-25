@@ -82,6 +82,7 @@ function mountTerminal(
   const stopLayout = observeTerminalLayout(host, textarea, fit, publishLayout);
   let current: Attempt | null = null;
   let nextId = 0;
+  let lifecycleEpoch = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let checkpointRead: Promise<Snapshot> | undefined;
   let pollEpoch = 0;
@@ -313,6 +314,7 @@ function mountTerminal(
   publishVisibility(document.visibilityState === "visible");
 
   function detach() {
+    lifecycleEpoch++;
     current = null;
     checkpointRead = undefined;
     stopPolling();
@@ -333,14 +335,17 @@ function mountTerminal(
         return false;
       }
       detach();
+      const startEpoch = lifecycleEpoch;
       terminal.scrollToBottom();
       const id = ++nextId;
       if (refocus) {
         textarea.value = "";
         terminal.focus();
       }
-      const generation = await recorder.start(selected.id);
-      if (generation === undefined || disposed || id !== nextId || document.visibilityState !== "visible") return false;
+      const generation = await recorder.start(selected.id, () =>
+        lifecycleEpoch === startEpoch && !disposed && document.visibilityState === "visible");
+      if (generation === undefined || disposed || id !== nextId || lifecycleEpoch !== startEpoch
+        || document.visibilityState !== "visible") return false;
       const attempt: Attempt = {
         id, selected, generation, startedAt: performance.now(), composition: selected.id.startsWith("composition-"),
         phase: "waiting", preedit: false, held: false, admitted: false, acknowledged: false, pending: 0, trace: [],

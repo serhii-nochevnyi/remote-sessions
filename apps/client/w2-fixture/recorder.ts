@@ -173,14 +173,14 @@ export function registerRecorder(input: InputSource, invoke: Invoke, onError: (e
         };
       }
     },
-    async start(caseId: string) {
+    async start(caseId: string, isCurrent: () => boolean = () => true) {
       retire();
       const request = epoch;
       lifetime.signal.throwIfAborted();
       const next = await withDeadline(lifetime.signal, () => invoke<unknown>("w2_begin_attempt", { caseId })).catch(reason => {
         if (epoch === request) throw reason;
       });
-      if (epoch !== request) return;
+      if (epoch !== request || !isCurrent()) return;
       if (!isUnsigned(next) || next <= generation) throw new Error("Invalid attempt generation");
       generation = next;
       active = {

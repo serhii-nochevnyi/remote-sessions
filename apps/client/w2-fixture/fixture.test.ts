@@ -1788,8 +1788,67 @@ async function checkForegroundRecovery(
   assert.equal(fixture.document.listenerCount("visibilitychange"), 0, "visibility listeners are disposed");
 }
 
+async function checkLateBegin(executable: string) {
+  const native = connectNative(executable, "requests");
+  const late = deferred();
+  let delayBegin = true;
+  const fixture = await mountFixture({
+    async invoke(command, args) {
+      const reply = await native.invoke(command, args);
+      if (delayBegin && command === "w2_begin_attempt") {
+        delayBegin = false;
+        await late.promise;
+      }
+      return reply;
+    },
+  });
+  async function visibility(state: string) {
+    await fixture.act(async () => {
+      fixture.document.visibilityState = state;
+      fixture.document.dispatch("visibilitychange");
+    });
+  }
+  try {
+    await fixture.waitFor(() => {
+      const start = fixture.container.find(node => node.localName === "button" && node.textContent === "Start");
+      return Boolean(start && !start.disabled);
+    }, "fixture becomes ready before a delayed start");
+    await fixture.click("Start");
+    await fixture.waitFor(() => fixture.ipc.some(call => call.command === "w2_begin_attempt"), "native start is pending");
+    await visibility("hidden");
+    await visibility("visible");
+    late.resolve();
+    await fixture.waitFor(() => {
+      const start = fixture.container.find(node => node.localName === "button" && node.textContent === "Start");
+      return Boolean(start && !start.disabled);
+    }, "visibility change retires the delayed start");
+    assert.equal(Boolean(fixture.container.find(node => node.localName === "button" && node.textContent === "Restart")), false,
+      "a pre-background start cannot activate after foregrounding");
+    assert.equal(fixture.button("Read").disabled, true);
+    await fixture.input("abandoned");
+    assert.equal(appends(fixture).length, 0, "the retired start admits no input");
+
+    await fixture.click("Start");
+    await fixture.waitFor(() => Boolean(fixture.container.find(node =>
+      node.localName === "button" && node.textContent === "Restart" && !node.disabled)), "a deliberate new start completes");
+    await fixture.input("ї");
+    await fixture.waitFor(() => appends(fixture).length === 1, "fresh input reaches the native recorder");
+    assert.deepEqual(appends(fixture), [
+      { command: "w2_append_input", args: { generation: 2, sequence: 1, events: [[0xd1, 0x97]] } },
+    ], "only the deliberate foreground generation records input");
+    await native.finish();
+  } catch (error) {
+    await native.abort();
+    throw error;
+  } finally {
+    late.resolve();
+    await fixture.dispose();
+  }
+}
+
 async function foregroundRecovery() {
   await withNativeExecutable(async executable => {
+    await checkLateBegin(executable);
     await checkForegroundRecovery(executable, "app-switch");
     await checkForegroundRecovery(executable, "lock-foreground");
     await checkForegroundRecovery(executable, "lock-foreground", undefined, "unavailable");
