@@ -3,13 +3,23 @@ import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
+import manifest from "./cases.json" with { type: "json" };
 import { fixtureCaseId, registerRecorder, type Snapshot } from "./recorder.ts";
 
-const transcript = "\x1b[1;36mOffline terminal fixture\x1b[0m\r\nSynthetic input only · ї + Return\r\n\r\n> ";
+const transcript = [
+  "\x1b[?2004l\x1b[1;36mOffline terminal fixture\x1b[0m",
+  ...Array.from({ length: 24 }, (_, index) => `History line ${index + 1} · Україна`),
+  "Selection target: COPY-Ї",
+  "> ",
+].join("\r\n");
+
+const emptyHex = "(empty)";
 
 function Fixture() {
   const viewport = React.useRef<HTMLDivElement>(null);
   const controls = React.useRef<{ terminal: Terminal; recorder: ReturnType<typeof registerRecorder> }>(null);
+  const [caseId, setCaseId] = React.useState(fixtureCaseId);
+  const selected = manifest.cases.find(entry => entry.id === caseId)!;
   const [ready, setReady] = React.useState(false);
   const [active, setActive] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
@@ -64,6 +74,14 @@ function Fixture() {
     };
   }, []);
 
+  function selectCase(event: React.ChangeEvent<HTMLSelectElement>) {
+    if (controls.current) controls.current.terminal.options.disableStdin = true;
+    setCaseId(event.currentTarget.value);
+    setActive(false);
+    setSnapshot(null);
+    setError("");
+  }
+
   async function start() {
     const mounted = controls.current;
     if (!mounted || !ready || busy) return;
@@ -72,9 +90,10 @@ function Fixture() {
     setError("");
     setSnapshot(null);
     mounted.terminal.options.disableStdin = true;
+    mounted.terminal.scrollToBottom();
     mounted.terminal.focus();
     try {
-      await mounted.recorder.start(fixtureCaseId);
+      await mounted.recorder.start(selected.id);
       if (controls.current !== mounted) return;
       mounted.terminal.options.disableStdin = false;
       setActive(true);
@@ -100,17 +119,40 @@ function Fixture() {
   }
 
   const readout = snapshot === "unavailable" ? "Unavailable" : snapshot
-    ? snapshot.bytes.map(byte => byte.toString(16).padStart(2, "0")).join("") || "(empty)"
+    ? snapshot.bytes.map(byte => byte.toString(16).padStart(2, "0")).join("") || emptyHex
     : "—";
   return (
     <main>
       <h1>Offline terminal fixture</h1>
-      <p>Start the case, type ї, then press Return. Select Read to inspect the captured bytes.</p>
+      <label htmlFor="case">Interaction case</label>{" "}
+      <select id="case" value={caseId} onChange={selectCase} disabled={busy}>
+        {manifest.cases.map(entry => <option key={entry.id} value={entry.id}>{entry.title}</option>)}
+      </select>
       <button type="button" onClick={start} disabled={!ready || busy}>{active || error ? "Restart" : "Start"}</button>
       <button type="button" onClick={read} disabled={!active || busy}>Read</button>
+      {selected.pasteText !== undefined && (
+        <button type="button" disabled={!active || busy || Boolean(error)} onClick={() => {
+          const terminal = controls.current?.terminal;
+          terminal?.focus();
+          terminal?.paste(selected.pasteText);
+        }}>Paste sample</button>
+      )}
       <div id="terminal" ref={viewport} aria-label="Synthetic terminal" />
       <label htmlFor="snapshot">Native snapshot (hex)</label>{" "}
       <output id="snapshot">{readout}</output>
+      <section aria-label="Case instructions">
+        <p>Start a fresh attempt, follow the steps, then select Read to compare the captured and expected bytes.</p>
+        <ol id="case-actions">{selected.actions.map(action => <li key={action}>{action}</li>)}</ol>
+        <ul id="case-observations" aria-label="Required observations">
+          {selected.observations.map(observation => <li key={observation}>{observation}</li>)}
+        </ul>
+        <dl>
+          <dt>Expected before action (hex)</dt>
+          <dd><output id="expected-before">{selected.expected.beforeHex || emptyHex}</output></dd>
+          <dt>Expected after action (hex)</dt>
+          <dd><output id="expected-after">{selected.expected.afterHex || emptyHex}</output></dd>
+        </dl>
+      </section>
       {error && <p role="alert">{error}</p>}
     </main>
   );
