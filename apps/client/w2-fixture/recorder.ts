@@ -32,17 +32,24 @@ type Attempt = {
   pendingEvents: number;
   pendingBytes: number;
   invalid: boolean;
+  drain: Promise<void> | undefined;
+  snapshot?: Snapshot;
 };
 
-async function withDeadline<T>(operation: () => Promise<T>): Promise<T> {
+async function withDeadline<T>(signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
+  signal.throwIfAborted();
+  let cancel!: () => void;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new Error("Local invoke timed out")), invokeDeadlineMs);
+    cancel = () => reject(signal.reason);
   });
+  signal.addEventListener("abort", cancel, { once: true });
   try {
     return await Promise.race([operation(), deadline]);
   } finally {
     clearTimeout(timer);
+    signal.removeEventListener("abort", cancel);
   }
 }
 
@@ -66,8 +73,8 @@ function isSnapshot(value: unknown, attempt: Attempt, minSequence: number): valu
 export function registerRecorder(input: InputSource, invoke: Invoke, onError: (error: unknown) => void) {
   const encoder = new TextEncoder();
   let active: Attempt | undefined;
-  let drain: Promise<void> | undefined;
-  let disposed = false;
+  let epoch = 0;
+  const lifetime = new AbortController();
   let generation = 0;
 
   function invalidate(attempt: Attempt, reason: unknown) {
@@ -90,7 +97,7 @@ export function registerRecorder(input: InputSource, invoke: Invoke, onError: (e
       const sequence = attempt.nextSequence;
       attempt.lastSent = sequence;
       try {
-        const ack = await withDeadline(() => invoke<unknown>("w2_append_input", {
+        const ack = await withDeadline(lifetime.signal, () => invoke<unknown>("w2_append_input", {
           generation: attempt.generation, sequence, events,
         }));
         if (active !== attempt) return;
@@ -107,10 +114,10 @@ export function registerRecorder(input: InputSource, invoke: Invoke, onError: (e
 
   function flush() {
     const attempt = active;
-    if (drain || !attempt || attempt.invalid || !attempt.queue.length) return;
-    drain = send(attempt).finally(() => {
-      drain = undefined;
-      flush();
+    if (!attempt || attempt.drain || attempt.invalid || !attempt.queue.length) return;
+    attempt.drain = send(attempt).finally(() => {
+      attempt.drain = undefined;
+      if (active === attempt) flush();
     });
   }
 
@@ -136,39 +143,66 @@ export function registerRecorder(input: InputSource, invoke: Invoke, onError: (e
     flush();
   });
 
+  function retire() {
+    epoch++;
+    const attempt = active;
+    active = undefined;
+    if (attempt) attempt.queue.length = 0;
+    return attempt;
+  }
+
+  async function readSnapshot(attempt: Attempt) {
+    const minSequence = attempt.nextSequence;
+    const snapshot = await withDeadline(lifetime.signal, () => invoke<unknown>("w2_read_attempt", { generation: attempt.generation }));
+    if (!isSnapshot(snapshot, attempt, minSequence)) throw new Error("Invalid readback acknowledgment");
+    return snapshot;
+  }
+
   return {
-    async start(caseId: string) {
-      if (active) active.queue.length = 0;
-      active = undefined;
-      if (drain) await drain;
-      if (disposed) throw new Error("Recorder is closed");
-      const next = await withDeadline(() => invoke<unknown>("w2_begin_attempt", { caseId }));
-      if (disposed) throw new Error("Recorder is closed");
+    retire,
+    async interrupt() {
+      const attempt = retire();
+      if (!attempt) return;
+      try {
+        const snapshot = await readSnapshot(attempt);
+        return { snapshot, uncertain: snapshot.nextSequence <= attempt.lastSent };
+      } catch {
+        return {
+          ...(attempt.snapshot === undefined ? {} : { snapshot: attempt.snapshot }),
+          uncertain: true,
+        };
+      }
+    },
+    async start(caseId: string, isCurrent: () => boolean = () => true) {
+      retire();
+      const request = epoch;
+      lifetime.signal.throwIfAborted();
+      const next = await withDeadline(lifetime.signal, () => invoke<unknown>("w2_begin_attempt", { caseId })).catch(reason => {
+        if (epoch === request) throw reason;
+      });
+      if (epoch !== request || !isCurrent()) return;
       if (!isUnsigned(next) || next <= generation) throw new Error("Invalid attempt generation");
       generation = next;
       active = {
         caseId, generation, nextSequence: 1, lastSent: 0, queue: [],
-        pendingEvents: 0, pendingBytes: 0, invalid: false,
+        pendingEvents: 0, pendingBytes: 0, invalid: false, drain: undefined,
       };
       return generation;
     },
-    async read() {
+    async read(isCurrent: () => boolean = () => true) {
       const attempt = active;
       if (!attempt) throw new Error("Start the fixture case first");
-      while (drain && active === attempt) await drain;
-      if (active !== attempt) throw new Error("Attempt was retired");
-      const minSequence = attempt.nextSequence;
-      const snapshot = await withDeadline(() => invoke<unknown>("w2_read_attempt", { generation: attempt.generation }));
-      if (active !== attempt || !isSnapshot(snapshot, attempt, minSequence)) {
-        throw new Error("Invalid readback acknowledgment");
-      }
+      while (attempt.drain && active === attempt) await attempt.drain;
+      if (active !== attempt || !isCurrent()) throw new Error("Attempt read expired");
+      const snapshot = await readSnapshot(attempt);
+      if (active !== attempt || !isCurrent()) throw new Error("Attempt read expired");
+      attempt.snapshot = snapshot;
       if (snapshot.invalid) invalidate(attempt, "Native recorder rejected input");
       return snapshot;
     },
     dispose() {
-      disposed = true;
-      if (active) active.queue.length = 0;
-      active = undefined;
+      lifetime.abort(new Error("Recorder is closed"));
+      retire();
       subscription.dispose();
     },
   };

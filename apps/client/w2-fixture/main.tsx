@@ -46,6 +46,11 @@ type Attempt = {
   checkpoint?: { sequence: number; snapshot: Snapshot };
 };
 
+type Interrupted = {
+  attempt: Attempt;
+  result?: { snapshot?: Snapshot; uncertain: boolean };
+};
+
 function hex(bytes: readonly number[]) {
   return bytes.map(byte => byte.toString(16).padStart(2, "0")).join("");
 }
@@ -55,6 +60,8 @@ function mountTerminal(
   publishLayout: (events: readonly LayoutEvent[]) => void,
   publishAttempt: (attempt: Attempt | null) => void,
   publishError: (error: string) => void,
+  publishVisibility: (visible: boolean) => void,
+  publishInterrupted: (interrupted: Interrupted) => void,
 ) {
   const document = host.ownerDocument;
   const terminal = new Terminal({
@@ -75,9 +82,9 @@ function mountTerminal(
   const stopLayout = observeTerminalLayout(host, textarea, fit, publishLayout);
   let current: Attempt | null = null;
   let nextId = 0;
+  let lifecycleEpoch = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let checkpointRead: Promise<Snapshot> | undefined;
-  let checkpointContext: { attempt: Attempt; epoch: number } | undefined;
   let pollEpoch = 0;
   let disposed = false;
   let composing = false;
@@ -131,10 +138,10 @@ function mountTerminal(
       poll(attempt);
       if (checkpointRead) return;
       const epoch = pollEpoch;
-      checkpointContext = { attempt, epoch };
-      checkpointRead = recorder.read();
+      const read = recorder.read(() => eligible(attempt) && epoch === pollEpoch);
+      checkpointRead = read;
       try {
-        const snapshot = await checkpointRead;
+        const snapshot = await read;
         if (!eligible(attempt) || epoch !== pollEpoch) return;
         if (snapshot.generation !== attempt.generation || snapshot.bytes.length
           || snapshot.eventLengths.length || snapshot.nextSequence !== 1 || snapshot.invalid || snapshot.rejected) {
@@ -149,8 +156,7 @@ function mountTerminal(
       } catch {
         if (eligible(attempt) && epoch === pollEpoch) hold(attempt, "Active checkpoint unavailable");
       } finally {
-        checkpointRead = undefined;
-        checkpointContext = undefined;
+        if (checkpointRead === read) checkpointRead = undefined;
       }
     }, checkpointInterval);
   }
@@ -175,8 +181,12 @@ function mountTerminal(
   }
 
   function compositionUpdate(event: CompositionEvent) {
+    if (!composing) {
+      event.stopPropagation();
+      return;
+    }
     const attempt = current;
-    if (!attempt?.composition) return;
+    if (!attempt?.composition || attempt.held) return;
     if (attempt.phase !== "active") {
       hold(attempt, "Unexpected composition update");
       return;
@@ -188,7 +198,11 @@ function mountTerminal(
     else stopPolling();
   }
 
-  function compositionEnd() {
+  function compositionEnd(event: CompositionEvent) {
+    if (!composing) {
+      event.stopPropagation();
+      return;
+    }
     composing = false;
     clearTimeout(settling);
     settling = setTimeout(() => {
@@ -209,7 +223,21 @@ function mountTerminal(
   }
 
   function visibilityChanged() {
-    if (document.visibilityState !== "visible") interrupt();
+    const visible = document.visibilityState === "visible";
+    publishVisibility(visible);
+    if (visible) return;
+    const attempt = current;
+    detach();
+    const readback = recorder.interrupt();
+    if (!attempt) return;
+    const frozen = { ...attempt, held: true };
+    publishInterrupted({ attempt: frozen });
+    void readback.then(result => {
+      if (!disposed) publishInterrupted({
+        attempt: frozen,
+        result: result ?? { uncertain: true },
+      });
+    });
   }
 
   textarea.addEventListener("compositionstart", compositionStart, true);
@@ -223,7 +251,7 @@ function mountTerminal(
     onData(deliver: (text: string) => void) {
       return terminal.onData(text => {
         const attempt = current;
-        if (!attempt) return;
+        if (!attempt || document.visibilityState !== "visible") return;
         if (attempt.composition) {
           if (!text) return;
           const bytes = encoder.encode(text);
@@ -242,18 +270,11 @@ function mountTerminal(
   };
 
   const transport: Invoke = async <T,>(command: string, args?: Parameters<Invoke>[1], options?: Parameters<Invoke>[2]) => {
-    if (command !== "w2_append_input") {
-      const checkpoint = command === "w2_read_attempt" ? checkpointContext : undefined;
-      const result = await invoke<T>(command, args, options);
-      if (checkpoint && (!eligible(checkpoint.attempt) || checkpoint.epoch !== pollEpoch)) {
-        throw new Error("Active checkpoint expired");
-      }
-      return result;
-    }
+    if (command !== "w2_append_input") return invoke<T>(command, args, options);
     const request = args as { generation: number; sequence: number; events: number[][] };
     const attempt = current;
     const requestEvent = request.events[0];
-    if (!attempt || request.generation !== attempt.generation || attempt.held
+    if (!attempt || document.visibilityState !== "visible" || request.generation !== attempt.generation || attempt.held
       || (attempt.composition && (attempt.phase !== "ended" || !attempt.admitted || composing
         || request.sequence !== 1 || request.events.length !== 1
         || requestEvent === undefined || hex(requestEvent) !== attempt.selected.expected.afterHex))) {
@@ -275,7 +296,7 @@ function mountTerminal(
       }
       return ack;
     } catch (reason) {
-      if (attempt.held) record(attempt, "append delivery unconfirmed", bytes, request.sequence);
+      if (current === attempt && attempt.held) record(attempt, "append delivery unconfirmed", bytes, request.sequence);
       throw reason;
     } finally {
       attempt.pending--;
@@ -290,8 +311,12 @@ function mountTerminal(
 
   const recorder = registerRecorder(input, transport, onCaptureError);
 
-  function retire() {
+  publishVisibility(document.visibilityState === "visible");
+
+  function detach() {
+    lifecycleEpoch++;
     current = null;
+    checkpointRead = undefined;
     stopPolling();
     terminal.options.disableStdin = true;
     publishAttempt(null);
@@ -299,13 +324,28 @@ function mountTerminal(
 
   return {
     terminal,
-    retire,
-    async start(selected: Case) {
-      retire();
+    retire() {
+      detach();
+      recorder.retire();
+    },
+    async start(selected: Case, refocus: boolean) {
+      if (document.visibilityState !== "visible") return false;
+      if (refocus && (composing || settling !== undefined)) {
+        publishError("Held: Previous composition is still ending. Try recovery again after it ends.");
+        return false;
+      }
+      detach();
+      const startEpoch = lifecycleEpoch;
       terminal.scrollToBottom();
       const id = ++nextId;
-      const generation = await recorder.start(selected.id);
-      if (disposed || id !== nextId) return false;
+      if (refocus) {
+        textarea.value = "";
+        terminal.focus();
+      }
+      const generation = await recorder.start(selected.id, () =>
+        lifecycleEpoch === startEpoch && !disposed && document.visibilityState === "visible");
+      if (generation === undefined || disposed || id !== nextId || lifecycleEpoch !== startEpoch
+        || document.visibilityState !== "visible") return false;
       const attempt: Attempt = {
         id, selected, generation, startedAt: performance.now(), composition: selected.id.startsWith("composition-"),
         phase: "waiting", preedit: false, held: false, admitted: false, acknowledged: false, pending: 0, trace: [],
@@ -371,17 +411,27 @@ function Fixture() {
   const [caseId, setCaseId] = React.useState(fixtureCaseId);
   const selected = manifest.cases.find(entry => entry.id === caseId)!;
   const [ready, setReady] = React.useState(false);
-  const [active, setActive] = React.useState(false);
+  const [visible, setVisible] = React.useState(false);
+  const [interrupted, setInterrupted] = React.useState<Interrupted | null>(null);
+  const [recovering, setRecovering] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
   const [snapshot, setSnapshot] = React.useState<Snapshot | "unavailable" | null>(null);
   const [layout, setLayout] = React.useState<readonly LayoutEvent[]>([]);
   const [attempt, setAttempt] = React.useState<Attempt | null>(null);
 
+  const active = attempt !== null;
+
   React.useEffect(() => {
     const host = viewport.current;
     if (!host) return;
-    const mounted = mountTerminal(host, setLayout, setAttempt, setError);
+    const mounted = mountTerminal(host, setLayout, setAttempt, setError, setVisible, evidence => {
+      setInterrupted(evidence);
+      if (!evidence.result) {
+        setRecovering(true);
+        setSnapshot(null);
+      }
+    });
     controls.current = mounted;
     mounted.terminal.write(transcript, () => {
       if (controls.current === mounted) setReady(true);
@@ -395,20 +445,18 @@ function Fixture() {
   function selectCase(event: React.ChangeEvent<HTMLSelectElement>) {
     controls.current?.retire();
     setCaseId(event.currentTarget.value);
-    setActive(false);
     setSnapshot(null);
     setError("");
   }
 
   async function start() {
     const mounted = controls.current;
-    if (!mounted || !ready || busy) return;
+    if (!mounted || !ready || busy || !visible || (recovering && !interrupted?.result)) return;
     setBusy(true);
-    setActive(false);
     setError("");
     setSnapshot(null);
     try {
-      if (await mounted.start(selected) && controls.current === mounted) setActive(true);
+      if (await mounted.start(selected, recovering) && controls.current === mounted) setRecovering(false);
     } catch (reason) {
       if (controls.current === mounted) setError(`Held: ${String(reason)}`);
     } finally {
@@ -418,7 +466,7 @@ function Fixture() {
 
   async function read() {
     const mounted = controls.current;
-    if (!mounted || !active || busy) return;
+    if (!mounted || !active || busy || !visible) return;
     setBusy(true);
     try {
       const result = await mounted.read();
@@ -437,11 +485,13 @@ function Fixture() {
       <select id="case" value={caseId} onChange={selectCase} disabled={busy}>
         {manifest.cases.map(entry => <option key={entry.id} value={entry.id}>{entry.title}</option>)}
       </select>
-      <button type="button" onClick={start} disabled={!ready || busy}>{active || error ? "Restart" : "Start"}</button>
-      <button type="button" onClick={read} disabled={!active || busy || (attempt?.composition && !attempt.held && attempt.phase !== "ended")}>Read</button>
-      <button type="button" disabled={!ready} onClick={() => controls.current?.terminal.focus()}>Focus</button>
+      <button type="button" onClick={start} disabled={!ready || busy || !visible || (recovering && !interrupted?.result)}>
+        {recovering ? "Start fresh and refocus" : active || error ? "Restart" : "Start"}
+      </button>
+      <button type="button" onClick={read} disabled={!visible || !active || busy || (attempt?.composition && !attempt.held && attempt.phase !== "ended")}>Read</button>
+      <button type="button" disabled={!ready || !visible || recovering} onClick={() => controls.current?.terminal.focus()}>Focus</button>
       {selected.pasteText !== undefined && (
-        <button type="button" disabled={!active || busy || Boolean(error)} onClick={() => {
+        <button type="button" disabled={!visible || !active || busy || Boolean(error)} onClick={() => {
           const terminal = controls.current?.terminal;
           terminal?.paste(selected.pasteText);
         }}>Paste sample</button>
@@ -462,6 +512,24 @@ function Fixture() {
       {snapshot && snapshot !== "unavailable" && (
         <span id="snapshot-counts"> · {snapshot.eventLengths.length} accepted events · {snapshot.bytes.length} bytes</span>
       )}
+      {interrupted && <section aria-label="Interrupted attempt">
+        <p>Interrupted attempt {interrupted.attempt.id} · {interrupted.attempt.selected.id} · generation {interrupted.attempt.generation} · Invalid</p>
+        <label htmlFor="retained-snapshot">Retained native snapshot (hex)</label>{" "}
+        <output id="retained-snapshot">{interrupted.result?.snapshot
+          ? hex(interrupted.result.snapshot.bytes) || emptyHex
+          : interrupted.result ? "Unavailable" : "Reading…"}</output>
+        {interrupted.result?.snapshot && (
+          <span> · {interrupted.result.snapshot.eventLengths.length} accepted events · {interrupted.result.snapshot.bytes.length} bytes</span>
+        )}
+        {interrupted.result?.uncertain && <p id="retained-uncertainty">Delivery uncertain. The full accepted bytes could not be confirmed.</p>}
+        {interrupted.attempt.checkpoint && <p>
+          Active checkpoint event {interrupted.attempt.checkpoint.sequence} · {hex(interrupted.attempt.checkpoint.snapshot.bytes) || emptyHex}
+        </p>}
+        {Boolean(interrupted.attempt.trace.length) && <details>
+          <summary>Interrupted attempt event trace</summary>
+          <pre>{JSON.stringify(interrupted.attempt.trace)}</pre>
+        </details>}
+      </section>}
       <section aria-label="Case instructions">
         <p>Start a fresh attempt, follow the steps, then select Read to compare the captured and expected bytes.</p>
         <ol id="case-actions">{selected.actions.map(action => <li key={action}>{action}</li>)}</ol>

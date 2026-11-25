@@ -12,7 +12,7 @@ const resolveModule = createRequire(import.meta.url);
 const lock = JSON.parse(readFileSync(resolve(repoRoot, "package-lock.json"), "utf8")) as {
   packages: Record<string, { version?: string }>;
 };
-const runtimeModules = ["@tauri-apps/api", "@xterm/xterm", "react", "react-dom", "scheduler"];
+const runtimeModules = ["@tauri-apps/api", "@xterm/xterm", "@xterm/addon-fit", "react", "react-dom", "scheduler"];
 const assetAttributes = new Set([
   "src", "href", "xlink:href", "srcset", "imagesrcset", "poster", "data", "action",
   "formaction", "background", "style",
