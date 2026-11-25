@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
-import { suppressViewerQueries } from "./terminal-protocol";
+import { bindTerminalProtocol } from "./terminal-protocol";
 import { localClient, TerminalViewScope } from "./local-client";
 import type { GeometryEvent, TerminalSize, TerminalStatus, TerminalStreamFailure } from "./local-client";
 import { GeometryBoundaryError, OrderedGeometry, ResizeProposals } from "./terminal-geometry";
@@ -48,7 +48,6 @@ export function TerminalView({ runtimeId, epoch, label, fontSize }: { runtimeId:
       fontFamily: "Menlo, Monaco, monospace", screenReaderMode: true, scrollback: 2000,
       theme: { background: "#111a21", foreground: "#d9e6e2" } });
     const fit = new FitAddon();
-    const queryHandlers = suppressViewerQueries(terminal);
     terminal.loadAddon(fit);
     terminal.open(container);
     if (document.activeElement === container) terminal.focus();
@@ -64,7 +63,7 @@ export function TerminalView({ runtimeId, epoch, label, fontSize }: { runtimeId:
 
     function report() {
       if (!routing || !scope.viewId || scope.failedInput) return;
-      const control = scope.canWrite ? "ви керуєте" : "режим перегляду";
+      const control = !protocol.inputAvailable ? "ввід недоступний" : scope.canWrite ? "ви керуєте" : "режим перегляду";
       setStatus(`Наживо · ${control} · ${geometryText(routing.status)}${resizeUnavailable ? " · зміна розміру недоступна" : ""}`);
     }
 
@@ -111,35 +110,27 @@ export function TerminalView({ runtimeId, epoch, label, fontSize }: { runtimeId:
     const observer = new ResizeObserver(layoutSoon);
     observer.observe(container);
 
-    const input = terminal.onData(data => {
-      const paste = data.startsWith("\x1b[200~") && data.endsWith("\x1b[201~");
-      void scope.send(new TextEncoder().encode(paste ? data.slice(6, -6) : data), paste);
-    });
-    const binaryInput = terminal.onBinary(data => void scope.send(Uint8Array.from(data, char => char.charCodeAt(0))));
     let streamStage: TerminalStreamFailure = "attachment_setup";
     let failure: TerminalStreamFailure | undefined;
     const scope = new TerminalViewScope({
       input: localClient.input,
       inputFailure(error) {
         proposals.close();
-        terminal.options.disableStdin = true;
+        protocol.pauseInput();
         setStatus(error === undefined
           ? "Ввід завеликий. Перепідключіть термінал перед продовженням."
           : `Ввід перервано; автоматично не повторюємо. ${String(error)}`);
       },
       retire(view) {
         container.removeAttribute("data-terminal-attached");
-        terminal.options.disableStdin = true;
+        protocol.dispose();
         updateFont.current = null;
         cancelAnimationFrame(frame);
         routing?.close();
         proposals.close();
         finishWrite?.();
-        input.dispose();
-        binaryInput.dispose();
         observer.disconnect();
         if (view) void detach(view, failure);
-        queryHandlers.forEach(handler => handler.dispose());
         if (terminal.textarea === document.activeElement && container.isConnected) container.focus();
         terminal.dispose();
       },
@@ -149,6 +140,7 @@ export function TerminalView({ runtimeId, epoch, label, fontSize }: { runtimeId:
         reconnectDelay.current = Math.min(reconnectDelay.current * 2, 4000);
       },
     });
+    const protocol = bindTerminalProtocol(terminal, (bytes, paste) => { void scope.send(bytes, paste); });
     const sink = {
       write: (data: readonly number[]) => new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => {
@@ -200,8 +192,7 @@ export function TerminalView({ runtimeId, epoch, label, fontSize }: { runtimeId:
             return;
           }
           streamStage = "geometry_routing";
-          if (!await scope.consume(view, chunk, () => ordered.consume(chunk, sink))) return;
-          terminal.options.disableStdin = !scope.canWrite;
+          if (!await protocol.consume(scope, view, chunk, () => ordered.consume(chunk, sink))) return;
           if (proposals.observe(ordered.status, scope.canWrite, ordered.applied)) {
             resizeUnavailable = false;
             layoutSoon();
