@@ -3,122 +3,122 @@
   "fixture_sha256": "8c08369864c9dd4ee6de19c8cf86171b179e928f276eebe2f9f89389ea353056",
   "status": "setup-hold",
   "reasons": [
-    "The selected developer directory is /Library/Developer/CommandLineTools. Full Xcode, the iPhoneOS SDK and Apple device tools are unavailable.",
-    "The worktree has pinned Rust 1.97.1 for aarch64-apple-darwin only. The aarch64-apple-ios target is absent.",
-    "Authorized signing and physical iPhone installation were unavailable in this run. The generated launcher, signed bundle and effective boundary, offline launch, live Mac invokes and physical attempts remain unobserved.",
-    "Repository core and native CI are pending for the signing revision."
+    "The active developer directory is /Library/Developer/CommandLineTools. Full Xcode, the iPhoneOS SDK, devicectl and simctl are absent on this Mac.",
+    "Rust 1.97.1 has aarch64-apple-darwin and wasm32-unknown-unknown installed, but not the aarch64-apple-ios target.",
+    "The operator has an iPhone and Apple signing access, but no signed bundle was built or installed because the current Mac lacks the iOS packaging toolchain and device utilities. The generated launcher, effective boundary, offline launch, live Mac invokes and physical attempts remain unobserved.",
+    "Physical acceptance remains setup-hold; no measured device cohort exists."
   ],
   "execution": {
     "observed_at": "2026-11-25",
-    "checkout_head": "bc46c6e2dd7a7c778a1f60d92721ac9fb7b69e94",
+    "checkout_head": "75324016bd7662a8c267fea1b7d3465cfa4796a2",
     "checks": [
+      {
+        "name": "W2 evidence validator unit tests",
+        "status": "pass",
+        "exit_code": 0,
+        "detail": "39 tests passed with python3 -m unittest discover -s tests/integration -p test_w2_iphone_evidence.py, including mixed-toolchain correction and comparison guards."
+      },
+      {
+        "name": "Python syntax compilation",
+        "status": "pass",
+        "exit_code": 0,
+        "detail": "py_compile passed for the W2 evidence validator and its unit tests on this checkout."
+      },
+      {
+        "name": "Observed report validation",
+        "status": "pass",
+        "exit_code": 0,
+        "detail": "The setup-hold report passed --check-report without converting it to a physical acceptance pass."
+      },
+      {
+        "name": "Exact generated-path ignore guard",
+        "status": "pass",
+        "exit_code": 0,
+        "detail": "Both path-specific generated rules matched; fixture source and capability files remained visible."
+      },
       {
         "name": "Vite production fixture build",
         "status": "pass",
         "exit_code": 0,
-        "detail": "Node 24.21.0 and npm 11.19.0 were present. Vite 8.3.8 built the fixture and reported a chunk-size warning."
+        "detail": "Vite 8.3.8 built the offline fixture; it emitted the existing advisory for a 573.14 kB JS chunk."
       },
       {
         "name": "Filtered declared fixture boundary",
         "status": "pass",
         "exit_code": 0,
-        "detail": "Both declared-boundary assertions passed. TAP reported two passes."
+        "detail": "Both iOS-only boundary assertions passed."
       },
       {
-        "name": "Disposable Git ignore mutation check",
+        "name": "Pinned Mac Cargo check",
         "status": "pass",
         "exit_code": 0,
-        "detail": "Both exact rules and the source probes matched in a disposable repository. Adding a blanket src-tauri rule or substituting it for either exact rule failed the guard."
+        "detail": "cargo 1.97.1 and rustc 1.97.1; cargo check --locked -p remote-sessions-client passed."
       },
       {
-        "name": "Native attempt chronology regression before correction",
-        "status": "failed",
-        "exit_code": 1,
-        "detail": "The original validator accepted two older native attempts presented after a later failure within the same app launch."
-      },
-      {
-        "name": "Targeted validator checks",
+        "name": "Repository core and native CI for checked fixture source",
         "status": "pass",
         "exit_code": 0,
-        "detail": "Twelve selected synthetic checks passed, including stale and relaunch attempt ordering, the complete matrix, composition controls and the correction gate."
-      },
-      {
-        "name": "Repository npm checks",
-        "status": "pass",
-        "exit_code": 0,
-        "detail": "Desktop typechecking, six tests, the production desktop bundle and documentation link validation passed."
+        "detail": "All four core/native check runs passed for candidate head e2f98b521da177b6bca1ddc2b490a7f0dff22c06. Runs: https://github.com/serhii-nochevnyi/remote-sessions/actions/runs/45700329350 and https://github.com/serhii-nochevnyi/remote-sessions/actions/runs/45700312050."
       },
       {
         "name": "xcode-select -p",
         "status": "pass",
         "exit_code": 0,
-        "detail": "/Library/Developer/CommandLineTools"
+        "detail": "/Library/Developer/CommandLineTools."
       },
       {
         "name": "xcodebuild -version",
         "status": "failed",
         "exit_code": 1,
-        "detail": "The selected developer directory provides Command Line Tools. xcodebuild requires full Xcode."
+        "detail": "Full Xcode is unavailable through the selected Command Line Tools directory."
       },
       {
         "name": "xcrun --sdk iphoneos --show-sdk-version",
         "status": "failed",
         "exit_code": 1,
-        "detail": "The iPhoneOS SDK and its SDKVersion were unavailable."
+        "detail": "The iPhoneOS SDK could not be located."
       },
       {
         "name": "xcrun --sdk iphoneos --show-sdk-build-version",
         "status": "failed",
         "exit_code": 1,
-        "detail": "The iPhoneOS SDK and its ProductBuildVersion were unavailable."
+        "detail": "The iPhoneOS SDK could not be located."
       },
       {
         "name": "xcrun --find devicectl",
         "status": "failed",
         "exit_code": 72,
-        "detail": "devicectl was unavailable."
+        "detail": "devicectl is unavailable."
       },
       {
         "name": "xcrun --find simctl",
         "status": "failed",
         "exit_code": 72,
-        "detail": "simctl was unavailable."
+        "detail": "simctl is unavailable."
       },
       {
         "name": "command -v pod",
         "status": "failed",
         "exit_code": 1,
-        "detail": "CocoaPods was absent from PATH. The generated project determines whether it is required."
+        "detail": "CocoaPods is absent from PATH; the generated project determines whether it is required."
       },
       {
-        "name": "Worktree Rustup toolchain list",
+        "name": "command -v idevice_id",
+        "status": "failed",
+        "exit_code": 1,
+        "detail": "Apple device enumeration utility is unavailable."
+      },
+      {
+        "name": "Rustup 1.97.1 installed targets",
         "status": "pass",
         "exit_code": 0,
-        "detail": "Rustup listed 1.97.1-aarch64-apple-darwin as active."
+        "detail": "Only aarch64-apple-darwin and wasm32-unknown-unknown are installed; aarch64-apple-ios is absent."
       },
       {
-        "name": "Worktree Rustup 1.97.1 installed targets",
-        "status": "pass",
-        "exit_code": 0,
-        "detail": "Only aarch64-apple-darwin was installed. The aarch64-apple-ios target was unavailable."
-      },
-      {
-        "name": "Locked Tauri CLI version",
-        "status": "pass",
-        "exit_code": 0,
-        "detail": "tauri-cli 2.12.6"
-      },
-      {
-        "name": "Exact host verification on the candidate",
+        "name": "Signed device build and physical matrix",
         "status": "pending",
         "exit_code": null,
-        "detail": "The exact Python discovery, observed report, generated-path guard and pinned Mac Cargo checks await the trusted host."
-      },
-      {
-        "name": "Repository core and native CI for the signing revision",
-        "status": "pending",
-        "exit_code": null,
-        "detail": "Record passing core and native runs on the revision selected for signing."
+        "detail": "Not attempted because full Xcode, the iPhoneOS SDK and Apple device utilities are absent on this host."
       }
     ]
   },
@@ -457,6 +457,120 @@
           "status": "pass",
           "exit_code": 0,
           "detail": "30 tests passed with python3 -m unittest discover -s tests/integration -p test_w2_iphone_evidence.py."
+        }
+      ]
+    },
+    {
+      "observed_at": "2026-11-25",
+      "checkout_head": "bc46c6e2dd7a7c778a1f60d92721ac9fb7b69e94",
+      "checks": [
+        {
+          "name": "Vite production fixture build",
+          "status": "pass",
+          "exit_code": 0,
+          "detail": "Node 24.21.0 and npm 11.19.0 were present. Vite 8.3.8 built the fixture and reported a chunk-size warning."
+        },
+        {
+          "name": "Filtered declared fixture boundary",
+          "status": "pass",
+          "exit_code": 0,
+          "detail": "Both declared-boundary assertions passed. TAP reported two passes."
+        },
+        {
+          "name": "Disposable Git ignore mutation check",
+          "status": "pass",
+          "exit_code": 0,
+          "detail": "Both exact rules and the source probes matched in a disposable repository. Adding a blanket src-tauri rule or substituting it for either exact rule failed the guard."
+        },
+        {
+          "name": "Native attempt chronology regression before correction",
+          "status": "failed",
+          "exit_code": 1,
+          "detail": "The original validator accepted two older native attempts presented after a later failure within the same app launch."
+        },
+        {
+          "name": "Targeted validator checks",
+          "status": "pass",
+          "exit_code": 0,
+          "detail": "Twelve selected synthetic checks passed, including stale and relaunch attempt ordering, the complete matrix, composition controls and the correction gate."
+        },
+        {
+          "name": "Repository npm checks",
+          "status": "pass",
+          "exit_code": 0,
+          "detail": "Desktop typechecking, six tests, the production desktop bundle and documentation link validation passed."
+        },
+        {
+          "name": "xcode-select -p",
+          "status": "pass",
+          "exit_code": 0,
+          "detail": "/Library/Developer/CommandLineTools"
+        },
+        {
+          "name": "xcodebuild -version",
+          "status": "failed",
+          "exit_code": 1,
+          "detail": "The selected developer directory provides Command Line Tools. xcodebuild requires full Xcode."
+        },
+        {
+          "name": "xcrun --sdk iphoneos --show-sdk-version",
+          "status": "failed",
+          "exit_code": 1,
+          "detail": "The iPhoneOS SDK and its SDKVersion were unavailable."
+        },
+        {
+          "name": "xcrun --sdk iphoneos --show-sdk-build-version",
+          "status": "failed",
+          "exit_code": 1,
+          "detail": "The iPhoneOS SDK and its ProductBuildVersion were unavailable."
+        },
+        {
+          "name": "xcrun --find devicectl",
+          "status": "failed",
+          "exit_code": 72,
+          "detail": "devicectl was unavailable."
+        },
+        {
+          "name": "xcrun --find simctl",
+          "status": "failed",
+          "exit_code": 72,
+          "detail": "simctl was unavailable."
+        },
+        {
+          "name": "command -v pod",
+          "status": "failed",
+          "exit_code": 1,
+          "detail": "CocoaPods was absent from PATH. The generated project determines whether it is required."
+        },
+        {
+          "name": "Worktree Rustup toolchain list",
+          "status": "pass",
+          "exit_code": 0,
+          "detail": "Rustup listed 1.97.1-aarch64-apple-darwin as active."
+        },
+        {
+          "name": "Worktree Rustup 1.97.1 installed targets",
+          "status": "pass",
+          "exit_code": 0,
+          "detail": "Only aarch64-apple-darwin was installed. The aarch64-apple-ios target was unavailable."
+        },
+        {
+          "name": "Locked Tauri CLI version",
+          "status": "pass",
+          "exit_code": 0,
+          "detail": "tauri-cli 2.12.6"
+        },
+        {
+          "name": "Exact host verification on the candidate",
+          "status": "pending",
+          "exit_code": null,
+          "detail": "The exact Python discovery, observed report, generated-path guard and pinned Mac Cargo checks await the trusted host."
+        },
+        {
+          "name": "Repository core and native CI for the signing revision",
+          "status": "pending",
+          "exit_code": null,
+          "detail": "Record passing core and native runs on the revision selected for signing."
         }
       ]
     }
