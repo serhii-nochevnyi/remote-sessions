@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "fixture_sha256": "8c08369864c9dd4ee6de19c8cf86171b179e928f276eebe2f9f89389ea353056",
+  "status": "setup-hold",
+  "reasons": [
+    "The selected developer directory is /Library/Developer/CommandLineTools. xcodebuild requires full Xcode, and xcrun cannot locate the iPhoneOS SDK or its version and build.",
+    "devicectl and simctl were unavailable. The shared Rust 1.97.1 cache had only aarch64-apple-darwin, and the worktree had no Rustup or Cargo cache at the time of the probe.",
+    "No authorized signing or physical iPhone installation session was available to this execution. The generated launcher, signed bundle, effective boundary, offline launch, Mac invoke regression and mandatory interaction cases were unobserved.",
+    "The exact generated-path check and pinned Mac Cargo check await their host run. Repository CI for the candidate revision is pending."
+  ],
+  "execution": {
+    "observed_at": "2026-11-25",
+    "checkout_head": "17b93222c67c2dc97f00d47aecbdceeb077cff7b",
+    "checks": [
+      {
+        "name": "Vite production fixture build",
+        "status": "pass",
+        "exit_code": 0,
+        "detail": "Vite 8.3.8 built the bundled fixture with Node 24.21.0 and npm 11.19.0. Vite reported a nonfatal chunk-size warning."
+      },
+      {
+        "name": "Filtered declared fixture boundary",
+        "status": "pass",
+        "exit_code": 0,
+        "detail": "Both the iOS-only declaration and broadened-declaration rejection tests passed."
+      },
+      {
+        "name": "Disposable Git ignore mutation check",
+        "status": "pass",
+        "exit_code": 0,
+        "detail": "The exact generated rules preserved source visibility. Adding or substituting a blanket src-tauri rule failed the guard."
+      },
+      {
+        "name": "Exact generated-path guard on the candidate",
+        "status": "pending",
+        "exit_code": null,
+        "detail": "Assigned to the trusted host."
+      },
+      {
+        "name": "Pinned Mac Cargo check on the candidate",
+        "status": "pending",
+        "exit_code": null,
+        "detail": "Assigned to the trusted host."
+      },
+      {
+        "name": "xcode-select -p",
+        "status": "pass",
+        "exit_code": 0,
+        "detail": "/Library/Developer/CommandLineTools"
+      },
+      {
+        "name": "xcodebuild -version",
+        "status": "failed",
+        "exit_code": 1,
+        "detail": "The selected developer directory is a command line tools instance. xcodebuild requires Xcode."
+      },
+      {
+        "name": "xcrun --sdk iphoneos --show-sdk-version",
+        "status": "failed",
+        "exit_code": 1,
+        "detail": "SDK iphoneos cannot be located. SDKVersion was unavailable."
+      },
+      {
+        "name": "xcrun --sdk iphoneos --show-sdk-build-version",
+        "status": "failed",
+        "exit_code": 1,
+        "detail": "SDK iphoneos cannot be located. ProductBuildVersion was unavailable."
+      },
+      {
+        "name": "xcrun --find devicectl",
+        "status": "failed",
+        "exit_code": 72,
+        "detail": "Unable to find devicectl."
+      },
+      {
+        "name": "xcrun --find simctl",
+        "status": "failed",
+        "exit_code": 72,
+        "detail": "Unable to find simctl."
+      },
+      {
+        "name": "CocoaPods on PATH",
+        "status": "unavailable",
+        "exit_code": null,
+        "detail": "pod was not on PATH. The requirement for CocoaPods depends on the generated project."
+      },
+      {
+        "name": "Locked Tauri CLI version",
+        "status": "pass",
+        "exit_code": 0,
+        "detail": "tauri-cli 2.12.6"
+      },
+      {
+        "name": "Rustup toolchain list in the shared cache",
+        "status": "pass",
+        "exit_code": 0,
+        "detail": "Listed 1.97.1-aarch64-apple-darwin. The worktree Rustup and Cargo homes were absent."
+      },
+      {
+        "name": "Rustup 1.97.1 installed targets in the shared cache",
+        "status": "pass",
+        "exit_code": 0,
+        "detail": "Listed aarch64-apple-darwin only. The device target aarch64-apple-ios was absent."
+      },
+      {
+        "name": "Repository core and native CI for the candidate",
+        "status": "pending",
+        "exit_code": null,
+        "detail": "The candidate is uncommitted. CI results are pending for the revision selected for signing."
+      }
+    ]
+  },
+  "cohorts": {},
+  "decision": {
+    "disposition": "inconclusive",
+    "production_shell": "open",
+    "minimum_ios": "open",
+    "supporting_attempt_ids": []
+  }
+}
