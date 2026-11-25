@@ -1486,11 +1486,13 @@ async function checkLateRead(executable: string, stop: "end" | "blur" | "hide" |
   const native = connectNative(executable, "requests");
   const gate = deferred();
   const returned = deferred();
+  let readsStarted = 0;
   const fixture = await mountFixture({
     browserPaste: true,
     async invoke(command, args) {
+      const delayCheckpoint = command === "w2_read_attempt" && ++readsStarted === 1;
       const result = await native.invoke(command, args);
-      if (command === "w2_read_attempt") {
+      if (delayCheckpoint) {
         await gate.promise;
         returned.resolve();
       }
@@ -1529,8 +1531,29 @@ async function checkLateRead(executable: string, stop: "end" | "blur" | "hide" |
     assert.equal(checkpoint?.textContent, prior, "stale checkpoint cannot publish");
     assert.equal(fixture.document.getElementById("composition-trace")?.textContent, priorTrace, "stale read cannot change the trace");
     await act(async () => { driver.clock.advance(1000); });
-    assert.equal(reads(fixture).length, 1, "stale read cannot schedule another poll");
+    assert.equal(reads(fixture).length, stop === "hide" ? 2 : 1, "stale read cannot schedule another poll");
     assert.equal(appends(fixture).length, 0);
+    if (stop === "hide") {
+      await fixture.waitFor(() => field(fixture, "retained-snapshot").textContent === "(empty)", "retired native snapshot is visible");
+      await act(async () => {
+        driver.end("é");
+        driver.clock.advance(10);
+        fixture.document.visibilityState = "visible";
+        fixture.document.dispatch("visibilitychange");
+      });
+      await fixture.click("Start fresh and refocus");
+      await fixture.waitFor(() => Boolean(fixture.container.find(node =>
+        node.localName === "button" && node.textContent === "Restart" && !node.disabled)), "recovered composition attempt starts");
+      await act(async () => {
+        driver.update("stale preedit");
+        driver.end("stale commit");
+        driver.clock.advance(250);
+      });
+      assert.equal(field(fixture, "checkpoint").textContent, "Pending", "fresh attempt cannot reuse the retired checkpoint");
+      assert.equal(fixture.document.getElementById("composition-trace"), null, "orphaned composition events cannot enter the fresh trace");
+      assert.equal(appends(fixture).length, 0, "retired composition cannot append to the fresh generation");
+      await fixture.waitFor(() => fixture.ipc.filter(call => call.command === "w2_begin_attempt").length === 2, "fresh composition begins natively");
+    }
     await native.finish();
   } catch (error) {
     await native.abort();
@@ -1628,7 +1651,8 @@ async function checkpointControls() {
       'const recorder = registerRecorder({ onData: () => ({ dispose() {} }) }, transport, onCaptureError);')),
     /guarded composition appends/);
     await assert.rejects(checkCheckpoint(executable, source => replaceOnce(source,
-      'checkpointRead = recorder.read();', 'checkpointRead = Promise.reject(new Error("disconnected read"));')),
+      'const read = recorder.read(() => eligible(attempt) && epoch === pollEpoch);',
+      'const read = Promise.reject(new Error("disconnected read"));')),
     /checkpoint read must not overlap/);
     await assert.rejects(checkCheckpoint(executable, source => replaceOnce(source,
       'const sequence = record(attempt, "active checkpoint"', 'textarea.focus(); const sequence = record(attempt, "active checkpoint"')),
@@ -1639,6 +1663,108 @@ async function checkpointControls() {
     for (const stop of ["end", "blur", "hide", "case", "restart", "unmount"] as const) {
       await checkLateRead(executable, stop);
     }
+  });
+}
+
+async function checkForegroundRecovery(
+  executable: string,
+  id: "app-switch" | "lock-foreground",
+  transformEntry?: MountOptions["transformEntry"],
+  unavailable = false,
+) {
+  const native = connectNative(executable, "requests");
+  const late = deferred();
+  const vector = requiredVectors[id];
+  const before = [...Buffer.from(vector.beforeHex, "hex")];
+  const after = [...Buffer.from(vector.afterHex, "hex")];
+  const fixture = await mountFixture({
+    browserPaste: true,
+    transformEntry,
+    async invoke(command, args) {
+      if (unavailable && command === "w2_read_attempt" && args?.generation === 1) {
+        throw new Error("Interrupted read unavailable");
+      }
+      const reply = await native.invoke(command, args);
+      if (command === "w2_append_input" && args?.generation === 1) await late.promise;
+      return reply;
+    },
+  });
+  const recoveryLabel = "Start fresh and refocus";
+  async function visibility(state: string) {
+    await fixture.act(async () => {
+      fixture.document.visibilityState = state;
+      fixture.document.dispatch("visibilitychange");
+    });
+  }
+  try {
+    await startCase(fixture, id);
+    await fixture.click("Focus");
+    const focuses = fixture.terminal.focuses;
+    await fixture.input(String.fromCharCode(...before));
+    await fixture.input("queued old input");
+    assert.equal(appends(fixture).length, 1, "old input is queued behind a pending acknowledgment");
+
+    await visibility("hidden");
+    const retained = fixture.document.getElementById("retained-snapshot");
+    assert(retained, "visibility retires the attempt and publishes retained state");
+    const retainedHex = unavailable ? "Unavailable" : vector.beforeHex;
+    await fixture.waitFor(() => retained.textContent === retainedHex, "retained state shows the accepted prefix or explicit unavailability");
+    assert.equal(Boolean(fixture.document.getElementById("retained-uncertainty")), unavailable);
+    assert.match(fixture.container.textContent, new RegExp(`Interrupted attempt 1 · ${id} · generation 1 · Invalid`));
+    assert(fixture.button(recoveryLabel).disabled, "recovery is disabled while suspended");
+    await fixture.input("hidden input");
+    assert.equal(appends(fixture).length, 1, "no sends while suspended");
+
+    await visibility("visible");
+    await fixture.input("input before deliberate recovery");
+    assert.equal(appends(fixture).length, 1, "foregrounding does not admit input");
+    assert.equal(fixture.ipc.filter(call => call.command === "w2_begin_attempt").length, 1, "foregrounding does not start a generation");
+    await fixture.click(recoveryLabel);
+    await fixture.waitFor(() => fixture.ipc.filter(call => call.command === "w2_begin_attempt").length === 2,
+      "recovery control begins a fresh generation");
+    await fixture.waitFor(() => !fixture.button("Read").disabled, "fresh attempt enables Read");
+    assert.equal(fixture.terminal.focuses, focuses + 1, "recovery explicitly refocuses");
+    assert.equal(appends(fixture).length, 1, "recovery invokes no append for queued input");
+    await finalRead(fixture);
+    assert.equal(field(fixture, "snapshot").textContent, "(empty)", "fresh generation starts empty");
+    assert.equal(retained.textContent, retainedHex, "starting fresh preserves the old readout");
+
+    await fixture.input(String.fromCharCode(...after));
+    await fixture.act(async () => { late.resolve(); });
+    await fixture.click("Read");
+    await fixture.waitFor(() => !fixture.button("Read").disabled, "fresh read completes");
+    assert.deepEqual(appends(fixture), [
+      { command: "w2_append_input", args: { generation: 1, sequence: 1, events: [before] } },
+      { command: "w2_append_input", args: { generation: 2, sequence: 1, events: [after] } },
+    ], "append invocations contain only the original and fresh input without replay");
+    assert.equal(field(fixture, "snapshot").textContent, vector.afterHex);
+    assert.equal(retained.textContent, retainedHex, "late callback cannot alter retained evidence");
+    assert.deepEqual((native.snapshot() as Snapshot).bytes, after);
+    await native.finish();
+  } catch (error) {
+    await native.abort();
+    throw error;
+  } finally {
+    late.resolve();
+    await fixture.dispose();
+  }
+  assert.equal(fixture.document.listenerCount("visibilitychange"), 0, "visibility listeners are disposed");
+}
+
+async function foregroundRecovery() {
+  await withNativeExecutable(async executable => {
+    await checkForegroundRecovery(executable, "app-switch");
+    await checkForegroundRecovery(executable, "lock-foreground");
+    await checkForegroundRecovery(executable, "lock-foreground", undefined, true);
+    await assert.rejects(checkForegroundRecovery(executable, "app-switch", source => replaceOnce(source,
+      'document.addEventListener("visibilitychange", visibilityChanged);', "")),
+    /visibility retires the attempt and publishes retained state/);
+    await assert.rejects(checkForegroundRecovery(executable, "app-switch", source => replaceOnce(source,
+      'onClick={start}', 'onClick={recovering ? undefined : start}')),
+    /recovery control begins a fresh generation/);
+    await assert.rejects(checkForegroundRecovery(executable, "app-switch", source => replaceOnce(source,
+      'terminal.options.disableStdin = false;', 'terminal.options.disableStdin = false; if (refocus) terminal.paste("queued old input");')),
+    /recovery invokes no append for queued input/);
   });
 }
 
@@ -2042,6 +2168,7 @@ if (import.meta.main) {
   test("viewport updates keep one terminal and dispose listeners", viewportUpdates);
   test("mounted fixture wires layout without remounting its terminal", mountedLayout);
   test("mounted composition checkpoint reads native bytes before commit without moving focus", checkpointControls);
+  test("foreground restart preserves evidence without replay", foregroundRecovery);
   test("native tracer rejects disconnected command wrappers", disconnectedWrapperControls);
   test("declared fixture boundary matches the iOS-only contract", () => assertBoundary(readBoundary()));
   test("declared fixture boundary rejects broadened declarations", declarationControls);

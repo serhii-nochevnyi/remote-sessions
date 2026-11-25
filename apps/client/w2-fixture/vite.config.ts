@@ -9,7 +9,7 @@ const repoRoot = resolve(fixtureRoot, "../../..");
 const lock = JSON.parse(readFileSync(resolve(repoRoot, "package-lock.json"), "utf8")) as {
   packages: Record<string, { version?: string }>;
 };
-const runtimeModules = ["@tauri-apps/api", "@xterm/xterm", "react", "react-dom", "scheduler"];
+const runtimeModules = ["@tauri-apps/api", "@xterm/xterm", "@xterm/addon-fit", "react", "react-dom", "scheduler"];
 const virtualModules = new Set([
   "\0rolldown/runtime.js",
   "\0vite/modulepreload-polyfill.js",
