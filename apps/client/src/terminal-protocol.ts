@@ -109,10 +109,9 @@ export function bindTerminalProtocol(
         pauseInput();
         if (!await scope.consume(view, chunk, async () => {}) || disposed) return false;
         await render();
-      } else if (!await scope.consume(view, chunk, render)) {
-        return false;
+        return !disposed && scope.owns(view);
       }
-      if (disposed || !scope.owns(view)) return false;
+      if (!await scope.consume(view, chunk, render) || disposed) return false;
       terminal.options.disableStdin = !input || !scope.canWrite;
       return true;
     },

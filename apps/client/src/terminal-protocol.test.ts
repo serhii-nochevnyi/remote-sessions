@@ -741,7 +741,7 @@ test("paste and keyboard share one FIFO input queue", async () => {
     firstReceipt.resolve({ result: "committed", receipt: receiptId });
     await Promise.all([before, paste, after]);
     assert.deepEqual(f.calls.map(call => call.kind), ["input", "stage", "commit", "ack", "input"]);
-    await f.consume(firstCompletion);
+    await f.publish(firstIncarnation);
     assert(!f.browser.terminal.options.disableStdin);
     await f.paste("unavailable");
     assert.equal(f.scope.pasteMessage, pasteIssueText.unavailable);
