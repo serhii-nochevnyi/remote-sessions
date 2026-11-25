@@ -5,11 +5,12 @@
   "reasons": [
     "The selected developer directory is /Library/Developer/CommandLineTools. Full Xcode, the iPhoneOS SDK and Apple device tools are unavailable.",
     "The worktree has pinned Rust 1.97.1 for aarch64-apple-darwin only. The aarch64-apple-ios target is absent.",
-    "Authorized signing and physical iPhone installation were unavailable in this run. The generated launcher, signed bundle and effective boundary, offline launch, live Mac invokes and physical attempts remain unobserved."
+    "Authorized signing and physical iPhone installation were unavailable in this run. The generated launcher, signed bundle and effective boundary, offline launch, live Mac invokes and physical attempts remain unobserved.",
+    "Repository core and native CI are pending for the signing revision."
   ],
   "execution": {
     "observed_at": "2026-11-25",
-    "checkout_head": "eee4c12195591e80c6dcdcf8ca8ddbb63af92525",
+    "checkout_head": "60d8fb42653a12be4697acb9adb90687e158b841",
     "checks": [
       {
         "name": "Vite production fixture build",
@@ -111,7 +112,7 @@
         "name": "Exact host verification on the candidate",
         "status": "pass",
         "exit_code": 0,
-        "detail": "On candidate eee4c12195591e80c6dcdcf8ca8ddbb63af92525: all 35 discovered Python validator tests passed; the report consistency check passed with setup-hold; the exact generated-path ignore guard passed; and cargo check passed with pinned Rust 1.97.1 for aarch64-apple-darwin."
+        "detail": "On candidate 60d8fb42653a12be4697acb9adb90687e158b841: all 35 discovered Python validator tests passed; the report consistency check passed with setup-hold; the exact generated-path ignore guard passed; and cargo check passed with pinned Rust 1.97.1 for aarch64-apple-darwin."
       },
       {
         "name": "Repository core and native CI for the signing revision",
