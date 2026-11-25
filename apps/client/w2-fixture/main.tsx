@@ -14,7 +14,7 @@ function Fixture() {
   const [active, setActive] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
-  const [snapshot, setSnapshot] = React.useState<Snapshot | null>(null);
+  const [snapshot, setSnapshot] = React.useState<Snapshot | "unavailable" | null>(null);
 
   React.useEffect(() => {
     const container = viewport.current;
@@ -47,7 +47,7 @@ function Fixture() {
 
     function onCaptureError(reason: unknown) {
       terminal.options.disableStdin = true;
-      setError(String(reason));
+      setError(`Invalid attempt: ${String(reason)}`);
     }
     const recorder = registerRecorder(terminal, invoke, onCaptureError);
     const mounted = { terminal, recorder };
@@ -79,7 +79,7 @@ function Fixture() {
       mounted.terminal.options.disableStdin = false;
       setActive(true);
     } catch (reason) {
-      if (controls.current === mounted) setError(String(reason));
+      if (controls.current === mounted) setError(`Invalid attempt: ${String(reason)}`);
     } finally {
       if (controls.current === mounted) setBusy(false);
     }
@@ -92,23 +92,25 @@ function Fixture() {
     try {
       const result = await mounted.recorder.read();
       if (controls.current === mounted) setSnapshot(result);
-    } catch (reason) {
-      if (controls.current === mounted) setError(String(reason));
+    } catch {
+      if (controls.current === mounted) setSnapshot("unavailable");
     } finally {
       if (controls.current === mounted) setBusy(false);
     }
   }
 
-  const hex = snapshot?.bytes.map(byte => byte.toString(16).padStart(2, "0")).join("");
+  const readout = snapshot === "unavailable" ? "Unavailable" : snapshot
+    ? snapshot.bytes.map(byte => byte.toString(16).padStart(2, "0")).join("") || "(empty)"
+    : "—";
   return (
     <main>
       <h1>Offline terminal fixture</h1>
       <p>Start the case, type ї, then press Return. Select Read to inspect the captured bytes.</p>
-      <button type="button" onClick={start} disabled={!ready || busy}>Start</button>
+      <button type="button" onClick={start} disabled={!ready || busy}>{active || error ? "Restart" : "Start"}</button>
       <button type="button" onClick={read} disabled={!active || busy}>Read</button>
       <div id="terminal" ref={viewport} aria-label="Synthetic terminal" />
       <label htmlFor="snapshot">Native snapshot (hex)</label>{" "}
-      <output id="snapshot">{snapshot ? hex || "(empty)" : "—"}</output>
+      <output id="snapshot">{readout}</output>
       {error && <p role="alert">{error}</p>}
     </main>
   );
