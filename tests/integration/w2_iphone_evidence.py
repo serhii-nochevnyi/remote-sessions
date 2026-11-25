@@ -62,11 +62,16 @@ class EvidenceError(ValueError):
 class MeasuredFailure(EvidenceError):
     """The recorded procedure and outcome establish a mandatory failure."""
 
+    def __init__(self, detail, observed):
+        super().__init__(detail)
+        self.observed = observed
+
 
 @dataclass(frozen=True)
 class Result:
     status: str
     detail: str = ""
+    observed: tuple = ()
 
 
 def need(condition, detail):
@@ -74,9 +79,9 @@ def need(condition, detail):
         raise EvidenceError(detail)
 
 
-def measured(condition, detail):
+def measured(condition, detail, *observed):
     if not condition:
-        raise MeasuredFailure(detail)
+        raise MeasuredFailure(detail, observed)
 
 
 def obj(value, label):
@@ -392,21 +397,27 @@ def check_composition(attempt, final, identity, expected):
          and final["acceptedEvents"] == len(acks) and sum(lengths) == final_event["bytes"]
          and final.get("eventLengths", lengths) == lengths,
          "final native snapshot does not reconcile with acknowledged appends")
+    accepted = 0
     for sample in samples:
-        accepted = [ack for ack in acks if ack["sequence"] < sample["sequence"]]
-        need(sample["bytes"] == sum(ack["bytes"] for ack in accepted)
-             and sample["nativeSequence"] == len(accepted) + 1, "checkpoint counters do not reconcile with the append trace")
-    need(checkpoint["acceptedEvents"] == checkpoint["nextSequence"] - 1,
-         "checkpoint event count does not reconcile with native sequence")
-    measured(not any(ack["sequence"] < end for ack in acks), "native input accepted before compositionend")
+        acknowledged = sum(ack["sequence"] < sample["sequence"] for ack in acks)
+        dispatched = sum(dispatch["sequence"] < sample["sequence"] for dispatch in dispatches)
+        count = sample["nativeSequence"] - 1
+        need(max(accepted, acknowledged) <= count <= dispatched
+             and sample["bytes"] == sum(lengths[:count]), "checkpoint counters do not reconcile with the append trace")
+        accepted = count
+    need(checkpoint["acceptedEvents"] == accepted, "checkpoint event count does not reconcile with native sequence")
+    need(final["hex"].startswith(checkpoint["hex"])
+         and checkpoint.get("eventLengths", lengths[:accepted]) == lengths[:accepted],
+         "checkpoint is not a prefix of the final native snapshot")
+    pre_end_count = max(accepted, sum(ack["sequence"] < end for ack in acks))
+    pre_end_hex = final["hex"][:2 * sum(lengths[:pre_end_count])]
+    measured(pre_end_count == 0, "native input accepted before compositionend", pre_end_hex)
     need(all(admit["sequence"] > end for admit in admissions)
          and all(event["sequence"] > end for event in events["rejection"]),
          "premature onData or uncertain pre-end native acceptance")
-    need(all(sample["bytes"] == 0 and sample["nativeSequence"] == 1 for sample in samples)
-         and not checkpoint["hex"] and checkpoint["acceptedEvents"] == 0,
-         "active preedit checkpoint must contain zero native input")
-    measured(len(acks) <= int(bool(expected)), "duplicate or unexpected composition append")
-    measured(final["hex"] == expected and len(acks) == int(bool(expected)), "composition final bytes differ from the manifest")
+    measured(len(acks) <= int(bool(expected)), "duplicate or unexpected composition append", final["hex"])
+    measured(final["hex"] == expected and len(acks) == int(bool(expected)),
+             "composition final bytes differ from the manifest", final["hex"])
     measured(not events["rejection"], "unexpected post-end onData callback")
 
 
@@ -447,7 +458,7 @@ def check_layout(attempt, case_id):
     return all(clear)
 
 
-def recovery(attempt, identity, expected):
+def check_recovery(attempt, identity, expected):
     old = obj(attempt.get("recovery"), "foreground recovery")
     initial = obj(old.get("before"), "pre-interruption native snapshot")
     old_id = attempt_identity(initial)
@@ -457,9 +468,11 @@ def recovery(attempt, identity, expected):
     retained = snapshot(old.get("retained"), old_id)
     need(old.get("delivery_uncertain") is False and type(old.get("old_generation_extra_event")) is bool,
          "retained snapshot or delivery is uncertain")
-    return (before["hex"] == retained["hex"] == expected
-            and before["acceptedEvents"] == retained["acceptedEvents"]
-            and not old["old_generation_extra_event"])
+    measured(before["hex"] == retained["hex"] == expected
+             and before["acceptedEvents"] == retained["acceptedEvents"]
+             and not old["old_generation_extra_event"], "retained native bytes or events changed",
+             before["hex"], retained["hex"], before["acceptedEvents"], retained["acceptedEvents"],
+             old["old_generation_extra_event"])
 
 
 def evaluate_attempt(attempt, case, cohort, qualification):
@@ -491,20 +504,21 @@ def evaluate_attempt(attempt, case, cohort, qualification):
             recipe = cohort["recipes"][case_id]
             need(attempt.get("recipe_id") == recipe["id"] and language == recipe["keyboard_language"],
                  "measured gesture does not use the frozen qualified recipe")
-            need(observed["preedit_visible"], "checkpoint was not observed during visible preedit")
+            need(all(observed[key] for key in OBSERVATIONS[case_id]),
+                 "measured preedit and end state do not establish the qualified gesture")
             need(attempt["id"] not in qualification.rehearsals, "qualification rehearsal is not a fresh measured attempt")
             check_composition(attempt, final, identity, case["expected"]["afterHex"])
         if case_id in RECOVERY:
-            measured(recovery(attempt, identity, case["expected"]["beforeHex"]), "retained native bytes or events changed")
+            check_recovery(attempt, identity, case["expected"]["beforeHex"])
         measured(attempt["start_empty"], "unexpected startup input")
         measured(not attempt["replayed"], "replayed input")
-        measured(final["hex"] == case["expected"]["afterHex"], "final bytes differ from the manifest")
+        measured(final["hex"] == case["expected"]["afterHex"], "final bytes differ from the manifest", final["hex"])
         need(not attempt["capture_error"], "native capture reported an unresolved error")
         for key in OBSERVATIONS[case_id]:
             measured(observed[key], f"visible observation failed: {key}")
         measured(viewport_clear, "prompt or cursor obscured in a measured viewport")
     except MeasuredFailure as error:
-        return Result("failing", str(error))
+        return Result("failing", str(error), error.observed)
     except EvidenceError as error:
         return Result("inconclusive", str(error))
     return Result("pass")

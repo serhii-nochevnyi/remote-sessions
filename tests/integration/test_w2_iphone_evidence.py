@@ -379,6 +379,26 @@ class EvidenceTest(unittest.TestCase):
         row["trace"]["events"] = events(*trace[:3], *trace[4:6], trace[3], *trace[6:])
         self.reject(report_for(self.baseline), "uncertain pre-end")
 
+    def test_preedit_snapshot_proves_acceptance_even_with_late_ack(self):
+        row = self.sample()
+        trace = row["trace"]["events"]
+        row["trace"]["events"] = events(*trace[:3], *trace[4:6], event("active checkpoint", 2, 2),
+                                          trace[3], *trace[6:])
+        row["checkpoint"].update(sequence=6, hex="c3a9", acceptedEvents=1, nextSequence=2)
+        failure = mark(row, "failing")
+        self.validate(report_for(self.baseline, "failing", "mandatory-failure", [failure]), "failing")
+        row["checkpoint"]["hex"] = "c3a8"
+        self.reject(report_for(self.baseline, "failing", "mandatory-failure", [failure]), "prefix of the final")
+
+    def test_unconfirmed_visual_gesture_cannot_be_measured_as_failure(self):
+        for case_id, observation in (("composition-commit", "end_state_observed"),
+                                     ("composition-replacement", "replaced_in_preedit")):
+            with self.subTest(case_id=case_id):
+                row = self.sample(case_id)
+                row["observations"][observation] = False
+                mark(row, "inconclusive")
+                self.validate(report_for(self.baseline, "inconclusive", "inconclusive", []), "inconclusive")
+
     def test_duplicate_post_end_append_is_failure(self):
         row = self.sample()
         trace = row["trace"]["events"]
@@ -491,6 +511,18 @@ class EvidenceTest(unittest.TestCase):
         corrected["attempts"].clear()
         report["cohorts"]["comparison"] = {}
         self.reject(report, "persistent corrected-build mandatory failure")
+
+    def test_correction_gate_distinguishes_wrong_byte_results(self):
+        report, corrected = self.correction_fixture()
+        for row in self.baseline["attempts"] + corrected["attempts"]:
+            row["observations"]["cursor_visible"] = True
+            row["final"]["hex"] = "6f6b"
+        self.validate(report, "failing")
+        self.baseline["attempts"][1]["final"]["hex"] = "6f6b0d0d"
+        self.reject(report, "same unresolved measured failure twice")
+        self.baseline["attempts"][1]["final"]["hex"] = "6f6b"
+        corrected["attempts"][0]["final"]["hex"] = "6f6b0d0d"
+        self.reject(report, "shell disposition must be mandatory-failure")
 
     def test_correction_gate_rejects_a_different_failed_case_or_mixed_conditions(self):
         report, corrected = self.correction_fixture()
