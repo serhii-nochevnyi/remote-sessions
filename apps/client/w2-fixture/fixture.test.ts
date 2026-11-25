@@ -230,10 +230,14 @@ function entryFromHtml() {
   const scripts = [...html.matchAll(/<script\s+type="module"\s+src="([^"]+)"\s*>\s*<\/script>/g)];
   assert(root, "fixture HTML declares a mount root");
   assert.equal(scripts.length, 1, "fixture HTML declares a single module entry");
-  assert(scripts[0][1].startsWith("./"), "fixture HTML loads a local module entry");
-  const entry = new URL(scripts[0][1], fixtureDir);
+  const id = root[1];
+  const entryPath = scripts[0]?.[1];
+  assert(id !== undefined, "fixture HTML declares a mount root id");
+  assert(entryPath !== undefined, "fixture HTML declares a module entry path");
+  assert(entryPath.startsWith("./"), "fixture HTML loads a local module entry");
+  const entry = new URL(entryPath, fixtureDir);
   assert(entry.href.startsWith(fixtureDir.href), "module entry belongs to the fixture directory");
-  return { id: root[1], entry };
+  return { id, entry };
 }
 
 export async function mountFixture(options: MountOptions = {}) {
@@ -347,6 +351,7 @@ export async function mountFixture(options: MountOptions = {}) {
     assert.equal(roots.length, 1, "production entry creates one React root");
     assert.equal(terminals.length, 1, "production entry creates one xterm");
     const terminal = terminals[0];
+    assert(terminal, "production entry creates an xterm");
     await act(async () => { await terminal.afterWrite(); });
 
     function button(label: string) {
@@ -490,10 +495,15 @@ async function assertMountedInput(
   const native = connectNative(executable, mode);
   let fixture: Awaited<ReturnType<typeof mountFixture>> | undefined;
   try {
-    const mounted = await mountFixture({ invoke: native.invoke, transformEntry });
+    const mounted = await mountFixture({
+      invoke: native.invoke,
+      ...(transformEntry === undefined ? {} : { transformEntry }),
+    });
     fixture = mounted;
     assert.deepEqual(mounted.ipc, [], "startup transcript emits no IPC or input");
-    assert.deepEqual(mounted.terminal.data, [], "startup transcript emits no xterm input");
+    const terminal = mounted.terminal;
+    assert(terminal, "production entry creates an xterm");
+    assert.deepEqual(terminal.data, [], "startup transcript emits no xterm input");
     const readout = mounted.document.getElementById("snapshot");
     assert(readout, "missing native snapshot readout");
     assert.equal(readout.textContent, "—");
@@ -501,10 +511,10 @@ async function assertMountedInput(
     await mounted.click("Start");
     await mounted.waitFor(() => !mounted.button("Read").disabled, "Start enables Read");
     await mounted.act(async () => {
-      if (mode === "combined") mounted.terminal.input("ї\r");
+      if (mode === "combined") terminal.input("ї\r");
       else {
-        mounted.terminal.input("ї");
-        mounted.terminal.input("\r");
+        terminal.input("ї");
+        terminal.input("\r");
       }
       mounted.button("Read").click();
     });
@@ -512,8 +522,8 @@ async function assertMountedInput(
 
     const events = mode === "combined" ? [[0xd1, 0x97, 0x0d]] : [[0xd1, 0x97], [0x0d]];
     assert.equal(mounted.registrations.length, 1, "production recorder registration");
-    assert.equal(mounted.terminal.subscriptions, 1, "one xterm onData subscription");
-    assert.deepEqual(mounted.terminal.data, mode === "combined" ? ["ї\r"] : ["ї", "\r"], "actual xterm input events");
+    assert.equal(terminal.subscriptions, 1, "one xterm onData subscription");
+    assert.deepEqual(terminal.data, mode === "combined" ? ["ї\r"] : ["ї", "\r"], "actual xterm input events");
     assert.deepEqual(mounted.ipc, [
       { command: "w2_begin_attempt", args: { caseId: syntheticCase } },
       ...events.map((event, index) => ({
@@ -522,7 +532,9 @@ async function assertMountedInput(
       })),
       { command: "w2_read_attempt", args: { generation: 1 } },
     ], "actual IPC trace");
-    assert.deepEqual(mounted.registrations[0].calls, mounted.ipc, "registered invoke trace matches actual IPC");
+    const registration = mounted.registrations[0];
+    assert(registration, "production recorder registration exists");
+    assert.deepEqual(registration.calls, mounted.ipc, "registered invoke trace matches actual IPC");
     assert.deepEqual(native.snapshot(), {
       caseId: syntheticCase,
       generation: 1,
@@ -604,7 +616,7 @@ function disconnectedWrapperControls() {
   const scratch = mkdtempSync(join(tmpdir(), "w2-wrapper-controls-"));
   try {
     const source = readFileSync(nativeSource, "utf8");
-    const controls = [
+    const controls: [string, string, string][] = [
       ["w2_begin_attempt", "let _ = (state, case_id); Ok(0)", "begin wrapper must start generation 1"],
       ["w2_append_input", "let _ = (state, generation, sequence, events); Ok(())", "append wrapper must commit the event"],
       ["w2_read_attempt", 'let _ = (state, generation); Err("disconnected read control")', "read wrapper must return the active snapshot"],
@@ -617,7 +629,9 @@ function disconnectedWrapperControls() {
       const signature = new RegExp(`(^    fn ${command}\\([^]*? \\{\\n)[^]*?^    \\}`, "m");
       const original = source.match(signature);
       assert(original, `wrapper to disconnect: ${command}`);
-      const mutated = replaceOnce(source, signature, `${original[1]}        ${replacement}\n    }`);
+      const prefix = original[1];
+      assert(prefix !== undefined, `wrapper to disconnect: ${command}`);
+      const mutated = replaceOnce(source, signature, `${prefix}        ${replacement}\n    }`);
       const path = join(scratch, `${command}.rs`);
       const executable = join(scratch, command);
       try {
@@ -806,8 +820,8 @@ function assertLibraryBoundary(source: string) {
   assert.deepEqual(attributesBefore(tokens, recorder),
     [rustTokens('#[cfg(any(target_os = "ios", test))]').join(" ")], "recorder module target guard");
   const module = bodyAt(tokens, recorder, recorderDecl);
-  const wrappers = positions(module, "fn", true).filter(index => module[index + 1].startsWith("w2_"));
-  assert.deepEqual(wrappers.map(index => module[index + 1]), commands, "exact command wrapper declarations");
+  const wrappers = positions(module, "fn", true).filter(index => module[index + 1]?.startsWith("w2_") ?? false);
+  assert.deepEqual(wrappers.map(index => module[index + 1] ?? ""), commands, "exact command wrapper declarations");
   for (const wrapper of wrappers) {
     assert.deepEqual(attributesBefore(module, wrapper), [rustTokens(commandAttribute).join(" ")],
       `iOS command attribute belongs to ${module[wrapper + 1]}`);
@@ -838,7 +852,9 @@ function assertLibraryBoundary(source: string) {
   const exports = positions(tokens, "pub use", true);
   assert.deepEqual(exports, positions(tokens, "pub use recorder::run;", true), "standalone run re-export");
   assert.equal(exports.length, 1, "standalone run re-export");
-  assert.deepEqual(attributesBefore(tokens, exports[0]), [rustTokens(iosCfg).join(" ")], "iOS cfg belongs to the run re-export");
+  const runExport = exports[0];
+  assert(runExport !== undefined, "standalone run export exists");
+  assert.deepEqual(attributesBefore(tokens, runExport), [rustTokens(iosCfg).join(" ")], "iOS cfg belongs to the run re-export");
   for (const declaration of ["fn start_app", "#[unsafe(export_name =", "#[export_name ="]) {
     assert.equal(positions(tokens, declaration).length, 0, "handwritten C ABI entry");
   }
@@ -854,6 +870,7 @@ function assertPermissions(entries: ReturnType<typeof readEntries>) {
   for (const file of files) {
     assert.equal(file.kind, "file", "generated permission is a regular file");
     const command = commands[paths.indexOf(file.path)];
+    assert(command !== undefined, `generated permission matches a command: ${file.path}`);
     const slug = command.replaceAll("_", "-");
     assert.deepEqual(parseToml(file.source), {
       permission: [
@@ -979,7 +996,9 @@ function declarationControls() {
     }],
     ["broadened generated permission", /exact generated permission definitions/, b => {
       b.permissions = structuredClone(permissions);
-      b.permissions[1].source = b.permissions[1].source.replace('commands.allow = ["w2_begin_attempt"]',
+      const permission = b.permissions[1];
+      assert(permission, "begin permission exists");
+      permission.source = permission.source.replace('commands.allow = ["w2_begin_attempt"]',
         'commands.allow = ["w2_begin_attempt", "arbitrary"]');
     }],
     ["host dependency", /only iOS recorder dependencies/, b => {
