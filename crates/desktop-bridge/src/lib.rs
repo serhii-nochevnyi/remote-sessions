@@ -111,6 +111,7 @@ struct Views {
     notices: VecDeque<ClosureNotice>,
     allocated: usize,
     paste_holds: HashMap<Uuid, PasteAdmission>,
+    control_samples: HashMap<Uuid, ControlSample>,
     #[cfg(test)]
     paste_fixture: Option<mpsc::UnboundedSender<PasteFixtureFrame>>,
 }
@@ -144,6 +145,49 @@ impl Views {
             expires: now + NOTICE_TTL,
         });
     }
+
+    fn publish_control(&mut self, view: Uuid, control: &Control) {
+        let paste_admission = self.paste_holds.get(&view).copied();
+        let sample = if paste_admission.is_some() {
+            ControlSample {
+                lease: None,
+                paste_admission,
+            }
+        } else {
+            ControlSample::from_control(control, None)
+        };
+        self.control_samples.insert(view, sample);
+    }
+
+    fn publish_lease(&mut self, view: Uuid, lease: &NativeLease) {
+        let paste_admission = self.paste_holds.get(&view).copied();
+        let sample = if paste_admission.is_some() {
+            ControlSample {
+                lease: None,
+                paste_admission,
+            }
+        } else {
+            ControlSample {
+                lease: Some(LeaseSample::from_lease(lease)),
+                paste_admission: None,
+            }
+        };
+        self.control_samples.insert(view, sample);
+    }
+}
+
+#[derive(Clone, Default)]
+struct ControlSample {
+    lease: Option<LeaseSample>,
+    paste_admission: Option<PasteAdmission>,
+}
+
+#[derive(Clone)]
+struct LeaseSample {
+    epoch: ResizeEpoch,
+    deadline: Instant,
+    incarnation: Uuid,
+    pending_paste: Option<(Uuid, u64)>,
 }
 
 struct Allocation(Arc<Mutex<Views>>);
@@ -237,6 +281,30 @@ pub enum PasteAction {
 impl NativeLease {
     fn writable(&self, now: Instant) -> bool {
         self.pending_paste.is_none() && self.deadline > now
+    }
+}
+
+impl ControlSample {
+    fn from_control(control: &Control, paste_admission: Option<PasteAdmission>) -> Self {
+        let lease = control.lease.as_ref().map(LeaseSample::from_lease);
+        Self {
+            lease,
+            paste_admission,
+        }
+    }
+}
+
+impl LeaseSample {
+    fn from_lease(lease: &NativeLease) -> Self {
+        Self {
+            epoch: lease.epoch,
+            deadline: lease.deadline,
+            incarnation: lease.incarnation,
+            pending_paste: lease
+                .pending_paste
+                .as_ref()
+                .map(|pending| (pending.binding.incarnation, pending.binding.operation)),
+        }
     }
 }
 enum PtyEvent {
@@ -398,6 +466,31 @@ impl View {
             let mut views = views.lock().unwrap();
             if views.live.contains_key(&self.terminal.view_id) {
                 views.paste_holds.insert(self.terminal.view_id, hold);
+                views.control_samples.insert(
+                    self.terminal.view_id,
+                    ControlSample {
+                        lease: None,
+                        paste_admission: Some(hold),
+                    },
+                );
+            }
+        }
+    }
+
+    fn publish_control(&self, control: &Control) {
+        if let Some(views) = self.views.upgrade() {
+            let mut views = views.lock().unwrap();
+            if views.live.contains_key(&self.terminal.view_id) {
+                views.publish_control(self.terminal.view_id, control);
+            }
+        }
+    }
+
+    fn publish_lease(&self, lease: &NativeLease) {
+        if let Some(views) = self.views.upgrade() {
+            let mut views = views.lock().unwrap();
+            if views.live.contains_key(&self.terminal.view_id) {
+                views.publish_lease(self.terminal.view_id, lease);
             }
         }
     }
@@ -441,6 +534,7 @@ impl View {
         let id = self.terminal.view_id;
         views.live.remove(&id)?;
         views.paste_holds.remove(&id);
+        views.control_samples.remove(&id);
         self.reader_state.store(CLOSE, Ordering::Release);
         if !self.reading.load(Ordering::Relaxed)
             && let Retirement::Typed(closure) = reason
@@ -757,6 +851,7 @@ async fn refresh_control(view: &View) {
                     }
                     if let Some(registry) = registry.as_mut() {
                         registry.paste_holds.remove(&view.terminal.view_id);
+                        registry.publish_control(view.terminal.view_id, &control);
                     }
                     return;
                 }
@@ -766,12 +861,14 @@ async fn refresh_control(view: &View) {
         }
         Ok(Response::Accepted {}) if !view.closed() && control.lease.is_some() => {
             control.lease.as_mut().unwrap().deadline = deadline;
+            view.publish_control(&control);
         }
         result => {
             if let Ok(Response::ControlRecovering { paste_admission }) = result {
                 view.hold_paste(paste_admission);
             }
             let token = control.lease.take().map(|lease| lease.token);
+            view.publish_control(&control);
             drop(control);
             if let Some(token) = token {
                 view.release(token).await;
@@ -1064,30 +1161,30 @@ async fn read_chunk(view: &View, output: &mut Output, now: impl Fn() -> Instant)
         }
         Err(_) => {}
     }
-    let control = view.control.lock().await;
-    if !view.closed() {
-        if let Some(lease) = &control.lease {
-            if let Some(pending) = &lease.pending_paste {
+    let control_sample = view.views.upgrade().and_then(|views| {
+        let views = views.lock().unwrap();
+        (!view.closed())
+            .then(|| views.control_samples.get(&view.terminal.view_id).cloned())
+            .flatten()
+    });
+    if let Some(sample) = control_sample {
+        chunk.paste_admission = sample.paste_admission;
+        if chunk.paste_admission.is_none()
+            && let Some(lease) = sample.lease
+        {
+            if let Some((incarnation, operation)) = lease.pending_paste {
                 chunk.paste_completion = Some(PasteCompletion {
-                    incarnation: pending.binding.incarnation,
-                    operation: pending.binding.operation,
+                    incarnation,
+                    operation,
                 });
             } else if scope_sampled
                 && output.status.terminal == view.terminal
                 && Some(lease.epoch) == output.status.epoch
-                && lease.writable(now())
+                && lease.deadline > now()
             {
                 chunk.paste_incarnation = Some(lease.incarnation);
             }
         }
-        chunk.paste_admission = view.views.upgrade().and_then(|views| {
-            views
-                .lock()
-                .unwrap()
-                .paste_holds
-                .get(&view.terminal.view_id)
-                .copied()
-        });
     }
     output.writable = chunk.paste_incarnation.is_some();
     chunk.writable = output.writable;
@@ -1469,23 +1566,23 @@ impl DesktopBridge {
             );
             (lease.token, lease.resize_sequence)
         };
-        let reply = request(
-            &view.directory,
-            &Request::ResizeTerminal {
+        let reply = view
+            .agent_request(&Request::ResizeTerminal {
                 terminal: view.terminal.clone(),
                 token,
                 sequence,
                 size,
-            },
-        )
-        .await;
+            })
+            .await;
         let mut control = view.control.lock().await;
         ensure!(!view.closed(), "View detached");
-        let lease = control
+        let pending_paste = control
             .lease
-            .as_mut()
-            .filter(|lease| lease.token == token && lease.pending_paste.is_none())
-            .context("Resize authority changed")?;
+            .as_ref()
+            .filter(|lease| lease.token == token)
+            .context("Resize authority changed")?
+            .pending_paste
+            .is_some();
         match reply {
             Ok(Response::Resize {
                 resize: ResizeResult::Committed { admission, status },
@@ -1495,7 +1592,7 @@ impl DesktopBridge {
                 && admission.epoch == epoch
                 && status.committed.size == size =>
             {
-                lease.resize_sequence = sequence
+                control.lease.as_mut().unwrap().resize_sequence = sequence
                     .checked_add(1)
                     .context("Resize sequence exhausted")?;
                 Ok(ResizeResult::Committed { admission, status })
@@ -1503,18 +1600,34 @@ impl DesktopBridge {
             Ok(Response::Resize {
                 resize: ResizeResult::Uncertain { terminal, intent },
             }) if terminal == view.terminal && intent.epoch == epoch => {
-                control.lease = None;
+                if pending_paste {
+                    control.lease.as_mut().unwrap().deadline = Instant::now();
+                } else {
+                    control.lease = None;
+                }
+                view.publish_control(&control);
                 Ok(ResizeResult::Uncertain { terminal, intent })
             }
             Ok(Response::Resize {
                 resize: ResizeResult::Rejected { terminal, intent },
             }) if terminal == view.terminal && intent.epoch == epoch => {
-                control.lease = None;
+                if pending_paste {
+                    control.lease.as_mut().unwrap().deadline = Instant::now();
+                } else {
+                    control.lease = None;
+                }
+                view.publish_control(&control);
                 Ok(ResizeResult::Rejected { terminal, intent })
             }
             Ok(Response::Error { message }) => bail!("{message}"),
             _ => {
+                if pending_paste {
+                    control.lease.as_mut().unwrap().deadline = Instant::now();
+                    view.publish_control(&control);
+                    bail!("Результат зміни розміру невідомий");
+                }
                 control.lease = None;
+                view.publish_control(&control);
                 drop(control);
                 view.release(token).await;
                 bail!("Результат зміни розміру невідомий");
@@ -1613,6 +1726,7 @@ impl DesktopBridge {
             view.hold_paste(*paste_admission);
         }
         control.lease = None;
+        view.publish_control(&control);
         drop(control);
         view.release(token).await;
         match result {
@@ -1674,13 +1788,17 @@ impl DesktopBridge {
             {
                 let writable = host_writable && lease.deadline > Instant::now() && !view.closed();
                 lease.pending_paste = None;
-                if !writable {
+                let release_token = if !writable {
                     let token = lease.token;
                     control.lease = None;
-                    drop(control);
-                    if host_writable {
-                        view.release(token).await;
-                    }
+                    Some(token)
+                } else {
+                    None
+                };
+                view.publish_control(&control);
+                drop(control);
+                if host_writable && let Some(token) = release_token {
+                    view.release(token).await;
                 }
                 return PasteResult::Acknowledged { writable };
             }
@@ -1722,6 +1840,7 @@ impl DesktopBridge {
             }) if committing && !receipt.is_nil() => {
                 lease.input_sequence += 1;
                 lease.pending_paste.as_mut().unwrap().receipt = Some(receipt);
+                view.publish_lease(lease);
                 PasteResult::Committed { receipt }
             }
             Ok(Response::Paste {
@@ -1734,6 +1853,7 @@ impl DesktopBridge {
                     | PasteResult::Unavailable {}),
             }) => {
                 lease.pending_paste = None;
+                view.publish_lease(lease);
                 paste
             }
             Ok(Response::Paste {
@@ -1742,6 +1862,7 @@ impl DesktopBridge {
             _ if committing => Self::hold_unknown_paste(&view, &mut control),
             _ => {
                 let token = control.lease.take().map(|lease| lease.token);
+                view.publish_control(&control);
                 drop(control);
                 if let Some(token) = token {
                     view.release(token).await;
@@ -1754,8 +1875,11 @@ impl DesktopBridge {
     fn hold_unknown_paste(view: &Arc<View>, control: &mut Control) -> PasteResult {
         view.hold_paste(PasteAdmission::PriorSendUnknown);
         if let Some(lease) = control.lease.take() {
+            view.publish_control(control);
             let view = view.clone();
             tokio::spawn(async move { view.release(lease.token).await });
+        } else {
+            view.publish_control(control);
         }
         PasteResult::Unknown {}
     }
@@ -2089,7 +2213,10 @@ mod tests {
             },
         );
         assert_eq!(task.await.unwrap(), PasteResult::Committed { receipt });
-        view.control.lock().await.lease.as_mut().unwrap().deadline = Instant::now();
+        let mut control = view.control.lock().await;
+        control.lease.as_mut().unwrap().deadline = Instant::now();
+        view.publish_control(&control);
+        drop(control);
         let completion = ipc.bridge.read(&id).await.unwrap();
         assert!(!completion.writable && completion.paste_incarnation.is_none());
         let completion = completion.paste_completion.unwrap();
@@ -2138,6 +2265,336 @@ mod tests {
             PasteResult::Acknowledged { writable: false }
         );
         assert!(view.control.lock().await.lease.is_none());
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_resize_reply_advances_sequence_while_paste_receipt_is_pending() {
+        use remote_sessions_host::model::{CommittedGeometry, ResizeIntent};
+
+        let ipc = PasteIpc::new();
+        let (view, output) = ipc.attach();
+        let id = view.terminal.view_id.to_string();
+        let (token, epoch, incarnation) = ipc.grant(&view).await;
+        let first_size = TerminalSize {
+            cols: 111,
+            rows: 34,
+        };
+        let bridge = ipc.bridge.clone();
+        let resize_view = id.clone();
+        let first_resize =
+            tokio::spawn(async move { bridge.resize(&resize_view, first_size, epoch).await });
+        let (resize_reply, request) = ipc.receive().await;
+        let Request::ResizeTerminal {
+            terminal,
+            token: actual_token,
+            sequence,
+            size,
+        } = request
+        else {
+            panic!("expected the first resize request");
+        };
+        assert_eq!(terminal, view.terminal);
+        assert_eq!((actual_token, sequence, size), (token, 0, first_size));
+
+        let staged = ipc.stage(&view, incarnation, 1).await;
+        let commit = ipc.invoke(&view, incarnation, 1, PasteAction::Commit { bytes: 1 });
+        let (commit_reply, request) = ipc.receive().await;
+        assert!(matches!(request, Request::PasteCommit { binding, bytes: 1 } if binding == staged));
+        output
+            .send(PtyEvent::Bytes(Arc::new(Mutex::new(
+                b"pending commit".to_vec(),
+            ))))
+            .await
+            .unwrap();
+        let pending = ipc.bridge.read(&id).await.unwrap();
+        assert!(pending.writable);
+        assert_eq!(pending.paste_incarnation, Some(incarnation));
+        assert!(pending.paste_completion.is_none());
+        let receipt = Uuid::new_v4();
+        PasteIpc::reply(
+            commit_reply,
+            Response::Paste {
+                paste: PasteResult::Committed { receipt },
+            },
+        );
+        assert_eq!(commit.await.unwrap(), PasteResult::Committed { receipt });
+        output
+            .send(PtyEvent::Bytes(Arc::new(Mutex::new(b"committed".to_vec()))))
+            .await
+            .unwrap();
+        let committed = ipc.bridge.read(&id).await.unwrap();
+        assert!(!committed.writable);
+        assert!(committed.paste_incarnation.is_none());
+        let completion = committed.paste_completion.unwrap();
+        assert_eq!(
+            (completion.incarnation, completion.operation),
+            (incarnation, 1)
+        );
+
+        let first_intent = ResizeIntent {
+            id: Uuid::new_v4(),
+            epoch,
+        };
+        let first_status = {
+            let mut status = view.output.lock().await.status.clone();
+            status.committed = CommittedGeometry {
+                size: first_size,
+                revision: 1,
+                intent: Some(first_intent),
+            };
+            status
+        };
+        PasteIpc::reply(
+            resize_reply,
+            Response::Resize {
+                resize: ResizeResult::Committed {
+                    admission: first_intent,
+                    status: first_status,
+                },
+            },
+        );
+        assert!(matches!(
+            first_resize.await.unwrap().unwrap(),
+            ResizeResult::Committed { admission, .. } if admission == first_intent
+        ));
+        {
+            let control = view.control.lock().await;
+            let lease = control.lease.as_ref().unwrap();
+            assert_eq!(lease.resize_sequence, 1);
+            assert_eq!(lease.pending_paste.as_ref().unwrap().receipt, Some(receipt));
+        }
+
+        let acknowledge = ipc.invoke(
+            &view,
+            incarnation,
+            1,
+            PasteAction::Ack {
+                receipt: receipt.to_string(),
+            },
+        );
+        let (ack_reply, request) = ipc.receive().await;
+        assert!(
+            matches!(request, Request::PasteAck { binding, receipt: actual } if binding == staged && actual == receipt)
+        );
+        PasteIpc::reply(
+            ack_reply,
+            Response::Paste {
+                paste: PasteResult::Acknowledged { writable: true },
+            },
+        );
+        assert_eq!(
+            acknowledge.await.unwrap(),
+            PasteResult::Acknowledged { writable: true }
+        );
+
+        let second_size = TerminalSize {
+            cols: 119,
+            rows: 38,
+        };
+        let bridge = ipc.bridge.clone();
+        let resize_view = id;
+        let second_resize =
+            tokio::spawn(async move { bridge.resize(&resize_view, second_size, epoch).await });
+        let (second_reply, request) = ipc.receive().await;
+        let Request::ResizeTerminal { sequence, size, .. } = request else {
+            panic!("expected the follow-up resize request");
+        };
+        assert_eq!((sequence, size), (1, second_size));
+        let second_intent = ResizeIntent {
+            id: Uuid::new_v4(),
+            epoch,
+        };
+        let second_status = {
+            let mut status = view.output.lock().await.status.clone();
+            status.committed = CommittedGeometry {
+                size: second_size,
+                revision: 2,
+                intent: Some(second_intent),
+            };
+            status
+        };
+        PasteIpc::reply(
+            second_reply,
+            Response::Resize {
+                resize: ResizeResult::Committed {
+                    admission: second_intent,
+                    status: second_status,
+                },
+            },
+        );
+        assert!(matches!(
+            second_resize.await.unwrap().unwrap(),
+            ResizeResult::Committed { admission, .. } if admission == second_intent
+        ));
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_resize_uncertainty_preserves_pending_paste_receipt() {
+        let ipc = PasteIpc::new();
+        let (view, _output) = ipc.attach();
+        let id = view.terminal.view_id.to_string();
+        let (token, epoch, incarnation) = ipc.grant(&view).await;
+        let bridge = ipc.bridge.clone();
+        let resize_view = id.clone();
+        let size = TerminalSize {
+            cols: 113,
+            rows: 35,
+        };
+        let resize = tokio::spawn(async move { bridge.resize(&resize_view, size, epoch).await });
+        let (resize_reply, request) = ipc.receive().await;
+        assert!(
+            matches!(request, Request::ResizeTerminal { token: actual, sequence: 0, .. } if actual == token)
+        );
+
+        let staged = ipc.stage(&view, incarnation, 1).await;
+        let commit = ipc.invoke(&view, incarnation, 1, PasteAction::Commit { bytes: 1 });
+        let (commit_reply, request) = ipc.receive().await;
+        assert!(matches!(request, Request::PasteCommit { binding, bytes: 1 } if binding == staged));
+        let receipt = Uuid::new_v4();
+        PasteIpc::reply(
+            commit_reply,
+            Response::Paste {
+                paste: PasteResult::Committed { receipt },
+            },
+        );
+        assert_eq!(commit.await.unwrap(), PasteResult::Committed { receipt });
+
+        let intent = remote_sessions_host::model::ResizeIntent {
+            id: Uuid::new_v4(),
+            epoch,
+        };
+        PasteIpc::reply(
+            resize_reply,
+            Response::Resize {
+                resize: ResizeResult::Uncertain {
+                    terminal: view.terminal.clone(),
+                    intent,
+                },
+            },
+        );
+        assert!(matches!(
+            resize.await.unwrap().unwrap(),
+            ResizeResult::Uncertain { terminal, intent: actual }
+                if terminal == view.terminal && actual == intent
+        ));
+        {
+            let control = view.control.lock().await;
+            let lease = control.lease.as_ref().unwrap();
+            assert!(lease.deadline <= Instant::now());
+            assert_eq!(lease.pending_paste.as_ref().unwrap().receipt, Some(receipt));
+        }
+        let completion = tokio::time::timeout(Duration::from_secs(1), ipc.bridge.read(&id))
+            .await
+            .unwrap()
+            .unwrap();
+        let completion = completion.paste_completion.unwrap();
+        assert_eq!(
+            (completion.incarnation, completion.operation),
+            (incarnation, 1)
+        );
+
+        let acknowledge = ipc.invoke(
+            &view,
+            incarnation,
+            1,
+            PasteAction::Ack {
+                receipt: receipt.to_string(),
+            },
+        );
+        let (ack_reply, request) = ipc.receive().await;
+        assert!(
+            matches!(request, Request::PasteAck { binding, receipt: actual } if binding == staged && actual == receipt)
+        );
+        PasteIpc::reply(
+            ack_reply,
+            Response::Paste {
+                paste: PasteResult::Acknowledged { writable: false },
+            },
+        );
+        assert_eq!(
+            acknowledge.await.unwrap(),
+            PasteResult::Acknowledged { writable: false }
+        );
+        assert!(view.control.lock().await.lease.is_none());
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_output_progresses_while_control_ipc_is_pending() {
+        let ipc = PasteIpc::new();
+        let (view, output) = ipc.attach();
+        let id = view.terminal.view_id.to_string();
+        let (_, _, incarnation) = ipc.grant(&view).await;
+        let stage = ipc.invoke(
+            &view,
+            incarnation,
+            1,
+            PasteAction::Stage {
+                offset: 0,
+                data: vec![b'x'],
+            },
+        );
+        let (stage_reply, request) = ipc.receive().await;
+        assert!(matches!(request, Request::PasteStage { .. }));
+        output
+            .send(PtyEvent::Bytes(Arc::new(Mutex::new(
+                b"live output".to_vec(),
+            ))))
+            .await
+            .unwrap();
+
+        let chunk = tokio::time::timeout(Duration::from_millis(100), ipc.bridge.read(&id))
+            .await
+            .expect("terminal read must not wait on control IPC")
+            .unwrap();
+        assert_eq!(chunk.data, b"live output");
+        assert!(chunk.writable);
+        assert_eq!(chunk.paste_incarnation, Some(incarnation));
+        assert!(chunk.paste_completion.is_none());
+
+        PasteIpc::reply(
+            stage_reply,
+            Response::Paste {
+                paste: PasteResult::Staged {},
+            },
+        );
+        assert_eq!(stage.await.unwrap(), PasteResult::Staged {});
+        let ready = tokio::time::timeout(Duration::from_secs(1), ipc.bridge.read(&id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready.paste_incarnation, Some(incarnation));
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_paste_hold_suppresses_published_lease_authority() {
+        let ipc = PasteIpc::new();
+        let (view, output) = ipc.attach();
+        let id = view.terminal.view_id.to_string();
+        let (_, _, incarnation) = ipc.grant(&view).await;
+        view.hold_paste(PasteAdmission::PriorSendUnknown);
+        output
+            .send(PtyEvent::Bytes(Arc::new(Mutex::new(b"held".to_vec()))))
+            .await
+            .unwrap();
+
+        let chunk = ipc.bridge.read(&id).await.unwrap();
+        assert!(!chunk.writable);
+        assert!(chunk.paste_incarnation.is_none());
+        assert!(chunk.paste_completion.is_none());
+        assert_eq!(
+            chunk.paste_admission,
+            Some(PasteAdmission::PriorSendUnknown)
+        );
+        assert_eq!(
+            view.control
+                .lock()
+                .await
+                .lease
+                .as_ref()
+                .unwrap()
+                .incarnation,
+            incarnation
+        );
     }
 
     #[tokio::test]

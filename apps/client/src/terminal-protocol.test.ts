@@ -767,6 +767,35 @@ test("paste and keyboard share one FIFO input queue", async () => {
   }
 });
 
+test("definite paste rejection preserves queued keyboard input after a concurrent read", async () => {
+  const entered = deferred<void>();
+  const rejected = deferred<{ result: "unavailable" }>();
+  const f = pasteFixture({
+    commit() { entered.resolve(); return rejected.promise; },
+  });
+  try {
+    await f.publish(firstIncarnation);
+    const paste = f.paste("draft");
+    const queuedInput = f.scope.send(Uint8Array.of(65));
+    await entered.promise;
+
+    await f.consume({
+      ...readOnly,
+      writable: true,
+      paste_incarnation: firstIncarnation,
+    });
+    assert.equal(f.scope.canWrite, true);
+
+    rejected.resolve({ result: "unavailable" });
+    await Promise.all([paste, queuedInput]);
+    assert.deepEqual(f.calls.map(call => call.kind), ["stage", "commit", "input"]);
+    assert.equal(f.scope.canWrite, true);
+  } finally {
+    rejected.resolve({ result: "unavailable" });
+    f.dispose();
+  }
+});
+
 test("a confirmed paste can acknowledge after the ordinary queue is disabled", async () => {
   const submitted = deferred<void>();
   const receipt = deferred<{ result: "committed"; receipt: string }>();
