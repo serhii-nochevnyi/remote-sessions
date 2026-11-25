@@ -1670,10 +1670,12 @@ async function checkForegroundRecovery(
   executable: string,
   id: "app-switch" | "lock-foreground",
   transformEntry?: MountOptions["transformEntry"],
-  unavailable = false,
+  readback: "available" | "unavailable" | "cached" = "available",
 ) {
   const native = connectNative(executable, "requests");
   const late = deferred();
+  let delayAppend = readback !== "cached";
+  let failRead = readback === "unavailable";
   const vector = requiredVectors[id];
   const before = [...Buffer.from(vector.beforeHex, "hex")];
   const after = [...Buffer.from(vector.afterHex, "hex")];
@@ -1681,11 +1683,14 @@ async function checkForegroundRecovery(
     browserPaste: true,
     transformEntry,
     async invoke(command, args) {
-      if (unavailable && command === "w2_read_attempt" && args?.generation === 1) {
+      if (failRead && command === "w2_read_attempt" && args?.generation === 1) {
         throw new Error("Interrupted read unavailable");
       }
       const reply = await native.invoke(command, args);
-      if (command === "w2_append_input" && args?.generation === 1) await late.promise;
+      if (delayAppend && command === "w2_append_input" && args?.generation === 1) {
+        await late.promise;
+        if (readback === "cached") throw new Error("Interrupted append acknowledgment unavailable");
+      }
       return reply;
     },
   });
@@ -1701,40 +1706,52 @@ async function checkForegroundRecovery(
     await fixture.click("Focus");
     const focuses = fixture.terminal.focuses;
     await fixture.input(String.fromCharCode(...before));
+    const oldAppends = [
+      { command: "w2_append_input", args: { generation: 1, sequence: 1, events: [before] } },
+    ];
+    if (readback === "cached") {
+      await finalRead(fixture);
+      assert.equal(field(fixture, "snapshot").textContent, vector.beforeHex);
+      delayAppend = true;
+      failRead = true;
+      const unconfirmed = "x";
+      await fixture.input(unconfirmed);
+      oldAppends.push({ command: "w2_append_input", args: { generation: 1, sequence: 2, events: [[unconfirmed.charCodeAt(0)]] } });
+    }
     await fixture.input("queued old input");
-    assert.equal(appends(fixture).length, 1, "old input is queued behind a pending acknowledgment");
+    assert.equal(appends(fixture).length, oldAppends.length, "old input is queued behind a pending acknowledgment");
 
     await visibility("hidden");
     const retained = fixture.document.getElementById("retained-snapshot");
     assert(retained, "visibility retires the attempt and publishes retained state");
-    const retainedHex = unavailable ? "Unavailable" : vector.beforeHex;
+    const retainedHex = readback === "unavailable" ? "Unavailable" : vector.beforeHex;
     await fixture.waitFor(() => retained.textContent === retainedHex, "retained state shows the accepted prefix or explicit unavailability");
-    assert.equal(Boolean(fixture.document.getElementById("retained-uncertainty")), unavailable);
+    assert.equal(Boolean(fixture.document.getElementById("retained-uncertainty")), readback !== "available");
     assert.match(fixture.container.textContent, new RegExp(`Interrupted attempt 1 · ${id} · generation 1 · Invalid`));
     assert(fixture.button(recoveryLabel).disabled, "recovery is disabled while suspended");
     await fixture.input("hidden input");
-    assert.equal(appends(fixture).length, 1, "no sends while suspended");
+    assert.equal(appends(fixture).length, oldAppends.length, "no sends while suspended");
 
     await visibility("visible");
     await fixture.input("input before deliberate recovery");
-    assert.equal(appends(fixture).length, 1, "foregrounding does not admit input");
+    assert.equal(appends(fixture).length, oldAppends.length, "foregrounding does not admit input");
     assert.equal(fixture.ipc.filter(call => call.command === "w2_begin_attempt").length, 1, "foregrounding does not start a generation");
     await fixture.click(recoveryLabel);
     await fixture.waitFor(() => fixture.ipc.filter(call => call.command === "w2_begin_attempt").length === 2,
       "recovery control begins a fresh generation");
     await fixture.waitFor(() => !fixture.button("Read").disabled, "fresh attempt enables Read");
     assert.equal(fixture.terminal.focuses, focuses + 1, "recovery explicitly refocuses");
-    assert.equal(appends(fixture).length, 1, "recovery invokes no append for queued input");
+    assert.equal(appends(fixture).length, oldAppends.length, "recovery invokes no append for queued input");
     await finalRead(fixture);
     assert.equal(field(fixture, "snapshot").textContent, "(empty)", "fresh generation starts empty");
     assert.equal(retained.textContent, retainedHex, "starting fresh preserves the old readout");
 
-    await fixture.input(String.fromCharCode(...after));
     await fixture.act(async () => { late.resolve(); });
+    await fixture.input(String.fromCharCode(...after));
     await fixture.click("Read");
     await fixture.waitFor(() => !fixture.button("Read").disabled, "fresh read completes");
     assert.deepEqual(appends(fixture), [
-      { command: "w2_append_input", args: { generation: 1, sequence: 1, events: [before] } },
+      ...oldAppends,
       { command: "w2_append_input", args: { generation: 2, sequence: 1, events: [after] } },
     ], "append invocations contain only the original and fresh input without replay");
     assert.equal(field(fixture, "snapshot").textContent, vector.afterHex);
@@ -1755,7 +1772,8 @@ async function foregroundRecovery() {
   await withNativeExecutable(async executable => {
     await checkForegroundRecovery(executable, "app-switch");
     await checkForegroundRecovery(executable, "lock-foreground");
-    await checkForegroundRecovery(executable, "lock-foreground", undefined, true);
+    await checkForegroundRecovery(executable, "lock-foreground", undefined, "unavailable");
+    await checkForegroundRecovery(executable, "lock-foreground", undefined, "cached");
     await assert.rejects(checkForegroundRecovery(executable, "app-switch", source => replaceOnce(source,
       'document.addEventListener("visibilitychange", visibilityChanged);', "")),
     /visibility retires the attempt and publishes retained state/);
