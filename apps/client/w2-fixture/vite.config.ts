@@ -106,7 +106,6 @@ function assertJsxAssets(source: string, id: string) {
     if (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) {
       for (const attribute of node.attributes.properties) {
         if (ts.isJsxSpreadAttribute(attribute)) {
-          // A runtime spread can hide a remote src or href from static inspection.
           throw new Error("Opaque JSX props are forbidden in the offline fixture");
         }
         if (!ts.isJsxAttribute(attribute)) continue;
