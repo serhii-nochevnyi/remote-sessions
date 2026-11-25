@@ -52,28 +52,39 @@ function assertCss(css: string) {
   for (const match of source.matchAll(/url\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*))\s*\)|@import\s+(?:"([^"]*)"|'([^']*)')/gi)) {
     assertLocal(match.slice(1).find(value => value !== undefined) ?? "");
   }
-  for (const [imageSet] of source.matchAll(/(?:-webkit-)?image-set\([^;{}]*/gi)) {
-    for (const [, quoted] of imageSet.matchAll(/["']([^"']*)["']/g)) assertLocal(quoted);
+  for (const imageSet of source.matchAll(/(?:-webkit-)?image-set\([^;{}]*/gi)) {
+    for (const quoted of (imageSet[0] ?? "").matchAll(/["']([^"']*)["']/g)) {
+      if (quoted[1] !== undefined) assertLocal(quoted[1]);
+    }
   }
 }
 
 function assertHtml(html: string) {
   const source = html.replace(/<!--[\s\S]*?-->/g, "");
-  for (const [tag] of source.matchAll(/<[a-z](?:"[^"]*"|'[^']*'|[^'">])*>/gi)) {
+  for (const tagMatch of source.matchAll(/<[a-z](?:"[^"]*"|'[^']*'|[^'">])*>/gi)) {
+    const tag = tagMatch[0] ?? "";
     if (/^<base\b|\s(?:http-equiv|srcdoc)\s*=/i.test(tag)) {
       throw new Error("Document redirects, base URLs and embedded HTML are forbidden in the fixture");
     }
-    for (const [, name, double, single, bare] of tag.matchAll(
+    for (const attribute of tag.matchAll(
       /\s(src|href|xlink:href|srcset|imagesrcset|poster|data|action|formaction|background|style)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi,
     )) {
+      const name = attribute[1];
+      const double = attribute[2];
+      const single = attribute[3];
+      const bare = attribute[4];
+      if (name === undefined) continue;
       const value = double ?? single ?? bare;
+      if (value === undefined) continue;
       if (name.toLowerCase() === "style") assertCss(value);
       else if (name.toLowerCase().endsWith("srcset")) {
-        for (const candidate of value.split(",")) assertLocal(candidate.trim().split(/\s+/, 1)[0]);
+        for (const candidate of value.split(",")) assertLocal(candidate.trim().split(/\s+/, 1)[0] ?? "");
       } else assertLocal(value);
     }
   }
-  for (const [, css] of source.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style\s*>/gi)) assertCss(css);
+  for (const styleMatch of source.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style\s*>/gi)) {
+    if (styleMatch[1] !== undefined) assertCss(styleMatch[1]);
+  }
 }
 
 function guardFixtureBundle(): Plugin {
@@ -82,7 +93,7 @@ function guardFixtureBundle(): Plugin {
 
   function assertModule(id: string) {
     if (virtualModules.has(id)) return;
-    const file = id.split("?", 1)[0];
+    const file = id.split("?", 1)[0] ?? id;
     if (isAbsolute(file) && existsSync(file)) {
       const actual = realpathSync(file);
       if (inside(appRoot, actual) || packageRoots.some(root => inside(root, actual))) return;
@@ -100,7 +111,7 @@ function guardFixtureBundle(): Plugin {
     resolveId: {
       order: "pre",
       handler(source) {
-        if (!source.startsWith("\0")) assertLocal(source.split("?", 1)[0]);
+        if (!source.startsWith("\0")) assertLocal(source.split("?", 1)[0] ?? source);
       },
     },
     transform: {
@@ -108,17 +119,26 @@ function guardFixtureBundle(): Plugin {
       handler(source, id) {
         if (/\.css(?:$|\?)/i.test(id)) {
           assertCss(source);
-          for (const [, double, single, bare] of source.matchAll(
+          for (const match of source.matchAll(
             /@import\s+(?:url\(\s*)?(?:"([^"]*)"|'([^']*)'|([^\s);]+))/gi,
           )) {
+            const double = match[1];
+            const single = match[2];
+            const bare = match[3];
             const path = double ?? single ?? bare;
-            if (path.startsWith(".")) assertModule(resolve(dirname(id.split("?", 1)[0]), path));
+            if (path === undefined) continue;
+            if (path.startsWith(".")) {
+              const importer = id.split("?", 1)[0] ?? id;
+              assertModule(resolve(dirname(importer), path));
+            }
             else if (path.startsWith("/")) assertModule(resolve(appRoot, `.${path}`));
           }
         } else if (/\.[cm]?[jt]sx?(?:$|\?)/i.test(id) && isAbsolute(id)) {
-          const file = id.split("?", 1)[0];
+          const file = id.split("?", 1)[0] ?? id;
           if (!existsSync(file) || !inside(appRoot, realpathSync(file))) return;
-          for (const [, , url] of source.matchAll(/\bnew\s+URL\s*\(\s*(["'`])([^"'`]*)\1/g)) assertLocal(url);
+          for (const match of source.matchAll(/\bnew\s+URL\s*\(\s*(["'`])([^"'`]*)\1/g)) {
+            if (match[2] !== undefined) assertLocal(match[2]);
+          }
         }
       },
     },

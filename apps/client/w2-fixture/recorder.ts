@@ -32,7 +32,7 @@ type Attempt = {
   pendingEvents: number;
   pendingBytes: number;
   invalid: boolean;
-  drain?: Promise<void>;
+  drain: Promise<void> | undefined;
   snapshot?: Snapshot;
 };
 
@@ -167,7 +167,10 @@ export function registerRecorder(input: InputSource, invoke: Invoke, onError: (e
         const snapshot = await readSnapshot(attempt);
         return { snapshot, uncertain: snapshot.nextSequence <= attempt.lastSent };
       } catch {
-        return { snapshot: attempt.snapshot, uncertain: true };
+        return {
+          ...(attempt.snapshot === undefined ? {} : { snapshot: attempt.snapshot }),
+          uncertain: true,
+        };
       }
     },
     async start(caseId: string) {
@@ -182,7 +185,7 @@ export function registerRecorder(input: InputSource, invoke: Invoke, onError: (e
       generation = next;
       active = {
         caseId, generation, nextSequence: 1, lastSent: 0, queue: [],
-        pendingEvents: 0, pendingBytes: 0, invalid: false,
+        pendingEvents: 0, pendingBytes: 0, invalid: false, drain: undefined,
       };
       return generation;
     },
