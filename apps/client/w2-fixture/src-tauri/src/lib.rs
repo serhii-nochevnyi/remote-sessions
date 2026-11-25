@@ -2,7 +2,21 @@
 mod recorder {
     use std::sync::Mutex;
 
-    const CASE_ID: &str = "ukrainian-return";
+    const CASE_IDS: &[&str] = &[
+        "english-return",
+        "ukrainian-return",
+        "composition-commit",
+        "composition-replacement",
+        "composition-cancel",
+        "paste-short",
+        "paste-multiline",
+        "touch-selection-copy",
+        "touch-scroll",
+        "keyboard-open-cursor",
+        "rotation",
+        "app-switch",
+        "lock-foreground",
+    ];
     const EVENT_BYTES: usize = 1024;
     const APPEND_EVENTS: usize = 16;
     const APPEND_BYTES: usize = 4096;
@@ -36,15 +50,17 @@ mod recorder {
 
     impl Recorder {
         fn begin(&mut self, case_id: &str) -> Result<u32, &'static str> {
-            if case_id != CASE_ID {
-                return Err("unknown fixture case");
-            }
+            let case_id = CASE_IDS
+                .iter()
+                .copied()
+                .find(|allowed| *allowed == case_id)
+                .ok_or("unknown fixture case")?;
             let generation = self
                 .generation
                 .checked_add(1)
                 .ok_or("generation exhausted")?;
             self.active = Some(Snapshot {
-                case_id: CASE_ID,
+                case_id,
                 generation,
                 next_sequence: 1,
                 bytes: Vec::new(),
@@ -236,10 +252,137 @@ mod recorder {
             )
         }
 
+        fn serve_requests(state: RecorderState<'_>) {
+            let mut stdout = io::stdout().lock();
+            for line in io::stdin().lock().lines() {
+                let response = match parse_request(&line.unwrap()) {
+                    Request::Begin(case_id) => {
+                        w2_begin_attempt(state, case_id).unwrap().to_string()
+                    }
+                    Request::Append(generation, sequence, events) => {
+                        w2_append_input(state, generation, sequence, events).unwrap();
+                        String::from("null")
+                    }
+                    Request::Read(generation) => {
+                        snapshot_json(&w2_read_attempt(state, generation).unwrap())
+                    }
+                };
+                writeln!(stdout, "W2\t{response}").unwrap();
+                stdout.flush().unwrap();
+            }
+        }
+
+        #[test]
+        fn w2_recorder_manifest_vectors() {
+            let built_in = concat!(
+                "english-return\t\t6f6b0d\n",
+                "ukrainian-return\t\td1970d\n",
+                "composition-commit\t\tc3a9\n",
+                "composition-replacement\t\tc3a8\n",
+                "composition-cancel\t\t\n",
+                "paste-short\t\td087d0b6\n",
+                "paste-multiline\t\td1970dc3a90de7958c\n",
+                "touch-selection-copy\t\t\n",
+                "touch-scroll\t\t\n",
+                "keyboard-open-cursor\t\t\n",
+                "rotation\t\t\n",
+                "app-switch\t61\t62\n",
+                "lock-foreground\t63\t64",
+            );
+            let supplied = std::env::var("W2_MANIFEST_VECTORS").ok();
+            let vectors: Vec<_> = supplied
+                .as_deref()
+                .unwrap_or(built_in)
+                .lines()
+                .map(|line| {
+                    let fields: Vec<_> = line.split('\t').collect();
+                    assert_eq!(fields.len(), 3, "case ID and two hex segments");
+                    (fields[0], [fields[1], fields[2]])
+                })
+                .collect();
+            let mut ids: Vec<_> = vectors.iter().map(|(id, _)| *id).collect();
+            ids.sort_unstable();
+            let mut allowed = CASE_IDS.to_vec();
+            allowed.sort_unstable();
+            assert_eq!(ids, allowed, "exact native case allowlist");
+
+            let state = &Mutex::new(Recorder::default());
+            let mut previous = 0;
+            for (case_id, segments) in vectors {
+                for hex in segments {
+                    assert!(hex.len().is_multiple_of(2));
+                    let bytes: Vec<_> = (0..hex.len())
+                        .step_by(2)
+                        .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
+                        .collect();
+                    assert_eq!(w2_begin_attempt(state, case_id.into()), Ok(previous + 1));
+                    let generation = previous + 1;
+                    previous = generation;
+                    let empty = w2_read_attempt(state, generation).unwrap();
+                    assert_eq!(empty.case_id, case_id);
+                    assert!(empty.bytes.is_empty());
+                    assert!(empty.event_lengths.is_empty());
+
+                    let mut sequence = 1;
+                    let mut lengths = Vec::new();
+                    if !bytes.is_empty() {
+                        assert_eq!(
+                            w2_append_input(state, generation, sequence, vec![bytes.clone()]),
+                            Ok(())
+                        );
+                        sequence += 1;
+                        lengths.push(bytes.len());
+                    }
+                    assert_eq!(
+                        w2_read_attempt(state, generation),
+                        Ok(Snapshot {
+                            bytes: bytes.clone(),
+                            next_sequence: sequence,
+                            event_lengths: lengths,
+                            ..empty
+                        })
+                    );
+
+                    let mut retained = bytes.clone();
+                    while retained.len() < ATTEMPT_BYTES {
+                        let filler = vec![0x5a; EVENT_BYTES.min(ATTEMPT_BYTES - retained.len())];
+                        assert_eq!(
+                            w2_append_input(state, generation, sequence, vec![filler.clone()]),
+                            Ok(())
+                        );
+                        retained.extend(filler);
+                        sequence += 1;
+                    }
+                    let full = w2_read_attempt(state, generation).unwrap();
+                    assert_eq!(full.bytes, retained);
+                    assert_eq!(
+                        w2_append_input(state, generation, sequence, vec![vec![0x5a]]),
+                        Err("attempt capacity exceeded")
+                    );
+                    assert_eq!(
+                        w2_read_attempt(state, generation),
+                        Ok(Snapshot {
+                            rejected: 1,
+                            invalid: true,
+                            ..full
+                        })
+                    );
+                }
+            }
+            assert_eq!(
+                w2_begin_attempt(state, "unknown".into()),
+                Err("unknown fixture case")
+            );
+        }
+
         #[test]
         fn w2_recorder_tracer() {
             let state = &Mutex::new(Recorder::default());
             let mode = std::env::var("W2_TRACER_CASE").ok();
+            if mode.as_deref() == Some("requests") {
+                serve_requests(state);
+                return;
+            }
             let events: &[&[u8]] = match mode.as_deref() {
                 None | Some("combined") => &[&SYNTHETIC_BYTES],
                 Some("split") => &[&SYNTHETIC_BYTES[..2], &SYNTHETIC_BYTES[2..]],

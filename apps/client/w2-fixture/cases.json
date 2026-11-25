@@ -1,0 +1,250 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "english-return",
+      "title": "English typing",
+      "actions": [
+        "Use the English keyboard and type ok, then press Return."
+      ],
+      "observations": [
+        "The prompt cursor stays visible while typing. The snapshot contains one ok and one Return."
+      ],
+      "terminalMode": {
+        "bracketedPaste": false
+      },
+      "expected": {
+        "beforeHex": "",
+        "afterHex": "6f6b0d"
+      }
+    },
+    {
+      "id": "ukrainian-return",
+      "title": "Ukrainian typing",
+      "actions": [
+        "Use the Ukrainian keyboard and type ї, then press Return."
+      ],
+      "observations": [
+        "The keyboard enters ї once and the prompt cursor stays visible."
+      ],
+      "terminalMode": {
+        "bracketedPaste": false
+      },
+      "expected": {
+        "beforeHex": "",
+        "afterHex": "d1970d"
+      }
+    },
+    {
+      "id": "composition-commit",
+      "title": "Composition commit",
+      "actions": [
+        "Use a qualified stock keyboard gesture to hold é in visible preedit.",
+        "Commit é once without pressing Return."
+      ],
+      "observations": [
+        "Preedit is visible with zero recorded bytes.",
+        "Preedit closes and the final snapshot contains only one é."
+      ],
+      "terminalMode": {
+        "bracketedPaste": false
+      },
+      "expected": {
+        "beforeHex": "",
+        "afterHex": "c3a9"
+      }
+    },
+    {
+      "id": "composition-replacement",
+      "title": "Composition replacement",
+      "actions": [
+        "Use a qualified stock keyboard gesture to show é in preedit.",
+        "Replace it with è while still composing, then commit è once."
+      ],
+      "observations": [
+        "The visible preedit changes from é to è with zero recorded bytes.",
+        "Preedit closes and only è reaches the recorder."
+      ],
+      "terminalMode": {
+        "bracketedPaste": false
+      },
+      "expected": {
+        "beforeHex": "",
+        "afterHex": "c3a8"
+      }
+    },
+    {
+      "id": "composition-cancel",
+      "title": "Composition cancellation",
+      "actions": [
+        "Use a qualified stock keyboard gesture to show é in preedit.",
+        "Cancel the composition without submitting it."
+      ],
+      "observations": [
+        "Preedit is visible with zero recorded bytes and disappears on cancellation.",
+        "The snapshot stays empty after cancellation."
+      ],
+      "terminalMode": {
+        "bracketedPaste": false
+      },
+      "expected": {
+        "beforeHex": "",
+        "afterHex": ""
+      }
+    },
+    {
+      "id": "paste-short",
+      "title": "Short Unicode paste",
+      "actions": [
+        "Use Paste sample once to send Їж through the terminal.",
+        "For touch qualification, use the same sample with the iPhone’s Paste action in a fresh attempt."
+      ],
+      "observations": [
+        "Paste is available at the focused prompt and the sample is captured once."
+      ],
+      "terminalMode": {
+        "bracketedPaste": false
+      },
+      "expected": {
+        "beforeHex": "",
+        "afterHex": "d087d0b6"
+      },
+      "pasteText": "Їж"
+    },
+    {
+      "id": "paste-multiline",
+      "title": "Multiline Unicode paste",
+      "actions": [
+        "Use Paste sample once to send ї, é and 界 on three lines (LF then CRLF).",
+        "For touch qualification, use the same three lines with the iPhone’s Paste action in a fresh attempt."
+      ],
+      "observations": [
+        "The three lines are captured in order with one carriage return at each line break."
+      ],
+      "terminalMode": {
+        "bracketedPaste": false
+      },
+      "expected": {
+        "beforeHex": "",
+        "afterHex": "d1970dc3a90de7958c"
+      },
+      "pasteText": "ї\né\r\n界"
+    },
+    {
+      "id": "touch-selection-copy",
+      "title": "Touch selection and copy",
+      "actions": [
+        "Select COPY-Ї using touch handles and use Copy.",
+        "Verify the clipboard text in a separate text field outside the fixture."
+      ],
+      "observations": [
+        "The handles select exactly COPY-Ї and the clipboard contains that token.",
+        "The terminal snapshot stays empty."
+      ],
+      "terminalMode": {
+        "bracketedPaste": false
+      },
+      "expected": {
+        "beforeHex": "",
+        "afterHex": ""
+      }
+    },
+    {
+      "id": "touch-scroll",
+      "title": "Touch scrolling",
+      "actions": [
+        "Swipe into the transcript history until earlier numbered lines appear.",
+        "Swipe back to the prompt."
+      ],
+      "observations": [
+        "Earlier lines become visible and the prompt and cursor return.",
+        "Scrolling produces zero input bytes."
+      ],
+      "terminalMode": {
+        "bracketedPaste": false
+      },
+      "expected": {
+        "beforeHex": "",
+        "afterHex": ""
+      }
+    },
+    {
+      "id": "keyboard-open-cursor",
+      "title": "Cursor with keyboard open",
+      "actions": [
+        "Dismiss the keyboard and note the prompt location.",
+        "Tap the prompt to open the software keyboard."
+      ],
+      "observations": [
+        "The prompt and cursor are visible and unobscured with the keyboard open.",
+        "Opening the keyboard produces zero input bytes."
+      ],
+      "terminalMode": {
+        "bracketedPaste": false
+      },
+      "expected": {
+        "beforeHex": "",
+        "afterHex": ""
+      }
+    },
+    {
+      "id": "rotation",
+      "title": "Portrait and landscape rotation",
+      "actions": [
+        "With the prompt visible in portrait, rotate to landscape.",
+        "Rotate back to portrait."
+      ],
+      "observations": [
+        "The prompt and cursor remain visible in both orientations and after returning.",
+        "Rotation produces zero input bytes."
+      ],
+      "terminalMode": {
+        "bracketedPaste": false
+      },
+      "expected": {
+        "beforeHex": "",
+        "afterHex": ""
+      }
+    },
+    {
+      "id": "app-switch",
+      "title": "App switch and return",
+      "actions": [
+        "Type a, then read the initial snapshot.",
+        "Switch to another app and return. Read the retained snapshot.",
+        "Start a fresh attempt and type b."
+      ],
+      "observations": [
+        "The prompt is visible on return and the retained snapshot still contains only a.",
+        "The fresh attempt contains only b."
+      ],
+      "terminalMode": {
+        "bracketedPaste": false
+      },
+      "expected": {
+        "beforeHex": "61",
+        "afterHex": "62"
+      }
+    },
+    {
+      "id": "lock-foreground",
+      "title": "Lock and return",
+      "actions": [
+        "Type c, then read the initial snapshot.",
+        "Lock and unlock the iPhone, then return. Read the retained snapshot.",
+        "Start a fresh attempt and type d."
+      ],
+      "observations": [
+        "The prompt is visible on return and the retained snapshot still contains only c.",
+        "The fresh attempt contains only d."
+      ],
+      "terminalMode": {
+        "bracketedPaste": false
+      },
+      "expected": {
+        "beforeHex": "63",
+        "afterHex": "64"
+      }
+    }
+  ]
+}

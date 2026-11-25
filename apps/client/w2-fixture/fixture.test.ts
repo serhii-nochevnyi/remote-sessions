@@ -9,10 +9,12 @@ import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import headless from "@xterm/headless";
+import browser from "@xterm/xterm";
+import type { Terminal as BrowserTerminal } from "@xterm/xterm";
 import { act } from "react";
 import ts from "typescript";
 import type { Root } from "react-dom/client";
-import type { Invoke, registerRecorder } from "./recorder.ts";
+import type { Invoke, Snapshot, registerRecorder } from "./recorder.ts";
 
 const fixtureDir = new URL("./", import.meta.url);
 const nativeDir = new URL("src-tauri/", fixtureDir);
@@ -28,6 +30,8 @@ type Registration = { calls: Request[] };
 type MountOptions = {
   invoke?: (command: string, args?: InvokeArgs, options?: unknown) => unknown;
   transformEntry?: (source: string) => string;
+  browserPaste?: boolean;
+  traceRegistration?: boolean;
 };
 type Listener = (event: {
   type: string;
@@ -58,6 +62,15 @@ class Element {
     this.nodeType = nodeType;
     this.namespaceURI = namespaceURI;
   }
+
+  private controlValue = "";
+  get value() { return this.getAttribute("value") ?? this.controlValue; }
+  set value(value: string) { this.controlValue = String(value); }
+  selected = false;
+  defaultSelected = false;
+
+  get options() { return this.localName === "select" ? this.childNodes : undefined; }
+  focus() {}
 
   get disabled() { return this.attributes.has("disabled"); }
   get tagName() { return this.localName.toUpperCase(); }
@@ -116,12 +129,15 @@ class Element {
   }
 
   click() {
-    if (this.disabled) return;
+    if (!this.disabled) this.dispatch("click");
+  }
+
+  dispatch(type: string) {
     const path: Element[] = [];
     for (let node: Element | null = this; node; node = node.parentNode) path.push(node);
     let stopped = false;
     const event = {
-      type: "click",
+      type,
       target: this,
       stopPropagation() { stopped = true; },
       preventDefault() {},
@@ -129,7 +145,7 @@ class Element {
     for (const capture of [true, false]) {
       for (const element of capture ? path.toReversed() : path) {
         if (stopped) return;
-        for (const listener of element.listeners.get("click") ?? []) {
+        for (const listener of element.listeners.get(type) ?? []) {
           if (listener.capture === capture) listener.callback(event);
         }
       }
@@ -172,24 +188,43 @@ class FixtureDocument extends Element {
 type TerminalOptions = ConstructorParameters<typeof headless.Terminal>[0];
 
 class FixtureTerminal {
-  readonly headless: InstanceType<typeof headless.Terminal>;
+  readonly backend: InstanceType<typeof headless.Terminal> | BrowserTerminal;
+  readonly browserTerminal?: BrowserTerminal;
   subscriptions = 0;
   readonly data: string[] = [];
   private lastWrite = Promise.resolve();
 
-  constructor(options: TerminalOptions) {
-    this.headless = new headless.Terminal(options);
+  constructor(options: TerminalOptions, browserPaste: boolean) {
+    if (browserPaste) {
+      this.browserTerminal = new browser.Terminal(options);
+      this.backend = this.browserTerminal;
+    } else {
+      this.backend = new headless.Terminal(options);
+    }
   }
 
-  get options() { return this.headless.options; }
-  get cols() { return this.headless.cols; }
-  get rows() { return this.headless.rows; }
-  open() {}
-  focus() {}
+  get options() { return this.backend.options; }
+  get cols() { return this.backend.cols; }
+  get rows() { return this.backend.rows; }
+  open(container: Element) {
+    if (!this.browserTerminal) return;
+    const terminal = this.browserTerminal as unknown as { _core: { textarea: Element } };
+    const textarea = container.ownerDocument!.createElement("textarea");
+    container.appendChild(textarea);
+    terminal._core.textarea = textarea;
+  }
+
+  focus() { this.browserTerminal?.focus(); }
+  scrollToBottom() { this.backend.scrollToBottom(); }
+
+  paste(text: string) {
+    assert(this.browserTerminal, "paste must use the browser Terminal");
+    this.browserTerminal.paste(text);
+  }
 
   write(data: string | Uint8Array, callback?: () => void) {
     this.lastWrite = new Promise<void>(resolve => {
-      this.headless.write(data, () => {
+      this.backend.write(data, () => {
         try {
           callback?.();
         } finally {
@@ -200,17 +235,17 @@ class FixtureTerminal {
   }
 
   afterWrite() { return this.lastWrite; }
-  input(data: string) { this.headless.input(data, true); }
+  input(data: string) { this.backend.input(data, true); }
 
   onData(callback: (data: string) => void) {
     this.subscriptions += 1;
-    return this.headless.onData(text => {
+    return this.backend.onData(text => {
       this.data.push(text);
       callback(text);
     });
   }
 
-  dispose() { this.headless.dispose(); }
+  dispose() { this.backend.dispose(); }
 }
 
 let mountNumber = 0;
@@ -230,14 +265,10 @@ function entryFromHtml() {
   const scripts = [...html.matchAll(/<script\s+type="module"\s+src="([^"]+)"\s*>\s*<\/script>/g)];
   assert(root, "fixture HTML declares a mount root");
   assert.equal(scripts.length, 1, "fixture HTML declares a single module entry");
-  const id = root[1];
-  const entryPath = scripts[0]?.[1];
-  assert(id !== undefined, "fixture HTML declares a mount root id");
-  assert(entryPath !== undefined, "fixture HTML declares a module entry path");
-  assert(entryPath.startsWith("./"), "fixture HTML loads a local module entry");
-  const entry = new URL(entryPath, fixtureDir);
+  assert(scripts[0][1].startsWith("./"), "fixture HTML loads a local module entry");
+  const entry = new URL(scripts[0][1], fixtureDir);
   assert(entry.href.startsWith(fixtureDir.href), "module entry belongs to the fixture directory");
-  return { id, entry };
+  return { id: root[1], entry };
 }
 
 export async function mountFixture(options: MountOptions = {}) {
@@ -291,7 +322,7 @@ export async function mountFixture(options: MountOptions = {}) {
       },
       Terminal: class extends FixtureTerminal {
         constructor(terminalOptions: TerminalOptions) {
-          super(terminalOptions);
+          super(terminalOptions, options.browserPaste ?? false);
           terminals.push(this);
         }
       },
@@ -320,6 +351,7 @@ export async function mountFixture(options: MountOptions = {}) {
         export function registerRecorder(...args) { return ${accessBridge}.register(actual, ...args); }
       `],
     ]);
+    if (options.traceRegistration === false) adapters.delete("./recorder.ts");
     const virtual = new Map<string, string>();
     const hooks = registerHooks({
       resolve(specifier, context, next) {
@@ -351,7 +383,6 @@ export async function mountFixture(options: MountOptions = {}) {
     assert.equal(roots.length, 1, "production entry creates one React root");
     assert.equal(terminals.length, 1, "production entry creates one xterm");
     const terminal = terminals[0];
-    assert(terminal, "production entry creates an xterm");
     await act(async () => { await terminal.afterWrite(); });
 
     function button(label: string) {
@@ -369,6 +400,15 @@ export async function mountFixture(options: MountOptions = {}) {
       act,
       button,
       async click(label: string) { await act(async () => { button(label).click(); }); },
+      async selectCase(caseId: string) {
+        const select = document.getElementById("case");
+        assert(select, "missing rendered case selector");
+        assert(select.options?.some(option => option.value === caseId), `missing case option ${caseId}`);
+        await act(async () => {
+          select.value = caseId;
+          select.dispatch("change");
+        });
+      },
       async input(text: string) { await act(async () => { terminal.input(text); }); },
       async waitFor(predicate: () => boolean, description: string) {
         const deadline = Date.now() + 5000;
@@ -393,7 +433,7 @@ function compileNative(source: string, executable: string) {
   assert.equal(compiler.status, 0, compiler.stderr);
 }
 
-type InputMode = "combined" | "split";
+type InputMode = "combined" | "split" | "requests";
 
 function requestFrame(command: string, raw: InvokeArgs) {
   assert(raw && Object.getPrototypeOf(raw) === Object.prototype, "fixture IPC takes object arguments");
@@ -401,7 +441,7 @@ function requestFrame(command: string, raw: InvokeArgs) {
   switch (command) {
     case "w2_begin_attempt":
       assert.deepEqual(Object.keys(args), ["caseId"]);
-      assert.equal(args.caseId, syntheticCase);
+      assert(typeof args.caseId === "string" && /^[a-z-]+$/.test(args.caseId));
       return [command, args.caseId].join("\t");
     case "w2_append_input": {
       assert.deepEqual(Object.keys(args).sort(), ["events", "generation", "sequence"]);
@@ -495,15 +535,10 @@ async function assertMountedInput(
   const native = connectNative(executable, mode);
   let fixture: Awaited<ReturnType<typeof mountFixture>> | undefined;
   try {
-    const mounted = await mountFixture({
-      invoke: native.invoke,
-      ...(transformEntry === undefined ? {} : { transformEntry }),
-    });
+    const mounted = await mountFixture({ invoke: native.invoke, transformEntry });
     fixture = mounted;
     assert.deepEqual(mounted.ipc, [], "startup transcript emits no IPC or input");
-    const terminal = mounted.terminal;
-    assert(terminal, "production entry creates an xterm");
-    assert.deepEqual(terminal.data, [], "startup transcript emits no xterm input");
+    assert.deepEqual(mounted.terminal.data, [], "startup transcript emits no xterm input");
     const readout = mounted.document.getElementById("snapshot");
     assert(readout, "missing native snapshot readout");
     assert.equal(readout.textContent, "—");
@@ -511,10 +546,10 @@ async function assertMountedInput(
     await mounted.click("Start");
     await mounted.waitFor(() => !mounted.button("Read").disabled, "Start enables Read");
     await mounted.act(async () => {
-      if (mode === "combined") terminal.input("ї\r");
+      if (mode === "combined") mounted.terminal.input("ї\r");
       else {
-        terminal.input("ї");
-        terminal.input("\r");
+        mounted.terminal.input("ї");
+        mounted.terminal.input("\r");
       }
       mounted.button("Read").click();
     });
@@ -522,8 +557,8 @@ async function assertMountedInput(
 
     const events = mode === "combined" ? [[0xd1, 0x97, 0x0d]] : [[0xd1, 0x97], [0x0d]];
     assert.equal(mounted.registrations.length, 1, "production recorder registration");
-    assert.equal(terminal.subscriptions, 1, "one xterm onData subscription");
-    assert.deepEqual(terminal.data, mode === "combined" ? ["ї\r"] : ["ї", "\r"], "actual xterm input events");
+    assert.equal(mounted.terminal.subscriptions, 1, "one xterm onData subscription");
+    assert.deepEqual(mounted.terminal.data, mode === "combined" ? ["ї\r"] : ["ї", "\r"], "actual xterm input events");
     assert.deepEqual(mounted.ipc, [
       { command: "w2_begin_attempt", args: { caseId: syntheticCase } },
       ...events.map((event, index) => ({
@@ -532,9 +567,7 @@ async function assertMountedInput(
       })),
       { command: "w2_read_attempt", args: { generation: 1 } },
     ], "actual IPC trace");
-    const registration = mounted.registrations[0];
-    assert(registration, "production recorder registration exists");
-    assert.deepEqual(registration.calls, mounted.ipc, "registered invoke trace matches actual IPC");
+    assert.deepEqual(mounted.registrations[0].calls, mounted.ipc, "registered invoke trace matches actual IPC");
     assert.deepEqual(native.snapshot(), {
       caseId: syntheticCase,
       generation: 1,
@@ -616,7 +649,7 @@ function disconnectedWrapperControls() {
   const scratch = mkdtempSync(join(tmpdir(), "w2-wrapper-controls-"));
   try {
     const source = readFileSync(nativeSource, "utf8");
-    const controls: [string, string, string][] = [
+    const controls = [
       ["w2_begin_attempt", "let _ = (state, case_id); Ok(0)", "begin wrapper must start generation 1"],
       ["w2_append_input", "let _ = (state, generation, sequence, events); Ok(())", "append wrapper must commit the event"],
       ["w2_read_attempt", 'let _ = (state, generation); Err("disconnected read control")', "read wrapper must return the active snapshot"],
@@ -629,9 +662,7 @@ function disconnectedWrapperControls() {
       const signature = new RegExp(`(^    fn ${command}\\([^]*? \\{\\n)[^]*?^    \\}`, "m");
       const original = source.match(signature);
       assert(original, `wrapper to disconnect: ${command}`);
-      const prefix = original[1];
-      assert(prefix !== undefined, `wrapper to disconnect: ${command}`);
-      const mutated = replaceOnce(source, signature, `${prefix}        ${replacement}\n    }`);
+      const mutated = replaceOnce(source, signature, `${original[1]}        ${replacement}\n    }`);
       const path = join(scratch, `${command}.rs`);
       const executable = join(scratch, command);
       try {
@@ -654,6 +685,181 @@ function disconnectedWrapperControls() {
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
+}
+
+const requiredVectors = {
+  "english-return": { text: "ok\r", beforeHex: "", afterHex: "6f6b0d" },
+  "ukrainian-return": { text: "ї\r", beforeHex: "", afterHex: "d1970d" },
+  "composition-commit": { text: "é", beforeHex: "", afterHex: "c3a9" },
+  "composition-replacement": { text: "è", beforeHex: "", afterHex: "c3a8" },
+  "composition-cancel": { text: "", beforeHex: "", afterHex: "" },
+  "paste-short": { text: "Їж", beforeHex: "", afterHex: "d087d0b6", paste: true },
+  "paste-multiline": { text: "ї\né\r\n界", beforeHex: "", afterHex: "d1970dc3a90de7958c", paste: true },
+  "touch-selection-copy": { text: "", beforeHex: "", afterHex: "" },
+  "touch-scroll": { text: "", beforeHex: "", afterHex: "" },
+  "keyboard-open-cursor": { text: "", beforeHex: "", afterHex: "" },
+  rotation: { text: "", beforeHex: "", afterHex: "" },
+  "app-switch": { text: "a", beforeHex: "61", afterHex: "62" },
+  "lock-foreground": { text: "c", beforeHex: "63", afterHex: "64" },
+};
+
+type CaseId = keyof typeof requiredVectors;
+const requiredIds = Object.keys(requiredVectors) as CaseId[];
+const pasteIds = ["paste-short", "paste-multiline"] as const;
+
+type CaseManifest = typeof import("./cases.json");
+function readManifest(): CaseManifest {
+  return JSON.parse(readFileSync(new URL("cases.json", fixtureDir), "utf8"));
+}
+
+async function withNativeExecutable(run: (executable: string) => void | Promise<void>) {
+  const scratch = mkdtempSync(join(tmpdir(), "w2-vectors-"));
+  try {
+    const executable = join(scratch, "recorder");
+    compileNative(nativeSource, executable);
+    await run(executable);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
+function assertManifestVectors() {
+  const manifest = readManifest();
+  assert.equal(manifest.version, 1);
+  assert.deepEqual(manifest.cases.map(entry => entry.id).sort(), requiredIds.toSorted(), "exact unique mandatory IDs");
+  for (const entry of manifest.cases) {
+    const expected = requiredVectors[entry.id as CaseId];
+    assert(entry.title.trim().length > 0);
+    for (const steps of [entry.actions, entry.observations]) {
+      assert(Array.isArray(steps) && steps.length >= 1 && steps.length <= 5, "finite case steps");
+      for (const step of steps) assert(step.trim().length > 0 && step.length <= 240, "bounded nonempty case step");
+    }
+    assert.deepEqual(entry.terminalMode, { bracketedPaste: false });
+    assert.deepEqual(entry.expected, { beforeHex: expected.beforeHex, afterHex: expected.afterHex });
+    if (entry.id.startsWith("composition-")) {
+      assert.equal(entry.expected.beforeHex, "", "zero preedit bytes");
+      assert(entry.observations.some(step => /preedit.*zero recorded bytes/i.test(step)));
+    }
+    assert.equal(entry.pasteText, "paste" in expected ? expected.text : undefined);
+  }
+  return withNativeExecutable(executable => {
+    const vectors = manifest.cases.map(({ id, expected }) => [id, expected.beforeHex, expected.afterHex].join("\t"));
+    const name = "recorder::tests::w2_recorder_manifest_vectors";
+    const result = spawnSync(executable, ["--exact", name], {
+      env: { ...process.env, W2_MANIFEST_VECTORS: vectors.join("\n") },
+      encoding: "utf8",
+      timeout: 5_000,
+    });
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert(result.stdout.includes(`test ${name} ... ok`));
+    assert.match(result.stdout, /^test result: ok\. 1 passed; 0 failed;/m);
+  });
+}
+
+async function exerciseCases(
+  executable: string,
+  ids: readonly CaseId[],
+  transformEntry?: MountOptions["transformEntry"],
+) {
+  const native = connectNative(executable, "requests");
+  const manifest = readManifest();
+  try {
+    for (const [index, id] of ids.entries()) {
+      const entry = manifest.cases.find(candidate => candidate.id === id);
+      assert(entry);
+      const vector = requiredVectors[id];
+      const usingPaste = "paste" in vector;
+      const generation = index + 1;
+      const fixture = await mountFixture({
+        invoke: native.invoke, transformEntry, browserPaste: usingPaste, traceRegistration: false,
+      });
+      try {
+        assert.equal(fixture.ipc.length, 0, "transcript generates no IPC");
+        const field = (id: string) => {
+          const element = fixture.document.getElementById(id);
+          assert(element, `missing case field ${id}`);
+          return element;
+        };
+
+        assert.deepEqual(field("case").options?.map(option => option.value).sort(),
+          requiredIds.toSorted(), "exact rendered case options");
+        await fixture.selectCase(id);
+        assert.deepEqual(field("case-actions").childNodes.map(node => node.textContent), entry.actions);
+        assert.deepEqual(field("case-observations").childNodes.map(node => node.textContent), entry.observations);
+        assert.equal(field("expected-before").textContent, vector.beforeHex || "(empty)");
+        assert.equal(field("expected-after").textContent, vector.afterHex || "(empty)");
+        assert.equal(field("snapshot").textContent, "—");
+        if (usingPaste) assert.equal(fixture.terminal.browserTerminal?.modes.bracketedPasteMode, false);
+
+        await fixture.click("Start");
+        assert.deepEqual(fixture.ipc, [{ command: "w2_begin_attempt", args: { caseId: id } }], "one selected begin");
+        await fixture.waitFor(() => !fixture.button("Read").disabled, "Start enables Read");
+
+        const snapshot = (bytes: number[]): Snapshot => ({
+          caseId: id, generation, nextSequence: bytes.length ? 2 : 1, bytes,
+          eventLengths: bytes.length ? [bytes.length] : [], rejected: 0, invalid: false,
+        });
+        async function checkRead(hex: string, bytes: number[]) {
+          const firstCall = fixture.ipc.length;
+          await fixture.click("Read");
+          await fixture.waitFor(() => !fixture.button("Read").disabled, "Read completes");
+          assert.deepEqual(fixture.ipc.slice(firstCall).filter(call => call.command === "w2_read_attempt"),
+            [{ command: "w2_read_attempt", args: { generation } }], "read the fresh generation");
+          assert.deepEqual(native.snapshot(), snapshot(bytes), "native recorder snapshot");
+          assert.equal(field("snapshot").textContent, hex || "(empty)", "rendered native snapshot");
+        }
+        await checkRead("", []);
+
+        const hex = vector.beforeHex || vector.afterHex;
+        const bytes = [...Buffer.from(hex, "hex")];
+        if (usingPaste) {
+          await act(async () => { fixture.terminal.paste(vector.text); });
+        } else if (vector.text) {
+          await fixture.input(vector.text);
+        }
+        await checkRead(hex, bytes);
+        const appends = fixture.ipc.filter(call => call.command === "w2_append_input");
+        assert.deepEqual(appends, bytes.length ? [{
+          command: "w2_append_input", args: { generation, sequence: 1, events: [bytes] },
+        }] : [], "production append bytes");
+        if (usingPaste) {
+          assert.equal(appends.length, 1, "paste emits one append");
+          const recorded = (native.snapshot() as Snapshot).bytes;
+          assert.equal(recorded.filter(byte => byte === 0x0d).length, id === "paste-multiline" ? 2 : 0);
+          assert(!recorded.includes(0x0a) && !recorded.includes(0x1b), "paste has no LF or bracket markers");
+        }
+      } finally {
+        await fixture.dispose();
+      }
+    }
+    await native.finish();
+  } catch (error) {
+    await native.abort();
+    throw error;
+  }
+}
+
+function pasteVectorsMatch() {
+  return withNativeExecutable(async executable => {
+    await assert.rejects(exerciseCases(executable, pasteIds, source => replaceOnce(source, registration,
+      'const recorder = registerRecorder({ onData: () => ({ dispose() {} }) }, invoke, onCaptureError);')),
+    /native recorder snapshot|production append bytes/);
+    await exerciseCases(executable, pasteIds);
+  });
+}
+
+function productionCaseControls() {
+  return withNativeExecutable(async executable => {
+    const optionList = "manifest.cases.map(entry => <option";
+    await assert.rejects(exerciseCases(executable, requiredIds, source => replaceOnce(source, optionList,
+      'manifest.cases.filter(entry => entry.id !== "english-return").map(entry => <option')), /exact rendered case options/);
+    await assert.rejects(exerciseCases(executable, requiredIds, source => replaceOnce(source, "onClick={start}",
+      "onClick={() => {}}")), /one selected begin/);
+    await assert.rejects(exerciseCases(executable, requiredIds, source => replaceOnce(source,
+      "selected.expected.afterHex || emptyHex", "manifest.cases[1].expected.afterHex || emptyHex")), /6f6b0d/);
+    await exerciseCases(executable, requiredIds);
+  });
 }
 
 const commands = ["w2_begin_attempt", "w2_append_input", "w2_read_attempt"];
@@ -820,8 +1026,8 @@ function assertLibraryBoundary(source: string) {
   assert.deepEqual(attributesBefore(tokens, recorder),
     [rustTokens('#[cfg(any(target_os = "ios", test))]').join(" ")], "recorder module target guard");
   const module = bodyAt(tokens, recorder, recorderDecl);
-  const wrappers = positions(module, "fn", true).filter(index => module[index + 1]?.startsWith("w2_") ?? false);
-  assert.deepEqual(wrappers.map(index => module[index + 1] ?? ""), commands, "exact command wrapper declarations");
+  const wrappers = positions(module, "fn", true).filter(index => module[index + 1].startsWith("w2_"));
+  assert.deepEqual(wrappers.map(index => module[index + 1]), commands, "exact command wrapper declarations");
   for (const wrapper of wrappers) {
     assert.deepEqual(attributesBefore(module, wrapper), [rustTokens(commandAttribute).join(" ")],
       `iOS command attribute belongs to ${module[wrapper + 1]}`);
@@ -852,9 +1058,7 @@ function assertLibraryBoundary(source: string) {
   const exports = positions(tokens, "pub use", true);
   assert.deepEqual(exports, positions(tokens, "pub use recorder::run;", true), "standalone run re-export");
   assert.equal(exports.length, 1, "standalone run re-export");
-  const runExport = exports[0];
-  assert(runExport !== undefined, "standalone run export exists");
-  assert.deepEqual(attributesBefore(tokens, runExport), [rustTokens(iosCfg).join(" ")], "iOS cfg belongs to the run re-export");
+  assert.deepEqual(attributesBefore(tokens, exports[0]), [rustTokens(iosCfg).join(" ")], "iOS cfg belongs to the run re-export");
   for (const declaration of ["fn start_app", "#[unsafe(export_name =", "#[export_name ="]) {
     assert.equal(positions(tokens, declaration).length, 0, "handwritten C ABI entry");
   }
@@ -870,7 +1074,6 @@ function assertPermissions(entries: ReturnType<typeof readEntries>) {
   for (const file of files) {
     assert.equal(file.kind, "file", "generated permission is a regular file");
     const command = commands[paths.indexOf(file.path)];
-    assert(command !== undefined, `generated permission matches a command: ${file.path}`);
     const slug = command.replaceAll("_", "-");
     assert.deepEqual(parseToml(file.source), {
       permission: [
@@ -996,9 +1199,7 @@ function declarationControls() {
     }],
     ["broadened generated permission", /exact generated permission definitions/, b => {
       b.permissions = structuredClone(permissions);
-      const permission = b.permissions[1];
-      assert(permission, "begin permission exists");
-      permission.source = permission.source.replace('commands.allow = ["w2_begin_attempt"]',
+      b.permissions[1].source = b.permissions[1].source.replace('commands.allow = ["w2_begin_attempt"]',
         'commands.allow = ["w2_begin_attempt", "arbitrary"]');
     }],
     ["host dependency", /only iOS recorder dependencies/, b => {
@@ -1055,6 +1256,9 @@ function declarationControls() {
 
 if (import.meta.main) {
   test("xterm input reaches the native recorder", mountedTracer);
+  test("mandatory cases use independent vectors and exact native case IDs", assertManifestVectors);
+  test("paste vectors match xterm newline normalization", pasteVectorsMatch);
+  test("production case controls launch every mandatory manifest vector", productionCaseControls);
   test("native tracer rejects disconnected command wrappers", disconnectedWrapperControls);
   test("declared fixture boundary matches the iOS-only contract", () => assertBoundary(readBoundary()));
   test("declared fixture boundary rejects broadened declarations", declarationControls);
