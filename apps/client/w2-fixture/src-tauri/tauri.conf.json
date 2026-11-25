@@ -1,0 +1,42 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Offline Terminal Fixture",
+  "version": "0.1.0",
+  "identifier": "dev.remotesessions.w2fixture",
+  "build": {
+    "beforeBuildCommand": {
+      "cwd": "..",
+      "script": "node ../../../node_modules/vite/bin/vite.js build"
+    },
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "w2-fixture",
+        "title": "Offline Terminal Fixture",
+        "url": "index.html"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost; base-uri 'none'; form-action 'none'",
+      "capabilities": [
+        {
+          "identifier": "w2-fixture",
+          "platforms": ["iOS"],
+          "local": true,
+          "windows": ["w2-fixture"],
+          "permissions": [
+            "allow-w2-begin-attempt",
+            "allow-w2-append-input",
+            "allow-w2-read-attempt"
+          ]
+        }
+      ]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "icon": ["../../src-tauri/icons/32x32.png"]
+  }
+}
