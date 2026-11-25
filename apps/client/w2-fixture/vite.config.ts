@@ -42,7 +42,15 @@ function assertLocal(reference: string) {
 }
 
 function assertCss(css: string) {
-  const source = css.replace(/\/\*[\s\S]*?\*\//g, "");
+  // CSS escapes can hide both URL syntax and the URL itself.
+  const source = css.replace(/\/\*[\s\S]*?\*\//g, "").replace(
+    /\\(?:([\da-f]{1,6})(?:\r\n|[\t\n\f\r ])?|(\r\n|[\s\S]))/gi,
+    (_escape, hex: string | undefined, literal: string | undefined) => {
+      if (!hex) return literal?.replace(/[\r\n\f]/g, "") ?? "";
+      const codePoint = Number.parseInt(hex, 16);
+      return codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : "\ufffd";
+    },
+  );
   for (const match of source.matchAll(/url\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*))\s*\)|@import\s+(?:"([^"]*)"|'([^']*)')/gi)) {
     assertLocal(match.slice(1).find(value => value !== undefined) ?? "");
   }
@@ -55,8 +63,8 @@ function assertCss(css: string) {
 function assertHtml(html: string) {
   const source = html.replace(/<!--[\s\S]*?-->/g, "");
   for (const [tag] of source.matchAll(/<[a-z](?:"[^"]*"|'[^']*'|[^'">])*>/gi)) {
-    if (/^<(?:base\b)|\bhttp-equiv\s*=/i.test(tag)) {
-      throw new Error("Document redirects and base URLs are forbidden in the fixture");
+    if (/^<base\b|\s(?:http-equiv|srcdoc)\s*=/i.test(tag)) {
+      throw new Error("Document redirects, base URLs and embedded HTML are forbidden in the fixture");
     }
     for (const [, name, double, single, bare] of tag.matchAll(
       /\s(src|href|xlink:href|srcset|imagesrcset|poster|data|action|formaction|background|style)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi,

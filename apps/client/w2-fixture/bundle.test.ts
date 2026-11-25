@@ -42,7 +42,13 @@ test("guarded bundle rejects desktop modules and external assets", async () => {
 
     write("local.css", 'body { background-image: url("https://example.invalid/remote.png"); }');
     await assert.rejects(bundle, /External asset is forbidden in the fixture: .*remote\.png/);
+    write("local.css", String.raw`body { background-image: u\72l(\68ttps://example.invalid/escaped.png); }`);
+    await assert.rejects(bundle, /External asset is forbidden in the fixture: .*escaped\.png/);
     write("local.css", "body { color: black; }");
+
+    write("index.html", html + '<iframe srcdoc="&lt;img src=//example.invalid/remote.svg&gt;"></iframe>');
+    await assert.rejects(bundle, /embedded HTML are forbidden in the fixture/);
+    write("index.html", html);
 
     write("entry.ts", 'document.body.dataset.fixture = new URL("https://example.invalid/remote.woff2", import.meta.url).href;');
     await assert.rejects(bundle, /External asset is forbidden in the fixture: .*remote\.woff2/);
