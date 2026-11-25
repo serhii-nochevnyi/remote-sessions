@@ -7,9 +7,9 @@ fn scaffold_status() -> remote_sessions_core::Status {
 mod desktop {
     use remote_sessions_desktop_bridge::{
         Attachment, Chunk, CreateSubmission, DesktopBridge, GeometryEvent, GridAcknowledgement,
-        Inventory, LocalCreateStatus, ProductIssue, ProviderProfile, ResizeEpoch, ResizeResult,
-        TerminalSize, TerminalStatus, WorkspaceReadiness, WorkspaceSelection,
-        encode_local_observation, encode_renderer_observation,
+        Inventory, LocalCreateStatus, PasteAction, PasteResult, ProductIssue, ProviderProfile,
+        ResizeEpoch, ResizeResult, TerminalSize, TerminalStatus, WorkspaceReadiness,
+        WorkspaceSelection, encode_local_observation, encode_renderer_observation,
     };
     use tauri::{State, WebviewWindow, async_runtime};
     use tauri_plugin_dialog::{DialogExt, FilePath};
@@ -688,13 +688,104 @@ mod desktop {
     pub async fn terminal_input(
         view_id: String,
         data: Vec<u8>,
-        paste: bool,
+        paste: Option<bool>,
         bridge: State<'_, DesktopBridge>,
     ) -> Result<(), String> {
-        bridge
-            .input(&view_id, data, paste)
-            .await
-            .map_err(|e| e.to_string())
+        ordinary_input(paste, async move || {
+            bridge
+                .input(&view_id, data, false)
+                .await
+                .map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    async fn ordinary_input(
+        paste: Option<bool>,
+        dispatch: impl AsyncFnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        if paste == Some(true) {
+            return Err("PasteUnavailable".into());
+        }
+        dispatch().await
+    }
+
+    #[tauri::command]
+    pub async fn terminal_paste_stage(
+        view_id: String,
+        incarnation: String,
+        operation: u64,
+        offset: usize,
+        data: Vec<u8>,
+        bridge: State<'_, DesktopBridge>,
+    ) -> Result<PasteResult, String> {
+        Ok(bridge
+            .paste(
+                &view_id,
+                &incarnation,
+                operation,
+                PasteAction::Stage { offset, data },
+            )
+            .await)
+    }
+
+    #[tauri::command]
+    pub async fn terminal_paste_commit(
+        view_id: String,
+        incarnation: String,
+        operation: u64,
+        bytes: usize,
+        bridge: State<'_, DesktopBridge>,
+    ) -> Result<PasteResult, String> {
+        Ok(bridge
+            .paste(
+                &view_id,
+                &incarnation,
+                operation,
+                PasteAction::Commit { bytes },
+            )
+            .await)
+    }
+
+    #[tauri::command]
+    pub async fn terminal_paste_ack(
+        view_id: String,
+        incarnation: String,
+        operation: u64,
+        receipt: String,
+        bridge: State<'_, DesktopBridge>,
+    ) -> Result<PasteResult, String> {
+        Ok(bridge
+            .paste(
+                &view_id,
+                &incarnation,
+                operation,
+                PasteAction::Ack { receipt },
+            )
+            .await)
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn terminal_input_rejects_legacy_paste() {
+        tauri::async_runtime::block_on(async {
+            let mut calls = 0;
+            for paste in [Some(true), Some(false), None] {
+                let result = ordinary_input(paste, async || {
+                    calls += 1;
+                    Ok(())
+                })
+                .await;
+                match paste {
+                    Some(true) => {
+                        assert_eq!(result, Err("PasteUnavailable".into()));
+                        assert_eq!(calls, 0);
+                    }
+                    _ => assert_eq!(result, Ok(())),
+                }
+            }
+            assert_eq!(calls, 2);
+        });
     }
     #[tauri::command]
     pub fn terminal_detach(
@@ -763,7 +854,10 @@ pub fn run() {
                 desktop::terminal_resize,
                 desktop::terminal_acknowledge_grid,
                 desktop::terminal_detach,
-                desktop::terminal_input
+                desktop::terminal_input,
+                desktop::terminal_paste_stage,
+                desktop::terminal_paste_commit,
+                desktop::terminal_paste_ack
             ])
     };
     #[cfg(not(target_os = "macos"))]

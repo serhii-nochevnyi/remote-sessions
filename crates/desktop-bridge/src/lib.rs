@@ -9,12 +9,15 @@ pub use pending_create::{
 };
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 pub use remote_sessions_host::encode_local_observation;
-pub use remote_sessions_host::model::{ProductIssue, ProviderProfile, WorkspaceDisplay};
+pub use remote_sessions_host::model::{
+    PasteResult, ProductIssue, ProviderProfile, WorkspaceDisplay,
+};
 pub use remote_sessions_host::model::{ResizeEpoch, ResizeResult, TerminalSize, TerminalStatus};
 use remote_sessions_host::{
     engine::set_local_pty_nonblocking,
     model::{
-        ObservationState, ProductRequest, ProductResponse, Request, Response, Runtime, TerminalView,
+        INPUT_CHUNK_LIMIT, INPUT_LEASE_TTL, ObservationState, PasteAdmission, PasteBinding,
+        ProductRequest, ProductResponse, Request, Response, Runtime, TerminalView,
     },
     product_launch::workspace_locator,
     product_request, request,
@@ -55,6 +58,12 @@ pub struct Chunk {
     pub status: Option<TerminalStatus>,
     pub geometry: Option<GeometryEvent>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub paste_incarnation: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paste_completion: Option<PasteCompletion>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paste_admission: Option<PasteAdmission>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub closure: Option<TerminalClosure>,
 }
 
@@ -66,6 +75,9 @@ impl Chunk {
             closed: true,
             status: None,
             geometry: None,
+            paste_incarnation: None,
+            paste_completion: None,
+            paste_admission: None,
             closure: Some(closure),
         }
     }
@@ -98,6 +110,16 @@ struct Views {
     live: HashMap<Uuid, Arc<View>>,
     notices: VecDeque<ClosureNotice>,
     allocated: usize,
+    paste_holds: HashMap<Uuid, PasteAdmission>,
+    control_samples: HashMap<Uuid, ControlSample>,
+    #[cfg(test)]
+    paste_fixture: Option<mpsc::UnboundedSender<PasteFixtureFrame>>,
+}
+
+#[cfg(test)]
+struct PasteFixtureFrame {
+    request: String,
+    reply: tokio::sync::oneshot::Sender<String>,
 }
 
 struct ClosureNotice {
@@ -123,6 +145,49 @@ impl Views {
             expires: now + NOTICE_TTL,
         });
     }
+
+    fn publish_control(&mut self, view: Uuid, control: &Control) {
+        let paste_admission = self.paste_holds.get(&view).copied();
+        let sample = if paste_admission.is_some() {
+            ControlSample {
+                lease: None,
+                paste_admission,
+            }
+        } else {
+            ControlSample::from_control(control, None)
+        };
+        self.control_samples.insert(view, sample);
+    }
+
+    fn publish_lease(&mut self, view: Uuid, lease: &NativeLease) {
+        let paste_admission = self.paste_holds.get(&view).copied();
+        let sample = if paste_admission.is_some() {
+            ControlSample {
+                lease: None,
+                paste_admission,
+            }
+        } else {
+            ControlSample {
+                lease: Some(LeaseSample::from_lease(lease)),
+                paste_admission: None,
+            }
+        };
+        self.control_samples.insert(view, sample);
+    }
+}
+
+#[derive(Clone, Default)]
+struct ControlSample {
+    lease: Option<LeaseSample>,
+    paste_admission: Option<PasteAdmission>,
+}
+
+#[derive(Clone)]
+struct LeaseSample {
+    epoch: ResizeEpoch,
+    deadline: Instant,
+    incarnation: Uuid,
+    pending_paste: Option<(Uuid, u64)>,
 }
 
 struct Allocation(Arc<Mutex<Views>>);
@@ -191,6 +256,56 @@ struct NativeLease {
     epoch: ResizeEpoch,
     input_sequence: u64,
     resize_sequence: u64,
+    deadline: Instant,
+    incarnation: Uuid,
+    pending_paste: Option<NativePaste>,
+}
+
+struct NativePaste {
+    binding: PasteBinding,
+    receipt: Option<Uuid>,
+}
+
+#[derive(Serialize)]
+pub struct PasteCompletion {
+    incarnation: Uuid,
+    operation: u64,
+}
+
+pub enum PasteAction {
+    Stage { offset: usize, data: Vec<u8> },
+    Commit { bytes: usize },
+    Ack { receipt: String },
+}
+
+impl NativeLease {
+    fn writable(&self, now: Instant) -> bool {
+        self.pending_paste.is_none() && self.deadline > now
+    }
+}
+
+impl ControlSample {
+    fn from_control(control: &Control, paste_admission: Option<PasteAdmission>) -> Self {
+        let lease = control.lease.as_ref().map(LeaseSample::from_lease);
+        Self {
+            lease,
+            paste_admission,
+        }
+    }
+}
+
+impl LeaseSample {
+    fn from_lease(lease: &NativeLease) -> Self {
+        Self {
+            epoch: lease.epoch,
+            deadline: lease.deadline,
+            incarnation: lease.incarnation,
+            pending_paste: lease
+                .pending_paste
+                .as_ref()
+                .map(|pending| (pending.binding.incarnation, pending.binding.operation)),
+        }
+    }
 }
 enum PtyEvent {
     Bytes(Arc<Mutex<Vec<u8>>>),
@@ -324,6 +439,62 @@ struct View {
     cleanup_confirmations: AtomicU64,
 }
 impl View {
+    async fn agent_request(&self, message: &Request) -> Result<Response> {
+        #[cfg(test)]
+        {
+            let fixture = self
+                .views
+                .upgrade()
+                .and_then(|views| views.lock().unwrap().paste_fixture.clone());
+            if let Some(fixture) = fixture {
+                let (reply, receive) = tokio::sync::oneshot::channel();
+                fixture
+                    .send(PasteFixtureFrame {
+                        request: encode_local_observation(message)? + "\n",
+                        reply,
+                    })
+                    .map_err(|_| anyhow::anyhow!("Fixture disconnected"))?;
+                let frame = tokio::time::timeout(Duration::from_secs(5), receive).await??;
+                return remote_sessions_host::decode_local_fixture(frame.as_bytes());
+            }
+        }
+        request(&self.directory, message).await
+    }
+
+    fn hold_paste(&self, hold: PasteAdmission) {
+        if let Some(views) = self.views.upgrade() {
+            let mut views = views.lock().unwrap();
+            if views.live.contains_key(&self.terminal.view_id) {
+                views.paste_holds.insert(self.terminal.view_id, hold);
+                views.control_samples.insert(
+                    self.terminal.view_id,
+                    ControlSample {
+                        lease: None,
+                        paste_admission: Some(hold),
+                    },
+                );
+            }
+        }
+    }
+
+    fn publish_control(&self, control: &Control) {
+        if let Some(views) = self.views.upgrade() {
+            let mut views = views.lock().unwrap();
+            if views.live.contains_key(&self.terminal.view_id) {
+                views.publish_control(self.terminal.view_id, control);
+            }
+        }
+    }
+
+    fn publish_lease(&self, lease: &NativeLease) {
+        if let Some(views) = self.views.upgrade() {
+            let mut views = views.lock().unwrap();
+            if views.live.contains_key(&self.terminal.view_id) {
+                views.publish_lease(self.terminal.view_id, lease);
+            }
+        }
+    }
+
     fn closed(&self) -> bool {
         self.reader_state.load(Ordering::Acquire) == CLOSE
     }
@@ -362,6 +533,8 @@ impl View {
     fn retire_locked(&self, views: &mut Views, reason: Retirement) -> Option<u64> {
         let id = self.terminal.view_id;
         views.live.remove(&id)?;
+        views.paste_holds.remove(&id);
+        views.control_samples.remove(&id);
         self.reader_state.store(CLOSE, Ordering::Release);
         if !self.reading.load(Ordering::Relaxed)
             && let Retirement::Typed(closure) = reason
@@ -402,13 +575,10 @@ impl View {
     async fn release(&self, token: Uuid) {
         let _ = tokio::time::timeout(
             Duration::from_secs(1),
-            request(
-                &self.directory,
-                &Request::Release {
-                    runtime_id: self.terminal.target.runtime_id,
-                    token,
-                },
-            ),
+            self.agent_request(&Request::Release {
+                runtime_id: self.terminal.target.runtime_id,
+                token,
+            }),
         )
         .await;
     }
@@ -646,6 +816,7 @@ async fn refresh_control(view: &View) {
         return;
     }
     let message = match &control.lease {
+        Some(lease) if lease.pending_paste.is_some() => return,
         Some(lease) => Request::Renew {
             runtime_id: view.terminal.target.runtime_id,
             token: lease.token,
@@ -654,27 +825,54 @@ async fn refresh_control(view: &View) {
             terminal: view.terminal.clone(),
         },
     };
-    match request(&view.directory, &message).await {
+    let deadline = Instant::now() + INPUT_LEASE_TTL;
+    match view.agent_request(&message).await {
         Ok(Response::TerminalControl { token, epoch }) => {
             {
                 let views = view.views.upgrade();
-                let _registry = views.as_ref().map(|views| views.lock().unwrap());
+                let mut registry = views.as_ref().map(|views| views.lock().unwrap());
                 if !view.closed() && epoch.agent == view.terminal.agent_epoch {
-                    control.lease = Some(NativeLease {
-                        token,
-                        epoch,
-                        input_sequence: 0,
-                        resize_sequence: 0,
-                    });
+                    if let Some(lease) = control
+                        .lease
+                        .as_mut()
+                        .filter(|lease| lease.token == token && lease.epoch == epoch)
+                    {
+                        lease.deadline = deadline;
+                    } else {
+                        control.lease = Some(NativeLease {
+                            token,
+                            epoch,
+                            deadline,
+                            input_sequence: 0,
+                            resize_sequence: 0,
+                            incarnation: Uuid::new_v4(),
+                            pending_paste: None,
+                        });
+                    }
+                    if let Some(registry) = registry.as_mut() {
+                        registry.paste_holds.remove(&view.terminal.view_id);
+                        registry.publish_control(view.terminal.view_id, &control);
+                    }
                     return;
                 }
             }
             drop(control);
             view.release(token).await;
         }
-        Ok(Response::Accepted {}) => {}
-        _ => {
-            control.lease = None;
+        Ok(Response::Accepted {}) if !view.closed() && control.lease.is_some() => {
+            control.lease.as_mut().unwrap().deadline = deadline;
+            view.publish_control(&control);
+        }
+        result => {
+            if let Ok(Response::ControlRecovering { paste_admission }) = result {
+                view.hold_paste(paste_admission);
+            }
+            let token = control.lease.take().map(|lease| lease.token);
+            view.publish_control(&control);
+            drop(control);
+            if let Some(token) = token {
+                view.release(token).await;
+            }
         }
     }
 }
@@ -883,10 +1081,14 @@ async fn read_chunk(view: &View, output: &mut Output, now: impl Fn() -> Instant)
         closed: false,
         status: None,
         geometry: None,
+        paste_incarnation: None,
+        paste_completion: None,
+        paste_admission: None,
         closure: None,
     };
     let reading_at = now();
     let remaining = drain_budget(output.drain_started, reading_at)?;
+    let mut scope_sampled = true;
     if reading_at >= output.refresh_at {
         let status = terminal_status_during_drain(view, remaining).await;
         drain_budget(output.drain_started, now())?;
@@ -894,13 +1096,19 @@ async fn read_chunk(view: &View, output: &mut Output, now: impl Fn() -> Instant)
             Ok(status) if status.committed.revision >= output.status.committed.revision => {
                 output.status = status
             }
-            Ok(_) => {}
+            Ok(_) => scope_sampled = false,
             Err(_) => {
+                scope_sampled = false;
                 output.status.provider = None;
                 output.status.observation = ObservationState::Unavailable;
             }
         }
-        output.refresh_at = now() + Duration::from_millis(150);
+        output.refresh_at = now()
+            + if scope_sampled {
+                Duration::from_millis(150)
+            } else {
+                Duration::ZERO
+            };
         chunk.status = Some(output.status.clone());
     }
     let draining_at = now();
@@ -953,12 +1161,32 @@ async fn read_chunk(view: &View, output: &mut Output, now: impl Fn() -> Instant)
         }
         Err(_) => {}
     }
-    if let Ok(control) = view.control.try_lock() {
-        output.writable = control
-            .lease
-            .as_ref()
-            .is_some_and(|lease| Some(lease.epoch) == output.status.epoch);
+    let control_sample = view.views.upgrade().and_then(|views| {
+        let views = views.lock().unwrap();
+        (!view.closed())
+            .then(|| views.control_samples.get(&view.terminal.view_id).cloned())
+            .flatten()
+    });
+    if let Some(sample) = control_sample {
+        chunk.paste_admission = sample.paste_admission;
+        if chunk.paste_admission.is_none()
+            && let Some(lease) = sample.lease
+        {
+            if let Some((incarnation, operation)) = lease.pending_paste {
+                chunk.paste_completion = Some(PasteCompletion {
+                    incarnation,
+                    operation,
+                });
+            } else if scope_sampled
+                && output.status.terminal == view.terminal
+                && Some(lease.epoch) == output.status.epoch
+                && lease.deadline > now()
+            {
+                chunk.paste_incarnation = Some(lease.incarnation);
+            }
+        }
     }
+    output.writable = chunk.paste_incarnation.is_some();
     chunk.writable = output.writable;
     Ok(chunk)
 }
@@ -1332,26 +1560,29 @@ impl DesktopBridge {
             let control = view.control.lock().await;
             ensure!(!view.closed(), "View detached");
             let lease = control.lease.as_ref().context("Керування ще не отримано")?;
-            ensure!(lease.epoch == epoch, "Resize authority changed");
+            ensure!(
+                lease.epoch == epoch && lease.writable(Instant::now()),
+                "Resize authority changed"
+            );
             (lease.token, lease.resize_sequence)
         };
-        let reply = request(
-            &view.directory,
-            &Request::ResizeTerminal {
+        let reply = view
+            .agent_request(&Request::ResizeTerminal {
                 terminal: view.terminal.clone(),
                 token,
                 sequence,
                 size,
-            },
-        )
-        .await;
+            })
+            .await;
         let mut control = view.control.lock().await;
         ensure!(!view.closed(), "View detached");
-        let lease = control
+        let pending_paste = control
             .lease
-            .as_mut()
+            .as_ref()
             .filter(|lease| lease.token == token)
-            .context("Resize authority changed")?;
+            .context("Resize authority changed")?
+            .pending_paste
+            .is_some();
         match reply {
             Ok(Response::Resize {
                 resize: ResizeResult::Committed { admission, status },
@@ -1361,7 +1592,7 @@ impl DesktopBridge {
                 && admission.epoch == epoch
                 && status.committed.size == size =>
             {
-                lease.resize_sequence = sequence
+                control.lease.as_mut().unwrap().resize_sequence = sequence
                     .checked_add(1)
                     .context("Resize sequence exhausted")?;
                 Ok(ResizeResult::Committed { admission, status })
@@ -1369,18 +1600,34 @@ impl DesktopBridge {
             Ok(Response::Resize {
                 resize: ResizeResult::Uncertain { terminal, intent },
             }) if terminal == view.terminal && intent.epoch == epoch => {
-                control.lease = None;
+                if pending_paste {
+                    control.lease.as_mut().unwrap().deadline = Instant::now();
+                } else {
+                    control.lease = None;
+                }
+                view.publish_control(&control);
                 Ok(ResizeResult::Uncertain { terminal, intent })
             }
             Ok(Response::Resize {
                 resize: ResizeResult::Rejected { terminal, intent },
             }) if terminal == view.terminal && intent.epoch == epoch => {
-                control.lease = None;
+                if pending_paste {
+                    control.lease.as_mut().unwrap().deadline = Instant::now();
+                } else {
+                    control.lease = None;
+                }
+                view.publish_control(&control);
                 Ok(ResizeResult::Rejected { terminal, intent })
             }
             Ok(Response::Error { message }) => bail!("{message}"),
             _ => {
+                if pending_paste {
+                    control.lease.as_mut().unwrap().deadline = Instant::now();
+                    view.publish_control(&control);
+                    bail!("Результат зміни розміру невідомий");
+                }
                 control.lease = None;
+                view.publish_control(&control);
                 drop(control);
                 view.release(token).await;
                 bail!("Результат зміни розміру невідомий");
@@ -1447,33 +1694,39 @@ impl DesktopBridge {
     }
 
     pub async fn input(&self, view_id: &str, data: Vec<u8>, paste: bool) -> Result<()> {
+        ensure!(!paste, "PasteUnavailable");
         ensure!(
-            !data.is_empty() && data.len() <= 4096,
+            (1..=INPUT_CHUNK_LIMIT).contains(&data.len()),
             "Input must contain 1..4096 bytes"
         );
         let view = self.view(view_id)?;
         let mut control = view.control.lock().await;
         ensure!(!view.closed(), "View detached");
         let lease = control.lease.as_mut().context("Керування ще не отримано")?;
+        ensure!(lease.writable(Instant::now()), "Керування втрачено");
         let token = lease.token;
         let sequence = lease.input_sequence;
-        lease.input_sequence += 1;
+        lease.input_sequence = sequence
+            .checked_add(1)
+            .context("Input sequence exhausted")?;
         let runtime_id = view.terminal.target.runtime_id;
-        let result = request(
-            &view.directory,
-            &Request::Input {
+        let result = view
+            .agent_request(&Request::Input {
                 runtime_id,
                 token,
                 sequence,
                 data,
-                paste,
-            },
-        )
-        .await;
+                paste: false,
+            })
+            .await;
         if matches!(result, Ok(Response::Accepted {})) {
             return Ok(());
         }
+        if let Ok(Response::ControlRecovering { paste_admission }) = &result {
+            view.hold_paste(*paste_admission);
+        }
         control.lease = None;
+        view.publish_control(&control);
         drop(control);
         view.release(token).await;
         match result {
@@ -1481,6 +1734,154 @@ impl DesktopBridge {
             Err(error) => Err(error.context("Input outcome unknown; input was not retried")),
             _ => bail!("Unexpected input response; input was not retried"),
         }
+    }
+
+    pub async fn paste(
+        &self,
+        view_id: &str,
+        incarnation: &str,
+        operation: u64,
+        action: PasteAction,
+    ) -> PasteResult {
+        let Ok(incarnation) = Uuid::parse_str(incarnation) else {
+            return PasteResult::Invalid {};
+        };
+        if incarnation.is_nil() || !(1..=(1 << 53) - 1).contains(&operation) {
+            return PasteResult::Invalid {};
+        }
+        let Ok(view) = self.view(view_id) else {
+            return PasteResult::Stale {};
+        };
+        let mut control = view.control.lock().await;
+        let Some(lease) = control
+            .lease
+            .as_mut()
+            .filter(|lease| lease.incarnation == incarnation && !view.closed())
+        else {
+            return PasteResult::Stale {};
+        };
+        if let PasteAction::Ack { receipt } = action {
+            let Ok(receipt) = Uuid::parse_str(&receipt) else {
+                return PasteResult::Invalid {};
+            };
+            let Some(pending) = lease.pending_paste.as_mut().filter(|pending| {
+                pending.binding.terminal == view.terminal
+                    && pending.binding.token == lease.token
+                    && pending.binding.epoch == lease.epoch
+                    && pending.binding.incarnation == incarnation
+                    && pending.binding.operation == operation
+                    && pending.receipt == Some(receipt)
+            }) else {
+                return PasteResult::Stale {};
+            };
+            let binding = pending.binding.clone();
+            pending.receipt = None;
+            let result = view
+                .agent_request(&Request::PasteAck { binding, receipt })
+                .await;
+            if let Ok(Response::Paste {
+                paste:
+                    PasteResult::Acknowledged {
+                        writable: host_writable,
+                    },
+            }) = result
+            {
+                let writable = host_writable && lease.deadline > Instant::now() && !view.closed();
+                lease.pending_paste = None;
+                let release_token = if !writable {
+                    let token = lease.token;
+                    control.lease = None;
+                    Some(token)
+                } else {
+                    None
+                };
+                view.publish_control(&control);
+                drop(control);
+                if host_writable && let Some(token) = release_token {
+                    view.release(token).await;
+                }
+                return PasteResult::Acknowledged { writable };
+            }
+            return Self::hold_unknown_paste(&view, &mut control);
+        }
+        if !lease.writable(Instant::now()) {
+            return PasteResult::Stale {};
+        }
+        let binding = PasteBinding {
+            terminal: view.terminal.clone(),
+            token: lease.token,
+            epoch: lease.epoch,
+            incarnation,
+            operation,
+            sequence: lease.input_sequence,
+        };
+        let request_message = match action {
+            PasteAction::Stage { offset, data } => Request::PasteStage {
+                binding,
+                offset,
+                data,
+            },
+            PasteAction::Commit { bytes } => {
+                if lease.input_sequence == u64::MAX {
+                    return Self::hold_unknown_paste(&view, &mut control);
+                }
+                lease.pending_paste = Some(NativePaste {
+                    binding: binding.clone(),
+                    receipt: None,
+                });
+                Request::PasteCommit { binding, bytes }
+            }
+            PasteAction::Ack { .. } => unreachable!("handled receipt above"),
+        };
+        let committing = matches!(&request_message, Request::PasteCommit { .. });
+        match view.agent_request(&request_message).await {
+            Ok(Response::Paste {
+                paste: PasteResult::Committed { receipt },
+            }) if committing && !receipt.is_nil() => {
+                lease.input_sequence += 1;
+                lease.pending_paste.as_mut().unwrap().receipt = Some(receipt);
+                view.publish_lease(lease);
+                PasteResult::Committed { receipt }
+            }
+            Ok(Response::Paste {
+                paste: PasteResult::Staged {},
+            }) if !committing => PasteResult::Staged {},
+            Ok(Response::Paste {
+                paste:
+                    paste @ (PasteResult::Stale {}
+                    | PasteResult::Invalid {}
+                    | PasteResult::Unavailable {}),
+            }) => {
+                lease.pending_paste = None;
+                view.publish_lease(lease);
+                paste
+            }
+            Ok(Response::Paste {
+                paste: PasteResult::Unknown {},
+            }) => Self::hold_unknown_paste(&view, &mut control),
+            _ if committing => Self::hold_unknown_paste(&view, &mut control),
+            _ => {
+                let token = control.lease.take().map(|lease| lease.token);
+                view.publish_control(&control);
+                drop(control);
+                if let Some(token) = token {
+                    view.release(token).await;
+                }
+                PasteResult::Unavailable {}
+            }
+        }
+    }
+
+    fn hold_unknown_paste(view: &Arc<View>, control: &mut Control) -> PasteResult {
+        view.hold_paste(PasteAdmission::PriorSendUnknown);
+        if let Some(lease) = control.lease.take() {
+            view.publish_control(control);
+            let view = view.clone();
+            tokio::spawn(async move { view.release(lease.token).await });
+        } else {
+            view.publish_control(control);
+        }
+        PasteResult::Unknown {}
     }
     pub fn detach(&self, view_id: &str) {
         if let Ok(view) = self.view(view_id) {
@@ -1522,6 +1923,779 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct PasteIpc {
+        bridge: Arc<DesktopBridge>,
+        frames: tokio::sync::Mutex<mpsc::UnboundedReceiver<PasteFixtureFrame>>,
+        target: remote_sessions_host::model::TerminalTarget,
+        agent: Uuid,
+    }
+
+    impl PasteIpc {
+        fn new() -> Self {
+            let (sender, frames) = mpsc::unbounded_channel();
+            let bridge = Arc::new(DesktopBridge::new(None, "/unused/tmux".into()));
+            bridge.views.lock().unwrap().paste_fixture = Some(sender);
+            Self {
+                bridge,
+                frames: tokio::sync::Mutex::new(frames),
+                agent: Uuid::new_v4(),
+                target: remote_sessions_host::model::TerminalTarget {
+                    runtime_id: Uuid::new_v4(),
+                    generation: Uuid::new_v4(),
+                    session: "$0".into(),
+                    window: "@0".into(),
+                    pane: "%0".into(),
+                    pid: 42,
+                    process_start: 120,
+                },
+            }
+        }
+
+        fn attach(&self) -> (Arc<View>, mpsc::Sender<PtyEvent>) {
+            use remote_sessions_host::model::CommittedGeometry;
+            let terminal = TerminalView {
+                target: self.target.clone(),
+                agent_epoch: self.agent,
+                view_id: Uuid::new_v4(),
+            };
+            let status = TerminalStatus {
+                terminal: terminal.clone(),
+                epoch: None,
+                provider: None,
+                observation: ObservationState::Unavailable,
+                committed: CommittedGeometry {
+                    size: TerminalSize {
+                        cols: 100,
+                        rows: 30,
+                    },
+                    revision: 0,
+                    intent: None,
+                },
+            };
+            let (sender, receiver) = mpsc::channel(1);
+            let view = Arc::new(View {
+                terminal,
+                directory: PathBuf::new(),
+                tmux: "/unused/tmux".into(),
+                client_pid: 12,
+                tty: PathBuf::new(),
+                control: Arc::new(tokio::sync::Mutex::new(Control { lease: None })),
+                resize: tokio::sync::Mutex::new(()),
+                master: Mutex::new(None),
+                output: tokio::sync::Mutex::new(Output {
+                    status,
+                    receiver,
+                    refresh_at: Instant::now() + Duration::from_secs(60),
+                    applied_revision: 0,
+                    pending: None,
+                    drain_started: None,
+                    writable: false,
+                }),
+                drain_revision: AtomicU64::new(0),
+                reader_state: Arc::new(AtomicU64::new(RESUME)),
+                views: Arc::downgrade(&self.bridge.views),
+                retirement: watch::channel(None).0,
+                reading: AtomicBool::new(false),
+                handle: tokio::runtime::Handle::current(),
+                cleanup_confirmations: AtomicU64::new(0),
+            });
+            self.bridge
+                .views
+                .lock()
+                .unwrap()
+                .live
+                .insert(view.terminal.view_id, view.clone());
+            (view, sender)
+        }
+
+        async fn receive(&self) -> (tokio::sync::oneshot::Sender<String>, Request) {
+            let mut frames = self.frames.lock().await;
+            let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let request =
+                remote_sessions_host::decode_local_fixture(frame.request.as_bytes()).unwrap();
+            (frame.reply, request)
+        }
+
+        fn reply(peer: tokio::sync::oneshot::Sender<String>, response: Response) {
+            peer.send(encode_local_observation(&response).unwrap() + "\n")
+                .unwrap();
+        }
+
+        fn refresh(view: &Arc<View>) -> tokio::task::JoinHandle<()> {
+            let view = view.clone();
+            tokio::spawn(async move { refresh_control(&view).await })
+        }
+
+        async fn grant(&self, view: &Arc<View>) -> (Uuid, ResizeEpoch, Uuid) {
+            let task = Self::refresh(view);
+            let (peer, request) = self.receive().await;
+            assert!(
+                matches!(request, Request::AcquireTerminal { terminal } if terminal == view.terminal)
+            );
+            let token = Uuid::new_v4();
+            let epoch = ResizeEpoch {
+                agent: self.agent,
+                owner: Uuid::new_v4(),
+            };
+            Self::reply(peer, Response::TerminalControl { token, epoch });
+            task.await.unwrap();
+            view.output.lock().await.status.epoch = Some(epoch);
+            let snapshot = self
+                .bridge
+                .read(&view.terminal.view_id.to_string())
+                .await
+                .unwrap();
+            assert!(snapshot.writable);
+            (token, epoch, snapshot.paste_incarnation.unwrap())
+        }
+
+        async fn lose(&self, view: &Arc<View>, token: Uuid) {
+            let task = Self::refresh(view);
+            let (peer, request) = self.receive().await;
+            assert!(matches!(request, Request::Renew { token: actual, .. } if actual == token));
+            Self::reply(
+                peer,
+                Response::Error {
+                    message: "expired".into(),
+                },
+            );
+            self.release(token).await;
+            task.await.unwrap();
+        }
+
+        async fn release(&self, token: Uuid) {
+            let (peer, request) = self.receive().await;
+            assert!(matches!(request, Request::Release { token: actual, .. } if actual == token));
+            Self::reply(peer, Response::Accepted {});
+        }
+
+        fn invoke(
+            &self,
+            view: &View,
+            incarnation: Uuid,
+            operation: u64,
+            action: PasteAction,
+        ) -> tokio::task::JoinHandle<PasteResult> {
+            let bridge = self.bridge.clone();
+            let view = view.terminal.view_id.to_string();
+            tokio::spawn(async move {
+                bridge
+                    .paste(&view, &incarnation.to_string(), operation, action)
+                    .await
+            })
+        }
+
+        async fn stage(&self, view: &View, incarnation: Uuid, operation: u64) -> PasteBinding {
+            let task = self.invoke(
+                view,
+                incarnation,
+                operation,
+                PasteAction::Stage {
+                    offset: 0,
+                    data: vec![b'x'],
+                },
+            );
+            let (peer, request) = self.receive().await;
+            let Request::PasteStage {
+                binding,
+                offset: 0,
+                data,
+            } = request
+            else {
+                panic!("expected scoped stage request");
+            };
+            assert_eq!(binding.terminal, view.terminal);
+            assert_eq!(
+                (binding.incarnation, binding.operation),
+                (incarnation, operation)
+            );
+            assert_eq!(data, b"x");
+            Self::reply(
+                peer,
+                Response::Paste {
+                    paste: PasteResult::Staged {},
+                },
+            );
+            assert_eq!(task.await.unwrap(), PasteResult::Staged {});
+            binding
+        }
+
+        async fn no_request(&self) {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(45), async {
+                    self.frames.lock().await.recv().await
+                })
+                .await
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_paste_lease_incarnation() {
+        let ipc = PasteIpc::new();
+        let (view, _output) = ipc.attach();
+        let id = view.terminal.view_id.to_string();
+        let (first, _, old) = ipc.grant(&view).await;
+        let task = PasteIpc::refresh(&view);
+        let (peer, request) = ipc.receive().await;
+        assert!(matches!(request, Request::Renew { token, .. } if token == first));
+        PasteIpc::reply(peer, Response::Accepted {});
+        task.await.unwrap();
+        assert_eq!(
+            ipc.bridge.read(&id).await.unwrap().paste_incarnation,
+            Some(old)
+        );
+
+        ipc.lose(&view, first).await;
+        let (second, _, successor) = ipc.grant(&view).await;
+        assert_ne!(old, successor);
+        for action in [
+            PasteAction::Stage {
+                offset: 0,
+                data: vec![1],
+            },
+            PasteAction::Commit { bytes: 1 },
+            PasteAction::Ack {
+                receipt: Uuid::new_v4().to_string(),
+            },
+        ] {
+            assert_eq!(
+                ipc.invoke(&view, old, 1, action).await.unwrap(),
+                PasteResult::Stale {}
+            );
+        }
+        ipc.no_request().await;
+
+        let staged = ipc.stage(&view, successor, 2).await;
+        assert_eq!(staged.token, second);
+        ipc.lose(&view, second).await;
+        let (third, epoch, current) = ipc.grant(&view).await;
+        assert_ne!(successor, current);
+        assert_eq!(
+            ipc.invoke(
+                &view,
+                successor,
+                2,
+                PasteAction::Stage {
+                    offset: 1,
+                    data: vec![2]
+                }
+            )
+            .await
+            .unwrap(),
+            PasteResult::Stale {}
+        );
+        assert_eq!(
+            ipc.invoke(&view, successor, 2, PasteAction::Commit { bytes: 1 })
+                .await
+                .unwrap(),
+            PasteResult::Stale {}
+        );
+        ipc.no_request().await;
+
+        let staged = ipc.stage(&view, current, 3).await;
+        assert_eq!((staged.token, staged.epoch), (third, epoch));
+        let task = ipc.invoke(&view, current, 3, PasteAction::Commit { bytes: 1 });
+        let (peer, request) = ipc.receive().await;
+        assert!(matches!(request, Request::PasteCommit { binding, bytes: 1 } if binding == staged));
+        let receipt = Uuid::new_v4();
+        PasteIpc::reply(
+            peer,
+            Response::Paste {
+                paste: PasteResult::Committed { receipt },
+            },
+        );
+        assert_eq!(task.await.unwrap(), PasteResult::Committed { receipt });
+        let mut control = view.control.lock().await;
+        control.lease.as_mut().unwrap().deadline = Instant::now();
+        view.publish_control(&control);
+        drop(control);
+        let completion = ipc.bridge.read(&id).await.unwrap();
+        assert!(!completion.writable && completion.paste_incarnation.is_none());
+        let completion = completion.paste_completion.unwrap();
+        assert_eq!((completion.incarnation, completion.operation), (current, 3));
+        assert!(ipc.bridge.input(&id, vec![b'x'], false).await.is_err());
+        for (incarnation, operation, key) in [
+            (old, 3, receipt),
+            (current, 2, receipt),
+            (current, 3, Uuid::new_v4()),
+        ] {
+            assert_eq!(
+                ipc.invoke(
+                    &view,
+                    incarnation,
+                    operation,
+                    PasteAction::Ack {
+                        receipt: key.to_string()
+                    }
+                )
+                .await
+                .unwrap(),
+                PasteResult::Stale {}
+            );
+        }
+        ipc.no_request().await;
+        let task = ipc.invoke(
+            &view,
+            current,
+            3,
+            PasteAction::Ack {
+                receipt: receipt.to_string(),
+            },
+        );
+        let (peer, request) = ipc.receive().await;
+        assert!(
+            matches!(request, Request::PasteAck { binding, receipt: key } if binding == staged && key == receipt)
+        );
+        PasteIpc::reply(
+            peer,
+            Response::Paste {
+                paste: PasteResult::Acknowledged { writable: false },
+            },
+        );
+        assert_eq!(
+            task.await.unwrap(),
+            PasteResult::Acknowledged { writable: false }
+        );
+        assert!(view.control.lock().await.lease.is_none());
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_resize_reply_advances_sequence_while_paste_receipt_is_pending() {
+        use remote_sessions_host::model::{CommittedGeometry, ResizeIntent};
+
+        let ipc = PasteIpc::new();
+        let (view, output) = ipc.attach();
+        let id = view.terminal.view_id.to_string();
+        let (token, epoch, incarnation) = ipc.grant(&view).await;
+        let first_size = TerminalSize {
+            cols: 111,
+            rows: 34,
+        };
+        let bridge = ipc.bridge.clone();
+        let resize_view = id.clone();
+        let first_resize =
+            tokio::spawn(async move { bridge.resize(&resize_view, first_size, epoch).await });
+        let (resize_reply, request) = ipc.receive().await;
+        let Request::ResizeTerminal {
+            terminal,
+            token: actual_token,
+            sequence,
+            size,
+        } = request
+        else {
+            panic!("expected the first resize request");
+        };
+        assert_eq!(terminal, view.terminal);
+        assert_eq!((actual_token, sequence, size), (token, 0, first_size));
+
+        let staged = ipc.stage(&view, incarnation, 1).await;
+        let commit = ipc.invoke(&view, incarnation, 1, PasteAction::Commit { bytes: 1 });
+        let (commit_reply, request) = ipc.receive().await;
+        assert!(matches!(request, Request::PasteCommit { binding, bytes: 1 } if binding == staged));
+        output
+            .send(PtyEvent::Bytes(Arc::new(Mutex::new(
+                b"pending commit".to_vec(),
+            ))))
+            .await
+            .unwrap();
+        let pending = ipc.bridge.read(&id).await.unwrap();
+        assert!(pending.writable);
+        assert_eq!(pending.paste_incarnation, Some(incarnation));
+        assert!(pending.paste_completion.is_none());
+        let receipt = Uuid::new_v4();
+        PasteIpc::reply(
+            commit_reply,
+            Response::Paste {
+                paste: PasteResult::Committed { receipt },
+            },
+        );
+        assert_eq!(commit.await.unwrap(), PasteResult::Committed { receipt });
+        output
+            .send(PtyEvent::Bytes(Arc::new(Mutex::new(b"committed".to_vec()))))
+            .await
+            .unwrap();
+        let committed = ipc.bridge.read(&id).await.unwrap();
+        assert!(!committed.writable);
+        assert!(committed.paste_incarnation.is_none());
+        let completion = committed.paste_completion.unwrap();
+        assert_eq!(
+            (completion.incarnation, completion.operation),
+            (incarnation, 1)
+        );
+
+        let first_intent = ResizeIntent {
+            id: Uuid::new_v4(),
+            epoch,
+        };
+        let first_status = {
+            let mut status = view.output.lock().await.status.clone();
+            status.committed = CommittedGeometry {
+                size: first_size,
+                revision: 1,
+                intent: Some(first_intent),
+            };
+            status
+        };
+        PasteIpc::reply(
+            resize_reply,
+            Response::Resize {
+                resize: ResizeResult::Committed {
+                    admission: first_intent,
+                    status: first_status,
+                },
+            },
+        );
+        assert!(matches!(
+            first_resize.await.unwrap().unwrap(),
+            ResizeResult::Committed { admission, .. } if admission == first_intent
+        ));
+        {
+            let control = view.control.lock().await;
+            let lease = control.lease.as_ref().unwrap();
+            assert_eq!(lease.resize_sequence, 1);
+            assert_eq!(lease.pending_paste.as_ref().unwrap().receipt, Some(receipt));
+        }
+
+        let acknowledge = ipc.invoke(
+            &view,
+            incarnation,
+            1,
+            PasteAction::Ack {
+                receipt: receipt.to_string(),
+            },
+        );
+        let (ack_reply, request) = ipc.receive().await;
+        assert!(
+            matches!(request, Request::PasteAck { binding, receipt: actual } if binding == staged && actual == receipt)
+        );
+        PasteIpc::reply(
+            ack_reply,
+            Response::Paste {
+                paste: PasteResult::Acknowledged { writable: true },
+            },
+        );
+        assert_eq!(
+            acknowledge.await.unwrap(),
+            PasteResult::Acknowledged { writable: true }
+        );
+
+        let second_size = TerminalSize {
+            cols: 119,
+            rows: 38,
+        };
+        let bridge = ipc.bridge.clone();
+        let resize_view = id;
+        let second_resize =
+            tokio::spawn(async move { bridge.resize(&resize_view, second_size, epoch).await });
+        let (second_reply, request) = ipc.receive().await;
+        let Request::ResizeTerminal { sequence, size, .. } = request else {
+            panic!("expected the follow-up resize request");
+        };
+        assert_eq!((sequence, size), (1, second_size));
+        let second_intent = ResizeIntent {
+            id: Uuid::new_v4(),
+            epoch,
+        };
+        let second_status = {
+            let mut status = view.output.lock().await.status.clone();
+            status.committed = CommittedGeometry {
+                size: second_size,
+                revision: 2,
+                intent: Some(second_intent),
+            };
+            status
+        };
+        PasteIpc::reply(
+            second_reply,
+            Response::Resize {
+                resize: ResizeResult::Committed {
+                    admission: second_intent,
+                    status: second_status,
+                },
+            },
+        );
+        assert!(matches!(
+            second_resize.await.unwrap().unwrap(),
+            ResizeResult::Committed { admission, .. } if admission == second_intent
+        ));
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_resize_uncertainty_preserves_pending_paste_receipt() {
+        let ipc = PasteIpc::new();
+        let (view, _output) = ipc.attach();
+        let id = view.terminal.view_id.to_string();
+        let (token, epoch, incarnation) = ipc.grant(&view).await;
+        let bridge = ipc.bridge.clone();
+        let resize_view = id.clone();
+        let size = TerminalSize {
+            cols: 113,
+            rows: 35,
+        };
+        let resize = tokio::spawn(async move { bridge.resize(&resize_view, size, epoch).await });
+        let (resize_reply, request) = ipc.receive().await;
+        assert!(
+            matches!(request, Request::ResizeTerminal { token: actual, sequence: 0, .. } if actual == token)
+        );
+
+        let staged = ipc.stage(&view, incarnation, 1).await;
+        let commit = ipc.invoke(&view, incarnation, 1, PasteAction::Commit { bytes: 1 });
+        let (commit_reply, request) = ipc.receive().await;
+        assert!(matches!(request, Request::PasteCommit { binding, bytes: 1 } if binding == staged));
+        let receipt = Uuid::new_v4();
+        PasteIpc::reply(
+            commit_reply,
+            Response::Paste {
+                paste: PasteResult::Committed { receipt },
+            },
+        );
+        assert_eq!(commit.await.unwrap(), PasteResult::Committed { receipt });
+
+        let intent = remote_sessions_host::model::ResizeIntent {
+            id: Uuid::new_v4(),
+            epoch,
+        };
+        PasteIpc::reply(
+            resize_reply,
+            Response::Resize {
+                resize: ResizeResult::Uncertain {
+                    terminal: view.terminal.clone(),
+                    intent,
+                },
+            },
+        );
+        assert!(matches!(
+            resize.await.unwrap().unwrap(),
+            ResizeResult::Uncertain { terminal, intent: actual }
+                if terminal == view.terminal && actual == intent
+        ));
+        {
+            let control = view.control.lock().await;
+            let lease = control.lease.as_ref().unwrap();
+            assert!(lease.deadline <= Instant::now());
+            assert_eq!(lease.pending_paste.as_ref().unwrap().receipt, Some(receipt));
+        }
+        let completion = tokio::time::timeout(Duration::from_secs(1), ipc.bridge.read(&id))
+            .await
+            .unwrap()
+            .unwrap();
+        let completion = completion.paste_completion.unwrap();
+        assert_eq!(
+            (completion.incarnation, completion.operation),
+            (incarnation, 1)
+        );
+
+        let acknowledge = ipc.invoke(
+            &view,
+            incarnation,
+            1,
+            PasteAction::Ack {
+                receipt: receipt.to_string(),
+            },
+        );
+        let (ack_reply, request) = ipc.receive().await;
+        assert!(
+            matches!(request, Request::PasteAck { binding, receipt: actual } if binding == staged && actual == receipt)
+        );
+        PasteIpc::reply(
+            ack_reply,
+            Response::Paste {
+                paste: PasteResult::Acknowledged { writable: false },
+            },
+        );
+        assert_eq!(
+            acknowledge.await.unwrap(),
+            PasteResult::Acknowledged { writable: false }
+        );
+        assert!(view.control.lock().await.lease.is_none());
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_output_progresses_while_control_ipc_is_pending() {
+        let ipc = PasteIpc::new();
+        let (view, output) = ipc.attach();
+        let id = view.terminal.view_id.to_string();
+        let (_, _, incarnation) = ipc.grant(&view).await;
+        let stage = ipc.invoke(
+            &view,
+            incarnation,
+            1,
+            PasteAction::Stage {
+                offset: 0,
+                data: vec![b'x'],
+            },
+        );
+        let (stage_reply, request) = ipc.receive().await;
+        assert!(matches!(request, Request::PasteStage { .. }));
+        output
+            .send(PtyEvent::Bytes(Arc::new(Mutex::new(
+                b"live output".to_vec(),
+            ))))
+            .await
+            .unwrap();
+
+        let chunk = tokio::time::timeout(Duration::from_millis(100), ipc.bridge.read(&id))
+            .await
+            .expect("terminal read must not wait on control IPC")
+            .unwrap();
+        assert_eq!(chunk.data, b"live output");
+        assert!(chunk.writable);
+        assert_eq!(chunk.paste_incarnation, Some(incarnation));
+        assert!(chunk.paste_completion.is_none());
+
+        PasteIpc::reply(
+            stage_reply,
+            Response::Paste {
+                paste: PasteResult::Staged {},
+            },
+        );
+        assert_eq!(stage.await.unwrap(), PasteResult::Staged {});
+        let ready = tokio::time::timeout(Duration::from_secs(1), ipc.bridge.read(&id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready.paste_incarnation, Some(incarnation));
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_paste_hold_suppresses_published_lease_authority() {
+        let ipc = PasteIpc::new();
+        let (view, output) = ipc.attach();
+        let id = view.terminal.view_id.to_string();
+        let (_, _, incarnation) = ipc.grant(&view).await;
+        view.hold_paste(PasteAdmission::PriorSendUnknown);
+        output
+            .send(PtyEvent::Bytes(Arc::new(Mutex::new(b"held".to_vec()))))
+            .await
+            .unwrap();
+
+        let chunk = ipc.bridge.read(&id).await.unwrap();
+        assert!(!chunk.writable);
+        assert!(chunk.paste_incarnation.is_none());
+        assert!(chunk.paste_completion.is_none());
+        assert_eq!(
+            chunk.paste_admission,
+            Some(PasteAdmission::PriorSendUnknown)
+        );
+        assert_eq!(
+            view.control
+                .lock()
+                .await
+                .lease
+                .as_ref()
+                .unwrap()
+                .incarnation,
+            incarnation
+        );
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_paste_lost_reply() {
+        for witnessed in [false, true] {
+            let ipc = PasteIpc::new();
+            let (view, _output) = ipc.attach();
+            let id = view.terminal.view_id.to_string();
+            let (token, _, incarnation) = ipc.grant(&view).await;
+            assert_eq!(
+                ipc.bridge
+                    .input(&id, vec![1], true)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "PasteUnavailable"
+            );
+            let staged = ipc.stage(&view, incarnation, 1).await;
+            assert_eq!(staged.sequence, 0);
+            let task = ipc.invoke(&view, incarnation, 1, PasteAction::Commit { bytes: 1 });
+            let (peer, request) = ipc.receive().await;
+            assert!(
+                matches!(request, Request::PasteCommit { binding, bytes: 1 } if binding == staged)
+            );
+            let outcome = if witnessed {
+                PasteResult::Committed {
+                    receipt: Uuid::new_v4(),
+                }
+            } else {
+                PasteResult::Unknown {}
+            };
+            drop(peer);
+            assert_eq!(task.await.unwrap(), PasteResult::Unknown {});
+            ipc.release(token).await;
+            let chunk = ipc.bridge.read(&id).await.unwrap();
+            assert_eq!(
+                chunk.paste_admission,
+                Some(PasteAdmission::PriorSendUnknown)
+            );
+            assert!(
+                !chunk.writable
+                    && chunk.paste_incarnation.is_none()
+                    && chunk.paste_completion.is_none()
+            );
+            assert!(ipc.bridge.input(&id, vec![1], false).await.is_err());
+            assert_eq!(
+                ipc.invoke(&view, incarnation, 1, PasteAction::Commit { bytes: 1 })
+                    .await
+                    .unwrap(),
+                PasteResult::Stale {}
+            );
+            let lost_receipt = match outcome {
+                PasteResult::Committed { receipt } => receipt,
+                _ => Uuid::new_v4(),
+            };
+            assert_eq!(
+                ipc.invoke(
+                    &view,
+                    incarnation,
+                    1,
+                    PasteAction::Ack {
+                        receipt: lost_receipt.to_string()
+                    }
+                )
+                .await
+                .unwrap(),
+                PasteResult::Stale {}
+            );
+            ipc.no_request().await;
+
+            ipc.bridge.detach(&id);
+            let (fresh, _fresh_output) = ipc.attach();
+            let refresh = PasteIpc::refresh(&fresh);
+            let (peer, request) = ipc.receive().await;
+            assert!(
+                matches!(request, Request::AcquireTerminal { terminal } if terminal == fresh.terminal)
+            );
+            PasteIpc::reply(
+                peer,
+                Response::ControlRecovering {
+                    paste_admission: PasteAdmission::PriorSendUnknown,
+                },
+            );
+            refresh.await.unwrap();
+            let fresh_id = fresh.terminal.view_id.to_string();
+            assert!(!ipc.bridge.read(&fresh_id).await.unwrap().writable);
+            assert_eq!(
+                ipc.invoke(
+                    &fresh,
+                    incarnation,
+                    1,
+                    PasteAction::Stage {
+                        offset: 1,
+                        data: vec![3]
+                    }
+                )
+                .await
+                .unwrap(),
+                PasteResult::Stale {}
+            );
+            ipc.no_request().await;
         }
     }
 

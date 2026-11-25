@@ -17,16 +17,22 @@ const DESIRED: TerminalSize = TerminalSize {
     cols: 117,
     rows: 39,
 };
+const SEND_WATCHDOG: Duration = Duration::from_secs(4);
 
-struct Fixture {
-    engine: Engine,
-    terminal: TerminalView,
-    temp: tempfile::TempDir,
-    _master: OwnedFd,
-    _slave: OwnedFd,
+pub(super) struct Fixture {
+    pub(super) engine: Arc<Engine>,
+    pub(super) terminal: TerminalView,
+    pub(super) temp: tempfile::TempDir,
+    pty: Option<TestPty>,
 }
 
-fn test_pty() -> (OwnedFd, OwnedFd, PathBuf) {
+struct TestPty {
+    master: OwnedFd,
+    _slave: OwnedFd,
+    path: PathBuf,
+}
+
+fn test_pty() -> TestPty {
     let mut master = -1;
     let mut slave = -1;
     let mut size = libc::winsize {
@@ -53,12 +59,48 @@ fn test_pty() -> (OwnedFd, OwnedFd, PathBuf) {
         .to_str()
         .unwrap()
         .into();
-    (master, slave, tty)
+    TestPty {
+        master,
+        _slave: slave,
+        path: tty,
+    }
 }
 
 impl Fixture {
     fn new() -> Self {
-        let (master, slave, tty) = test_pty();
+        Self::build(SEND_WATCHDOG, Some(test_pty()))
+    }
+
+    pub(super) fn paste() -> Self {
+        Self::with_paste_watchdog(SEND_WATCHDOG)
+    }
+
+    fn engine(
+        tmux: PathBuf,
+        socket: PathBuf,
+        watchdog: Duration,
+        provider_sample: Option<ProviderSample>,
+    ) -> Engine {
+        let mut engine = Engine::new(tmux, socket);
+        engine.paste_test.sender_fixture = true;
+        engine.paste_test.provider_sample = provider_sample;
+        engine.paste_test.send_watchdog = Some(watchdog);
+        engine
+    }
+
+    pub(super) fn with_paste_watchdog(watchdog: Duration) -> Self {
+        Self::build(watchdog, None)
+    }
+
+    fn build(watchdog: Duration, pty: Option<TestPty>) -> Self {
+        let tty = match &pty {
+            Some(pty) => pty.path.clone(),
+            None => PathBuf::from("/dev/ttysfixture"),
+        };
+        let provider_sample = pty.is_none().then_some(ProviderSample {
+            size: ORIGINAL,
+            sampled_at_us: 1,
+        });
         let temp = tempfile::tempdir_in("/tmp").unwrap();
         let root = temp.path();
         let runtime_id = Uuid::new_v4();
@@ -68,7 +110,12 @@ impl Fixture {
         let pid = std::process::id();
         let tmux = root.join("tmux-fixture");
         let socket = root.join("tmux.sock");
-        let engine = Engine::new(tmux.clone(), socket);
+        let engine = Arc::new(Self::engine(
+            tmux.clone(),
+            socket,
+            watchdog,
+            provider_sample,
+        ));
         let terminal = TerminalView {
             target: TerminalTarget {
                 runtime_id,
@@ -86,64 +133,231 @@ impl Fixture {
         fs::write(root.join("epoch"), "").unwrap();
         fs::write(root.join("intent"), "").unwrap();
         fs::write(root.join("mode"), "").unwrap();
-        let script = r#"#!/bin/sh
-set -eu
-root=$(dirname "$0")
-read -r cols rows < "$root/grid" || true
-epoch=$(cat "$root/epoch")
-intent=$(cat "$root/intent")
-mode=$(cat "$root/mode")
-case "$4" in
-  display-message)
-    printf '%s|%s|%s|%s|%s|%s|%s\n' 'PREFIX' "$cols" "$rows" "$cols" "$rows" "$epoch" "$intent"
-    ;;
-  if-shell)
-    printf '%s\n%s\n' "$8" "$9" > "$root/last-write"
-    case "$9" in
-      resize-window*)
-        case "$mode" in
-          stale) exit 0 ;;
-          lost-before) exit 1 ;;
-        esac
-        set -- $9
-        printf '%s %s\n' "$5" "$7" > "$root/grid"
-        printf '%s' "${14}" > "$root/intent"
-        test "$mode" != lost-after || exit 1
-        printf '%s\n' rs-committed
-        ;;
-      set-option*)
-        set -- $9
-        for word; do
-          if [ "${previous:-}" = '@rs_resize_epoch' ]; then
-            printf '%s' "$word" > "$root/epoch"
-            break
-          fi
-          previous=$word
-        done
-        printf '%s\n' rs-fenced
-        ;;
-      *) exit 91 ;;
-    esac
-    ;;
-  *) exit 92 ;;
-esac
-"#;
+        let launch = Uuid::new_v4().to_string();
+        let server = ServerGeneration {
+            pid: 987,
+            start: 123456,
+            token: generation,
+        };
+        let initial = GeometryReadback {
+            target: terminal.target.clone(),
+            server,
+            name: name.clone(),
+            nonce: String::new(),
+            tty: tty.clone(),
+            epoch: None,
+            committed: CommittedGeometry {
+                size: ORIGINAL,
+                revision: 0,
+                intent: None,
+            },
+            paste_launch: launch,
+            paste_marker: String::new(),
+            sender_supported: true,
+            input_enabled: true,
+        };
+        fs::write(root.join("launch"), &initial.paste_launch).unwrap();
+        fs::write(root.join("marker"), initial.ready_marker(None)).unwrap();
+        let script = r##"#!/usr/bin/env python3
+from pathlib import Path
+import json
+import re
+import subprocess
+import sys
+import time
+
+root = Path(__file__).parent
+def read(name):
+    return (root / name).read_text() if (root / name).exists() else ""
+def write(name, value):
+    (root / name).write_text(value)
+def append(name, data):
+    with (root / name).open("ab") as out:
+        out.write(data)
+def until(name):
+    end = time.monotonic() + 15
+    while root.is_dir() and not (root / name).exists() and time.monotonic() < end:
+        time.sleep(.005)
+    return (root / name).exists()
+def check(guard, pane, write_input=False):
+    match = (
+        pane == "%0" and not read("scope") and
+        ("#{==:#{@rs_resize_epoch}," + read("epoch") + "}") in guard and
+        ("#{==:#{@rs_paste_admission}," + read("marker") + "}") in guard and
+        ("#{==:#{@rs_paste_launch}," + read("launch") + "}") in guard and
+        "#{==:#{pane_id},%0}" in guard and
+        "#{==:#{pane_pid},PANE_PID}" in guard and
+        "#{==:#{@rs_create_generation},GENERATION}" in guard and not read("unsupported")
+    )
+    return match and (not write_input or (
+        "#{==:#{pane_input_off},0}" in guard and not read("input-off")
+    ))
+def rejection(branch):
+    return re.search(r"rs-(?:paste-)?rejected-[0-9a-f-]+", branch).group()
+def send(args):
+    _, _, _, pane, guard, branch, reject = args
+    nodes = [node.split() for node in branch.split(" ; ")]
+    marker, paste, reply = nodes
+    if not check(guard, pane, True) or read("paste-mode") == "reject":
+        return rejection(reject)
+    assert marker[:5] == ["set-option", "-p", "-t", pane, "@rs_paste_admission"]
+    assert paste[:7] == ["paste-buffer", "-p", "-r", "-S", "-d", "-b", paste[6]]
+    assert paste[7:] == ["-t", pane] and "~a~" in read("marker")
+    assert marker[5] == read("marker").replace("~a~", "~s~", 1)
+    assert reply[:5] == ["display-message", "-p", "-l", "-t", pane]
+    write("marker", marker[5])
+    data = (root / paste[6]).read_bytes()
+    if read("bracketed"):
+        data = b"\x1b[200~" + data + b"\x1b[201~"
+    append("pane0-bytes", data)
+    (root / paste[6]).unlink()
+    append("effects", b"1")
+    return reply[-1]
+
+if sys.argv[1] == "--server-send":
+    args = json.loads(sys.argv[2])
+    write("server-parked", "1")
+    if until("allow-effect"):
+        write("late-result.tmp", send(args))
+        (root / "late-result.tmp").replace(root / "late-result")
+    sys.exit()
+
+args = sys.argv[4:]
+command = args[0]
+cols, rows = read("grid").split()
+epoch, intent, mode = read("epoch"), read("intent"), read("mode")
+if command == "list-sessions":
+    print("RUNTIME_NAME")
+elif command == "list-panes":
+    print("RUNTIME_NAME", "%0", "PANE_PID", 0, cols, rows, "fixture", sep="\t")
+elif command == "list-commands":
+    print("load-buffer (loadb) [-w] [-b buffer-name] path")
+    flags = "dpr" if read("probe-mode") == "missing-flag" else "dprS"
+    print(f"paste-buffer (pasteb) [-{flags}] [-b buffer-name] [-t target-pane]")
+elif command == "display-message":
+    if args[-1] == "#{pid}|#{start_time}|#{@rs_create_generation}":
+        print("987|123456|GENERATION")
+    else:
+        prefix = 'PREFIX'.replace('|%0|', '|%1|') if read("scope") else 'PREFIX'
+        print(prefix, cols, rows, cols, rows, epoch, intent, read("launch"),
+              read("marker"), int(bool(read("input-off"))), int(not read("unsupported")), sep="|")
+elif command == "load-buffer":
+    assert args[1] == "-b" and args[2].startswith("rs-paste-") and args[3:] == ["-"]
+    identifier = args[2].removeprefix("rs-paste-").removeprefix("probe-")
+    assert re.fullmatch("[0-9a-f]{32}", identifier)
+    (root / args[2]).write_bytes(sys.stdin.buffer.read())
+    write("last-load", args[2])
+elif command == "save-buffer":
+    assert args[1] == "-b" and args[2].startswith("rs-paste-probe-") and args[3:] == ["-"]
+    data = (root / args[2]).read_bytes()
+    sys.stdout.buffer.write(data[:-1] if read("probe-mode") == "truncated" else data)
+elif command == "delete-buffer":
+    assert args[1] == "-b"
+    (root / args[2]).unlink(missing_ok=True)
+elif command == "if-shell":
+    _, flags, target, pane, guard, branch, *otherwise = args
+    assert (flags, target) == ("-F", "-t")
+    write("last-write", guard + "\n" + branch + "\n")
+    if branch.startswith("resize-window"):
+        if mode == "stale":
+            sys.exit()
+        if mode == "lost-before":
+            sys.exit(1)
+        resize, marker, reply = [node.split() for node in branch.split(" ; ")]
+        write("grid", resize[4] + " " + resize[6])
+        write("intent", marker[5])
+        if mode == "lost-after":
+            sys.exit(1)
+        print(reply[-1])
+    elif " ; paste-buffer " in branch:
+        append("submissions", b"1")
+        write("last-effect-command", json.dumps(args))
+        paste_mode = read("paste-mode")
+        if paste_mode in ("late", "timeout-before"):
+            subprocess.Popen([sys.executable, __file__, "--server-send", json.dumps(args)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+            if until("late-result"):
+                print(read("late-result"))
+        else:
+            reply = send(args)
+            if paste_mode in ("hold-reply", "timeout-after"):
+                if not until("allow-reply"):
+                    sys.exit(1)
+            print(reply)
+    elif branch.startswith("send-keys"):
+        if check(guard, pane, True):
+            send_keys, reply = [node.split() for node in branch.split(" ; ")]
+            assert send_keys[:4] == ["send-keys", "-H", "-t", pane]
+            assert reply == ["display-message", "-p", "-l", "-t", pane, "rs-input-accepted"]
+            append("pane0-bytes", bytes.fromhex(" ".join(send_keys[4:])))
+            print(reply[-1])
+    elif branch.startswith("set-option"):
+        if not check(guard, pane):
+            if otherwise:
+                print(rejection(otherwise[0]))
+            sys.exit()
+        for node in branch.split(" ; "):
+            words = node.split()
+            if words[0] == "display-message":
+                assert words[:5] == ["display-message", "-p", "-l", "-t", pane]
+                print(words[-1])
+            elif words[-2] == "@rs_resize_epoch":
+                write("epoch", words[-1])
+            elif words[-2] == "@rs_paste_launch":
+                write("launch", words[-1])
+            elif words[-2] == "@rs_paste_admission":
+                ack_reply = read("ack-reply") if "~s~" in read("marker") and "~r~" in words[-1] else ""
+                if ack_reply == "before":
+                    sys.exit(1)
+                write("marker", words[-1])
+                if ack_reply == "after":
+                    sys.exit(1)
+            else:
+                sys.exit(91)
+    else:
+        sys.exit(91)
+else:
+    sys.exit(92)
+"##;
         let prefix = format!(
             "987|123456|{generation}|$0|@0|%0|{pid}|{name}|0|0||0|1|1|manual|{}",
             tty.display()
         );
-        fs::write(&tmux, script.replace("PREFIX", &prefix)).unwrap();
+        fs::write(
+            &tmux,
+            script
+                .replace("PREFIX", &prefix)
+                .replace("RUNTIME_NAME", &name)
+                .replace("PANE_PID", &pid.to_string())
+                .replace("GENERATION", &generation.to_string()),
+        )
+        .unwrap();
         fs::set_permissions(tmux, fs::Permissions::from_mode(0o700)).unwrap();
         Self {
             engine,
             terminal,
             temp,
-            _master: master,
-            _slave: slave,
+            pty,
         }
     }
 
-    async fn acquire(&self, terminal: TerminalView) -> (Uuid, ResizeEpoch) {
+    pub(super) fn restart(&self) -> (Engine, TerminalView) {
+        let engine = Self::engine(
+            self.engine.tmux.clone(),
+            self.engine.socket.clone(),
+            self.engine.paste_test.send_watchdog.unwrap(),
+            self.engine.paste_test.provider_sample,
+        );
+        let terminal = TerminalView {
+            agent_epoch: engine.agent_epoch,
+            view_id: Uuid::new_v4(),
+            ..self.terminal.clone()
+        };
+        (engine, terminal)
+    }
+
+    pub(super) async fn acquire(&self, terminal: TerminalView) -> (Uuid, ResizeEpoch) {
         match self
             .engine
             .handle(Request::AcquireTerminal { terminal }, None)
@@ -329,11 +543,7 @@ async fn w1_resize_lost_replies_revoke_and_restart_recovers_from_sampled_predece
         let status = f.status(&f.engine, f.terminal.clone()).await;
         assert_eq!(status.committed.revision, revision);
 
-        let restarted = Engine::new(f.engine.tmux.clone(), f.engine.socket.clone());
-        let terminal = TerminalView {
-            agent_epoch: restarted.agent_epoch,
-            ..f.terminal.clone()
-        };
+        let (restarted, terminal) = f.restart();
         assert!(matches!(
             restarted
                 .handle(
@@ -426,8 +636,9 @@ async fn w1_resize_reconciliation_waits_for_a_fresh_identity_bracketed_sample() 
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
+        let pty = f.pty.as_ref().expect("Resize fixture requires a real PTY");
         let applied =
-            unsafe { libc::ioctl(f._master.as_raw_fd(), libc::TIOCSWINSZ, &raw const winsize) };
+            unsafe { libc::ioctl(pty.master.as_raw_fd(), libc::TIOCSWINSZ, &raw const winsize) };
         assert_eq!(applied, 0);
     };
     set_grid(TerminalSize { cols: 0, rows: 0 });

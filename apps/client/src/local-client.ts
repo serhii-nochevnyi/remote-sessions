@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { openView } from "./session-state.ts";
 import type { SessionViews } from "./session-state.ts";
+import { TERMINAL_INPUT_BUDGET, terminalInputChunks } from "./terminal-protocol.ts";
 
 export interface RuntimeInfo {
   readonly runtime_id: string;
@@ -68,7 +69,28 @@ export interface Chunk {
   readonly status?: TerminalStatus | null;
   readonly geometry?: GeometryEvent | null;
   readonly closure?: TerminalClosure;
+  readonly paste_incarnation?: string;
+  readonly paste_completion?: PasteCompletion;
+  readonly paste_admission?: PasteAdmission;
 }
+type PasteAdmission = "prior_send_unknown" | "unavailable";
+interface PasteCompletion { readonly incarnation: string; readonly operation: number }
+interface PasteGesture extends PasteCompletion { readonly viewId: string }
+function samePaste(left: PasteCompletion | undefined, right: PasteCompletion | undefined) {
+  return left !== undefined && right !== undefined
+    && left.incarnation === right.incarnation && left.operation === right.operation;
+}
+type PasteResult = { readonly result: "staged" | "stale" | "invalid" | "unavailable" | "unknown" }
+  | { readonly result: "committed"; readonly receipt: string }
+  | { readonly result: "acknowledged"; readonly writable: boolean };
+type PasteIssue = "invalid" | "unavailable" | "stale" | "unknown" | "oversize";
+export const pasteIssueText: Record<PasteIssue, string> = {
+  invalid: "Вставлення заблоковано до надсилання. Текст містить неприпустимі символи.",
+  unavailable: "Вставлення з буфера обміну заблоковано до надсилання й недоступне на цьому бекенді.",
+  stale: "Вставлення скасовано до надсилання через зміну керування.",
+  unknown: "Доставку вставлення не підтверджено. Перевірте чернетку в цій сесії. Для продовження створіть окрему сесію й введіть текст вручну.",
+  oversize: "Вставлення заблоковано до надсилання. Завеликий обсяг тексту в черзі вводу.",
+};
 export type GeometryBoundaryFailure = "geometry_revision_not_new" | "geometry_status_rejected" | "geometry_output_incomplete";
 export type TerminalStreamFailure = "attachment_setup" | "read_response" | "grid_ack_response"
   | "geometry_routing" | "stream_closed" | "terminal_status_changed" | GeometryBoundaryFailure
@@ -191,14 +213,56 @@ export function parseChunk(value: unknown): Chunk {
     return { ...chunk, status: null, geometry: null, closure };
   }
   if (!("status" in item) && !("geometry" in item)) return chunk;
-  expectKeys(item, "writable", "closed", "data", "status", "geometry");
+  const optional = ["paste_incarnation", "paste_completion", "paste_admission"].filter(key => key in item);
+  expectKeys(item, "writable", "closed", "data", "status", "geometry", ...optional);
   const status = item.status === null ? null : parseTerminalStatus(item.status);
   const geometry = item.geometry === null ? null : parseGeometryEvent(item.geometry);
   if (geometry && (chunk.closed || chunk.data.length || status)) throw Error("Некоректна межа зміни розміру");
-  return { ...chunk, status, geometry };
+  const incarnation = "paste_incarnation" in item ? scopeId(item.paste_incarnation) : undefined;
+  const completion = "paste_completion" in item ? parsePasteCompletion(item.paste_completion) : undefined;
+  const admission = item.paste_admission;
+  if ((admission !== undefined && admission !== "prior_send_unknown" && admission !== "unavailable")
+    || (incarnation && !chunk.writable) || ((completion || admission) && chunk.writable)
+    || (chunk.closed && optional.length) || (completion && admission)) throw Error("Некоректний стан вставлення");
+  return { ...chunk, status, geometry,
+    ...(incarnation ? { paste_incarnation: incarnation } : {}),
+    ...(completion ? { paste_completion: completion } : {}),
+    ...(admission ? { paste_admission: admission } : {}),
+  };
+}
+
+function parsePasteCompletion(value: unknown): PasteCompletion {
+  const item = record(value);
+  expectKeys(item, "incarnation", "operation");
+  return { incarnation: scopeId(item.incarnation), operation: integer(item.operation, 1, Number.MAX_SAFE_INTEGER) };
+}
+
+function parsePasteResult(value: unknown): PasteResult {
+  const item = record(value);
+  switch (item.result) {
+    case "staged": case "stale": case "invalid": case "unavailable": case "unknown":
+      expectKeys(item, "result");
+      return { result: item.result };
+    case "committed":
+      expectKeys(item, "result", "receipt");
+      return { result: "committed", receipt: scopeId(item.receipt) };
+    case "acknowledged":
+      expectKeys(item, "result", "writable");
+      if (typeof item.writable !== "boolean") break;
+      return { result: "acknowledged", writable: item.writable };
+  }
+  throw Error("Некоректна відповідь вставлення");
+}
+
+interface TerminalPasteCallbacks {
+  stage(gesture: PasteGesture, offset: number, data: number[]): Promise<PasteResult>;
+  commit(gesture: PasteGesture, bytes: number): Promise<PasteResult>;
+  ack(gesture: PasteGesture, receipt: string): Promise<PasteResult>;
+  changed(): void;
 }
 interface TerminalViewCallbacks {
-  input(view: string, data: number[], paste: boolean): Promise<void>;
+  input(view: string, data: number[]): Promise<void>;
+  paste?: TerminalPasteCallbacks;
   inputFailure(error?: unknown): void;
   retire(view: string | null): void;
   reconnect(error: unknown): void;
@@ -209,6 +273,16 @@ export class TerminalViewScope {
   private retired = false;
   private writable = false;
   private inputFailed = false;
+  private incarnation: string | undefined;
+  private completion: PasteCompletion | undefined;
+  private admission: PasteAdmission | undefined;
+  private pasteIssue: PasteIssue | undefined;
+  private pendingPaste: PasteGesture | undefined;
+  private acknowledgedPaste: PasteGesture | undefined;
+  private endedPasteIncarnation: string | undefined;
+  private snapshot = 0;
+  private writeGeneration = 0;
+  private operation = 0;
   private pendingBytes = 0;
   private inputChain = Promise.resolve();
   private readonly pendingInput = new Set<{ bytes: Uint8Array | null }>();
@@ -219,8 +293,12 @@ export class TerminalViewScope {
 
   get viewId() { return this.attached; }
   get active() { return !this.retired; }
-  get canWrite() { return this.active && this.writable && !this.inputFailed; }
-  get failedInput() { return this.inputFailed; }
+  get canWrite() { return this.active && this.writable && !this.inputFailed && this.pasteIssue !== "unknown"; }
+  get pasteMessage() {
+    return this.admission === "prior_send_unknown" ? pasteIssueText.unknown
+      : this.pasteIssue ? pasteIssueText[this.pasteIssue]
+      : this.admission === "unavailable" ? pasteIssueText.unavailable : undefined;
+  }
 
   bind(view: string): boolean {
     if (this.retired || this.attached !== null) return false;
@@ -251,9 +329,32 @@ export class TerminalViewScope {
 
   async consume(view: string, chunk: Chunk, render: () => Promise<void>): Promise<boolean> {
     if (!this.owns(view)) return false;
+    if (samePaste(chunk.paste_completion, this.acknowledgedPaste)) {
+      await render();
+      return this.owns(view);
+    }
+    const snapshot = ++this.snapshot;
+    const writable = chunk.writable
+      && (chunk.paste_incarnation === undefined || chunk.paste_incarnation !== this.endedPasteIncarnation);
+    const incarnation = writable ? chunk.paste_incarnation : undefined;
+    if (this.pendingPaste && (
+      (incarnation && incarnation !== this.pendingPaste.incarnation)
+      || (chunk.paste_completion && !samePaste(chunk.paste_completion, this.pendingPaste))
+    )) {
+      this.pendingPaste = undefined;
+    }
+    if (this.incarnation !== incarnation || (this.writable && !writable)) {
+      const ownCompletion = samePaste(chunk.paste_completion, this.pendingPaste)
+        || (samePaste(this.completion, this.pendingPaste) && incarnation === this.pendingPaste?.incarnation);
+      if (!ownCompletion) this.writeGeneration++;
+      this.writable = false;
+    }
+    this.incarnation = incarnation;
+    this.completion = chunk.paste_completion;
+    this.admission = chunk.paste_admission;
     await render();
     if (!this.owns(view)) return false;
-    this.writable = chunk.writable;
+    if (snapshot === this.snapshot) this.writable = writable;
     return true;
   }
 
@@ -262,37 +363,118 @@ export class TerminalViewScope {
     this.callbacks.inputFailure(error);
   }
 
-  send(data: Uint8Array, paste = false): Promise<void> {
+  private showPaste(issue?: PasteIssue) {
+    if (this.pasteIssue === "unknown") return;
+    if (issue === "unknown") this.writeGeneration++;
+    this.pasteIssue = issue;
+    this.callbacks.paste?.changed();
+  }
+
+  private enqueue(data: Uint8Array, work: (frame: { bytes: Uint8Array | null }) => Promise<void>) {
+    const length = data.length;
+    const frame = { bytes: data };
+    this.pendingBytes += length;
+    this.pendingInput.add(frame);
+    this.inputChain = this.inputChain.then(() => work(frame)).finally(() => {
+      this.pendingInput.delete(frame);
+      this.pendingBytes -= length;
+    });
+    return this.inputChain;
+  }
+
+  send(data: Uint8Array): Promise<void> {
     const view = this.attached;
     if (!view || !this.canWrite) return Promise.resolve();
-    if (this.pendingBytes + data.length > 65536) {
+    if (this.pendingBytes + data.length > TERMINAL_INPUT_BUDGET) {
       this.failInput();
       return Promise.resolve();
     }
-    const length = data.length;
-    const frame: { bytes: Uint8Array | null } = { bytes: data };
-    this.pendingBytes += length;
-    this.pendingInput.add(frame);
-    this.inputChain = this.inputChain.then(async () => {
+    const generation = this.writeGeneration;
+    return this.enqueue(data, async frame => {
       try {
-        for (let offset = 0; offset < length;) {
-          const bytes = frame.bytes;
-          if (!bytes || !this.owns(view) || !this.canWrite) return;
-          let end = Math.min(offset + 4096, length);
-          if (paste && end < length) {
-            while (end > offset && ((bytes[end] ?? 0) & 0xc0) === 0x80) end--;
-          }
-          await this.callbacks.input(view, Array.from(bytes.subarray(offset, end)), paste);
-          offset = end;
+        if (!frame.bytes) return;
+        for (const { bytes } of terminalInputChunks(frame.bytes)) {
+          if (!this.owns(view) || !this.canWrite || this.writeGeneration !== generation) return;
+          await this.callbacks.input(view, Array.from(bytes));
         }
       } catch (error) {
         if (this.owns(view)) this.failInput(error);
-      } finally {
-        this.pendingInput.delete(frame);
-        this.pendingBytes -= length;
       }
     });
-    return this.inputChain;
+  }
+
+  paste(data: Uint8Array | null): Promise<void> {
+    const viewId = this.attached;
+    const incarnation = this.incarnation;
+    const paste = this.callbacks.paste;
+    if (!viewId || !this.canWrite || data?.length === 0) return Promise.resolve();
+    if (!incarnation || !paste) {
+      this.showPaste("unavailable");
+      return Promise.resolve();
+    }
+    if (!data || this.pendingBytes + data.length > TERMINAL_INPUT_BUDGET) {
+      this.showPaste("oversize");
+      return Promise.resolve();
+    }
+    const gesture = { viewId, incarnation, operation: ++this.operation };
+    const generation = this.writeGeneration;
+    const live = () => this.owns(viewId) && this.canWrite && this.incarnation === incarnation
+      && this.writeGeneration === generation;
+    return this.enqueue(data, async frame => {
+      let submitted = false;
+      const issue = (result: PasteIssue) => { if (this.owns(viewId)) this.showPaste(result); };
+      try {
+        if (!frame.bytes) return;
+        if (!live()) { issue("stale"); return; }
+        this.showPaste();
+        for (const { offset, bytes } of terminalInputChunks(frame.bytes)) {
+          if (!live()) { issue("stale"); return; }
+          const staged = await paste.stage(gesture, offset, Array.from(bytes));
+          if (!live()) { issue(staged.result === "unknown" ? "unknown" : "stale"); return; }
+          if (staged.result !== "staged") {
+            issue(staged.result === "stale" || staged.result === "invalid" || staged.result === "unknown"
+              ? staged.result : "unavailable");
+            return;
+          }
+        }
+        if (!live()) { issue("stale"); return; }
+        submitted = true;
+        this.pendingPaste = gesture;
+        const result = await paste.commit(gesture, frame.bytes.length);
+        if (!this.owns(viewId)) return;
+        if (result.result !== "committed") {
+          issue(result.result === "stale" || result.result === "invalid" || result.result === "unavailable"
+            ? result.result : "unknown");
+          return;
+        }
+        // @invariant: The exact receipt permits Ack after a read-only sample, even when completion polling lags.
+        if (this.pendingPaste !== gesture) { issue("unknown"); return; }
+        const ack = await paste.ack(gesture, result.receipt);
+        if (!this.owns(viewId)) return;
+        if (ack.result !== "acknowledged") { issue("unknown"); return; }
+        this.acknowledgedPaste = gesture;
+        if (ack.writable && this.pendingPaste === gesture
+          && this.writeGeneration === generation && samePaste(this.completion, gesture)) {
+          this.snapshot++;
+          this.incarnation = incarnation;
+          this.completion = undefined;
+          this.writable = true;
+        }
+        if (!ack.writable) {
+          this.endedPasteIncarnation = incarnation;
+          if (this.incarnation === incarnation) {
+            this.snapshot++;
+            this.incarnation = undefined;
+            this.writable = false;
+            this.writeGeneration++;
+          }
+        }
+      } catch {
+        issue(submitted ? "unknown" : "unavailable");
+      } finally {
+        if (this.pendingPaste === gesture) this.pendingPaste = undefined;
+      }
+    });
   }
 }
 function expectKeys(item: Record<string, unknown>, ...keys: string[]) {
@@ -541,7 +723,13 @@ export const localClient = {
     parseResizeResult(await invoke<unknown>("terminal_resize", { viewId, epoch, size })),
   acknowledgeGrid: async (viewId: string, acknowledgement: GridAcknowledgement) =>
     parseGeometryEvent(await invoke<unknown>("terminal_acknowledge_grid", { viewId, acknowledgement })),
-  input: async (viewId: string, data: readonly number[], paste: boolean) => { await invoke("terminal_input", { viewId, data, paste }); },
+  input: async (viewId: string, data: readonly number[]) => { await invoke("terminal_input", { viewId, data }); },
+  pasteStage: async (gesture: PasteGesture, offset: number, data: number[]) =>
+    parsePasteResult(await invoke("terminal_paste_stage", { ...gesture, offset, data })),
+  pasteCommit: async (gesture: PasteGesture, bytes: number) =>
+    parsePasteResult(await invoke("terminal_paste_commit", { ...gesture, bytes })),
+  pasteAck: async (gesture: PasteGesture, receipt: string) =>
+    parsePasteResult(await invoke("terminal_paste_ack", { ...gesture, receipt })),
   detach: async (viewId: string, failure?: TerminalStreamFailure) => {
     await invoke("terminal_detach", { viewId, failure });
   },

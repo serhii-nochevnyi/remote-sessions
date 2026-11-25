@@ -29,9 +29,38 @@ type XtermInputSource = {
   triggerDataEvent(data: string, wasUserInput?: boolean): void;
 };
 
+export const TERMINAL_INPUT_BUDGET = 65536;
+const TERMINAL_INPUT_CHUNK = 4096;
+
+export function* terminalInputChunks(bytes: Uint8Array) {
+  for (let offset = 0; offset < bytes.length; offset += TERMINAL_INPUT_CHUNK) {
+    yield { offset, bytes: bytes.subarray(offset, offset + TERMINAL_INPUT_CHUNK) };
+  }
+}
+
+export function encodeTerminalPaste(plainText: string): Uint8Array | null {
+  if (plainText.length > TERMINAL_INPUT_BUDGET * 2) return null;
+  const text = plainText.replace(/\r\n?/g, "\n");
+  if (text.length > TERMINAL_INPUT_BUDGET) return null;
+  const bytes = new Uint8Array(Math.min(text.length * 3, TERMINAL_INPUT_BUDGET));
+  const { read, written } = new TextEncoder().encodeInto(text, bytes);
+  return read === text.length ? bytes.subarray(0, written) : null;
+}
+
+export function bindTerminalPaste(container: EventTarget, send: (bytes: Uint8Array | null) => void) {
+  const capture = (event: Event) => {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    const text = (event as ClipboardEvent).clipboardData?.getData("text/plain");
+    if (text) send(encodeTerminalPaste(text));
+  };
+  container.addEventListener("paste", capture, true);
+  return { dispose: () => container.removeEventListener("paste", capture, true) };
+}
+
 function routeTerminalInput(
   terminal: Pick<Terminal, "options" | "onBinary">,
-  send: (bytes: Uint8Array, paste: boolean) => void,
+  send: (bytes: Uint8Array) => void,
 ) {
   // @contract: xterm 6.0.0 keeps the text origin on triggerDataEvent through keyboard and IME handling.
   const core = (terminal as { _core?: { coreService?: XtermInputSource } })._core?.coreService;
@@ -43,12 +72,11 @@ function routeTerminalInput(
     if (!active || wasUserInput !== true || terminal.options.disableStdin) return;
     triggerDataEvent.call(core, data, true);
     if (!active || terminal.options.disableStdin) return;
-    const paste = data.startsWith("\x1b[200~") && data.endsWith("\x1b[201~");
-    send(encoder.encode(paste ? data.slice(6, -6) : data), paste);
+    send(encoder.encode(data));
   };
   if (!Reflect.set(core, "triggerDataEvent", routeUserData) || core.triggerDataEvent !== routeUserData) return;
   const binaryInput = terminal.onBinary(data => {
-    if (active && !terminal.options.disableStdin) send(Uint8Array.from(data, char => char.charCodeAt(0)), false);
+    if (active && !terminal.options.disableStdin) send(Uint8Array.from(data, char => char.charCodeAt(0)));
   });
   return {
     dispose() {
@@ -61,7 +89,7 @@ function routeTerminalInput(
 
 export function bindTerminalProtocol(
   terminal: Pick<Terminal, "parser" | "options" | "onBinary">,
-  send: (bytes: Uint8Array, paste: boolean) => void,
+  send: (bytes: Uint8Array) => void,
 ) {
   function pauseInput() {
     terminal.options.disableStdin = true;

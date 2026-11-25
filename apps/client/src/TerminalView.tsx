@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
-import { bindTerminalProtocol } from "./terminal-protocol";
+import { bindTerminalPaste, bindTerminalProtocol } from "./terminal-protocol";
 import { localClient, TerminalViewScope } from "./local-client";
 import type { GeometryEvent, TerminalSize, TerminalStatus, TerminalStreamFailure } from "./local-client";
 import { GeometryBoundaryError, OrderedGeometry, ResizeProposals } from "./terminal-geometry";
@@ -55,6 +55,7 @@ export function TerminalView({ runtimeId, epoch, label, fontSize }: { runtimeId:
     const proposals = new ResizeProposals();
     let routing: OrderedGeometry | undefined;
     let resizeUnavailable = false;
+    let inputIssue: string | undefined;
     let finishWrite: (() => void) | undefined;
     let reconnect: ReturnType<typeof setTimeout> | undefined;
     let frame = 0;
@@ -62,9 +63,14 @@ export function TerminalView({ runtimeId, epoch, label, fontSize }: { runtimeId:
     const detach = (view: string, failure?: TerminalStreamFailure) => localClient.detach(view, failure).catch(() => undefined);
 
     function report() {
-      if (!routing || !scope.viewId || scope.failedInput) return;
+      if (!routing || !scope.viewId) return;
+      const paste = scope.pasteMessage;
+      if (inputIssue) {
+        setStatus(paste ? `${inputIssue} · ${paste}` : inputIssue);
+        return;
+      }
       const control = !protocol.inputAvailable ? "ввід недоступний" : scope.canWrite ? "ви керуєте" : "режим перегляду";
-      setStatus(`Наживо · ${control} · ${geometryText(routing.status)}${resizeUnavailable ? " · зміна розміру недоступна" : ""}`);
+      setStatus(`Наживо · ${control} · ${geometryText(routing.status)}${resizeUnavailable ? " · зміна розміру недоступна" : ""}${paste ? ` · ${paste}` : ""}`);
     }
 
     async function propose() {
@@ -114,16 +120,27 @@ export function TerminalView({ runtimeId, epoch, label, fontSize }: { runtimeId:
     let failure: TerminalStreamFailure | undefined;
     const scope = new TerminalViewScope({
       input: localClient.input,
+      paste: {
+        stage: localClient.pasteStage,
+        commit: localClient.pasteCommit,
+        ack: localClient.pasteAck,
+        changed() {
+          if (!scope.canWrite) protocol.pauseInput();
+          report();
+        },
+      },
       inputFailure(error) {
         proposals.close();
         protocol.pauseInput();
-        setStatus(error === undefined
+        inputIssue = error === undefined
           ? "Ввід завеликий. Перепідключіть термінал перед продовженням."
-          : `Ввід перервано; автоматично не повторюємо. ${String(error)}`);
+          : `Ввід перервано; автоматично не повторюємо. ${String(error)}`;
+        report();
       },
       retire(view) {
         container.removeAttribute("data-terminal-attached");
         protocol.dispose();
+        clipboard.dispose();
         updateFont.current = null;
         cancelAnimationFrame(frame);
         routing?.close();
@@ -140,7 +157,8 @@ export function TerminalView({ runtimeId, epoch, label, fontSize }: { runtimeId:
         reconnectDelay.current = Math.min(reconnectDelay.current * 2, 4000);
       },
     });
-    const protocol = bindTerminalProtocol(terminal, (bytes, paste) => { void scope.send(bytes, paste); });
+    const protocol = bindTerminalProtocol(terminal, bytes => { void scope.send(bytes); });
+    const clipboard = bindTerminalPaste(container, bytes => { void scope.paste(bytes); });
     const sink = {
       write: (data: readonly number[]) => new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => {
