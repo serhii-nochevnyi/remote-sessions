@@ -35,15 +35,13 @@ function inside(root: string, path: string) {
 }
 
 function assertLocal(reference: string) {
-  // Character references and CSS escapes can turn apparently relative text into a URL.
   if (/^(?:[a-z][a-z\d+.-]*:|\/\/)|[\\&\u0000-\u0020]/i.test(reference.trim())) {
     throw new Error(`External asset is forbidden in the fixture: ${reference}`);
   }
 }
 
 function assertCss(css: string) {
-  // CSS escapes can hide both URL syntax and the URL itself.
-  const source = css.replace(/\/\*[\s\S]*?\*\//g, "").replace(
+  const source = css.replace(/\x2f\x2a[\s\S]*?\x2a\x2f/g, "").replace(
     /\\(?:([\da-f]{1,6})(?:\r\n|[\t\n\f\r ])?|(\r\n|[\s\S]))/gi,
     (_escape, hex: string | undefined, literal: string | undefined) => {
       if (!hex) return literal?.replace(/[\r\n\f]/g, "") ?? "";
@@ -54,7 +52,6 @@ function assertCss(css: string) {
   for (const match of source.matchAll(/url\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*))\s*\)|@import\s+(?:"([^"]*)"|'([^']*)')/gi)) {
     assertLocal(match.slice(1).find(value => value !== undefined) ?? "");
   }
-  // Image-set also accepts bare URL strings.
   for (const [imageSet] of source.matchAll(/(?:-webkit-)?image-set\([^;{}]*/gi)) {
     for (const [, quoted] of imageSet.matchAll(/["']([^"']*)["']/g)) assertLocal(quoted);
   }
@@ -103,7 +100,6 @@ function guardFixtureBundle(): Plugin {
     resolveId: {
       order: "pre",
       handler(source) {
-        // Vite's synthetic HTML and CSS imports carry query parameters joined by ampersands.
         if (!source.startsWith("\0")) assertLocal(source.split("?", 1)[0]);
       },
     },

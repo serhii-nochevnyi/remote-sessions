@@ -94,7 +94,6 @@ export function registerRecorder(input: InputSource, invoke: Invoke, onError: (e
           generation: attempt.generation, sequence, events,
         }));
         if (active !== attempt) return;
-        // The native Result<(), _> encodes success as JSON null.
         if (ack !== null) throw new Error("Invalid append acknowledgment");
         attempt.nextSequence++;
       } catch (reason) {
@@ -118,7 +117,6 @@ export function registerRecorder(input: InputSource, invoke: Invoke, onError: (e
   const subscription = input.onData(text => {
     const attempt = active;
     if (!attempt || attempt.invalid) return;
-    // Each UTF-16 code unit requires at least one UTF-8 byte.
     if (!text.length || text.length > eventBytes) {
       invalidate(attempt, "Invalid input event size");
       return;
