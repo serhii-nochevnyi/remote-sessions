@@ -1,5 +1,3 @@
-/// <reference types="vite/client" />
-
 import * as React from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
@@ -74,7 +72,6 @@ function Fixture() {
     setError("");
     setSnapshot(null);
     mounted.terminal.options.disableStdin = true;
-    // Focus inside the tap handler so iOS can open the software keyboard.
     mounted.terminal.focus();
     try {
       await mounted.recorder.start(fixtureCaseId);

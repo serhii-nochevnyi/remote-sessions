@@ -75,7 +75,7 @@ mod recorder {
                 active.event_lengths.push(event.len());
                 active.bytes.extend(event);
             }
-            active.next_sequence += 1; // At most ATTEMPT_EVENTS nonempty appends.
+            active.next_sequence += 1;
             Ok(())
         }
 
@@ -167,7 +167,6 @@ mod recorder {
         use super::*;
         use std::io::{self, BufRead, Write};
 
-        // Independent of both the frontend encoder and the recorder implementation.
         const SYNTHETIC_CASE: &str = "ukrainian-return";
         const SYNTHETIC_BYTES: [u8; 3] = [0xd1, 0x97, 0x0d];
 
@@ -225,7 +224,6 @@ mod recorder {
         }
 
         fn snapshot_json(snapshot: &Snapshot) -> String {
-            // The sole case ID is ASCII, and all other fields are numeric or boolean.
             format!(
                 "{{\"caseId\":{:?},\"generation\":{},\"nextSequence\":{},\"bytes\":{:?},\"eventLengths\":{:?},\"rejected\":{},\"invalid\":{}}}",
                 snapshot.case_id,

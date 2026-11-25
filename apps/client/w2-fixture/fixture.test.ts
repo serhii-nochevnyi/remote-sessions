@@ -36,8 +36,6 @@ type Listener = (event: {
   preventDefault: () => void;
 }) => void;
 
-// Only the DOM operations used by this entry and React DOM. xterm's visual renderer
-// is replaced independently, so its input event delivery and write queue stay real.
 class Element {
   id = "";
   parentNode: Element | null = null;
@@ -698,15 +696,13 @@ function readBoundary() {
   };
 }
 
-// Keep string literals opaque and ignore line and nested block comments before
-// checking which declarations own the security-sensitive attributes and calls.
 function rustTokens(source: string): string[] {
   const pattern = /\s+|\/\/[^\n]*|\/\*|(?:br|cr|r)(#*)"[\s\S]*?"\1|(?:b|c)?"(?:\\[\s\S]|[^"\\])*"|b?'(?:\\.|[^'\\\n])'|[A-Za-z_]\w*|::|==|[^\s]/gy;
   const tokens: string[] = [];
   for (let match = pattern.exec(source); match; match = pattern.exec(source)) {
     const token = match[0];
     if (token === "/*") {
-      const comment = /\/\*|\*\//g;
+      const comment = /\x2f\x2a|\x2a\x2f/g;
       comment.lastIndex = pattern.lastIndex;
       let depth = 1;
       while (depth) {

@@ -48,7 +48,7 @@ export function registerRecorder(input: InputSource, invoke: Invoke, onError: (e
         attempt.failed = true;
         if (!disposed && active === attempt) onError(error);
       }
-    }).catch(() => {}); // Disposal stops queued operations before they invoke.
+    }).catch(() => {});
   });
 
   return {
