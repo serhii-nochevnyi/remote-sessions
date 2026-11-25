@@ -59,12 +59,15 @@ export interface GridAcknowledgement {
 }
 export type ResizeResult = { readonly result: "committed"; readonly admission: ResizeIntent; readonly status: TerminalStatus }
   | { readonly result: "uncertain" | "rejected"; readonly terminal: TerminalScope; readonly intent: ResizeIntent };
+export type TerminalClosure = { readonly reason: "overflow"; readonly high_water: 16 }
+  | { readonly reason: "eof" | "detached" | "geometry_timeout" };
 export interface Chunk {
   readonly writable: boolean;
   readonly data: readonly number[];
   readonly closed: boolean;
   readonly status?: TerminalStatus | null;
   readonly geometry?: GeometryEvent | null;
+  readonly closure?: TerminalClosure;
 }
 export type GeometryBoundaryFailure = "geometry_revision_not_new" | "geometry_status_rejected" | "geometry_output_incomplete";
 export type TerminalStreamFailure = "attachment_setup" | "read_response" | "grid_ack_response"
@@ -164,12 +167,133 @@ export function parseChunk(value: unknown): Chunk {
   const item = record(value);
   if (typeof item.writable !== "boolean" || typeof item.closed !== "boolean" || !Array.isArray(item.data) || item.data.length > 8192) throw Error("Некоректний потік термінала");
   const chunk = { writable: item.writable, closed: item.closed, data: item.data.map((byte: unknown) => integer(byte, 0, 255)) };
+  if ("closure" in item) {
+    expectKeys(item, "writable", "closed", "data", "status", "geometry", "closure");
+    if (!chunk.closed || chunk.writable || chunk.data.length || item.status !== null || item.geometry !== null) {
+      throw Error("Некоректне закриття потоку термінала");
+    }
+    const metadata = record(item.closure);
+    const reason = metadata.reason;
+    let closure: TerminalClosure;
+    switch (reason) {
+      case "overflow":
+        expectKeys(metadata, "reason", "high_water");
+        if (metadata.high_water !== 16) throw Error("Некоректна глибина черги термінала");
+        closure = { reason, high_water: 16 };
+        break;
+      case "eof": case "detached": case "geometry_timeout":
+        expectKeys(metadata, "reason");
+        closure = { reason };
+        break;
+      default:
+        throw Error("Некоректна причина закриття потоку термінала");
+    }
+    return { ...chunk, status: null, geometry: null, closure };
+  }
   if (!("status" in item) && !("geometry" in item)) return chunk;
   expectKeys(item, "writable", "closed", "data", "status", "geometry");
   const status = item.status === null ? null : parseTerminalStatus(item.status);
   const geometry = item.geometry === null ? null : parseGeometryEvent(item.geometry);
   if (geometry && (chunk.closed || chunk.data.length || status)) throw Error("Некоректна межа зміни розміру");
   return { ...chunk, status, geometry };
+}
+interface TerminalViewCallbacks {
+  input(view: string, data: number[], paste: boolean): Promise<void>;
+  inputFailure(error?: unknown): void;
+  retire(view: string | null): void;
+  reconnect(error: unknown): void;
+}
+
+export class TerminalViewScope {
+  private attached: string | null = null;
+  private retired = false;
+  private writable = false;
+  private inputFailed = false;
+  private pendingBytes = 0;
+  private inputChain = Promise.resolve();
+  private readonly pendingInput = new Set<{ bytes: Uint8Array | null }>();
+
+  private readonly callbacks: TerminalViewCallbacks;
+
+  constructor(callbacks: TerminalViewCallbacks) { this.callbacks = callbacks; }
+
+  get viewId() { return this.attached; }
+  get active() { return !this.retired; }
+  get canWrite() { return this.active && this.writable && !this.inputFailed; }
+  get failedInput() { return this.inputFailed; }
+
+  bind(view: string): boolean {
+    if (this.retired || this.attached !== null) return false;
+    this.attached = view;
+    return true;
+  }
+
+  owns(view: string) { return this.active && this.attached === view; }
+
+  retire(recovery?: { error: unknown }) {
+    if (this.retired) return;
+    this.retired = true;
+    const view = this.attached;
+    this.attached = null;
+    this.writable = false;
+    for (const frame of this.pendingInput) frame.bytes = null;
+    this.pendingInput.clear();
+    this.callbacks.retire(view);
+    if (recovery) this.callbacks.reconnect(recovery.error);
+  }
+
+  acceptClosure(view: string, closure: TerminalClosure) {
+    if (this.owns(view)) {
+      const reason = closure.reason === "overflow" ? "Спостерігач не встиг обробити вивід" : "Потік перервано";
+      this.retire({ error: Error(reason) });
+    }
+  }
+
+  async consume(view: string, chunk: Chunk, render: () => Promise<void>): Promise<boolean> {
+    if (!this.owns(view)) return false;
+    await render();
+    if (!this.owns(view)) return false;
+    this.writable = chunk.writable;
+    return true;
+  }
+
+  private failInput(error?: unknown) {
+    this.inputFailed = true;
+    this.callbacks.inputFailure(error);
+  }
+
+  send(data: Uint8Array, paste = false): Promise<void> {
+    const view = this.attached;
+    if (!view || !this.canWrite) return Promise.resolve();
+    if (this.pendingBytes + data.length > 65536) {
+      this.failInput();
+      return Promise.resolve();
+    }
+    const length = data.length;
+    const frame: { bytes: Uint8Array | null } = { bytes: data };
+    this.pendingBytes += length;
+    this.pendingInput.add(frame);
+    this.inputChain = this.inputChain.then(async () => {
+      try {
+        for (let offset = 0; offset < length;) {
+          const bytes = frame.bytes;
+          if (!bytes || !this.owns(view) || !this.canWrite) return;
+          let end = Math.min(offset + 4096, length);
+          if (paste && end < length) {
+            while (end > offset && ((bytes[end] ?? 0) & 0xc0) === 0x80) end--;
+          }
+          await this.callbacks.input(view, Array.from(bytes.subarray(offset, end)), paste);
+          offset = end;
+        }
+      } catch (error) {
+        if (this.owns(view)) this.failInput(error);
+      } finally {
+        this.pendingInput.delete(frame);
+        this.pendingBytes -= length;
+      }
+    });
+    return this.inputChain;
+  }
 }
 function expectKeys(item: Record<string, unknown>, ...keys: string[]) {
   if (Object.keys(item).length !== keys.length || keys.some(key => !Object.prototype.hasOwnProperty.call(item, key))) {

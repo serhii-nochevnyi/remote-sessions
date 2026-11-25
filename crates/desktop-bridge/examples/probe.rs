@@ -2,7 +2,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use remote_sessions_desktop_bridge::{
     Attachment, DesktopBridge, GeometryEvent, GridAcknowledgement, ResizeEpoch, ResizeResult,
-    TerminalSize, TerminalStatus,
+    TerminalClosure, TerminalSize, TerminalStatus,
 };
 use remote_sessions_host::{
     decode_local_fixture, encode_local_observation,
@@ -12,10 +12,11 @@ use remote_sessions_host::{
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    os::unix::fs::{DirBuilderExt, PermissionsExt, symlink},
+    io::Write,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
     process::Stdio,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 #[tokio::main]
@@ -23,9 +24,12 @@ async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let first = args
         .next()
-        .context("state directory or resize subcommand")?;
+        .context("state directory or resize/pressure subcommand")?;
     if first == "resize" {
         return resize_probe(args.collect()).await;
+    }
+    if first == "pressure" {
+        return pressure_probe(args.collect()).await;
     }
     legacy(first.into(), args.next().context("runtime id")?).await
 }
@@ -1125,4 +1129,316 @@ async fn run_matrix(lab: &Lab, report: &mut Report) -> Result<()> {
     fresh.release(&lab.directory).await?;
     report.witnessed.push("agent_only_restart");
     Ok(())
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PressureHeartbeat {
+    pid: u32,
+    instance: Uuid,
+    sequence: u64,
+    at_ns: u64,
+}
+
+#[derive(Serialize)]
+struct PressureView {
+    view_id: String,
+    pid: u32,
+    started: String,
+    rss_kib: u64,
+}
+
+impl PressureView {
+    async fn observe(bridge: &DesktopBridge, view: &Attachment) -> Result<Self> {
+        let pid = bridge.attachment_pid(&view.view_id)?;
+        let pid_arg = pid.to_string();
+        let ps = Path::new("/bin/ps");
+        let started = command(ps, &["-p", &pid_arg, "-o", "lstart="]).await?;
+        let rss = command(ps, &["-p", &pid_arg, "-o", "rss="]).await?;
+        ensure!(
+            !started.is_empty() && started.len() <= 32,
+            "Attachment start unavailable"
+        );
+        Ok(Self {
+            view_id: view.view_id.clone(),
+            pid,
+            started: started.trim().to_owned(),
+            rss_kib: rss.trim().parse()?,
+        })
+    }
+
+    async fn wait_reaped(&self) -> Result<()> {
+        let pid = self.pid.to_string();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let current = tokio::process::Command::new("/bin/ps")
+                    .args(["-p", &pid, "-o", "lstart="])
+                    .kill_on_drop(true)
+                    .output()
+                    .await?;
+                if !current.status.success()
+                    || String::from_utf8_lossy(&current.stdout).trim() != self.started.trim()
+                {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+        })
+        .await
+        .context("Disposable attachment client did not exit")?
+    }
+}
+
+#[derive(Serialize)]
+struct PressureOutput {
+    bytes: usize,
+    first_at_us: u64,
+    last_at_us: u64,
+}
+
+#[derive(Serialize)]
+struct PressureReport {
+    run_id: Uuid,
+    agent_pid: u32,
+    source: String,
+    source_tree: String,
+    engine_version: String,
+    started_at_us: u64,
+    ended_at_us: u64,
+    overflow_returned_at_us: u64,
+    elapsed_ms: u128,
+    owner: PressureView,
+    victim: PressureView,
+    replacement: PressureView,
+    heartbeat_before: PressureHeartbeat,
+    heartbeat_after: PressureHeartbeat,
+    committed: TerminalStatus,
+    owner_grid: GeometryEvent,
+    provider_after: TerminalStatus,
+    fresh_status: TerminalStatus,
+    healthy_output: PressureOutput,
+    startup_redraw: bool,
+    fresh_redraw: bool,
+    fresh_input_submitted: bool,
+    closure: TerminalClosure,
+}
+
+fn pressure_heartbeat(directory: &Path) -> Result<PressureHeartbeat> {
+    decode_local_fixture(&fs::read(directory.join("pressure-heartbeat.json"))?)
+}
+
+fn wall_us() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_micros()
+        .try_into()?)
+}
+
+async fn pressure_probe(args: Vec<String>) -> Result<()> {
+    ensure!(
+        args.len() == 10,
+        "Expected --run-id, --state-dir, --runtime-id, --tmux-bin and --report"
+    );
+    let run_id = Uuid::parse_str(&option(&args, "--run-id")?)?;
+    let directory = PathBuf::from(option(&args, "--state-dir")?);
+    let tmux = PathBuf::from(option(&args, "--tmux-bin")?);
+    let runtime = Uuid::parse_str(&option(&args, "--runtime-id")?)?;
+    let report = PathBuf::from(option(&args, "--report")?);
+    validate_directory(&directory)?;
+    ensure!(
+        cfg!(target_os = "macos")
+            && directory == directory.canonicalize()?
+            && directory.parent() == Some(Path::new("/private/tmp"))
+            && directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| { name.starts_with("rs-p0-") || name.starts_with("rs-w1-") })
+            && report == directory.join("pressure-probe.json"),
+        "Pressure mode requires a private disposable lab report"
+    );
+    let heartbeat = pressure_heartbeat(&directory)?;
+    let runtime_id = runtime.to_string();
+    let bridge = DesktopBridge::new(Some(directory.clone()), tmux.clone());
+    let initial = bridge.inventory().await?;
+    ensure!(
+        initial
+            .runtimes
+            .iter()
+            .any(|entry| entry.runtime_id == runtime
+                && entry.pane_pid == Some(heartbeat.pid)
+                && !entry.exited),
+        "Raw fixture is not the requested managed process"
+    );
+
+    let started = Instant::now();
+    let started_at_us = wall_us()?;
+    let owner = bridge.attach(&runtime_id).await?;
+    let owner_process = PressureView::observe(&bridge, &owner).await?;
+    let epoch = await_owner(&bridge, &owner).await?;
+    let victim = bridge.attach_observer(&runtime_id).await?;
+    let victim_process = PressureView::observe(&bridge, &victim).await?;
+    let committed = async {
+        pressure_bytes(&bridge, &victim, false, b"RSSTARTREADY").await?;
+        let size = if owner.status.committed.size == NORMAL {
+            NARROW
+        } else {
+            NORMAL
+        };
+        let ResizeResult::Committed { status, .. } =
+            bridge.resize(&owner.view_id, size, epoch).await?
+        else {
+            bail!("Pressure geometry commit was unconfirmed");
+        };
+        Ok::<_, anyhow::Error>(status)
+    }
+    .await?;
+    let owner_grid = await_grid(&bridge, &owner, &committed, true).await?;
+    let heartbeat_before = pressure_heartbeat(&directory)?;
+    ensure!(
+        heartbeat_before.pid == heartbeat.pid && heartbeat_before.instance == heartbeat.instance,
+        "Raw fixture changed before pressure"
+    );
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(directory.join("pressure-bridge.trigger"))?;
+    let peer = pressure_bytes(&bridge, &owner, true, b"RSBRIDGEKEPT");
+    let overflow = async {
+        let retired = tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                if bridge.attachment_pid(&victim.view_id).is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        ensure!(retired.is_ok(), "overflow not reached");
+        let chunk = bridge
+            .read(&victim.view_id)
+            .await
+            .context("overflow not reached")?;
+        let closure = TerminalClosure::Overflow { high_water: 16 };
+        ensure!(chunk.closure == Some(closure), "overflow not reached");
+        ensure!(
+            chunk.closed
+                && !chunk.writable
+                && chunk.data.is_empty()
+                && chunk.status.is_none()
+                && chunk.geometry.is_none()
+                && bridge.read(&victim.view_id).await.is_err(),
+            "Overflow did not retire only the original scoped stream"
+        );
+        let at = wall_us()?;
+        victim_process.wait_reaped().await?;
+        Ok::<_, anyhow::Error>((closure, at))
+    };
+    let ((closure, overflow_returned_at_us), healthy_output) = tokio::try_join!(overflow, peer)?;
+    let heartbeat_after = pressure_heartbeat(&directory)?;
+    ensure!(
+        heartbeat_after.pid == heartbeat_before.pid
+            && heartbeat_after.instance == heartbeat_before.instance
+            && heartbeat_after.sequence > heartbeat_before.sequence,
+        "Independent heartbeat did not advance through Full"
+    );
+    let provider_after = wait_provider(&directory, &committed).await?;
+    ensure!(
+        provider_after.terminal.target == owner.status.terminal.target
+            && provider_after.epoch == Some(epoch),
+        "Owner, runtime, or provider changed through pressure"
+    );
+
+    let replacement = bridge.attach_observer(&runtime_id).await?;
+    let replacement_process = PressureView::observe(&bridge, &replacement).await?;
+    ensure!(
+        replacement.view_id != victim.view_id
+            && replacement.status.terminal.target == committed.terminal.target
+            && replacement.status.committed == committed.committed,
+        "Replacement did not attach to the current target and grid"
+    );
+    pressure_bytes(&bridge, &replacement, false, b"RSBRIDGEKEPT").await?;
+    bridge
+        .input(&owner.view_id, b"RS-BRIDGE-FRESH\r".to_vec(), false)
+        .await?;
+    bridge.detach(&replacement.view_id);
+    bridge.detach(&owner.view_id);
+    tokio::try_join!(
+        replacement_process.wait_reaped(),
+        owner_process.wait_reaped()
+    )?;
+
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = repo.to_str().context("Invalid repository path")?;
+    let git = Path::new("/usr/bin/git");
+    let result = PressureReport {
+        run_id,
+        agent_pid: initial.agent_pid,
+        source: command(git, &["-C", repo, "rev-parse", "HEAD"]).await?,
+        source_tree: command(git, &["-C", repo, "rev-parse", "HEAD^{tree}"]).await?,
+        engine_version: command(&tmux, &["-V"]).await?,
+        started_at_us,
+        ended_at_us: wall_us()?,
+        elapsed_ms: started.elapsed().as_millis(),
+        overflow_returned_at_us,
+        owner: owner_process,
+        victim: victim_process,
+        replacement: replacement_process,
+        heartbeat_before,
+        heartbeat_after,
+        committed,
+        owner_grid,
+        provider_after,
+        fresh_status: replacement.status,
+        healthy_output,
+        startup_redraw: true,
+        fresh_redraw: true,
+        fresh_input_submitted: true,
+        closure,
+    };
+    let mut out = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(report)?;
+    writeln!(out, "{}", encode_local_observation(&result)?)?;
+    Ok(())
+}
+
+async fn pressure_bytes(
+    bridge: &DesktopBridge,
+    view: &Attachment,
+    writable: bool,
+    marker: &[u8],
+) -> Result<PressureOutput> {
+    tokio::time::timeout(Duration::from_secs(14), async {
+        let mut tail = Vec::new();
+        let mut total = 0;
+        let mut first = None;
+        loop {
+            let chunk = bridge.read(&view.view_id).await?;
+            ensure!(
+                !chunk.closed && chunk.writable == writable && chunk.geometry.is_none(),
+                "Healthy view lost stream or authority"
+            );
+            if chunk.data.is_empty() {
+                continue;
+            }
+            let at = wall_us()?;
+            let first_at_us = *first.get_or_insert(at);
+            total += chunk.data.len();
+            tail.extend(chunk.data);
+            if tail.windows(marker.len()).any(|window| window == marker) {
+                return Ok(PressureOutput {
+                    bytes: total,
+                    first_at_us,
+                    last_at_us: at,
+                });
+            }
+            let keep = tail.len().min(marker.len() - 1);
+            tail.drain(..tail.len() - keep);
+        }
+    })
+    .await
+    .context("Actual terminal output witness did not arrive")?
 }
