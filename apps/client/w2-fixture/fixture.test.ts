@@ -839,7 +839,9 @@ function assertLibraryBoundary(source: string) {
   assert.deepEqual(exports, positions(tokens, "pub use recorder::run;", true), "standalone run re-export");
   assert.equal(exports.length, 1, "standalone run re-export");
   assert.deepEqual(attributesBefore(tokens, exports[0]), [rustTokens(iosCfg).join(" ")], "iOS cfg belongs to the run re-export");
-  assert.equal(positions(tokens, "fn start_app").length, 0, "handwritten C ABI entry");
+  for (const declaration of ["fn start_app", "#[unsafe(export_name =", "#[export_name ="]) {
+    assert.equal(positions(tokens, declaration).length, 0, "handwritten C ABI entry");
+  }
 }
 
 function assertPermissions(entries: ReturnType<typeof readEntries>) {
@@ -1013,6 +1015,9 @@ function declarationControls() {
         `${iosCfg}\n    ${mobileEntry}\n    fn unrelated() {}\n\n    ${iosCfg}`);
     }],
     ["handwritten start_app", /handwritten C ABI entry/, b => { b.library += '\npub extern "C" fn start_app() {}\n'; }],
+    ["handwritten start_app export", /handwritten C ABI entry/, b => {
+      b.library += '\n#[unsafe(export_name = "start_app")]\npub extern "C" fn alternate_entry() {}\n';
+    }],
     ["Mac registration", /production Mac registry excludes W2/, b => {
       b.macLibrary = replaceOnce(b.macLibrary, "tauri::generate_handler![", "tauri::generate_handler![w2_read_attempt,");
     }],
