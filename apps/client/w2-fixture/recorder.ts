@@ -19,6 +19,13 @@ export type Snapshot = {
   invalid: boolean;
 };
 
+export type AppendOutcome = {
+  generation: number;
+  sequence: number;
+  bytes: number;
+  status: "acknowledged" | "unconfirmed";
+};
+
 type InputSource = {
   onData(callback: (text: string) => void): { dispose(): void };
 };
@@ -31,6 +38,7 @@ type Attempt = {
   queue: number[][];
   queuedBytes: number;
   invalid: boolean;
+  deliveryUnconfirmed?: boolean;
   snapshot?: Snapshot;
 };
 
@@ -76,7 +84,12 @@ function isSnapshot(value: unknown, attempt: Attempt, minSequence: number): valu
     && snapshot.eventLengths.reduce((sum, length) => sum + length, 0) === snapshot.bytes.length;
 }
 
-export function registerRecorder(input: InputSource, invoke: Invoke, onError: (error: unknown) => void) {
+export function registerRecorder(
+  input: InputSource,
+  invoke: Invoke,
+  onError: (error: unknown) => void,
+  onAppendOutcome?: (outcome: AppendOutcome) => void,
+) {
   const encoder = new TextEncoder();
   let active: Attempt | undefined;
   let appendSlot: AppendBatch | undefined;
@@ -93,16 +106,31 @@ export function registerRecorder(input: InputSource, invoke: Invoke, onError: (e
   }
 
   async function send(batch: AppendBatch) {
-    const { attempt, sequence, events } = batch;
+    const { attempt, sequence, events, bytes } = batch;
+    const receipt = { generation: attempt.generation, sequence, bytes };
+    const ownsBatch = () => appendSlot === batch && active === attempt && !attempt.invalid && !lifetime.signal.aborted;
     try {
-      const ack = await withDeadline(lifetime.signal, () => invoke<unknown>("w2_append_input", {
-        generation: attempt.generation, sequence, events,
-      }));
-      if (appendSlot !== batch || active !== attempt) return;
-      if (ack !== null) throw new Error("Invalid append acknowledgment");
+      try {
+        const deadline = performance.now() + invokeDeadlineMs;
+        const ack = await withDeadline(lifetime.signal, () => invoke<unknown>("w2_append_input", {
+          generation: attempt.generation, sequence, events,
+        }));
+        if (!ownsBatch()) return;
+        if (ack !== null) throw new Error("Invalid append acknowledgment");
+        if (performance.now() >= deadline) throw new Error("Local invoke timed out");
+      } catch (reason) {
+        if (ownsBatch()) {
+          attempt.deliveryUnconfirmed = true;
+          try {
+            onAppendOutcome?.({ ...receipt, status: "unconfirmed" });
+          } finally {
+            invalidate(attempt, reason);
+          }
+        }
+        return;
+      }
       attempt.nextSequence++;
-    } catch (reason) {
-      if (appendSlot === batch) invalidate(attempt, reason);
+      onAppendOutcome?.({ ...receipt, status: "acknowledged" });
     } finally {
       if (appendSlot === batch) {
         appendSlot = undefined;
@@ -178,7 +206,7 @@ export function registerRecorder(input: InputSource, invoke: Invoke, onError: (e
       if (!attempt) return;
       try {
         const snapshot = await readSnapshot(attempt);
-        return { snapshot, uncertain: snapshot.nextSequence <= attempt.lastSent };
+        return { snapshot, uncertain: attempt.deliveryUnconfirmed === true || snapshot.nextSequence <= attempt.lastSent };
       } catch {
         return {
           ...(attempt.snapshot === undefined ? {} : { snapshot: attempt.snapshot }),

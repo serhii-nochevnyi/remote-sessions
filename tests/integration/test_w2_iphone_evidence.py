@@ -468,6 +468,28 @@ class EvidenceTest(unittest.TestCase):
         row["trace"]["events"] = events(*trace[:3], *trace[4:6], trace[3], *trace[6:])
         self.reject(report_for(self.baseline), "uncertain pre-end")
 
+    def test_exact_final_bytes_after_append_timeout_cannot_support_a_clean_matrix(self):
+        report = self.complete(self.baseline)
+        row = next(row for row in self.baseline["attempts"] if row["case_id"] == "composition-commit")
+        row["checkpoint"]["eventLengths"] = []
+        row["final"]["eventLengths"] = [len(row["final"]["hex"]) // 2]
+        self.validate(report, "pass")
+
+        receipt = next(evt for evt in row["trace"]["events"] if evt["event"] == "append acknowledgment")
+        receipt["event"] = "append delivery unconfirmed"
+        self.reject(report, "native append delivery is uncertain")
+
+        mark(row, "inconclusive")
+        self.reject(report, "report status must be inconclusive")
+        report["status"] = "inconclusive"
+        report["reasons"] = ["Composition append receipt missed its deadline"]
+        self.reject(report, "shell disposition must be inconclusive")
+        report["decision"]["disposition"] = "inconclusive"
+        report["decision"]["supporting_attempt_ids"] = [row["id"]]
+        self.reject(report, "disposition must reference the attempts that establish it")
+        report["decision"]["supporting_attempt_ids"] = []
+        self.validate(report, "inconclusive")
+
     def test_preedit_snapshot_proves_acceptance_even_with_late_ack(self):
         row = self.sample()
         trace = row["trace"]["events"]

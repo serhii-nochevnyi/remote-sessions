@@ -15,7 +15,7 @@ import { act } from "react";
 import ts from "typescript";
 import type { Root } from "react-dom/client";
 import { observeTerminalLayout, type LayoutEvent } from "./terminal-layout.ts";
-import type { Invoke, Snapshot, registerRecorder } from "./recorder.ts";
+import type { AppendOutcome, Invoke, Snapshot, registerRecorder } from "./recorder.ts";
 
 const fixtureDir = new URL("./", import.meta.url);
 const nativeDir = new URL("src-tauri/", fixtureDir);
@@ -27,13 +27,14 @@ const expectedHex = "d1970d";
 
 type InvokeArgs = Parameters<Invoke>[1];
 type Request = { command: string; args?: InvokeArgs };
-type Registration = { calls: Request[] };
+type Registration = { calls: Request[]; outcomes: AppendOutcome[] };
 type MountOptions = {
   invoke?: (command: string, args?: InvokeArgs, options?: unknown) => unknown;
   transformEntry?: (source: string) => string;
   browserPaste?: boolean;
   suppressCompositionEnd?: boolean;
   traceRegistration?: boolean;
+  observeAppendOutcome?: (outcome: AppendOutcome) => void;
 };
 type Listener = (event: {
   type: string;
@@ -504,15 +505,19 @@ export async function mountFixture(options: MountOptions = {}) {
           terminals.push(this);
         }
       },
-      register(record: typeof registerRecorder, ...[terminal, invoke, ...args]: Parameters<typeof registerRecorder>) {
-        const registration: Registration = { calls: [] };
+      register(record: typeof registerRecorder, ...[terminal, invoke, onError, onAppendOutcome]: Parameters<typeof registerRecorder>) {
+        const registration: Registration = { calls: [], outcomes: [] };
         registrations.push(registration);
         const observed: Invoke = (...request) => {
           const [command, requestArgs] = request;
           registration.calls.push({ command, args: structuredClone(requestArgs) });
           return invoke(...request);
         };
-        return record(terminal, observed, ...args);
+        return record(terminal, observed, onError, outcome => {
+          registration.outcomes.push(outcome);
+          onAppendOutcome?.(outcome);
+          options.observeAppendOutcome?.(outcome);
+        });
       },
     }));
 
@@ -789,7 +794,7 @@ function replaceOnce(source: string, original: string | RegExp, replacement: str
   return source.replace(original, () => replacement);
 }
 
-const registration = "const recorder = registerRecorder(input, transport, onCaptureError);";
+const registration = "const recorder = registerRecorder(input, transport, onCaptureError, onAppendOutcome);";
 
 function skipRegistration(source: string) {
   return replaceOnce(source, registration, `
@@ -803,7 +808,7 @@ function skipRegistration(source: string) {
 
 function bypassRegistrationTransport(source: string) {
   return replaceOnce(source, registration, `
-    const unused = registerRecorder({ onData: () => ({ dispose() {} }) }, invoke, onCaptureError);
+    const unused = registerRecorder({ onData: () => ({ dispose() {} }) }, invoke, onCaptureError, onAppendOutcome);
     let generation = 0;
     let sequence = 0;
     let pending = Promise.resolve();
@@ -963,22 +968,38 @@ function field(fixture: Mounted, id: string) {
   return element;
 }
 
-function controlledClock() {
+function assertSnapshotIdentity(fixture: Mounted, caseId: string, attemptId: number, generation: number) {
+  assert.equal(field(fixture, "snapshot-identity").textContent, `${caseId} · attempt ${attemptId} · generation ${generation}`);
+}
+
+function assertVisibleSnapshot(fixture: Mounted, snapshot: Snapshot, attemptId: number) {
+  assertSnapshotIdentity(fixture, snapshot.caseId, attemptId, snapshot.generation);
+  assert.equal(field(fixture, "snapshot").textContent, Buffer.from(snapshot.bytes).toString("hex") || "(empty)");
+  assert.equal(field(fixture, "snapshot-counts").textContent,
+    ` · ${snapshot.eventLengths.length} accepted events · ${snapshot.bytes.length} bytes`);
+}
+
+export function controlledClock() {
   const realSet = globalThis.setTimeout;
   const realClear = globalThis.clearTimeout;
-  let now = 0;
+  let now = Math.ceil(performance.now());
+  const originalNow = Object.getOwnPropertyDescriptor(performance, "now");
+  Object.defineProperty(performance, "now", { configurable: true, value: () => now });
   let order = 0;
-  const work = new Map<object, { run: () => void; due: number; order: number }>();
+  let invokeTimeouts = 0;
+  const work = new Map<object, { run: () => void; due: number; order: number; ms: number }>();
   const restoreSet = installGlobal("setTimeout", (callback: () => void, ms = 0) => {
     if (ms !== 0 && ms !== 250 && ms !== 5000) return realSet(callback, ms);
     const handle = {};
-    work.set(handle, { run: callback, due: now + ms, order: ++order });
+    work.set(handle, { run: callback, due: now + ms, order: ++order, ms });
     return handle;
   });
   const restoreClear = installGlobal("clearTimeout", (handle: ReturnType<typeof setTimeout>) => {
     if (!work.delete(handle)) realClear(handle);
   });
   return {
+    elapse(ms: number) { now += ms; },
+    get invokeTimeouts() { return invokeTimeouts; },
     advance(ms: number) {
       const target = now + ms;
       for (;;) {
@@ -986,12 +1007,18 @@ function controlledClock() {
           .sort(([, a], [, b]) => a.due - b.due || a.order - b.order)[0];
         if (!next) break;
         work.delete(next[0]);
-        now = next[1].due;
+        now = Math.max(now, next[1].due);
+        if (next[1].ms === 5000) invokeTimeouts++;
         next[1].run();
       }
       now = target;
     },
-    dispose() { restoreClear(); restoreSet(); },
+    dispose() {
+      restoreClear();
+      restoreSet();
+      if (originalNow) Object.defineProperty(performance, "now", originalNow);
+      else Reflect.deleteProperty(performance, "now");
+    },
   };
 }
 
@@ -1050,6 +1077,7 @@ function trace(fixture: Mounted) {
     caseId: string;
     attemptId: number;
     generation: number;
+    complete: boolean;
     events: { event: string; sequence: number; bytes?: number; nativeSequence?: number }[];
   };
 }
@@ -1368,7 +1396,7 @@ async function exerciseCases(
 function pasteVectorsMatch() {
   return withNativeExecutable(async executable => {
     await assert.rejects(exerciseCases(executable, pasteIds, source => replaceOnce(source, registration,
-      'const recorder = registerRecorder({ onData: () => ({ dispose() {} }) }, invoke, onCaptureError);')),
+      'const recorder = registerRecorder({ onData: () => ({ dispose() {} }) }, invoke, onCaptureError, onAppendOutcome);')),
     /native recorder snapshot|production append bytes/);
     await exerciseCases(executable, pasteIds);
   });
@@ -1565,6 +1593,184 @@ function deferred() {
   let resolve!: () => void;
   const promise = new Promise<void>(done => { resolve = done; });
   return { promise, resolve };
+}
+
+async function checkCompositionReceipt(
+  executable: string,
+  prefix: number,
+  order: "on time" | "elapsed first" | "timeout first" | "refused",
+) {
+  const native = connectNative(executable, "requests");
+  const rawGate = deferred();
+  const readGate = deferred();
+  const caseId = "composition-commit";
+  const { text, afterHex } = requiredVectors[caseId];
+  const bytes = [...Buffer.from(afterHex, "hex")];
+  const nativeAppends: Request[] = [];
+  const milestones: (AppendOutcome | "final Read")[] = [];
+  let nativeReads = 0;
+  let generation: unknown;
+  let appendWaiting = false;
+  let rawReturned = false;
+  let finalSnapshot: unknown;
+  const fixture = await mountFixture({
+    browserPaste: true,
+    observeAppendOutcome: outcome => milestones.push(outcome),
+    async invoke(command, args) {
+      if (command === "w2_begin_attempt") {
+        generation = await native.invoke(command, args);
+        return generation;
+      }
+      if (command === "w2_append_input") {
+        nativeAppends.push({ command, args });
+        const reply = await native.invoke(command, args);
+        assert.equal(reply, null);
+        appendWaiting = true;
+        await rawGate.promise;
+        rawReturned = true;
+        return reply;
+      }
+      assert.equal(command, "w2_read_attempt");
+      if (++nativeReads === 1) return native.invoke(command, args);
+      milestones.push("final Read");
+      finalSnapshot = await native.invoke(command, args);
+      await readGate.promise;
+      return finalSnapshot;
+    },
+  });
+  const driver = await compositionDriver(fixture);
+  const alert = () => fixture.container.find(node => node.getAttribute("role") === "alert")?.textContent ?? "";
+  const late = order === "elapsed first" || order === "timeout first";
+  const refused = order === "refused";
+  const dropped = late && prefix === 92;
+  const receipt = late ? "append delivery unconfirmed" : "append acknowledgment";
+  try {
+    await startCase(fixture, caseId);
+    assert.equal(generation, 1);
+    assert.equal(fixture.registrations.length, 1);
+    const registration = fixture.registrations[0]!;
+    await fixture.act(async () => {
+      driver.start();
+      for (let i = 0; i < prefix - 3; i++) driver.update(`draft ${i}`);
+      driver.clock.advance(250);
+    });
+    const checkpoint = field(fixture, "checkpoint");
+    await fixture.waitFor(() => checkpoint.textContent.includes("active and focused"), "focused checkpoint for receipt control");
+    assert.match(checkpoint.textContent, new RegExp(`^${caseId} · attempt 1 · generation ${generation} · event ${prefix - 1} · active and focused · 0 accepted events · 0 bytes · [(]empty[)]$`));
+    assert.deepEqual(native.snapshot(), {
+      caseId, generation, nextSequence: 1, bytes: [], eventLengths: [], rejected: 0, invalid: false,
+    });
+    await fixture.act(async () => { driver.end(text); });
+    assertTrace(fixture, caseId, 1, [
+      "start", ...Array.from({ length: prefix - 3 }, () => "update"), "active checkpoint", "end",
+    ]);
+    assert.deepEqual(fixture.terminal.data, [], "public xterm commit timer has not run");
+    assert.deepEqual(nativeAppends, []);
+    await fixture.act(async () => { driver.clock.advance(0); });
+    assert.deepEqual(fixture.terminal.data, [text], "the valid gesture reaches public xterm input");
+
+    const readRequests = [{ command: "w2_read_attempt", args: { generation } }];
+    if (refused) {
+      assert.match(alert(), /^Held: Composition trace capacity exceeded$/);
+      assert.deepEqual(nativeAppends, []);
+      assert.deepEqual(registration.outcomes, []);
+    } else {
+      await fixture.waitFor(() => appendWaiting, "real native append has replied and raw null is gated");
+      assert.deepEqual(nativeAppends, [
+        { command: "w2_append_input", args: { generation, sequence: 1, events: [bytes] } },
+      ]);
+      assert.equal(rawReturned, false);
+    }
+
+    await fixture.click("Read");
+    if (!refused) {
+      assert.deepEqual(reads(fixture), readRequests, "final Read waits for recorder settlement");
+      assert.deepEqual(milestones, []);
+      assert.deepEqual(trace(fixture).events.slice(prefix).map(evt => evt.event), ["admission", "append dispatch"]);
+      assert.equal(alert(), "");
+      if (dropped) {
+        await fixture.act(async () => { driver.type("unexpected"); });
+        assert.deepEqual(fixture.terminal.data, [text, "unexpected"]);
+        assert.equal(rawReturned, false);
+        assert.match(alert(), /^Held: Composition trace capacity exceeded$/);
+        assert.equal(trace(fixture).complete, false);
+        assert.deepEqual(trace(fixture).events.slice(prefix).map(evt => evt.event), ["admission", "append dispatch"]);
+      }
+      await fixture.act(async () => {
+        if (order === "timeout first") driver.clock.advance(5000);
+        else {
+          driver.clock.elapse(late ? 5001 : 4999);
+          rawGate.resolve();
+        }
+      });
+    }
+
+    const outcomes: AppendOutcome[] = refused ? [] : [{
+      generation: 1, sequence: 1, bytes: bytes.length, status: late ? "unconfirmed" : "acknowledged",
+    }];
+    await fixture.waitFor(() => finalSnapshot !== undefined, "independent final native Read has returned to its gate");
+    assert.deepEqual(milestones, [...outcomes, "final Read"]);
+    assert.deepEqual(registration.outcomes, outcomes);
+    assert.deepEqual(reads(fixture), [...readRequests, ...readRequests]);
+    assert.equal(driver.clock.invokeTimeouts, Number(order === "timeout first"));
+    assert.equal(rawReturned, !refused && order !== "timeout first");
+    const heldMessage = refused || dropped ? "Held: Composition trace capacity exceeded"
+      : late ? "Held: Error: Local invoke timed out" : "";
+    assert.equal(alert(), heldMessage);
+    const beforeRead = trace(fixture);
+    const settlement = refused ? [] : [
+      { event: "admission", sequence: prefix + 1, bytes: bytes.length },
+      { event: "append dispatch", sequence: prefix + 2, bytes: bytes.length, nativeSequence: 1 },
+      { event: receipt, sequence: prefix + 3, bytes: bytes.length, nativeSequence: 1 },
+    ];
+    const markers = () => trace(fixture).events.slice(prefix).map(({ event, sequence, bytes, nativeSequence }) => ({
+      event, sequence, ...(bytes === undefined ? {} : { bytes }), ...(nativeSequence === undefined ? {} : { nativeSequence }),
+    }));
+    assert.deepEqual(markers(), settlement, "receipt is present while the independent Read response is gated");
+    assert.equal(field(fixture, "snapshot").textContent, "—");
+
+    if (order === "timeout first") {
+      await fixture.act(async () => { rawGate.resolve(); });
+      assert.equal(rawReturned, true);
+      assert.equal(alert(), heldMessage);
+      assert.deepEqual(trace(fixture), beforeRead, "late raw null cannot add a receipt");
+      assert.deepEqual(registration.outcomes, outcomes);
+    }
+
+    assert.deepEqual(finalSnapshot, {
+      caseId, generation, nextSequence: refused ? 1 : 2, bytes: refused ? [] : bytes,
+      eventLengths: refused ? [] : [bytes.length], rejected: 0, invalid: false,
+    });
+    await fixture.act(async () => { readGate.resolve(); });
+    await fixture.waitFor(() => field(fixture, "snapshot").textContent !== "—", "final native snapshot is visible");
+    assert.equal(alert(), heldMessage);
+    const final = trace(fixture);
+    assert.deepEqual([final.caseId, final.attemptId, final.generation], [caseId, 1, generation]);
+    assert.equal(final.complete, !refused && !dropped);
+    assert.deepEqual(markers(), [...settlement, {
+      event: "final snapshot", sequence: prefix + settlement.length + 1,
+      bytes: refused ? 0 : bytes.length, nativeSequence: refused ? 1 : 2,
+    }]);
+    assert(final.events.length <= 96);
+    if (prefix === 92) assert.equal(final.events.length, 96);
+    assert.equal(field(fixture, "snapshot").textContent, refused ? "(empty)" : afterHex);
+    assertVisibleSnapshot(fixture, finalSnapshot as Snapshot, 1);
+    await fixture.act(async () => { driver.clock.advance(5000); });
+    assert.deepEqual(trace(fixture), final);
+    assert.deepEqual(registration.outcomes, outcomes);
+    assert.deepEqual(milestones, [...outcomes, "final Read"]);
+    assert.equal(driver.clock.invokeTimeouts, Number(order === "timeout first"));
+    assert.equal(nativeAppends.length, refused ? 0 : 1);
+    assert.equal(alert(), heldMessage);
+    await native.finish();
+  } catch (error) {
+    await native.abort();
+    throw error;
+  } finally {
+    rawGate.resolve();
+    readGate.resolve();
+    try { await fixture.dispose(); } finally { driver.clock.dispose(); }
+  }
 }
 
 async function checkRestartWithPendingAppend(executable: string, release: "acknowledgment" | "deadline") {
@@ -1879,8 +2085,8 @@ async function checkpointControls() {
       /unexpected input holds|guarded composition appends|composition trace phases/);
     }
     await assert.rejects(checkCheckpoint(executable, source => replaceOnce(source,
-      'const recorder = registerRecorder(input, transport, onCaptureError);',
-      'const recorder = registerRecorder({ onData: () => ({ dispose() {} }) }, transport, onCaptureError);')),
+      registration,
+      'const recorder = registerRecorder({ onData: () => ({ dispose() {} }) }, transport, onCaptureError, onAppendOutcome);')),
     /guarded composition appends/);
     await assert.rejects(checkCheckpoint(executable, source => replaceOnce(source,
       'const read = recorder.read(() => eligible(attempt) && epoch === pollEpoch);',
@@ -1902,12 +2108,13 @@ async function checkForegroundRecovery(
   executable: string,
   id: "app-switch" | "lock-foreground",
   transformEntry?: MountOptions["transformEntry"],
-  readback: "available" | "unavailable" | "cached" = "available",
+  readback: "available" | "unavailable" | "cached" | "measured" = "available",
 ) {
   const native = connectNative(executable, "requests");
   const late = deferred();
-  let delayAppend = readback !== "cached";
+  let delayAppend = readback === "available" || readback === "unavailable";
   let failRead = readback === "unavailable";
+  const generations: number[] = [];
   const vector = requiredVectors[id];
   const before = [...Buffer.from(vector.beforeHex, "hex")];
   const after = [...Buffer.from(vector.afterHex, "hex")];
@@ -1920,6 +2127,7 @@ async function checkForegroundRecovery(
         throw new Error("Interrupted read unavailable");
       }
       const reply = await native.invoke(command, args);
+      if (command === "w2_begin_attempt") generations.push(reply as number);
       if (delayAppend && command === "w2_append_input" && generation === 1) {
         await late.promise;
         if (readback === "cached") throw new Error("Interrupted append acknowledgment unavailable");
@@ -1936,31 +2144,56 @@ async function checkForegroundRecovery(
   }
   try {
     await startCase(fixture, id);
+    const [oldGeneration] = generations;
+    assert.equal(oldGeneration, 1);
+    assertSnapshotIdentity(fixture, id, 1, oldGeneration);
+    assert.equal(field(fixture, "snapshot").textContent, "—");
+    assert.equal(fixture.document.getElementById("snapshot-counts"), null);
     await fixture.click("Focus");
     const focuses = fixture.terminal.focuses;
     await fixture.input(String.fromCharCode(...before));
     const oldAppends = [
       { command: "w2_append_input", args: { generation: 1, sequence: 1, events: [before] } },
     ];
-    if (readback === "cached") {
+    if (readback === "cached" || readback === "measured") {
       await finalRead(fixture);
-      assert.equal(field(fixture, "snapshot").textContent, vector.beforeHex);
+      const initial = native.snapshot() as Snapshot;
+      assert.deepEqual(initial, {
+        caseId: id, generation: oldGeneration, nextSequence: 2, bytes: before,
+        eventLengths: [before.length], rejected: 0, invalid: false,
+      });
+      assertVisibleSnapshot(fixture, initial, 1);
+    }
+    if (readback === "cached") {
       delayAppend = true;
       failRead = true;
       const unconfirmed = "x";
       await fixture.input(unconfirmed);
       oldAppends.push({ command: "w2_append_input", args: { generation: 1, sequence: 2, events: [[unconfirmed.charCodeAt(0)]] } });
     }
-    await fixture.input("queued old input");
-    assert.equal(appends(fixture).length, oldAppends.length, "old input is queued behind a pending acknowledgment");
+    if (readback !== "measured") {
+      await fixture.input("queued old input");
+      assert.equal(appends(fixture).length, oldAppends.length, "old input is queued behind a pending acknowledgment");
+    }
 
     await visibility("hidden");
     const retained = fixture.document.getElementById("retained-snapshot");
     assert(retained, "visibility retires the attempt and publishes retained state");
     const retainedHex = readback === "unavailable" ? "Unavailable" : vector.beforeHex;
     await fixture.waitFor(() => retained.textContent === retainedHex, "retained state shows the accepted prefix or explicit unavailability");
-    assert.equal(Boolean(fixture.document.getElementById("retained-uncertainty")), readback !== "available");
-    assert.match(fixture.container.textContent, new RegExp(`Interrupted attempt 1 · ${id} · generation 1 · Invalid`));
+    const retainedIdentity = `Interrupted attempt 1 · ${id} · generation ${oldGeneration} · Invalid`;
+    assert(fixture.container.textContent.includes(retainedIdentity));
+    assert.equal(fixture.document.getElementById("snapshot-identity"), null);
+    assert.equal(fixture.document.getElementById("snapshot-counts"), null);
+    if (readback === "measured") {
+      const snapshot = native.snapshot() as Snapshot;
+      assert.equal(snapshot.generation, oldGeneration);
+      assert.deepEqual(snapshot.bytes, before);
+      assert.equal(retained.parentNode!.textContent.includes(
+        ` · ${snapshot.eventLengths.length} accepted events · ${snapshot.bytes.length} bytes`), true);
+    }
+    assert.equal(Boolean(fixture.document.getElementById("retained-uncertainty")),
+      readback === "unavailable" || readback === "cached");
     assert(fixture.button(recoveryLabel).disabled, "recovery is disabled while suspended");
     await fixture.input("hidden input");
     assert.equal(appends(fixture).length, oldAppends.length, "no sends while suspended");
@@ -1973,11 +2206,17 @@ async function checkForegroundRecovery(
     await fixture.waitFor(() => fixture.ipc.filter(call => call.command === "w2_begin_attempt").length === 2,
       "recovery control begins a fresh generation");
     await fixture.waitFor(() => !fixture.button("Read").disabled, "fresh attempt enables Read");
+    const freshGeneration = generations[1]!;
+    assert(freshGeneration > oldGeneration);
+    assertSnapshotIdentity(fixture, id, 2, freshGeneration);
+    assert.equal(field(fixture, "snapshot").textContent, "—");
+    assert.equal(fixture.document.getElementById("snapshot-counts"), null);
     assert.equal(fixture.terminal.focuses, focuses + 1, "recovery explicitly refocuses");
     await fixture.act(async () => { late.resolve(); });
     assert.equal(appends(fixture).length, oldAppends.length, "recovery invokes no append for queued input");
     await finalRead(fixture);
     assert.equal(field(fixture, "snapshot").textContent, "(empty)", "fresh generation starts empty");
+    assertVisibleSnapshot(fixture, native.snapshot() as Snapshot, 2);
     assert.equal(retained.textContent, retainedHex, "starting fresh preserves the old readout");
 
     await fixture.input(String.fromCharCode(...after));
@@ -1987,9 +2226,14 @@ async function checkForegroundRecovery(
       ...oldAppends,
       { command: "w2_append_input", args: { generation: 2, sequence: 1, events: [after] } },
     ], "append invocations contain only the original and fresh input without replay");
-    assert.equal(field(fixture, "snapshot").textContent, vector.afterHex);
+    const fresh = native.snapshot() as Snapshot;
+    assert.deepEqual(fresh, {
+      caseId: id, generation: freshGeneration, nextSequence: 2, bytes: after,
+      eventLengths: [after.length], rejected: 0, invalid: false,
+    });
+    assertVisibleSnapshot(fixture, fresh, 2);
+    assert(fixture.container.textContent.includes(retainedIdentity));
     assert.equal(retained.textContent, retainedHex, "late callback cannot alter retained evidence");
-    assert.deepEqual((native.snapshot() as Snapshot).bytes, after);
     await native.finish();
   } catch (error) {
     await native.abort();
@@ -2159,8 +2403,11 @@ async function foregroundRecovery() {
     await checkLateBegin(executable);
     await checkForegroundRecovery(executable, "app-switch");
     await checkForegroundRecovery(executable, "lock-foreground");
+    await checkForegroundRecovery(executable, "app-switch", undefined, "measured");
+    await checkForegroundRecovery(executable, "lock-foreground", undefined, "measured");
     await checkForegroundRecovery(executable, "lock-foreground", undefined, "unavailable");
     await checkForegroundRecovery(executable, "lock-foreground", undefined, "cached");
+    await checkCurrentReadback(executable);
     await assert.rejects(checkForegroundRecovery(executable, "app-switch", source => replaceOnce(source,
       'document.addEventListener("visibilitychange", visibilityChanged);', "")),
     /visibility retires the attempt and publishes retained state/);
@@ -2173,13 +2420,100 @@ async function foregroundRecovery() {
   });
 }
 
+async function checkCurrentReadback(executable: string) {
+  const native = connectNative(executable, "requests");
+  const gate = deferred();
+  let staleSnapshot: Snapshot | undefined;
+  let staleReturned = false;
+  let readCount = 0;
+  const fixture = await mountFixture({
+    browserPaste: true,
+    async invoke(command, args) {
+      if (command !== "w2_read_attempt") return native.invoke(command, args);
+      const ordinal = ++readCount;
+      const result = await native.invoke(command, args) as Snapshot;
+      if (ordinal === 2) return { ...result, generation: result.generation + 1 };
+      if (ordinal === 3) {
+        staleSnapshot = result;
+        await gate.promise;
+        staleReturned = true;
+      }
+      return result;
+    },
+  });
+  const driver = await compositionDriver(fixture);
+  const pending = (id: number) => {
+    assertSnapshotIdentity(fixture, "english-return", id, id);
+    assert.equal(field(fixture, "snapshot").textContent, "—");
+    assert.equal(fixture.document.getElementById("snapshot-counts"), null);
+  };
+  const visibility = (value: string) => fixture.act(async () => {
+    fixture.document.visibilityState = value;
+    fixture.document.dispatch("visibilitychange");
+  });
+  try {
+    await startCase(fixture, "english-return");
+    pending(1);
+    await fixture.act(async () => { driver.type("ok"); driver.type("\r"); });
+    await finalRead(fixture);
+    const original = native.snapshot() as Snapshot;
+    assert.deepEqual(original.bytes, [111, 107, 13]);
+    assertVisibleSnapshot(fixture, original, 1);
+    await fixture.click("Read");
+    await fixture.waitFor(() => field(fixture, "snapshot").textContent === "Unavailable", "wrong generation is unavailable");
+    assertSnapshotIdentity(fixture, "english-return", 1, original.generation);
+    assert.equal(fixture.document.getElementById("snapshot-counts"), null);
+    await fixture.click("Read");
+    await fixture.waitFor(() => staleSnapshot !== undefined, "old native Read is waiting for delivery");
+    assert.deepEqual(staleSnapshot, original);
+    pending(1);
+
+    await visibility("hidden");
+    await fixture.waitFor(() => field(fixture, "retained-snapshot").textContent === "6f6b0d", "old bytes are retained");
+    await fixture.act(async () => { driver.clock.advance(5000); });
+    assert.equal(staleReturned, false);
+    await visibility("visible");
+    await fixture.click("Start fresh and refocus");
+    await fixture.waitFor(() => !fixture.button("Read").disabled, "new native generation is ready");
+    pending(2);
+    await fixture.act(async () => { gate.resolve(); });
+    assert.equal(staleReturned, true);
+    pending(2);
+    await finalRead(fixture);
+    assert.deepEqual(native.snapshot(), {
+      caseId: "english-return", generation: 2, nextSequence: 1, bytes: [], eventLengths: [], rejected: 0, invalid: false,
+    });
+    assertVisibleSnapshot(fixture, native.snapshot() as Snapshot, 2);
+    assert.equal(field(fixture, "retained-snapshot").textContent, "6f6b0d");
+    await native.finish();
+  } catch (error) {
+    await native.abort();
+    throw error;
+  } finally {
+    gate.resolve();
+    try { await fixture.dispose(); } finally { driver.clock.dispose(); }
+  }
+}
+
 
 async function touchCopyVerification() {
   await withNativeExecutable(async executable => {
     const native = connectNative(executable, "requests");
-    const fixture = await mountFixture({ browserPaste: true, invoke: native.invoke });
+    let generation: number | undefined;
+    const fixture = await mountFixture({
+      browserPaste: true,
+      async invoke(command, args) {
+        const reply = await native.invoke(command, args);
+        if (command === "w2_begin_attempt") generation = reply as number;
+        return reply;
+      },
+    });
     try {
       await startCase(fixture, "touch-selection-copy");
+      assert.equal(generation, 1);
+      assertSnapshotIdentity(fixture, "touch-selection-copy", 1, generation);
+      assert.equal(field(fixture, "snapshot").textContent, "—");
+      assert.equal(fixture.document.getElementById("snapshot-counts"), null);
       await fixture.click("Focus");
       const terminal = fixture.terminal.browserTerminal!;
       const textarea = fixture.terminal.textarea as unknown as Element;
@@ -2209,18 +2543,20 @@ async function touchCopyVerification() {
       assert.equal(verify.value, "", "clipboard text is discarded");
       clipboard.set("text/plain", token);
       await act(async () => { verify.dispatchEvent(clipboardEvent("paste")); });
+      assert.equal(field(fixture, "copy-verification").textContent, "Match");
+      assert.equal(fixture.document.visibilityState, "visible");
+      assertSnapshotIdentity(fixture, "touch-selection-copy", 1, generation);
       await finalRead(fixture);
       assert.equal(field(fixture, "copy-verification").textContent, "Match");
-      assert.equal(field(fixture, "snapshot").textContent, "(empty)");
-      assert.match(field(fixture, "snapshot-counts").textContent, /0 accepted events · 0 bytes/);
       assert.deepEqual(fixture.ipc, [
         { command: "w2_begin_attempt", args: { caseId: "touch-selection-copy" } },
         { command: "w2_read_attempt", args: { generation: 1 } },
       ]);
       assert.deepEqual(native.snapshot(), {
-        caseId: "touch-selection-copy", generation: 1, nextSequence: 1,
+        caseId: "touch-selection-copy", generation, nextSequence: 1,
         bytes: [], eventLengths: [], rejected: 0, invalid: false,
       });
+      assertVisibleSnapshot(fixture, native.snapshot() as Snapshot, 1);
       await fixture.click("Restart");
       await fixture.waitFor(() => field(fixture, "copy-verification").textContent === "", "restart clears copy verification");
       await native.finish();
@@ -2644,6 +2980,16 @@ if (import.meta.main) {
   test("mounted composition rejects a textarea change without a matching commit input", () => checkUnattributedComposition("mutation"));
   test("mounted composition rejects intervening key input", () => checkUnattributedComposition("key"));
   test("mounted composition rejects intervening paste", () => checkUnattributedComposition("paste"));
+  test("mounted composition retains deadline receipts through independent native Read", () => withNativeExecutable(async executable => {
+    await checkCompositionReceipt(executable, 5, "elapsed first");
+    await checkCompositionReceipt(executable, 5, "timeout first");
+  }));
+  test("mounted composition reserves trace capacity before dispatch", () => withNativeExecutable(async executable => {
+    await checkCompositionReceipt(executable, 92, "on time");
+    await checkCompositionReceipt(executable, 92, "elapsed first");
+    await checkCompositionReceipt(executable, 92, "timeout first");
+    await checkCompositionReceipt(executable, 93, "refused");
+  }));
   test("mounted Restart serializes fresh input past an outstanding append", () => withNativeExecutable(async executable => {
     await checkRestartWithPendingAppend(executable, "acknowledgment");
     await checkRestartWithPendingAppend(executable, "deadline");
