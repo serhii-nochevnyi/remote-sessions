@@ -79,16 +79,17 @@ test("guarded bundle rejects desktop modules and external assets", async () => {
       createRoot(document.body).render(${element});
     `;
     write("react-marker.svg", '<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"/>');
-    for (const [tagExpression, marker] of [
-      ['"img"', "rendered-local"],
-      ["tag", "rendered-nonliteral-local"],
+    for (const [tagExpression, attribute, marker, children] of [
+      ['"img"', "src", "rendered-local", ""],
+      ["tag", "src", "rendered-nonliteral-local", ""],
+      ['"video"', "poster", "rendered-local-with-children", ', ...["local fallback"]'],
     ] as const) {
       write("entry.tsx", rendered('import React from "react";',
         `React.createElement(${tagExpression}, {
-          src: new URL("./react-marker.svg", import.meta.url).href,
-          alt: "${marker}",
+          ${attribute}: new URL("./react-marker.svg", import.meta.url).href,
+          "aria-label": "${marker}",
           style: { backgroundImage: "url(./marker.svg)", opacity: 1 }
-        })`));
+        }${children})`));
       const localReact = await bundle();
       assert("output" in localReact, `Vite emits the rendered asset control: ${marker}`);
       const reactAsset = localReact.output.find(file => file.type === "asset"
@@ -107,6 +108,12 @@ test("guarded bundle rejects desktop modules and external assets", async () => {
     }
 
     for (const [reactImport, element, diagnostic] of [
+      ['import React from "react";',
+        'React.createElement(...["img", { src: "https://example.invalid/remote.svg" }])',
+        /Spread arguments for the React tag or props are forbidden in the offline fixture/],
+      ['import { createElement as element } from "react";',
+        'element("img", ...[{ src: "https://example.invalid/remote.svg" }])',
+        /Spread arguments for the React tag or props are forbidden in the offline fixture/],
       ['import React from "react";',
         'React.createElement("img", { src: "https://example.invalid/remote.svg" })',
         /External asset is forbidden in the fixture: .*remote\.svg/],

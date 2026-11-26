@@ -769,17 +769,18 @@ def moved_attempts(attempts, positions):
     return moved
 
 
-def native_keys(attempt):
+def native_keys(attempt, record, bound):
     """The fixture counters can reset only on a separately identified app launch."""
-    pairs = []
-    if (attempt["case_id"] in RECOVERY and isinstance(attempt.get("recovery"), dict)
+    _, _, launch, _, native_id, generation = record
+    primary = (launch, native_id, generation)
+    if (bound and attempt["case_id"] in RECOVERY and isinstance(attempt.get("recovery"), dict)
             and isinstance(attempt["recovery"].get("before"), dict)):
-        _, native_id, generation = attempt_identity(attempt["recovery"]["before"])
-        pairs.append((native_id, generation))
-    pairs.append((attempt.get("attemptId"), attempt.get("generation")))
-    keys = [(attempt["launch_id"], native_id, generation) for native_id, generation in pairs
-            if number(native_id, 1) and number(generation, 1)]
-    return tuple(dict.fromkeys(keys))
+        _, before_id, before_generation = attempt_identity(attempt["recovery"]["before"])
+        if number(before_id, 1) and number(before_generation, 1):
+            before = (launch, before_id, before_generation)
+            if before != primary:
+                return (before, primary)
+    return (primary,)
 
 
 def restart_reference(attempt):
@@ -791,14 +792,14 @@ def restart_reference(attempt):
     return None
 
 
-def out_of_order_attempts(attempts):
+def out_of_order_attempts(identities):
     latest = {}
     out_of_order = set()
-    for attempt in attempts:
-        for launch, native_id, generation in native_keys(attempt):
+    for attempt_id, keys in identities.items():
+        for launch, native_id, generation in keys:
             last_id, last_generation = latest.get(launch, (0, 0))
             if native_id <= last_id or generation <= last_generation:
-                out_of_order.add(attempt["id"])
+                out_of_order.add(attempt_id)
             latest[launch] = (max(last_id, native_id), max(last_generation, generation))
     return out_of_order
 
@@ -825,11 +826,15 @@ def assess_cohort(cohort, role, cases, ids):
                      key=lambda attempt: records[attempt["id"]][:2])
     unpositioned = [attempt for attempt in attempts if attempt["id"] not in records]
     bound = [attempt for attempt in ordered if attempt["id"] in bound_positions]
-    keys = [key for attempt in bound for key in native_keys(attempt)]
+    identities = {}
+    for attempt in ordered:
+        attempt_id = attempt["id"]
+        identities[attempt_id] = native_keys(attempt, records[attempt_id], attempt_id in bound_positions)
+    keys = [key for row_keys in identities.values() for key in row_keys]
     attempt_ids = Counter((launch, attempt_id) for launch, attempt_id, _ in keys)
     generations = Counter((launch, generation) for launch, _, generation in keys)
     restarts = Counter(ref for attempt in bound if (ref := restart_reference(attempt)) is not None)
-    out_of_order = out_of_order_attempts(bound)
+    out_of_order = out_of_order_attempts(identities)
     for attempt in [*ordered, *unpositioned]:
         attempt_id = attempt["id"]
         case_id = attempt["case_id"]
@@ -838,7 +843,7 @@ def assess_cohort(cohort, role, cases, ids):
         elif attempt_id not in bound_positions:
             result = Result("inconclusive", "attempt does not match its retained launch and measurement")
         elif any(attempt_ids[launch, native_id] > 1 or generations[launch, generation] > 1
-                 for launch, native_id, generation in native_keys(attempt)):
+                 for launch, native_id, generation in identities[attempt_id]):
             result = Result("inconclusive", "native attempt or generation is reused within an app launch")
         elif attempt_id in out_of_order:
             result = Result("inconclusive", "native attempt or generation is out of order within an app launch")

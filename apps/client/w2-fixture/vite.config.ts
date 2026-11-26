@@ -187,7 +187,11 @@ function assertSourceAssets(source: string, id: string) {
       if ((ts.isIdentifier(callee) && reactFactories.has(callee.text))
           || (ts.isPropertyAccessExpression(callee) && callee.name.text === "createElement"
             && ts.isIdentifier(callee.expression) && reactObjects.has(callee.expression.text))) {
-        assertReactAssets(node.arguments[1]);
+        const [tag, props] = node.arguments;
+        if ((tag && ts.isSpreadElement(tag)) || (props && ts.isSpreadElement(props))) {
+          throw new Error("Spread arguments for the React tag or props are forbidden in the offline fixture");
+        }
+        assertReactAssets(props);
       }
     }
     if (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) {

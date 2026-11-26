@@ -389,11 +389,9 @@ function mountTerminal(
       const id = ++nextId;
       const isCurrent = () =>
         lifecycleEpoch === startEpoch && !disposed && document.visibilityState === "visible";
-      if (refocus) {
-        clearPreedit();
-        if (composing) textarea.dispatchEvent(new Event("compositionend", { bubbles: true }));
-        terminal.focus();
-      }
+      clearPreedit();
+      if (composing) textarea.dispatchEvent(new Event("compositionend", { bubbles: true }));
+      if (refocus) terminal.focus();
       if (needsCompositionDrain) await (settling?.done ?? settleComposition());
       if (!isCurrent()) return false;
       const generation = await recorder.start(selected.id, isCurrent);

@@ -1531,16 +1531,20 @@ async function checkLateRead(executable: string, stop: "end" | "blur" | "hide" |
   const native = connectNative(executable, "requests");
   const gate = deferred();
   const returned = deferred();
+  const beginGate = deferred();
   let readsStarted = 0;
+  let beginsStarted = 0;
   const fixture = await mountFixture({
     browserPaste: true,
     async invoke(command, args) {
       const delayCheckpoint = command === "w2_read_attempt" && ++readsStarted === 1;
+      const delayBegin = stop === "restart" && command === "w2_begin_attempt" && ++beginsStarted === 2;
       const result = await native.invoke(command, args);
       if (delayCheckpoint) {
         await gate.promise;
         returned.resolve();
       }
+      if (delayBegin) await beginGate.promise;
       return result;
     },
   });
@@ -1556,8 +1560,38 @@ async function checkLateRead(executable: string, stop: "end" | "blur" | "hide" |
     if (stop === "unmount") await fixture.dispose();
     else if (stop === "case") await fixture.selectCase("rotation");
     else if (stop === "restart") {
+      const compositionView = field(fixture, "terminal").find(node => node.classList.contains("composition-view"));
+      assert(compositionView && compositionView.classList.contains("active"), "xterm shows the retired preedit before Restart");
+      assert.equal(driver.textarea.value, "draft");
+      const focusCount = driver.textarea.focusCount;
       await fixture.click("Restart");
-      await fixture.waitFor(() => fixture.ipc.filter(call => call.command === "w2_begin_attempt").length === 2, "fresh attempt starts");
+      assert.equal(fixture.terminal.options.disableStdin, true, "stdin is disabled during the Restart drain");
+      assert.equal(beginsStarted, 1, "Restart drains preedit before invoking native begin");
+      assert(!compositionView.classList.contains("active"), "Restart clears the xterm preedit view");
+      assert.equal(driver.textarea.value, "");
+      await act(async () => { driver.clock.advance(0); });
+      await fixture.waitFor(() => beginsStarted === 2, "native begin starts after settlement");
+      assert.equal(fixture.terminal.options.disableStdin, true, "stdin stays disabled while native begin is pending");
+      await act(async () => { beginGate.resolve(); });
+      await fixture.waitFor(() => Boolean(fixture.container.find(node =>
+        node.localName === "button" && node.textContent === "Restart" && !node.disabled)), "fresh attempt is ready");
+      assert.equal(fixture.terminal.options.disableStdin, false);
+      assert.equal(fixture.document.activeElement, driver.textarea);
+      assert.equal(driver.textarea.focusCount, focusCount, "ordinary Restart does not request focus");
+      await act(async () => {
+        driver.end("old commit");
+        driver.textarea.value = "old preedit";
+        driver.premature("old preedit");
+        driver.clock.advance(250);
+      });
+      assert.deepEqual(fixture.terminal.data, [], "xterm emits no retired input");
+      assert.equal(driver.textarea.value, "");
+      assert.equal(field(fixture, "checkpoint").textContent, "Pending");
+      assert.equal(fixture.document.getElementById("composition-trace"), null);
+      assert.equal(fixture.container.find(node => node.getAttribute("role") === "alert"), undefined);
+      assert.deepEqual(await native.invoke("w2_read_attempt", { generation: 2 }), {
+        caseId: "composition-commit", generation: 2, nextSequence: 1, bytes: [], eventLengths: [], rejected: 0, invalid: false,
+      });
     } else await act(async () => {
       if (stop === "end") driver.end("é");
       if (stop === "blur") driver.textarea.blur();
@@ -1599,12 +1633,14 @@ async function checkLateRead(executable: string, stop: "end" | "blur" | "hide" |
       assert.equal(appends(fixture).length, 0, "retired composition cannot append to the fresh generation");
       await fixture.waitFor(() => fixture.ipc.filter(call => call.command === "w2_begin_attempt").length === 2, "fresh composition begins natively");
     }
+    if (stop === "restart") await compositionVector(fixture, native, "composition-commit", 2, { attemptId: 2 });
     await native.finish();
   } catch (error) {
     await native.abort();
     throw error;
   } finally {
     gate.resolve();
+    beginGate.resolve();
     await fixture.dispose();
     driver.clock.dispose();
   }
