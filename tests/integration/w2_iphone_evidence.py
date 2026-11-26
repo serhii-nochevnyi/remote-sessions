@@ -67,9 +67,10 @@ class EvidenceError(ValueError):
 class MeasuredFailure(EvidenceError):
     """The recorded procedure and outcome establish a mandatory failure."""
 
-    def __init__(self, detail, observed):
+    def __init__(self, detail, observed, *, old_identity=None):
         super().__init__(detail)
         self.observed = observed
+        self.old_identity = old_identity
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,11 @@ class Result:
     status: str
     detail: str = ""
     observed: tuple = ()
+    old_observation: tuple | None = None
+
+    @property
+    def failure_signature(self):
+        return self.status, self.detail, self.observed
 
 
 @dataclass
@@ -623,9 +629,11 @@ def check_recovery(attempt, identity, expected, observed, recovery_prefix):
             observed_input = (before_hex, retained_hex, before_count, retained_count, extra_event)
             if before_hex == retained_hex and before_count == retained_count and not extra_event:
                 observed_input += (tuple(before["eventLengths"]), tuple(retained["eventLengths"]))
-            raise MeasuredFailure("retained native bytes or events changed", observed_input)
-        if attempt.get("capture_error") is False:
-            measured(before_hex == expected, "initial bytes differ from the manifest", before_hex)
+            raise MeasuredFailure("retained native bytes or events changed", observed_input,
+                                  old_identity=attempt_identity(retained))
+        if attempt.get("capture_error") is False and before_hex != expected:
+            raise MeasuredFailure("initial bytes differ from the manifest", (before_hex,),
+                                  old_identity=attempt_identity(retained))
     outcome = corroborate_restart(attempt, identity, retained, observed.get("started_fresh"), recovery_prefix)
     if outcome == "no-new-generation":
         raise MeasuredFailure("foreground restart produced no new generation", ())
@@ -675,7 +683,7 @@ def check_attempt_context(attempt, case, cohort):
     return obj(attempt.get("observations"), "visible observations"), recovery_prefix
 
 
-def evaluate_attempt(attempt, case, cohort, qualification):
+def evaluate_attempt(attempt, case, cohort, qualification, retained_launch):
     case_id = case["id"]
     try:
         observed, recovery_prefix = check_attempt_context(attempt, case, cohort)
@@ -708,7 +716,8 @@ def evaluate_attempt(attempt, case, cohort, qualification):
         need(type(attempt.get("start_empty")) is bool and type(attempt.get("replayed")) is bool,
              "missing start or replay observation")
     except MeasuredFailure as error:
-        return Result("failing", str(error), error.observed)
+        old_observation = (retained_launch, *error.old_identity) if error.old_identity is not None else None
+        return Result("failing", str(error), error.observed, old_observation)
     except EvidenceError as error:
         return Result("inconclusive", str(error))
     return Result("pass")
@@ -764,14 +773,25 @@ class CaseRecord:
         attempt, result = records[0]
         if result.status != "failing":
             return None
+        signature = result.failure_signature
         conditions = tuple(attempt.get(key) for key in ("route", "keyboard_language", "recipe_id"))
         same_conditions = [value for run, value in self.open_attempts.values()
                            if tuple(run.get(key) for key in ("route", "keyboard_language", "recipe_id")) == conditions]
-        if (same_conditions[-1] == result
-                and all(value == result and tuple(run.get(key) for key in ("route", "keyboard_language", "recipe_id")) == conditions
-                        for run, value in records)):
-            return result, conditions
-        return None
+        if (same_conditions[-1].failure_signature != signature
+                or any(value.failure_signature != signature
+                       or tuple(run.get(key) for key in ("route", "keyboard_language", "recipe_id")) != conditions
+                       for run, value in records)):
+            return None
+        if len(records) == 2:
+            first, second = result.old_observation, records[1][1].old_observation
+            if first is not None and second is not None:
+                launch, case_id, attempt_id, generation = first
+                other_launch, other_case, other_id, other_generation = second
+                if (launch, case_id) == (other_launch, other_case) and (
+                    attempt_id == other_id or generation == other_generation
+                ):
+                    return None
+        return signature, conditions
 
 
 def retained_measurements(cohort):
@@ -919,7 +939,8 @@ def assess_cohort(cohort, role, cases, ids):
         elif restarts[restart_reference(attempt)] > 1:
             result = Result("inconclusive", "foreground restart observation is reused")
         else:
-            result = evaluate_attempt(attempt, cases[case_id], cohort, recipes.get(case_id))
+            retained_launch = records[attempt_id][2]
+            result = evaluate_attempt(attempt, cases[case_id], cohort, recipes.get(case_id), retained_launch)
             # Keep verified failures at their retained positions and disqualify moved passes.
             if result.status == "pass" and attempt_id in moved:
                 result = Result("inconclusive",
