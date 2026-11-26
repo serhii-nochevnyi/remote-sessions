@@ -29,11 +29,17 @@ type Attempt = {
   nextSequence: number;
   lastSent: number;
   queue: number[][];
-  pendingEvents: number;
-  pendingBytes: number;
+  queuedBytes: number;
   invalid: boolean;
-  drain: Promise<void> | undefined;
   snapshot?: Snapshot;
+};
+
+type AppendBatch = {
+  attempt: Attempt;
+  sequence: number;
+  events: number[][];
+  bytes: number;
+  done?: Promise<void>;
 };
 
 async function withDeadline<T>(signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
@@ -73,6 +79,7 @@ function isSnapshot(value: unknown, attempt: Attempt, minSequence: number): valu
 export function registerRecorder(input: InputSource, invoke: Invoke, onError: (error: unknown) => void) {
   const encoder = new TextEncoder();
   let active: Attempt | undefined;
+  let appendSlot: AppendBatch | undefined;
   let epoch = 0;
   const lifetime = new AbortController();
   let generation = 0;
@@ -81,44 +88,46 @@ export function registerRecorder(input: InputSource, invoke: Invoke, onError: (e
     if (active !== attempt || attempt.invalid) return;
     attempt.invalid = true;
     attempt.queue.length = 0;
+    attempt.queuedBytes = 0;
     onError(reason);
   }
 
-  async function send(attempt: Attempt) {
-    while (active === attempt && !attempt.invalid && attempt.queue.length) {
-      const events: number[][] = [];
-      let bytes = 0;
-      for (const event of attempt.queue) {
-        if (events.length === appendEvents || bytes + event.length > appendBytes) break;
-        events.push(event);
-        bytes += event.length;
-      }
-      attempt.queue.splice(0, events.length);
-      const sequence = attempt.nextSequence;
-      attempt.lastSent = sequence;
-      try {
-        const ack = await withDeadline(lifetime.signal, () => invoke<unknown>("w2_append_input", {
-          generation: attempt.generation, sequence, events,
-        }));
-        if (active !== attempt) return;
-        if (ack !== null) throw new Error("Invalid append acknowledgment");
-        attempt.nextSequence++;
-      } catch (reason) {
-        invalidate(attempt, reason);
-      } finally {
-        attempt.pendingEvents -= events.length;
-        attempt.pendingBytes -= bytes;
+  async function send(batch: AppendBatch) {
+    const { attempt, sequence, events } = batch;
+    try {
+      const ack = await withDeadline(lifetime.signal, () => invoke<unknown>("w2_append_input", {
+        generation: attempt.generation, sequence, events,
+      }));
+      if (appendSlot !== batch || active !== attempt) return;
+      if (ack !== null) throw new Error("Invalid append acknowledgment");
+      attempt.nextSequence++;
+    } catch (reason) {
+      if (appendSlot === batch) invalidate(attempt, reason);
+    } finally {
+      if (appendSlot === batch) {
+        appendSlot = undefined;
+        flush();
       }
     }
   }
 
   function flush() {
     const attempt = active;
-    if (!attempt || attempt.drain || attempt.invalid || !attempt.queue.length) return;
-    attempt.drain = send(attempt).finally(() => {
-      attempt.drain = undefined;
-      if (active === attempt) flush();
-    });
+    if (!attempt || appendSlot || attempt.invalid || !attempt.queue.length) return;
+    const events: number[][] = [];
+    let bytes = 0;
+    for (const event of attempt.queue) {
+      if (events.length === appendEvents || bytes + event.length > appendBytes) break;
+      events.push(event);
+      bytes += event.length;
+    }
+    attempt.queue.splice(0, events.length);
+    attempt.queuedBytes -= bytes;
+    const sequence = attempt.nextSequence;
+    attempt.lastSent = sequence;
+    const batch: AppendBatch = { attempt, sequence, events, bytes };
+    appendSlot = batch;
+    batch.done = send(batch);
   }
 
   const subscription = input.onData(text => {
@@ -133,13 +142,14 @@ export function registerRecorder(input: InputSource, invoke: Invoke, onError: (e
       invalidate(attempt, "Invalid input event size");
       return;
     }
-    if (attempt.pendingEvents >= retainedEvents || attempt.pendingBytes + encoded.length > retainedBytes) {
+    const pendingEvents = attempt.queue.length + (appendSlot?.events.length ?? 0);
+    const pendingBytes = attempt.queuedBytes + (appendSlot?.bytes ?? 0);
+    if (pendingEvents >= retainedEvents || pendingBytes + encoded.length > retainedBytes) {
       invalidate(attempt, "Pending input capacity exceeded");
       return;
     }
     attempt.queue.push(Array.from(encoded));
-    attempt.pendingEvents++;
-    attempt.pendingBytes += encoded.length;
+    attempt.queuedBytes += encoded.length;
     flush();
   });
 
@@ -147,7 +157,10 @@ export function registerRecorder(input: InputSource, invoke: Invoke, onError: (e
     epoch++;
     const attempt = active;
     active = undefined;
-    if (attempt) attempt.queue.length = 0;
+    if (attempt) {
+      attempt.queue.length = 0;
+      attempt.queuedBytes = 0;
+    }
     return attempt;
   }
 
@@ -185,14 +198,16 @@ export function registerRecorder(input: InputSource, invoke: Invoke, onError: (e
       generation = next;
       active = {
         caseId, generation, nextSequence: 1, lastSent: 0, queue: [],
-        pendingEvents: 0, pendingBytes: 0, invalid: false, drain: undefined,
+        queuedBytes: 0, invalid: false,
       };
       return generation;
     },
     async read(isCurrent: () => boolean = () => true) {
       const attempt = active;
       if (!attempt) throw new Error("Start the fixture case first");
-      while (attempt.drain && active === attempt) await attempt.drain;
+      while (active === attempt && appendSlot && (appendSlot.attempt === attempt || attempt.queue.length)) {
+        await appendSlot.done;
+      }
       if (active !== attempt || !isCurrent()) throw new Error("Attempt read expired");
       const snapshot = await readSnapshot(attempt);
       if (active !== attempt || !isCurrent()) throw new Error("Attempt read expired");

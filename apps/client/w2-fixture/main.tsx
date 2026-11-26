@@ -92,8 +92,15 @@ function mountTerminal(
   let composing = false;
   let needsCompositionDrain = false;
   type CompositionOwner = { attempt: Attempt; epoch: number };
+  type CompositionSettlement = {
+    owner: CompositionOwner | undefined;
+    commitValue?: string;
+    contaminated: boolean;
+    done: Promise<void>;
+    cancel: () => void;
+  };
   let activeComposition: CompositionOwner | undefined;
-  let settling: { owner: CompositionOwner | undefined; done: Promise<void>; cancel: () => void } | undefined;
+  let settling: CompositionSettlement | undefined;
 
   function ownsComposition(owner: CompositionOwner | undefined) {
     return owner !== undefined && owner.attempt === current && owner.epoch === lifecycleEpoch;
@@ -107,8 +114,9 @@ function mountTerminal(
     let timer: ReturnType<typeof setTimeout>;
     let finish!: () => void;
     const done = new Promise<void>(resolve => { finish = resolve; });
-    const cycle = {
+    const cycle: CompositionSettlement = {
       owner,
+      contaminated: false,
       done,
       cancel() {
         clearTimeout(timer);
@@ -205,11 +213,22 @@ function mountTerminal(
   function compositionInput(inputEvent: Event) {
     if (inputEvent.target !== textarea) return;
     const event = inputEvent as InputEvent;
+    const cycle = settling;
+    if (cycle && ownsComposition(cycle.owner)) {
+      if (event.inputType === "insertFromComposition" && !event.isComposing
+        && cycle.commitValue === undefined && !cycle.contaminated) {
+        cycle.commitValue = textarea.value;
+      } else cycle.contaminated = true;
+    }
     if (!event.isComposing && event.inputType !== "insertCompositionText"
       && event.inputType !== "deleteCompositionText" && event.inputType !== "insertFromComposition") return;
-    if (ownsComposition(activeComposition) || ownsComposition(settling?.owner)) return;
+    if (ownsComposition(activeComposition) || ownsComposition(cycle?.owner)) return;
     clearPreedit();
     event.stopImmediatePropagation();
+  }
+
+  function contaminateSettlement() {
+    if (settling && ownsComposition(settling.owner)) settling.contaminated = true;
   }
 
   function compositionStart() {
@@ -294,6 +313,9 @@ function mountTerminal(
   textarea.addEventListener("compositionupdate", compositionUpdate, true);
   textarea.addEventListener("compositionend", compositionEnd, true);
   host.addEventListener("input", compositionInput, true);
+  host.addEventListener("keydown", contaminateSettlement, true);
+  host.addEventListener("keypress", contaminateSettlement, true);
+  host.addEventListener("paste", contaminateSettlement, true);
   textarea.addEventListener("blur", interrupt, true);
   document.addEventListener("visibilitychange", visibilityChanged);
 
@@ -306,7 +328,10 @@ function mountTerminal(
         if (attempt.composition) {
           if (!text) return;
           const bytes = encoder.encode(text);
+          const cycle = settling;
           if (attempt.held || attempt.phase !== "ended" || attempt.admitted
+            || !cycle || !ownsComposition(cycle.owner) || cycle.contaminated
+            || cycle.commitValue !== text || textarea.value !== cycle.commitValue
             || hex([...bytes]) !== attempt.selected.expected.afterHex) {
             record(attempt, "rejection", bytes.length);
             hold(attempt, "Unexpected composition input");
@@ -450,6 +475,9 @@ function mountTerminal(
       textarea.removeEventListener("compositionupdate", compositionUpdate, true);
       textarea.removeEventListener("compositionend", compositionEnd, true);
       host.removeEventListener("input", compositionInput, true);
+      host.removeEventListener("keydown", contaminateSettlement, true);
+      host.removeEventListener("keypress", contaminateSettlement, true);
+      host.removeEventListener("paste", contaminateSettlement, true);
       textarea.removeEventListener("blur", interrupt, true);
       document.removeEventListener("visibilitychange", visibilityChanged);
       stopLayout();
