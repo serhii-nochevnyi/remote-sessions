@@ -215,7 +215,6 @@ function mountTerminal(
     const event = inputEvent as InputEvent;
     const cycle = settling;
     if (cycle && ownsComposition(cycle.owner)) {
-      // Ordinary insertText can emit synchronously and change what the deferred callback reads.
       if (event.inputType === "insertFromComposition" && !event.isComposing
         && cycle.commitValue === undefined && !cycle.contaminated) {
         cycle.commitValue = textarea.value;

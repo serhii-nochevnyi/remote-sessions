@@ -79,7 +79,6 @@ function isSnapshot(value: unknown, attempt: Attempt, minSequence: number): valu
 export function registerRecorder(input: InputSource, invoke: Invoke, onError: (error: unknown) => void) {
   const encoder = new TextEncoder();
   let active: Attempt | undefined;
-  // The dispatched batch owns this slot even when Restart replaces its attempt.
   let appendSlot: AppendBatch | undefined;
   let epoch = 0;
   const lifetime = new AbortController();
