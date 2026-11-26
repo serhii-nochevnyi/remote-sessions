@@ -8,6 +8,7 @@ export interface RuntimeInfo {
   readonly session_id: string;
   readonly command: string;
   readonly pane_pid: number | null;
+  readonly pane_id?: string;
   readonly exited: boolean;
   readonly width: number;
   readonly height: number;
@@ -147,6 +148,42 @@ export type WorkspaceSelection = Blocked | { readonly result: "cancelled" }
   | { readonly result: "selected"; readonly workspace: WorkspaceDisplay };
 export type WorkspaceReadiness = Blocked | { readonly result: "ready" };
 
+interface ReadinessCheck {
+  readonly workspaceId: string;
+  readonly profile: ProviderProfile;
+}
+
+export class CreateReadiness {
+  private current: ReadinessCheck | undefined;
+  private ready = false;
+
+  begin(workspaceId: string, profile: ProviderProfile): ReadinessCheck {
+    this.ready = false;
+    return this.current = { workspaceId, profile };
+  }
+
+  invalidate() {
+    this.current = undefined;
+    this.ready = false;
+  }
+
+  finish(check: ReadinessCheck, result: WorkspaceReadiness | undefined): boolean {
+    if (this.current !== check) return false;
+    this.ready = result?.result === "ready";
+    return true;
+  }
+
+  allows(workspaceId: string, profile: ProviderProfile): boolean {
+    return this.ready && this.current?.workspaceId === workspaceId && this.current.profile === profile;
+  }
+
+  take(workspaceId: string, profile: ProviderProfile): boolean {
+    if (!this.allows(workspaceId, profile)) return false;
+    this.invalidate();
+    return true;
+  }
+}
+
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function record(value: unknown): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw Error("Некоректна відповідь агента");
@@ -172,7 +209,8 @@ function parseRuntime(value: unknown): RuntimeInfo {
   if (typeof runtime.command !== "string" || runtime.command.length > 256 || typeof runtime.exited !== "boolean") throw Error("Некоректний опис сесії");
   const base = { runtime_id: id(runtime.runtime_id), session_id: id(runtime.session_id), command: runtime.command,
     pane_pid: runtime.pane_pid === null ? null : integer(runtime.pane_pid, 1, 2 ** 31), exited: runtime.exited,
-    width: integer(runtime.width, 1, 10000), height: integer(runtime.height, 1, 10000) };
+    width: integer(runtime.width, 1, 10000), height: integer(runtime.height, 1, 10000),
+    ...(runtime.pane_id === undefined ? {} : { pane_id: tmuxId(runtime.pane_id, "%") }) };
   if (runtime.origin === undefined) return base;
   if (runtime.origin === "managed") {
     return { ...base, origin: "managed", workspace_id: id(runtime.workspace_id), operation_id: id(runtime.operation_id) };
@@ -273,6 +311,8 @@ export class TerminalViewScope {
   private attached: string | null = null;
   private retired = false;
   private writable = false;
+  private inputEligible = true;
+  private eligibilityVersion = 0;
   private inputFailed = false;
   private incarnation: string | undefined;
   private completion: PasteCompletion | undefined;
@@ -296,7 +336,7 @@ export class TerminalViewScope {
   get viewId() { return this.attached; }
   get active() { return !this.retired; }
   get canWrite() {
-    return this.active && this.writable && this.incarnation !== undefined && !this.inputFailed && !this.pasteHeld;
+    return this.active && this.inputEligible && this.writable && this.incarnation !== undefined && !this.inputFailed && !this.pasteHeld;
   }
   get pasteMessage() {
     return this.pasteIssue ? pasteIssueText[this.pasteIssue]
@@ -311,6 +351,24 @@ export class TerminalViewScope {
   }
 
   owns(view: string) { return this.active && this.attached === view; }
+
+  setInputEligible(eligible: boolean) {
+    if (this.inputEligible === eligible) return;
+    this.inputEligible = eligible;
+    this.eligibilityVersion++;
+    this.writeGeneration++;
+    this.writable = false;
+    for (const frame of this.pendingInput) frame.bytes = null;
+  }
+
+  captureReadEligibility(): (chunk: Chunk) => Chunk {
+    const version = this.eligibilityVersion;
+    return chunk => {
+      if (version === this.eligibilityVersion || !chunk.writable) return chunk;
+      const { paste_incarnation: _, ...readOnly } = chunk;
+      return { ...readOnly, writable: false };
+    };
+  }
 
   retire(recovery?: { error: unknown }) {
     if (this.retired) return;
@@ -339,6 +397,7 @@ export class TerminalViewScope {
       return this.owns(view);
     }
     const snapshot = ++this.snapshot;
+    const eligibility = this.eligibilityVersion;
     const writable = chunk.writable
       && (chunk.paste_incarnation === undefined || chunk.paste_incarnation !== this.endedPasteIncarnation);
     const incarnation = writable ? chunk.paste_incarnation : undefined;
@@ -359,7 +418,7 @@ export class TerminalViewScope {
     this.admission = chunk.paste_admission;
     await render();
     if (!this.owns(view)) return false;
-    if (snapshot === this.snapshot) this.writable = writable;
+    if (snapshot === this.snapshot && eligibility === this.eligibilityVersion && this.inputEligible) this.writable = writable;
     return true;
   }
 
@@ -732,7 +791,7 @@ export const localClient = {
     parseCreateStatus(await invoke<unknown>("local_create_status", { reference, presented: true })),
   attach: async (runtimeId: string) => parseLiveAttachment(await invoke<unknown>("terminal_attach", { runtimeId })),
   read: async (viewId: string) => parseChunk(await invoke<unknown>("terminal_read", { viewId })),
-  terminalStatus: async (viewId: string) =>
+  terminalStatus: async (viewId: string): Promise<TerminalStatus> =>
     parseTerminalStatus(await invoke<unknown>("terminal_status", { viewId })),
   resize: async (viewId: string, epoch: ResizeEpoch, size: TerminalSize) =>
     parseResizeResult(await invoke<unknown>("terminal_resize", { viewId, epoch, size })),

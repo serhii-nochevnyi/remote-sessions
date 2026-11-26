@@ -193,3 +193,84 @@ for (const held of ["write", "ack"] as const) {
     });
   }
 }
+
+test("native status reads the existing view and decodes its exact target without granting input", async t => {
+  const calls: unknown[] = [];
+  const original = Object.getOwnPropertyDescriptor(globalThis, "window");
+  let response: unknown = terminalStatus(id, 0);
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: { __TAURI_INTERNALS__: {
+      invoke(command: string, args: unknown) {
+        calls.push([command, args]);
+        return response;
+      },
+    } },
+  });
+  t.after(() => {
+    if (original) Object.defineProperty(globalThis, "window", original);
+    else Reflect.deleteProperty(globalThis, "window");
+  });
+  assert.deepEqual(await localClient.terminalStatus(id), response);
+  response = { ...terminalStatus(id, 0), terminal: {
+    ...terminalStatus(id, 0).terminal, target: { ...target, process_start: 0 },
+  } };
+  await assert.rejects(localClient.terminalStatus(id), /Некоректне числове значення/);
+  assert.deepEqual(calls, [
+    ["terminal_status", { viewId: id }],
+    ["terminal_status", { viewId: id }],
+  ]);
+});
+
+test("read-only verification preserves output and drops queued input until a new native grant arrives", async () => {
+  const sent: [string, number[], string][] = [];
+  const writing = deferred<void>();
+  const rendering = deferred<void>();
+  const scope = new TerminalViewScope({
+    input: async (view, bytes, incarnation) => {
+      sent.push([view, bytes, incarnation]);
+      if (sent.length === 1) await writing.promise;
+    },
+    inputFailure: error => assert.fail(String(error)),
+    retire: () => assert.fail("read-only observation retired the view"),
+    reconnect: () => assert.fail("read-only observation reconnected the view"),
+  });
+  const canWrite = () => scope.canWrite;
+  assert.ok(scope.bind(id));
+  assert.ok(await scope.consume(id, liveChunk, async () => {}));
+  const priorRead = scope.captureReadEligibility();
+  const sending = scope.send(Uint8Array.of(1));
+  await Promise.resolve();
+  const obsolete = scope.send(Uint8Array.of(2));
+  const output: number[] = [];
+  const reading = scope.consume(id, { ...liveChunk, data: [65] }, async () => {
+    await rendering.promise;
+    output.push(65);
+  });
+  scope.setInputEligible(false);
+  assert.equal(canWrite(), false);
+  assert.ok(scope.owns(id));
+  await scope.send(Uint8Array.of(3));
+  scope.setInputEligible(true);
+  rendering.resolve();
+  assert.ok(await reading);
+  assert.deepEqual(output, [65]);
+  assert.equal(canWrite(), false);
+  assert.ok(await scope.consume(id, priorRead(liveChunk), async () => {}));
+  assert.equal(canWrite(), false);
+  writing.resolve();
+  await Promise.all([sending, obsolete]);
+
+  assert.ok(await scope.consume(id, { ...liveChunk, paste_incarnation: freshId }, async () => {}));
+  assert.equal(canWrite(), true);
+  await scope.send(Uint8Array.of(4));
+  assert.deepEqual(sent, [[id, [1], id], [id, [4], freshId]]);
+
+  assert.ok(await scope.consume(id, { closed: false, writable: false, data: [], paste_admission: "prior_send_unknown" }, async () => {}));
+  scope.setInputEligible(false);
+  scope.setInputEligible(true);
+  assert.ok(await scope.consume(id, liveChunk, async () => {}));
+  assert.equal(canWrite(), false);
+  await scope.send(Uint8Array.of(5));
+  assert.equal(sent.length, 2);
+});

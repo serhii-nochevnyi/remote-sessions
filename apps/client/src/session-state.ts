@@ -59,6 +59,41 @@ export function viewAvailability(
   return runtime ? (runtime.exited ? "exited" : "live") : "missing";
 }
 
+export interface BoundTerminal {
+  readonly agentPid: number;
+  readonly terminal: TerminalScope;
+}
+
+export function mountedTerminal(
+  id: string,
+  inventory: Inventory | null,
+  expected: { operationId: string | null; sessionId: string } | undefined,
+  bound: BoundTerminal | null,
+  verified: TerminalScope | null | undefined,
+  checking: boolean,
+): { mode: "live" | "observe" | "pending" | "offline" | "missing" | "exited"; key?: string } {
+  const runtime = inventory?.runtimes.find(entry => entry.runtime_id === id);
+  if (inventory && !runtime) return { mode: "missing" };
+  if (runtime && expected && (runtime.session_id !== expected.sessionId ||
+      (runtime.operation_id && runtime.operation_id !== expected.operationId))) return { mode: "missing" };
+  if (runtime?.exited) return { mode: "exited" };
+  const enriched = runtime && (!expected || (runtime.operation_id ?? null) === expected.operationId);
+
+  if (!bound || bound.terminal.target.runtime_id !== id) {
+    if (!inventory) return { mode: "offline" };
+    return enriched ? { mode: "live", key: `${id}:${inventory.agent_pid}` } : { mode: "missing" };
+  }
+
+  const { terminal, agentPid } = bound;
+  if ((inventory && inventory.agent_pid !== agentPid) ||
+      (runtime && (runtime.pane_pid !== terminal.target.pid || (runtime.pane_id && runtime.pane_id !== terminal.target.pane))) ||
+      verified === null || (verified && !sameTerminal(terminal, verified))) return { mode: "missing" };
+
+  const key = `${id}:${agentPid}`;
+  if (!verified && (checking || !enriched)) return { mode: "pending", key };
+  return { mode: enriched ? "live" : "observe", key };
+}
+
 export function tabStop(state: SessionViews, focused: string | null): string | null {
   return focused !== null && state.open.includes(focused) ? focused : state.active ?? state.open[0] ?? null;
 }
@@ -121,3 +156,5 @@ export function parseScaffoldStatus(value: unknown): ScaffoldStatus {
   }
   return { protocolVersion: 1, appVersion: value.appVersion, stage: "scaffold", capabilities: [] };
 }
+import type { Inventory, TerminalScope } from "./local-client.ts";
+import { sameTerminal } from "./terminal-geometry.ts";
