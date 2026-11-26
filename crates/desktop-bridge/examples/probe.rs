@@ -47,20 +47,24 @@ async fn legacy(directory: PathBuf, runtime: String) -> Result<()> {
         let view = bridge.attach(&runtime).await?;
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut output = Vec::new();
+        let mut incarnation = None;
         while Instant::now() < deadline {
             let chunk = bridge.read(&view.view_id).await?;
             assert!(!chunk.closed);
             assert!(chunk.data.len() <= 8192);
             output.extend(chunk.data);
             if chunk.writable && String::from_utf8_lossy(&output).contains("P0 runtime alive") {
+                incarnation = chunk.paste_incarnation;
                 break;
             }
         }
         assert!(String::from_utf8_lossy(&output).contains("P0 runtime alive"));
+        let incarnation = incarnation.context("Native writer grant unavailable")?;
         bridge
             .input(
                 &view.view_id,
                 "Native bridge — Україна\r".as_bytes().to_vec(),
+                &incarnation.to_string(),
                 false,
             )
             .await?;
@@ -1358,8 +1362,18 @@ async fn pressure_probe(args: Vec<String>) -> Result<()> {
         "Replacement did not attach to the current target and grid"
     );
     pressure_bytes(&bridge, &replacement, false, b"RSBRIDGEKEPT").await?;
+    let incarnation = bridge
+        .read(&owner.view_id)
+        .await?
+        .paste_incarnation
+        .context("Pressure owner writer grant unavailable")?;
     bridge
-        .input(&owner.view_id, b"RS-BRIDGE-FRESH\r".to_vec(), false)
+        .input(
+            &owner.view_id,
+            b"RS-BRIDGE-FRESH\r".to_vec(),
+            &incarnation.to_string(),
+            false,
+        )
         .await?;
     bridge.detach(&replacement.view_id);
     bridge.detach(&owner.view_id);

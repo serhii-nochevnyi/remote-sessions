@@ -2003,17 +2003,25 @@ impl DesktopBridge {
         Ok(event)
     }
 
-    pub async fn input(&self, view_id: &str, data: Vec<u8>, paste: bool) -> Result<()> {
+    pub async fn input(
+        &self,
+        view_id: &str,
+        data: Vec<u8>,
+        incarnation: &str,
+        paste: bool,
+    ) -> Result<()> {
         ensure!(!paste, "PasteUnavailable");
         ensure!(
             (1..=INPUT_CHUNK_LIMIT).contains(&data.len()),
             "Input must contain 1..4096 bytes"
         );
+        let incarnation = Uuid::parse_str(incarnation).context("Некоректна прив’язка вводу")?;
         let view = self.view(view_id)?;
         let mut control = view.control.lock().await;
         ensure!(!view.closed(), "View detached");
         let lease = control.lease.as_mut().context("Керування ще не отримано")?;
         ensure!(lease.writable(Instant::now()), "Керування втрачено");
+        ensure!(lease.incarnation == incarnation, "Керування змінилося");
         let token = lease.token;
         let sequence = lease.input_sequence;
         lease.input_sequence = sequence
@@ -2544,7 +2552,12 @@ mod tests {
         assert!(!completion.writable && completion.paste_incarnation.is_none());
         let completion = completion.paste_completion.unwrap();
         assert_eq!((completion.incarnation, completion.operation), (current, 3));
-        assert!(ipc.bridge.input(&id, vec![b'x'], false).await.is_err());
+        assert!(
+            ipc.bridge
+                .input(&id, vec![b'x'], &current.to_string(), false)
+                .await
+                .is_err()
+        );
         for (incarnation, operation, key) in [
             (old, 3, receipt),
             (current, 2, receipt),
@@ -2929,7 +2942,7 @@ mod tests {
             let (token, _, incarnation) = ipc.grant(&view).await;
             assert_eq!(
                 ipc.bridge
-                    .input(&id, vec![1], true)
+                    .input(&id, vec![1], &incarnation.to_string(), true)
                     .await
                     .unwrap_err()
                     .to_string(),
@@ -2962,7 +2975,12 @@ mod tests {
                     && chunk.paste_incarnation.is_none()
                     && chunk.paste_completion.is_none()
             );
-            assert!(ipc.bridge.input(&id, vec![1], false).await.is_err());
+            assert!(
+                ipc.bridge
+                    .input(&id, vec![1], &incarnation.to_string(), false)
+                    .await
+                    .is_err()
+            );
             assert_eq!(
                 ipc.invoke(&view, incarnation, 1, PasteAction::Commit { bytes: 1 })
                     .await
@@ -3292,14 +3310,14 @@ esac
         let key = &view.view_id;
         tokio::time::timeout(Duration::from_secs(3), async {
             let mut output = Vec::new();
-            loop {
+            let incarnation = loop {
                 let chunk = bridge.read(key).await.unwrap();
                 assert!(!chunk.closed);
                 output.extend(chunk.data);
                 if chunk.writable && output == b"initial stream\x1b[" {
-                    break;
+                    break chunk.paste_incarnation.unwrap().to_string();
                 }
-            }
+            };
             assert!(
                 bridge
                     .resize(
@@ -3407,7 +3425,7 @@ esac
                 assert!(bridge.read(key).await.is_err());
                 assert!(
                     bridge
-                        .input(key, b"after close".to_vec(), false)
+                        .input(key, b"after close".to_vec(), &incarnation, false)
                         .await
                         .is_err()
                 );

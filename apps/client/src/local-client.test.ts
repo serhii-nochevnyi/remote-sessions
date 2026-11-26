@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseInventory, parseAttachment, parseChunk, TerminalViewScope } from "./local-client.ts";
+import { localClient, parseInventory, parseAttachment, parseChunk, TerminalViewScope } from "./local-client.ts";
 import type { GeometryEvent, TerminalStatus } from "./local-client.ts";
 import { OrderedGeometry } from "./terminal-geometry.ts";
 import { closeView, openView } from "./session-state.ts";
@@ -73,7 +73,45 @@ function terminalStatus(view_id: string, revision: number): TerminalStatus {
     provider: null, observation: "pending",
   };
 }
-const liveChunk = { closed: false, writable: true, data: [] };
+const liveChunk = { closed: false, writable: true, data: [], paste_incarnation: id };
+
+test("ordinary input sends the captured grant with each native invoke", async t => {
+  const calls: unknown[] = [];
+  const original = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: { __TAURI_INTERNALS__: {
+      invoke(command: string, args: Record<string, unknown>) { calls.push([command, args]); },
+    } },
+  });
+  t.after(() => {
+    if (original) Object.defineProperty(globalThis, "window", original);
+    else Reflect.deleteProperty(globalThis, "window");
+  });
+  const scope = new TerminalViewScope({
+    input: (viewId, data, incarnation) => localClient.input({ viewId, data, incarnation }),
+    inputFailure: error => assert.fail(String(error)),
+    retire: () => {},
+    reconnect: () => {},
+  });
+  assert(scope.bind(id));
+  await scope.consume(id, { closed: false, writable: true, data: [] }, async () => {});
+  await scope.send(Uint8Array.of(1));
+  assert.deepEqual(calls, []);
+  await scope.consume(id, liveChunk, async () => {});
+  const first = new Uint8Array(4096).fill(0xff);
+  const frame = new Uint8Array(4097);
+  frame.set(first);
+  frame[4096] = 0x80;
+  await scope.send(frame);
+  await scope.consume(id, { ...liveChunk, paste_incarnation: freshId }, async () => {});
+  await scope.send(Uint8Array.of(27, 2));
+  assert.deepEqual(calls, [
+    ["terminal_input", { viewId: id, data: Array.from(first), incarnation: id }],
+    ["terminal_input", { viewId: id, data: [0x80], incarnation: id }],
+    ["terminal_input", { viewId: id, data: [27, 2], incarnation: freshId }],
+  ]);
+});
 
 for (const held of ["write", "ack"] as const) {
   for (const inputOutcome of ["accepted", "uncertain"] as const) {
@@ -83,14 +121,14 @@ for (const held of ["write", "ack"] as const) {
       const write = deferred<void>();
       const ack = deferred<GeometryEvent>();
       const submitted = deferred<void>();
-      const sends: [string, number[]][] = [];
+      const sends: [string, number[], string][] = [];
       const retired: (string | null)[] = [];
       const retries: unknown[] = [];
       const statuses: unknown[] = [];
       const frames: number[][] = [];
       const acknowledged: string[] = [];
-      const send = (view: string, bytes: number[]) => {
-        sends.push([view, bytes]);
+      const send = (view: string, bytes: number[], incarnation: string) => {
+        sends.push([view, bytes, incarnation]);
         return view === id ? submitted.promise : Promise.resolve();
       };
       const old = new TerminalViewScope({
@@ -110,7 +148,7 @@ for (const held of ["write", "ack"] as const) {
       const first = old.send(Uint8Array.of(1));
       const queued = old.send(Uint8Array.of(2));
       await Promise.resolve();
-      assert.deepEqual(sends, [[id, [1]]]);
+      assert.deepEqual(sends, [[id, [1], id]]);
 
       const sample = { size: { cols: 101, rows: 30 }, sampled_at_us: 1 };
       const geometry = { status: terminalStatus(id, 1), bridge_pty: sample, client: sample };
@@ -131,7 +169,7 @@ for (const held of ["write", "ack"] as const) {
 
       assert(fresh.bind(freshId));
       assert.equal(freshRouting.status.terminal.target.runtime_id, oldRouting.status.terminal.target.runtime_id);
-      const redraw = { ...liveChunk, data: [70, 82, 69, 83, 72] };
+      const redraw = { ...liveChunk, data: [70, 82, 69, 83, 72], paste_incarnation: freshId };
       assert(await fresh.consume(freshId, redraw, () => freshRouting.consume(redraw, {
         write: async bytes => { frames.push([...bytes]); },
         resize: () => assert.fail("unexpected resize"),
@@ -151,7 +189,7 @@ for (const held of ["write", "ack"] as const) {
       assert(fresh.canWrite);
       assert.equal(retries.length, 1);
       await fresh.send(Uint8Array.of(3));
-      assert.deepEqual(sends, [[id, [1]], [freshId, [3]]]);
+      assert.deepEqual(sends, [[id, [1], id], [freshId, [3], freshId]]);
     });
   }
 }

@@ -852,7 +852,9 @@ async fn w1_terminal_eof_fifo() {
         assert_eq!(terminal, view.terminal);
         respond(&mut peer, Response::TerminalControl { token, epoch }).await;
         acquire.await.unwrap();
-        assert!(bridge.read(&id).await.unwrap().writable);
+        let writable = bridge.read(&id).await.unwrap();
+        assert!(writable.writable);
+        let incarnation = writable.paste_incarnation.unwrap().to_string();
 
         let mut pending = std::pin::pin!(bridge.read(&id));
         if parked {
@@ -878,7 +880,7 @@ async fn w1_terminal_eof_fifo() {
         assert!(bridge.status(&id).await.is_err());
         assert!(
             bridge
-                .input(&id, b"after EOF".to_vec(), false)
+                .input(&id, b"after EOF".to_vec(), &incarnation, false)
                 .await
                 .is_err()
         );
@@ -1045,6 +1047,51 @@ async fn receive(listener: &UnixListener) -> (UnixStream, Request) {
 async fn respond(peer: &mut UnixStream, reply: Response) {
     let line = encode_local_observation(&reply).unwrap() + "\n";
     peer.write_all(line.as_bytes()).await.unwrap();
+}
+
+fn refresh_fixture_control(view: &Arc<View>) -> tokio::task::JoinHandle<()> {
+    let view = view.clone();
+    tokio::spawn(async move { refresh_control(&view).await })
+}
+
+async fn acquire_fixture_writer(listener: &UnixListener, view: &View) -> UnixStream {
+    let (peer, Request::AcquireTerminal { terminal }) = receive(listener).await else {
+        panic!("expected scoped acquisition");
+    };
+    assert_eq!(terminal, view.terminal);
+    peer
+}
+
+async fn release_fixture_writer(listener: &UnixListener, view: &View, expected: Uuid) {
+    let (mut peer, Request::Release { runtime_id, token }) = receive(listener).await else {
+        panic!("expected scoped release");
+    };
+    assert_eq!(
+        (runtime_id, token),
+        (view.terminal.target.runtime_id, expected)
+    );
+    respond(&mut peer, Response::Accepted {}).await;
+}
+
+async fn separate_writer_incarnation() -> String {
+    let fixture = AgentFixture::new();
+    let listener = UnixListener::bind(fixture.0.join("agent.sock")).unwrap();
+    let bridge = DesktopBridge::new(Some(fixture.0.clone()), "/unused/tmux".into());
+    let (view, reader, _) = controlled_view(&bridge, &target(), Uuid::new_v4(), 0);
+    let id = view.terminal.view_id.to_string();
+    let token = Uuid::new_v4();
+    let epoch = view.output.lock().await.status.epoch.unwrap();
+    let acquiring = refresh_fixture_control(&view);
+    let mut peer = acquire_fixture_writer(&listener, &view).await;
+    respond(&mut peer, Response::TerminalControl { token, epoch }).await;
+    acquiring.await.unwrap();
+    let writable = bridge.read(&id).await.unwrap();
+    assert!(writable.writable);
+    bridge.detach(&id);
+    release_fixture_writer(&listener, &view, token).await;
+    reader.finish();
+    until(|| allocation_counts(&bridge) == (0, 0)).await;
+    writable.paste_incarnation.unwrap().to_string()
 }
 
 fn attachment_tmux(fixture: &AgentFixture, generation: Uuid, flags: &str) -> PathBuf {
@@ -1562,6 +1609,7 @@ enum AttachmentProof {
 #[tokio::test]
 async fn w1_terminal_exact_attachment() {
     use AttachmentProof::*;
+    let incarnation = separate_writer_incarnation().await;
     for proof in [
         Verified,
         ReplacementServer,
@@ -1621,7 +1669,7 @@ async fn w1_terminal_exact_attachment() {
         assert!(bridge.status(&id).await.is_err());
         assert!(
             bridge
-                .input(&id, b"pre-proof".to_vec(), false)
+                .input(&id, b"pre-proof".to_vec(), &incarnation, false)
                 .await
                 .is_err()
         );
@@ -1724,7 +1772,7 @@ async fn w1_terminal_exact_attachment() {
         assert!(bridge.status(&id).await.is_err());
         assert!(
             bridge
-                .input(&id, b"post-proof".to_vec(), false)
+                .input(&id, b"post-proof".to_vec(), &incarnation, false)
                 .await
                 .is_err()
         );
@@ -1827,14 +1875,16 @@ async fn w1_terminal_parked_read_gets_producer_full_and_late_lease_is_released_o
     respond(&mut release, Response::Accepted {}).await;
     acquire_old.await.unwrap();
     assert!(old.control.lock().await.lease.is_none());
-    assert_eq!(
-        fresh.control.lock().await.lease.as_ref().unwrap().token,
-        successor_token
-    );
+    let incarnation = {
+        let control = fresh.control.lock().await;
+        let lease = control.lease.as_ref().unwrap();
+        assert_eq!(lease.token, successor_token);
+        lease.incarnation.to_string()
+    };
     let fresh_input = {
         let bridge = bridge.clone();
         let view = fresh.terminal.view_id.to_string();
-        tokio::spawn(async move { bridge.input(&view, vec![b'F'], false).await })
+        tokio::spawn(async move { bridge.input(&view, vec![b'F'], &incarnation, false).await })
     };
     let (
         mut peer,
@@ -1862,6 +1912,144 @@ async fn w1_terminal_parked_read_gets_producer_full_and_late_lease_is_released_o
     );
     reader.finish();
     fresh_reader.finish();
+}
+
+#[tokio::test]
+async fn w1_terminal_ordinary_input_native_capture() {
+    use std::{future::Future, task::Poll};
+
+    let fixture = AgentFixture::new();
+    let listener = UnixListener::bind(fixture.0.join("agent.sock")).unwrap();
+    let bridge = DesktopBridge::new(Some(fixture.0.clone()), "/unused/tmux".into());
+    let (view, reader, _) = controlled_view(&bridge, &target(), Uuid::new_v4(), 0);
+    let id = view.terminal.view_id.to_string();
+    let first_epoch = view.output.lock().await.status.epoch.unwrap();
+    let first_token = Uuid::new_v4();
+    let acquiring = refresh_fixture_control(&view);
+    let mut peer = acquire_fixture_writer(&listener, &view).await;
+    respond(
+        &mut peer,
+        Response::TerminalControl {
+            token: first_token,
+            epoch: first_epoch,
+        },
+    )
+    .await;
+    acquiring.await.unwrap();
+    let first = bridge.read(&id).await.unwrap();
+    assert!(first.writable);
+    let first_incarnation = first.paste_incarnation.unwrap().to_string();
+
+    let renewing = refresh_fixture_control(&view);
+    let (mut peer, Request::Renew { runtime_id, token }) = receive(&listener).await else {
+        panic!("expected predecessor renewal");
+    };
+    assert_eq!(
+        (runtime_id, token),
+        (view.terminal.target.runtime_id, first_token)
+    );
+    respond(
+        &mut peer,
+        Response::Error {
+            message: "expired".into(),
+        },
+    )
+    .await;
+    release_fixture_writer(&listener, &view, first_token).await;
+    renewing.await.unwrap();
+
+    let successor_token = Uuid::new_v4();
+    let successor_epoch = ResizeEpoch {
+        owner: Uuid::new_v4(),
+        ..first_epoch
+    };
+    view.output.lock().await.status.epoch = Some(successor_epoch);
+    let acquiring = refresh_fixture_control(&view);
+    let mut peer = acquire_fixture_writer(&listener, &view).await;
+    assert!(view.control.try_lock().is_err());
+    let mut stale_text =
+        std::pin::pin!(bridge.input(&id, b"old text".to_vec(), &first_incarnation, false));
+    let mut stale_binary =
+        std::pin::pin!(bridge.input(&id, vec![0x1b, 0xff], &first_incarnation, false));
+    std::future::poll_fn(|cx| {
+        assert!(stale_text.as_mut().poll(cx).is_pending());
+        assert!(stale_binary.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    respond(
+        &mut peer,
+        Response::TerminalControl {
+            token: successor_token,
+            epoch: successor_epoch,
+        },
+    )
+    .await;
+    acquiring.await.unwrap();
+    for stale in [stale_text, stale_binary] {
+        let rejected = tokio::time::timeout(Duration::from_secs(1), stale)
+            .await
+            .unwrap();
+        assert_eq!(rejected.unwrap_err().to_string(), "Керування змінилося");
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), listener.accept())
+            .await
+            .is_err()
+    );
+    let current = bridge.read(&id).await.unwrap();
+    assert!(current.writable);
+    let incarnation = current.paste_incarnation.unwrap().to_string();
+    assert_ne!(incarnation, first_incarnation);
+    {
+        let control = view.control.lock().await;
+        let lease = control.lease.as_ref().unwrap();
+        assert_eq!(
+            (lease.token, lease.epoch, lease.input_sequence),
+            (successor_token, successor_epoch, 0)
+        );
+    }
+
+    for (sequence, expected) in [(0, b"fresh text".as_slice()), (1, &[0x1b, 0x80, 0xff])] {
+        let input = bridge.input(&id, expected.to_vec(), &incarnation, false);
+        let accept = async {
+            let (
+                mut peer,
+                Request::Input {
+                    runtime_id,
+                    token,
+                    sequence: actual,
+                    data,
+                    paste,
+                },
+            ) = receive(&listener).await
+            else {
+                panic!("expected successor input");
+            };
+            assert_eq!(
+                (runtime_id, token, actual, data.as_slice(), paste),
+                (
+                    view.terminal.target.runtime_id,
+                    successor_token,
+                    sequence,
+                    expected,
+                    false
+                )
+            );
+            respond(&mut peer, Response::Accepted {}).await;
+        };
+        let (result, ()) = tokio::join!(input, accept);
+        result.unwrap();
+    }
+    bridge.detach(&id);
+    release_fixture_writer(&listener, &view, successor_token).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), listener.accept())
+            .await
+            .is_err()
+    );
+    reader.finish();
+    until(|| allocation_counts(&bridge) == (0, 0)).await;
 }
 
 async fn saturate_parked(view: &View, reader: &mut ReadControl) {
