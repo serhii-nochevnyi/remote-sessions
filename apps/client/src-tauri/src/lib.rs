@@ -688,12 +688,14 @@ mod desktop {
     pub async fn terminal_input(
         view_id: String,
         data: Vec<u8>,
+        incarnation: Option<String>,
         paste: Option<bool>,
         bridge: State<'_, DesktopBridge>,
     ) -> Result<(), String> {
         ordinary_input(paste, async move || {
+            let incarnation = incarnation.as_deref().ok_or("Керування ще не отримано")?;
             bridge
-                .input(&view_id, data, false)
+                .input(&view_id, data, incarnation, false)
                 .await
                 .map_err(|e| e.to_string())
         })

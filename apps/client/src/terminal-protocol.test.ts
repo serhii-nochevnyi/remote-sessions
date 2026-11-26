@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import xterm from "@xterm/xterm";
 import headless from "@xterm/headless";
-import { TerminalViewScope, pasteIssueText } from "./local-client.ts";
+import { TerminalViewScope, parseChunk, pasteIssueText } from "./local-client.ts";
 import type { Chunk, GeometryEvent, TerminalSize, TerminalStatus } from "./local-client.ts";
 import { OrderedGeometry } from "./terminal-geometry.ts";
 import { bindTerminalPaste, bindTerminalProtocol, encodeTerminalPaste, TERMINAL_INPUT_BUDGET } from "./terminal-protocol.ts";
@@ -41,7 +41,7 @@ function leasedTerminal(terminal: Emulator, view = "current", deliver?: (frame: 
   assert.equal(protocol.inputAvailable, true, "the input source in locked xterm 6.0.0 must be available");
   assert.equal(scope.bind(view), true);
   function consume(chunk: Chunk, render: () => Promise<void>) {
-    return protocol.consume(scope, view, chunk, render);
+    return protocol.consume(scope, view, chunk.writable ? { ...chunk, paste_incarnation: firstIncarnation } : chunk, render);
   }
   async function write(data: readonly number[]) {
     await new Promise<void>(resolve => terminal.write(Uint8Array.from(data), resolve));
@@ -460,7 +460,7 @@ type ViewCallbacks = ConstructorParameters<typeof TerminalViewScope>[0];
 type PasteCallbacks = NonNullable<ViewCallbacks["paste"]>;
 type Gesture = Parameters<PasteCallbacks["stage"]>[0];
 type StageArgs = Parameters<PasteCallbacks["stage"]>;
-type Call = { kind: "input"; data: number[] }
+type Call = { kind: "input"; viewId: string; data: number[]; incarnation: string }
   | { kind: "stage"; gesture: Gesture; offset: number; data: number[] }
   | { kind: "commit"; gesture: Gesture; bytes: number }
   | { kind: "ack"; gesture: Gesture; receipt: string };
@@ -472,13 +472,14 @@ const readOnly: Chunk = { writable: false, closed: false, data: [] };
 
 function pasteFixture(options: Partial<PasteCallbacks & Pick<ViewCallbacks, "input" | "inputFailure">> = {}) {
   const calls: Call[] = [];
+  const protocolSends: { data: number[]; work: Promise<void> }[] = [];
   const browser = browserFixture();
   const viewId = "view";
   let nativeIncarnation = firstIncarnation;
   const scope = new TerminalViewScope({
-    async input(view, data) {
-      calls.push({ kind: "input", data });
-      await options.input?.(view, data);
+    async input(viewId, data, incarnation) {
+      calls.push({ kind: "input", viewId, data, incarnation });
+      await options.input?.(viewId, data, incarnation);
     },
     paste: {
       async stage(gesture, offset, data) {
@@ -496,17 +497,23 @@ function pasteFixture(options: Partial<PasteCallbacks & Pick<ViewCallbacks, "inp
         assert.equal(receipt, receiptId);
         return options.ack ? options.ack(gesture, receipt) : { result: "acknowledged", writable: true };
       },
-      changed: () => options.changed?.(),
+      changed() {
+        if (!scope.canWrite) protocol.pauseInput();
+        options.changed?.();
+      },
     },
     inputFailure: options.inputFailure ?? (() => assert.fail("Unexpected ordinary input failure")),
     reconnect: () => {},
     retire: () => protocol.dispose(),
   });
-  const protocol = bindTerminalProtocol(browser.terminal, bytes => { void scope.send(bytes); });
+  const protocol = bindTerminalProtocol(browser.terminal, bytes => {
+    protocolSends.push({ data: Array.from(bytes), work: scope.send(bytes) });
+  });
   assert(scope.bind(viewId));
   const consume = (chunk: Chunk) => protocol.consume(scope, viewId, chunk, async () => {});
   return {
-    browser, scope, calls, consume,
+    browser, scope, calls, consume, protocolSends,
+    enableMouse: () => new Promise<void>(resolve => browser.terminal.write("\x1b[?1000h", resolve)),
     turnOwner(incarnation: string) { nativeIncarnation = incarnation; },
     publish: (incarnation: string) => consume({ ...readOnly, writable: true, paste_incarnation: incarnation }),
     paste(text: string) { return scope.paste(encodeTerminalPaste(text)); },
@@ -595,6 +602,54 @@ async function checkClipboardCapture(bracketed: boolean) {
 
 test("clipboard capture precedes xterm listeners in normal mode", () => checkClipboardCapture(false));
 test("clipboard capture precedes xterm listeners in bracketed mode", () => checkClipboardCapture(true));
+
+const mouseBytes = [27, 91, 77, 32, 35, 36];
+
+test("queued ordinary text and binary retain their captured lease", async () => {
+  const entered = deferred<void>();
+  const reply = deferred<void>();
+  const f = pasteFixture({
+    async input(_view, data, incarnation) {
+      if (data[0] === 65) {
+        entered.resolve();
+        await reply.promise;
+        throw Error("Predecessor reply lost");
+      }
+      assert.equal(incarnation, nextIncarnation);
+    },
+  });
+  try {
+    await f.publish(firstIncarnation);
+    await f.enableMouse();
+    const preceding = f.scope.send(Uint8Array.of(65));
+    await entered.promise;
+    f.browser.insertText("старий");
+    assert(f.browser.click(2, 3));
+    assert.deepEqual(f.protocolSends.map(send => send.data), [encode("старий"), mouseBytes]);
+    const expected: Call[] = [{ kind: "input", viewId: "view", data: [65], incarnation: firstIncarnation }];
+    assert.deepEqual(f.calls, expected);
+
+    f.turnOwner(nextIncarnation);
+    await f.publish(nextIncarnation);
+    const fresh = "x".repeat(4095) + "Ж";
+    const freshBytes = encode(fresh);
+    f.browser.insertText(fresh);
+    assert(f.browser.click(2, 3));
+    assert.deepEqual(f.protocolSends.map(send => send.data),
+      [encode("старий"), mouseBytes, freshBytes, mouseBytes]);
+    assert.deepEqual(f.calls, expected);
+    reply.resolve();
+    await Promise.all([preceding, ...f.protocolSends.map(send => send.work)]);
+    expected.push(...[freshBytes.slice(0, 4096), [0x96], mouseBytes].map<Call>(data => ({
+      kind: "input", viewId: "view", data, incarnation: nextIncarnation,
+    })));
+    assert.deepEqual(f.calls, expected);
+    assert(f.scope.canWrite);
+  } finally {
+    reply.resolve();
+    f.dispose();
+  }
+});
 
 test("queued paste keeps its lease on same-view reacquisition without a loss event", async () => {
   for (const observed of [true, false]) {
@@ -844,22 +899,111 @@ test("a successor snapshot retires the original paste completion binding", async
   }
 });
 
+function priorSendHold() {
+  const hold = parseChunk({
+    closed: false, writable: false, data: [], status: null, geometry: null,
+    paste_admission: "prior_send_unknown",
+  });
+  assert.equal(hold.paste_admission, "prior_send_unknown");
+  return hold;
+}
+
+async function attemptHeldInput(f: ReturnType<typeof pasteFixture>) {
+  assert(f.browser.terminal.options.disableStdin);
+  assert(!f.scope.canWrite);
+  const count = f.protocolSends.length;
+  f.browser.insertText("held");
+  f.browser.click(2, 3);
+  await Promise.all([
+    ...f.protocolSends.slice(count).map(send => send.work),
+    f.scope.send(Uint8Array.from(encode("held"))),
+    f.scope.send(Uint8Array.from(mouseBytes)),
+    f.scope.paste(Uint8Array.from(encode("held paste"))),
+  ]);
+  assert.equal(f.protocolSends.length, count);
+}
+
+for (const holdFirst of [false, true]) {
+  test(`stage stop preserves pre-submission feedback when ${holdFirst ? "the hold read" : "the stage reply"} arrives first`, async () => {
+    const entered = deferred<void>();
+    const reply = deferred<{ result: "unknown" }>();
+    const f = pasteFixture({
+      stage() { entered.resolve(); return reply.promise; },
+    });
+    try {
+      await f.publish(firstIncarnation);
+      await f.enableMouse();
+      const first = f.paste("original");
+      await entered.promise;
+      f.browser.insertText("queued text");
+      assert(f.browser.click(2, 3));
+      const second = f.paste("queued paste");
+      assert.deepEqual(f.protocolSends.map(send => send.data), [encode("queued text"), mouseBytes]);
+      const calls: Call[] = [{
+        kind: "stage", gesture: { viewId: "view", incarnation: firstIncarnation, operation: 1 },
+        offset: 0, data: encode("original"),
+      }];
+      assert.deepEqual(f.calls, calls);
+      const hold = priorSendHold();
+      if (holdFirst) {
+        assert(await f.consume(hold));
+        assert(f.browser.terminal.options.disableStdin);
+        assert(!f.scope.canWrite);
+      }
+      reply.resolve({ result: "unknown" });
+      await Promise.all([first, second, ...f.protocolSends.map(send => send.work)]);
+      const feedback = pasteIssueText.stageStopped;
+      assert.match(feedback, /Це вставлення не було надіслано/);
+      assert.match(feedback, /через непідтверджену доставку попереднього вводу/);
+      assert.equal(f.scope.pasteMessage, feedback);
+      assert(f.browser.terminal.options.disableStdin);
+      assert(!f.scope.canWrite);
+      if (!holdFirst) assert(await f.consume(hold));
+      assert.equal(f.scope.pasteMessage, feedback);
+      await attemptHeldInput(f);
+      f.turnOwner(nextIncarnation);
+      assert(await f.publish(nextIncarnation));
+      await attemptHeldInput(f);
+      assert.equal(f.scope.pasteMessage, feedback);
+      assert.deepEqual(f.calls, calls);
+    } finally {
+      reply.resolve({ result: "unknown" });
+      f.dispose();
+    }
+  });
+}
+
 test("lost paste commit reply reports unknown without retry", async () => {
   const f = pasteFixture({ async commit() { throw Error("IPC response lost"); } });
   try {
     await f.publish(firstIncarnation);
-    const sent = f.paste("неповторюваний текст");
+    await f.enableMouse();
+    const original = "неповторюваний текст";
+    const sent = f.paste(original);
     const queued = f.paste("queued before the reply");
     const later = f.scope.send(Uint8Array.of(65));
     await Promise.all([sent, queued, later]);
     assert.equal(f.scope.pasteMessage, pasteIssueText.unknown);
-    await f.paste("neither retry nor fallback");
-    assert.deepEqual(f.calls.map(call => call.kind), ["stage", "commit"]);
+    assert.notEqual(f.scope.pasteMessage, pasteIssueText.stageStopped);
+    const gesture = { viewId: "view", incarnation: firstIncarnation, operation: 1 };
+    const calls: Call[] = [
+      { kind: "stage", gesture, offset: 0, data: encode(original) },
+      { kind: "commit", gesture, bytes: encode(original).length },
+    ];
+    assert.deepEqual(f.calls, calls);
+    assert(f.browser.terminal.options.disableStdin);
+    assert(!f.scope.canWrite);
+    assert(await f.consume(priorSendHold()));
+    assert.equal(f.scope.pasteMessage, pasteIssueText.unknown);
+    await attemptHeldInput(f);
+    assert.deepEqual(f.calls, calls);
     f.scope.retire();
     const reconnect = pasteFixture();
     try {
-      await reconnect.consume({ ...readOnly, paste_admission: "prior_send_unknown" });
+      assert(await reconnect.consume(priorSendHold()));
       assert.equal(reconnect.scope.pasteMessage, pasteIssueText.unknown);
+      assert(reconnect.browser.terminal.options.disableStdin);
+      assert(!reconnect.scope.canWrite);
       await reconnect.scope.send(Uint8Array.of(1));
       await reconnect.paste("held pane");
       assert.deepEqual(reconnect.calls, []);

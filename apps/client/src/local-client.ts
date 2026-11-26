@@ -83,11 +83,12 @@ function samePaste(left: PasteCompletion | undefined, right: PasteCompletion | u
 type PasteResult = { readonly result: "staged" | "stale" | "invalid" | "unavailable" | "unknown" }
   | { readonly result: "committed"; readonly receipt: string }
   | { readonly result: "acknowledged"; readonly writable: boolean };
-type PasteIssue = "invalid" | "unavailable" | "stale" | "unknown" | "oversize";
+type PasteIssue = "invalid" | "unavailable" | "stale" | "stageStopped" | "unknown" | "oversize";
 export const pasteIssueText: Record<PasteIssue, string> = {
   invalid: "Вставлення заблоковано до надсилання. Текст містить неприпустимі символи.",
   unavailable: "Вставлення з буфера обміну заблоковано до надсилання й недоступне на цьому бекенді.",
   stale: "Вставлення скасовано до надсилання через зміну керування.",
+  stageStopped: "Це вставлення не було надіслано. Ввід у терміналі заблоковано через непідтверджену доставку попереднього вводу.",
   unknown: "Доставку вставлення не підтверджено. Перевірте чернетку в цій сесії. Для продовження створіть окрему сесію й введіть текст вручну.",
   oversize: "Вставлення заблоковано до надсилання. Завеликий обсяг тексту в черзі вводу.",
 };
@@ -261,7 +262,7 @@ interface TerminalPasteCallbacks {
   changed(): void;
 }
 interface TerminalViewCallbacks {
-  input(view: string, data: number[]): Promise<void>;
+  input(view: string, data: number[], incarnation: string): Promise<void>;
   paste?: TerminalPasteCallbacks;
   inputFailure(error?: unknown): void;
   retire(view: string | null): void;
@@ -277,6 +278,7 @@ export class TerminalViewScope {
   private completion: PasteCompletion | undefined;
   private admission: PasteAdmission | undefined;
   private pasteIssue: PasteIssue | undefined;
+  private pasteHeld = false;
   private pendingPaste: PasteGesture | undefined;
   private acknowledgedPaste: PasteGesture | undefined;
   private endedPasteIncarnation: string | undefined;
@@ -293,10 +295,12 @@ export class TerminalViewScope {
 
   get viewId() { return this.attached; }
   get active() { return !this.retired; }
-  get canWrite() { return this.active && this.writable && !this.inputFailed && this.pasteIssue !== "unknown"; }
+  get canWrite() {
+    return this.active && this.writable && this.incarnation !== undefined && !this.inputFailed && !this.pasteHeld;
+  }
   get pasteMessage() {
-    return this.admission === "prior_send_unknown" ? pasteIssueText.unknown
-      : this.pasteIssue ? pasteIssueText[this.pasteIssue]
+    return this.pasteIssue ? pasteIssueText[this.pasteIssue]
+      : this.pasteHeld ? pasteIssueText.unknown
       : this.admission === "unavailable" ? pasteIssueText.unavailable : undefined;
   }
 
@@ -329,6 +333,7 @@ export class TerminalViewScope {
 
   async consume(view: string, chunk: Chunk, render: () => Promise<void>): Promise<boolean> {
     if (!this.owns(view)) return false;
+    if (chunk.paste_admission === "prior_send_unknown") this.holdPaste();
     if (samePaste(chunk.paste_completion, this.acknowledgedPaste)) {
       await render();
       return this.owns(view);
@@ -363,9 +368,16 @@ export class TerminalViewScope {
     this.callbacks.inputFailure(error);
   }
 
+  private holdPaste() {
+    if (this.pasteHeld) return;
+    this.pasteHeld = true;
+    this.writeGeneration++;
+    this.pasteIssue = undefined;
+  }
+
   private showPaste(issue?: PasteIssue) {
-    if (this.pasteIssue === "unknown") return;
-    if (issue === "unknown") this.writeGeneration++;
+    if (issue === "stageStopped" || issue === "unknown") this.holdPaste();
+    else if (this.pasteHeld) return;
     this.pasteIssue = issue;
     this.callbacks.paste?.changed();
   }
@@ -384,21 +396,24 @@ export class TerminalViewScope {
 
   send(data: Uint8Array): Promise<void> {
     const view = this.attached;
-    if (!view || !this.canWrite) return Promise.resolve();
+    const incarnation = this.incarnation;
+    if (!view || !incarnation || !this.canWrite) return Promise.resolve();
     if (this.pendingBytes + data.length > TERMINAL_INPUT_BUDGET) {
       this.failInput();
       return Promise.resolve();
     }
     const generation = this.writeGeneration;
+    const live = () => this.owns(view) && this.canWrite && this.incarnation === incarnation
+      && this.writeGeneration === generation;
     return this.enqueue(data, async frame => {
       try {
         if (!frame.bytes) return;
         for (const { bytes } of terminalInputChunks(frame.bytes)) {
-          if (!this.owns(view) || !this.canWrite || this.writeGeneration !== generation) return;
-          await this.callbacks.input(view, Array.from(bytes));
+          if (!live()) return;
+          await this.callbacks.input(view, Array.from(bytes), incarnation);
         }
       } catch (error) {
-        if (this.owns(view)) this.failInput(error);
+        if (live()) this.failInput(error);
       }
     });
   }
@@ -430,10 +445,10 @@ export class TerminalViewScope {
         for (const { offset, bytes } of terminalInputChunks(frame.bytes)) {
           if (!live()) { issue("stale"); return; }
           const staged = await paste.stage(gesture, offset, Array.from(bytes));
-          if (!live()) { issue(staged.result === "unknown" ? "unknown" : "stale"); return; }
+          if (staged.result === "unknown") { issue("stageStopped"); return; }
+          if (!live()) { issue("stale"); return; }
           if (staged.result !== "staged") {
-            issue(staged.result === "stale" || staged.result === "invalid" || staged.result === "unknown"
-              ? staged.result : "unavailable");
+            issue(staged.result === "stale" || staged.result === "invalid" ? staged.result : "unavailable");
             return;
           }
         }
@@ -723,7 +738,9 @@ export const localClient = {
     parseResizeResult(await invoke<unknown>("terminal_resize", { viewId, epoch, size })),
   acknowledgeGrid: async (viewId: string, acknowledgement: GridAcknowledgement) =>
     parseGeometryEvent(await invoke<unknown>("terminal_acknowledge_grid", { viewId, acknowledgement })),
-  input: async (viewId: string, data: readonly number[]) => { await invoke("terminal_input", { viewId, data }); },
+  input: async (input: { viewId: string; data: readonly number[]; incarnation: string }) => {
+    await invoke("terminal_input", input);
+  },
   pasteStage: async (gesture: PasteGesture, offset: number, data: number[]) =>
     parsePasteResult(await invoke("terminal_paste_stage", { ...gesture, offset, data })),
   pasteCommit: async (gesture: PasteGesture, bytes: number) =>

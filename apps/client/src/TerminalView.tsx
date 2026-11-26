@@ -119,7 +119,7 @@ export function TerminalView({ runtimeId, epoch, label, fontSize }: { runtimeId:
     let streamStage: TerminalStreamFailure = "attachment_setup";
     let failure: TerminalStreamFailure | undefined;
     const scope = new TerminalViewScope({
-      input: localClient.input,
+      input: (viewId, data, incarnation) => localClient.input({ viewId, data, incarnation }),
       paste: {
         stage: localClient.pasteStage,
         commit: localClient.pasteCommit,
