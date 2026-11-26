@@ -617,7 +617,6 @@ def evaluate_attempt(attempt, case, cohort, qualification):
         except MeasuredFailure:
             raise
         except EvidenceError as error:
-            # An unresolved final capture can coexist with a measured startup or visible failure.
             capture_issue = error
         measured(attempt.get("start_empty") is not False, "unexpected startup input")
         measured(attempt.get("replayed") is not True, "replayed input")
@@ -768,7 +767,6 @@ def native_keys(attempt):
     pairs.append((attempt.get("attemptId"), attempt.get("generation")))
     keys = [(attempt["launch_id"], native_id, generation) for native_id, generation in pairs
             if number(native_id, 1) and number(generation, 1)]
-    # A failed restart can leave the old identity as the row's only native observation.
     return tuple(dict.fromkeys(keys))
 
 
