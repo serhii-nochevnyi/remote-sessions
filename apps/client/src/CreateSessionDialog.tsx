@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
-import { localClient, mergeCreateOperations, workspaceIssueText } from "./local-client";
-import type { CreateDisposition, CreateIntent, LocalCreate, ProviderProfile, WorkspaceDisplay } from "./local-client";
+import { CreateReadiness, localClient, mergeCreateOperations, workspaceIssueText } from "./local-client";
+import type { CreateDisposition, CreateIntent, LocalCreate, ProviderProfile, WorkspaceDisplay, WorkspaceReadiness } from "./local-client";
 
 const profiles = [
   { value: "claude_code", label: "Claude Code" },
@@ -10,7 +10,8 @@ const profiles = [
 
 interface CreateSessionDialogProps {
   readonly onDismiss: () => void;
-  readonly onOpen: (operation: LocalCreate, explicit: boolean) => void;
+  readonly onOpen: (operation: LocalCreate) => Promise<boolean>;
+  readonly captureSubmission: () => (operation: LocalCreate) => boolean;
   readonly returnFocus: RefObject<HTMLButtonElement | null>;
   readonly connection: number;
 }
@@ -29,7 +30,7 @@ function statusText(disposition: CreateDisposition): string {
   }
 }
 
-export function CreateSessionDialog({ onDismiss, onOpen, returnFocus, connection }: CreateSessionDialogProps) {
+export function CreateSessionDialog({ onDismiss, onOpen, captureSubmission, returnFocus, connection }: CreateSessionDialogProps) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const mounted = useRef(false);
   const completed = useRef(false);
@@ -39,6 +40,9 @@ export function CreateSessionDialog({ onDismiss, onOpen, returnFocus, connection
   const [profile, setProfile] = useState<ProviderProfile>("claude_code");
   const [operations, setOperations] = useState<readonly LocalCreate[]>([]);
   const [pending, setPending] = useState<"picker" | "submit" | "status" | null>(null);
+  const [readiness] = useState(() => new CreateReadiness());
+  const [readinessStatus, setReadinessStatus] = useState<WorkspaceReadiness | "pending" | "unavailable" | null>(null);
+  const [readinessRetry, setReadinessRetry] = useState(0);
   const [feedback, setFeedback] = useState("");
   const [storeIssue, setStoreIssue] = useState("");
   const [confirmSeparate, setConfirmSeparate] = useState<string | null>(null);
@@ -54,6 +58,22 @@ export function CreateSessionDialog({ onDismiss, onOpen, returnFocus, connection
       if (!completed.current) trigger?.focus();
     };
   }, [returnFocus]);
+
+  const workspaceId = workspace?.workspace_id;
+  const picking = pending === "picker";
+  useLayoutEffect(() => {
+    if (!workspaceId || picking) {
+      setReadinessStatus(null);
+      return;
+    }
+    const check = readiness.begin(workspaceId, profile);
+    setReadinessStatus("pending");
+    void localClient.workspaceReadiness(workspaceId, profile).then(
+      result => { if (readiness.finish(check, result)) setReadinessStatus(result); },
+      () => { if (readiness.finish(check, undefined)) setReadinessStatus("unavailable"); },
+    );
+    return () => readiness.invalidate();
+  }, [workspaceId, profile, picking, readiness, readinessRetry, connection]);
 
   useEffect(() => {
     let disposed = false;
@@ -86,8 +106,10 @@ export function CreateSessionDialog({ onDismiss, onOpen, returnFocus, connection
 
   function chooseWorkspace() {
     return act("picker", async () => {
+      readiness.invalidate();
       const choice = await localClient.pickWorkspace();
       if (!mounted.current) return;
+      setReadinessRetry(value => value + 1);
       if (choice.result === "selected") setWorkspace(choice.workspace);
       if (choice.result === "blocked") {
         setWorkspace(null);
@@ -96,23 +118,38 @@ export function CreateSessionDialog({ onDismiss, onOpen, returnFocus, connection
     });
   }
 
-  function open(operation: LocalCreate, explicit: boolean) {
-    completed.current = true;
-    onOpen(operation, explicit);
+  function dismiss() {
+    readiness.invalidate();
+    mounted.current = false;
+    onDismiss();
   }
 
-  function submit(workspaceId: string, selectedProfile: ProviderProfile, intent?: CreateIntent) {
+  function selectProfile(next: ProviderProfile) {
+    if (next !== profile) readiness.invalidate();
+    setProfile(next);
+    setFeedback("");
+  }
+
+  function submit(id: string, selectedProfile: ProviderProfile, intent?: CreateIntent) {
+    if (!mounted.current || inAction.current) return;
+    if (!intent?.continueReference) {
+      if (workspaceId !== id || selectedProfile !== profile || !readiness.take(id, selectedProfile)) return;
+      setReadinessStatus(null);
+    }
+    const present = captureSubmission();
     return act("submit", async () => {
-      const reply = await localClient.createSession(workspaceId, selectedProfile, intent);
-      if (!mounted.current) return;
-      setConfirmSeparate(null);
+      const reply = await localClient.createSession(id, selectedProfile, intent);
+      if (mounted.current) setConfirmSeparate(null);
       if (reply.result === "blocked") {
-        setFeedback(workspaceIssueText[reply.issue]);
+        if (mounted.current) setFeedback(workspaceIssueText[reply.issue]);
         return;
       }
-      setOperations(current => mergeCreateOperations(current, [reply.operation]));
+      if (mounted.current) setOperations(current => mergeCreateOperations(current, [reply.operation]));
       const disposition = reply.operation.disposition;
-      if (disposition.result === "launched" && disposition.current === "live") open(reply.operation, false);
+      if (disposition.result === "launched" && disposition.current === "live") {
+        completed.current = present(reply.operation);
+        if (!completed.current && mounted.current) setFeedback("Відкрийте цей термінал із запису попередньої спроби.");
+      }
     });
   }
 
@@ -125,10 +162,15 @@ export function CreateSessionDialog({ onDismiss, onOpen, returnFocus, connection
     });
   }
 
+  const ready = workspaceId !== undefined && readiness.allows(workspaceId, profile);
+  const readinessText = readinessStatus === "pending" ? "Перевіряємо папку та CLI в агенті Mac…" :
+    readinessStatus === "unavailable" ? "Не вдалося перевірити папку та CLI. Повторіть перевірку." :
+    readinessStatus?.result === "blocked" ? workspaceIssueText[readinessStatus.issue] : "";
+
   return <dialog
     ref={dialogRef}
     aria-labelledby="create-session-title"
-    onCancel={event => { event.preventDefault(); onDismiss(); }}
+    onCancel={event => { event.preventDefault(); dismiss(); }}
     style={{ color: "inherit", background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 12,
       padding: 24, maxWidth: "min(34rem, calc(100vw - 32px))" }}
   >
@@ -143,13 +185,16 @@ export function CreateSessionDialog({ onDismiss, onOpen, returnFocus, connection
       <legend>Профіль</legend>
       {profiles.map(choice => <label key={choice.value} style={{ display: "block", padding: "4px 0" }}>
         <input type="radio" name="provider-profile" value={choice.value} checked={profile === choice.value}
-          onChange={() => { setProfile(choice.value); setFeedback(""); }} /> {choice.label}
+          onChange={() => selectProfile(choice.value)} /> {choice.label}
       </label>)}
     </fieldset>
     <p role="status" aria-live="polite">
       {pending === "picker" ? "Очікуємо вибору папки…" : pending === "submit" ? "Створюємо термінал…" :
         pending === "status" ? "Оновлюємо стан…" : feedback}
     </p>
+    {readinessText && <p role="status">{readinessText}</p>}
+    {workspace && pending === null && !ready && readinessStatus !== "pending" &&
+      <button type="button" onClick={() => setReadinessRetry(value => value + 1)}>Перевірити знову</button>}
     {(operations.length > 0 || storeIssue) && <section aria-labelledby="create-recovery-title" style={{ maxHeight: "40vh", overflow: "auto" }}>
       <h3 id="create-recovery-title">Попередні спроби</h3>
       {storeIssue && <p role="status">{storeIssue}</p>}
@@ -164,27 +209,38 @@ export function CreateSessionDialog({ onDismiss, onOpen, returnFocus, connection
             <p><strong>{name} · {id}</strong> <span role="status">{statusText(disposition)}</span></p>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
               <button type="button" disabled={pending !== null} aria-label={`Оновити спробу ${id}`} onClick={() => void refresh(operation.reference)}>Оновити</button>
-              {(disposition.result === "launched" || disposition.result === "exited") &&
-                <button type="button" onClick={() => open(operation, true)}>Відкрити вкладку</button>}
+              {((disposition.result === "launched" && disposition.current === "live") ||
+                (disposition.result === "exited" && disposition.current === "exited")) &&
+                <button type="button" disabled={pending !== null} onClick={() => void act("status", async () => {
+                  completed.current = await onOpen(operation);
+                  if (!completed.current && mounted.current) setFeedback("Не вдалося відкрити вкладку. Оновіть запис і спробуйте знову.");
+                })}>Відкрити вкладку</button>}
               {disposition.result === "pending" &&
                 <button type="button" disabled={pending !== null} onClick={() => void submit(operation.workspace_id, operation.profile, { continueReference: operation.reference })}>Продовжити</button>}
               {disposition.result !== "pending" && confirmSeparate !== operation.reference &&
-                <button type="button" disabled={pending !== null} onClick={() => setConfirmSeparate(operation.reference)}>Створити окрему сесію…</button>}
+                <button type="button" disabled={pending !== null} onClick={() => {
+                  if (workspaceId !== operation.workspace_id) readiness.invalidate();
+                  setWorkspace(workspaceId === operation.workspace_id ? workspace : { workspace_id: operation.workspace_id, label: name ?? id });
+                  selectProfile(operation.profile);
+                  setConfirmSeparate(operation.reference);
+                }}>Створити окрему сесію…</button>}
             </div>
             {confirmSeparate === operation.reference && <div>
               <p>{disposition.result === "unknown"
                 ? "Результат попередньої спроби залишається невідомим. Окрема сесія може запустити ще один процес."
                 : "Буде створено окремий процес із цією папкою та профілем."}</p>
               <button type="button" onClick={() => setConfirmSeparate(null)}>Назад</button>{" "}
-              <button type="button" disabled={pending !== null} onClick={() => void submit(operation.workspace_id, operation.profile, { separateFrom: operation.reference })}>Створити окремо</button>
+              <button type="button" disabled={pending !== null || !ready || workspaceId !== operation.workspace_id || profile !== operation.profile}
+                onClick={() => void submit(operation.workspace_id, operation.profile, { separateFrom: operation.reference })}>Створити окремо</button>
             </div>}
           </li>;
         })}
       </ul>
     </section>}
     <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "end", gap: 8 }}>
-      <button type="button" onClick={onDismiss}>{pending === "submit" || operations.length > 0 ? "Закрити" : "Скасувати"}</button>
-      <button type="button" disabled={!workspace || pending !== null} onClick={() => { if (workspace) void submit(workspace.workspace_id, profile); }}>
+      <button type="button" onClick={dismiss}>{pending === "submit" || operations.length > 0 ? "Закрити" : "Скасувати"}</button>
+      <button type="button" disabled={!ready || pending !== null || confirmSeparate !== null}
+        onClick={() => { if (workspaceId && confirmSeparate === null) void submit(workspaceId, profile); }}>
         Створити сесію
       </button>
     </div>
