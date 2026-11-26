@@ -196,8 +196,6 @@ function mountTerminal(
   }
 
   function compositionInput(event: InputEvent) {
-    // The browser can update the textarea after a retired compositionend was blocked.
-    // Preserve the value only while the current xterm cycle can consume it.
     if (!event.isComposing && event.inputType !== "insertCompositionText"
       && event.inputType !== "deleteCompositionText" && event.inputType !== "insertFromComposition") return;
     if (!current || (!composing && !needsCompositionDrain)) clearPreedit();
@@ -379,7 +377,6 @@ function mountTerminal(
         lifecycleEpoch === startEpoch && !disposed && document.visibilityState === "visible";
       if (refocus) {
         clearPreedit();
-        // @invariant: End abandoned preedit in xterm with stdin disabled and no attached attempt.
         if (composing) textarea.dispatchEvent(new Event("compositionend", { bubbles: true }));
         terminal.focus();
       }
