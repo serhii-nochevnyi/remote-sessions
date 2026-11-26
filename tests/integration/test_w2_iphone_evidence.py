@@ -975,6 +975,50 @@ class EvidenceTest(unittest.TestCase):
                                   supporting_attempt_ids=report["correction"]["baseline_attempt_ids"])
         self.validate(report, "inconclusive")
 
+    def test_unconfirmed_typing_actions_cannot_support_reproduction_or_persistence(self):
+        for case_id, wrong_hex, actions in (
+            ("english-return", "6f6b", ("return_pressed_once",)),
+            ("ukrainian-return", "d197", ("ukrainian_key_pressed_once", "return_pressed_once")),
+        ):
+            self.baseline = bound_cohort()
+            make_recipes(self.baseline, self.cases)
+            confirmed, _ = self.correction_fixture(case_id)
+            for cohort in confirmed["cohorts"].values():
+                for row in cohort["attempts"]:
+                    row["observations"]["cursor_visible"] = True
+                    row["final"]["hex"] = wrong_hex
+            self.validate(confirmed, "failing")
+
+            for action in actions:
+                for missing in (False, True):
+                    for role in ("baseline", "corrected"):
+                        with self.subTest(case=case_id, action=action, missing=missing, role=role):
+                            report = copy.deepcopy(confirmed)
+                            rows = report["cohorts"][role]["attempts"]
+                            for row in rows:
+                                if missing:
+                                    del row["observations"][action]
+                                else:
+                                    row["observations"][action] = False
+                            self.reject(report, f"expected inconclusive.*unconfirmed prescribed typing action: {action}")
+                            for row in rows:
+                                mark(row, "inconclusive")
+
+                            if role == "baseline":
+                                self.reject(report, "same unresolved measured failure twice")
+                                del report["cohorts"]["corrected"], report["correction"]
+                                support = []
+                            else:
+                                self.add_comparison(report, native_cohort())
+                                self.reject(report, "persistent corrected-build mandatory failure")
+                                del report["cohorts"]["comparison"]
+                                support = report["correction"]["baseline_attempt_ids"]
+                            report.update(status="inconclusive")
+                            report["decision"].update(disposition="inconclusive", supporting_attempt_ids=support)
+                            self.validate(report, "inconclusive")
+                            report["decision"]["supporting_attempt_ids"] = [*support, *(row["id"] for row in rows)]
+                            self.reject(report, "disposition must reference the attempts that establish it")
+
     def test_unchanged_recovery_read_requires_confirmed_initial_delivery_for_comparison(self):
         report, corrected = self.correction_fixture("app-switch", "prompt_visible")
         baseline_rows = self.baseline["attempts"]
@@ -1067,6 +1111,25 @@ class EvidenceTest(unittest.TestCase):
                 if case_id == "app-switch":
                     row["recovery"]["retained"]["hex"] = "6161"
                 self.reject(report_for(self.baseline), expected)
+                failure_id = mark(row, "failing")
+                self.validate(report_for(self.baseline, "failing", "mandatory-failure", [failure_id]), "failing")
+                remove_attempts(self.baseline, row)
+
+    def test_unconfirmed_typing_action_preserves_independent_measured_failures(self):
+        for failure, expected in (
+            ("cursor_visible", "visible observation failed: cursor_visible"),
+            ("start_empty", "unexpected startup input"),
+            ("replayed", "replayed input"),
+        ):
+            with self.subTest(failure=failure):
+                row = self.sample("english-return")
+                row["observations"]["return_pressed_once"] = False
+                row["final"]["hex"] = "6f6b"
+                if failure == "cursor_visible":
+                    row["observations"][failure] = False
+                else:
+                    row[failure] = failure == "replayed"
+                self.reject(report_for(self.baseline), f"expected failing.*{expected}")
                 failure_id = mark(row, "failing")
                 self.validate(report_for(self.baseline, "failing", "mandatory-failure", [failure_id]), "failing")
                 remove_attempts(self.baseline, row)
@@ -1177,16 +1240,90 @@ class EvidenceTest(unittest.TestCase):
                 self.add_comparison(report, alternative)
                 self.reject(report, message)
 
-    def test_comparison_requires_shared_recipes_and_complete_matrix(self):
+    def test_comparison_requires_the_declared_candidate_shell(self):
         report, _ = self.correction_fixture()
+        correction_support = report["decision"]["supporting_attempt_ids"].copy()
+        alternative = native_cohort()
+        alternative["tuple"]["shell"] = "other-wkwebview"
+        alternative["fingerprint"] = evidence.fingerprint(alternative["tuple"])
+        self.add_comparison(report, alternative)
+        self.reject(report, "cohort shell does not match its role")
+        for row in alternative["attempts"]:
+            mark(row, "inconclusive")
+        self.reject(report, "shell disposition must be comparison-eligible")
+        report["decision"].update(disposition="comparison-eligible", supporting_attempt_ids=correction_support)
+        self.validate(report, "failing")
+
+    def test_comparison_requires_qualified_recipes_on_each_signed_cohort(self):
+        case_id = "composition-cancel"
+        complete, _ = self.correction_fixture()
+        correction_support = complete["decision"]["supporting_attempt_ids"].copy()
+        self.add_comparison(complete, native_cohort())
+
+        for role, donor in (("baseline", "corrected"), ("corrected", "comparison"), ("comparison", "baseline")):
+            for defect, reason in (
+                ("missing recipe", f"{case_id} recipe requires an object"),
+                ("missing rehearsal", "two distinct observable rehearsals"),
+                ("borrowed rehearsals", "rehearsal belongs to a different signed cohort"),
+                ("reused rehearsal ID", "rehearsal ID is reused across recipes"),
+                ("changed steps", "recipe ID does not match its frozen procedure"),
+            ):
+                with self.subTest(role=role, defect=defect):
+                    report = copy.deepcopy(complete)
+                    cohort = report["cohorts"][role]
+                    recipe = cohort["recipes"][case_id]
+                    if defect == "missing recipe":
+                        del cohort["recipes"][case_id]
+                    elif defect == "missing rehearsal":
+                        recipe["rehearsals"].pop()
+                    elif defect == "borrowed rehearsals":
+                        recipe["rehearsals"] = report["cohorts"][donor]["recipes"][case_id]["rehearsals"]
+                    elif defect == "reused rehearsal ID":
+                        recipe["rehearsals"][0]["id"] = cohort["recipes"]["composition-commit"]["rehearsals"][0]["id"]
+                    else:
+                        recipe["steps"].append("Changed frozen gesture")
+
+                    if role == "comparison":
+                        self.reject(report, reason)
+                        for row in cohort["attempts"]:
+                            if row["case_id"] == case_id:
+                                mark(row, "inconclusive")
+                    self.reject(report, "shell disposition must be comparison-eligible")
+                    report["decision"].update(disposition="comparison-eligible",
+                                              supporting_attempt_ids=correction_support)
+                    self.validate(report, "failing")
+
+    def test_comparison_requires_the_same_verified_frozen_recipes(self):
+        report, _ = self.correction_fixture()
+        correction_support = report["decision"]["supporting_attempt_ids"].copy()
         alternative = native_cohort()
         self.add_comparison(report, alternative)
-        recipe = self.baseline["recipes"].pop("composition-commit")
-        self.reject(report, "baseline's frozen composition recipes")
-        self.baseline["recipes"]["composition-commit"] = recipe
+        case_id = "composition-replacement"
+        recipe = alternative["recipes"][case_id]
+        recipe["steps"].append("Different qualified gesture")
+        recipe["id"] = evidence.fingerprint({key: value for key, value in recipe.items()
+                                             if key not in ("id", "rehearsals")})
+        for rehearsal in recipe["rehearsals"]:
+            rehearsal["recipe_id"] = recipe["id"]
+        for row in alternative["attempts"]:
+            if row["case_id"] == case_id:
+                row["recipe_id"] = recipe["id"]
+        self.reject(report, "shell disposition must be comparison-eligible")
+        report["decision"].update(disposition="comparison-eligible", supporting_attempt_ids=correction_support)
+        self.validate(report, "failing")
+
+    def test_comparison_requires_a_complete_clean_matrix(self):
+        report, _ = self.correction_fixture()
+        correction_support = report["decision"]["supporting_attempt_ids"].copy()
+        alternative = native_cohort()
+        self.add_comparison(report, alternative)
         attempt = alternative["attempts"][-1]
         remove_attempts(alternative, attempt)
         self.reject(report, "shell disposition must be comparison-eligible")
+        report["decision"].update(disposition="comparison-eligible", supporting_attempt_ids=correction_support)
+        self.validate(report, "failing")
+        report["decision"]["supporting_attempt_ids"] = [*correction_support, alternative["attempts"][0]["id"]]
+        self.reject(report, "disposition must reference the attempts that establish it")
 
     def test_both_tauri_roles_require_exact_effective_acl(self):
         report, _ = self.correction_fixture()

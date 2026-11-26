@@ -20,9 +20,13 @@ CAPABILITY = {
 }
 LOCKS = ("package-lock.json", "Cargo.lock", "apps/client/w2-fixture/src-tauri/Cargo.lock")
 TOOLS = ("node", "npm", "vite", "tauri_cli", "tauri", "wry", "xterm", "cargo", "rustc")
+TYPING_ACTIONS = {
+    "english-return": ("return_pressed_once",),
+    "ukrainian-return": ("ukrainian_key_pressed_once", "return_pressed_once"),
+}
 OBSERVATIONS = {
-    "english-return": ("cursor_visible", "return_pressed_once"),
-    "ukrainian-return": ("cursor_visible", "ukrainian_key_pressed_once", "return_pressed_once"),
+    "english-return": ("cursor_visible", *TYPING_ACTIONS["english-return"]),
+    "ukrainian-return": ("cursor_visible", *TYPING_ACTIONS["ukrainian-return"]),
     "composition-commit": ("preedit_visible", "end_state_observed"),
     "composition-replacement": ("preedit_visible", "replaced_in_preedit", "end_state_observed"),
     "composition-cancel": ("preedit_visible", "end_state_observed"),
@@ -73,6 +77,13 @@ class Result:
     status: str
     detail: str = ""
     observed: tuple = ()
+
+
+@dataclass
+class Qualification:
+    rehearsals: set
+    detail: str = ""
+    fingerprint: str = ""
 
 
 def need(condition, detail):
@@ -146,7 +157,8 @@ def check_tuple(data, role):
     need(data.get("destination") == "physical-iphone", "a signed physical iPhone destination is required")
     need(named(data, "shell", "device_alias", "device_model", "ios_build", "deployment_target"),
          "missing shell, redacted device alias, device model, iOS build or deployment target")
-    need((data["shell"] == "tauri") == (role != "comparison"), "cohort shell does not match its role")
+    expected_shell = "native-wkwebview" if role == "comparison" else "tauri"
+    need(data["shell"] == expected_shell, "cohort shell does not match its role")
     need(version_tuple(data.get("ios_version")) >= version_tuple(data["deployment_target"]),
          "generated deployment target is newer than the tested OS")
     need(data.get("orientation") == "portrait", "record the prescribed starting orientation")
@@ -320,7 +332,8 @@ def qualify(recipe, case, data, cohort_fingerprint):
     frozen = {key: recipe[key] for key in (
         "case_id", "keyboard_language", "keyboard", "expected_hex", "steps", "preedit", "end_action", "end_state",
     )}
-    need(recipe.get("id") == fingerprint(frozen), "recipe ID does not match its frozen procedure")
+    verified_fingerprint = fingerprint(frozen)
+    need(recipe.get("id") == verified_fingerprint, "recipe ID does not match its frozen procedure")
     rehearsals = items(recipe.get("rehearsals"), "recipe rehearsals")
     seen = set()
     for rehearsal in rehearsals:
@@ -328,12 +341,12 @@ def qualify(recipe, case, data, cohort_fingerprint):
         need(rehearsal.get("cohort_fingerprint") == cohort_fingerprint,
              "recipe rehearsal belongs to a different signed cohort")
         need(named(rehearsal, "id", "ref") and rehearsal["id"] not in seen
-             and rehearsal.get("recipe_id") == recipe["id"]
+             and rehearsal.get("recipe_id") == verified_fingerprint
              and rehearsal.get("preedit") == preedit and rehearsal.get("end_state") == recipe["end_state"],
              "rehearsal has missing, duplicate or different visible outcomes")
         seen.add(rehearsal["id"])
     need(len(seen) >= 2, "two distinct observable rehearsals are required")
-    return seen
+    return Qualification(seen, fingerprint=verified_fingerprint)
 
 
 def attempt_identity(record):
@@ -591,7 +604,8 @@ def check_capture(attempt, case, cohort, qualification, observed, identity, reco
     if case_id in COMPOSITION:
         need(not qualification.detail, qualification.detail)
         recipe = cohort["recipes"][case_id]
-        need(attempt.get("recipe_id") == recipe["id"] and attempt["keyboard_language"] == recipe["keyboard_language"],
+        need(attempt.get("recipe_id") == qualification.fingerprint
+             and attempt["keyboard_language"] == recipe["keyboard_language"],
              "measured gesture does not use the frozen qualified recipe")
         need(all(observed.get(key) is True for key in OBSERVATIONS[case_id]),
              "measured preedit and end state do not establish the qualified gesture")
@@ -599,6 +613,8 @@ def check_capture(attempt, case, cohort, qualification, observed, identity, reco
         final = snapshot(attempt.get("final"), identity)
         check_composition(attempt, final, identity, expected)
     need(attempt.get("capture_error") is False, "native capture reported an unresolved error")
+    for action in TYPING_ACTIONS.get(case_id, ()):
+        need(observed.get(action) is True, f"unconfirmed prescribed typing action: {action}")
     return final if final is not None else snapshot(attempt.get("final"), identity)
 
 
@@ -635,8 +651,9 @@ def evaluate_attempt(attempt, case, cohort, qualification):
         if final is not None:
             measured(final["hex"] == case["expected"]["afterHex"],
                      "final bytes differ from the manifest", final["hex"])
+        typing_actions = TYPING_ACTIONS.get(case_id, ())
         for key in OBSERVATIONS[case_id]:
-            if case_id in COMPOSITION or key == "started_fresh":
+            if case_id in COMPOSITION or key == "started_fresh" or key in typing_actions:
                 continue
             measured(observed.get(key) is not False, f"visible observation failed: {key}")
         viewport_clear = check_layout(attempt, case_id) if case_id in LAYOUT_CASES else True
@@ -654,12 +671,6 @@ def evaluate_attempt(attempt, case, cohort, qualification):
     return Result("pass")
 
 
-@dataclass
-class Qualification:
-    rehearsals: set
-    detail: str = ""
-
-
 def qualifications(cohort, cases):
     recipes = obj(cohort.get("recipes", {}), "composition recipes")
     result = {}
@@ -667,12 +678,12 @@ def qualifications(cohort, cases):
     for case_id in COMPOSITION:
         try:
             recipe = obj(recipes.get(case_id), f"{case_id} recipe")
-            rehearsals = qualify(recipe, cases[case_id], cohort["tuple"], cohort["fingerprint"])
-            need(not (rehearsals & all_rehearsals), "rehearsal ID is reused across recipes")
-            all_rehearsals.update(rehearsals)
-            result[case_id] = Qualification(rehearsals)
+            qualified = qualify(recipe, cases[case_id], cohort["tuple"], cohort["fingerprint"])
+            need(not (qualified.rehearsals & all_rehearsals), "rehearsal ID is reused across recipes")
+            all_rehearsals.update(qualified.rehearsals)
+            result[case_id] = qualified
         except EvidenceError as error:
-            result[case_id] = Qualification(set(), str(error))
+            result[case_id] = Qualification(set(), detail=str(error))
     return result
 
 
@@ -804,6 +815,13 @@ def out_of_order_attempts(identities):
     return out_of_order
 
 
+@dataclass
+class CohortAssessment:
+    readiness: Result
+    rows: dict
+    recipes: dict
+
+
 def assess_cohort(cohort, role, cases, ids):
     readiness = cohort_readiness(cohort, role)
     recipes = qualifications(cohort, cases) if readiness.status == "pass" else {}
@@ -860,7 +878,7 @@ def assess_cohort(cohort, role, cases, ids):
         if result.status != "pass":
             need(named(attempt, "reason"), f"{attempt['id']}: record the reason for the non-pass")
         rows[case_id].add(attempt, result)
-    return readiness, rows
+    return CohortAssessment(readiness, rows, recipes)
 
 
 def matching_conditions(original, updated, allow_shell_change=False):
@@ -885,14 +903,14 @@ def matching_conditions(original, updated, allow_shell_change=False):
     return stable_conditions(before) == stable_conditions(after)
 
 
-def matching_recipes(original, updated, require_original=False):
-    recipes = obj(original.get("recipes", {}), "original composition recipes")
-    for case_id, recipe in obj(updated.get("recipes", {}), "updated composition recipes").items():
-        if require_original and case_id in COMPOSITION:
-            need(case_id in recipes, "comparison requires the baseline's frozen composition recipes")
-        if case_id in recipes:
-            need(isinstance(recipe, dict) and isinstance(recipes[case_id], dict)
-                 and recipe.get("id") == recipes[case_id].get("id"), "another build changed a frozen composition recipe")
+def comparison_recipes_match(assessed):
+    if any(assessed[role].readiness.status != "pass" for role in COHORTS):
+        return False
+    for case_id in COMPOSITION:
+        original, corrected, comparison = (assessed[role].recipes[case_id].fingerprint for role in COHORTS)
+        if not original or original != corrected or original != comparison:
+            return False
+    return True
 
 
 def correction_result(correction, cohorts, assessed):
@@ -906,18 +924,22 @@ def correction_result(correction, cohorts, assessed):
     repeats = items(correction.get("baseline_attempt_ids"), "baseline failure attempts")
     need(len(repeats) == 2 and all(string(value) for value in repeats) and repeats[0] != repeats[1],
          "name two distinct baseline failure attempts")
-    original = assessed["baseline"][1][case]
+    baseline, corrected = assessed["baseline"], assessed["corrected"]
+    original = baseline.rows[case]
     reproduced = original.reproduction(repeats)
     need(reproduced is not None, "correction requires the same unresolved measured failure twice on the baseline")
-    if assessed["corrected"][0].status != "pass":
+    if corrected.readiness.status != "pass":
         return False, repeats
     need(matching_conditions(cohorts["baseline"], cohorts["corrected"])
          and cohorts["baseline"]["tuple"]["source_revision"] != cohorts["corrected"]["tuple"]["source_revision"],
          "correction requires a different signed revision and bundle under the same physical conditions")
-    matching_recipes(cohorts["baseline"], cohorts["corrected"])
-    corrected = assessed["corrected"][1][case]
-    for attempt_id in reversed(corrected.open_attempts):
-        if corrected.reproduction([attempt_id]) == reproduced:
+    for case_id in COMPOSITION:
+        before = baseline.recipes[case_id].fingerprint
+        after = corrected.recipes[case_id].fingerprint
+        need(not before or not after or before == after, "another build changed a frozen composition recipe")
+    corrected_case = corrected.rows[case]
+    for attempt_id in reversed(corrected_case.open_attempts):
+        if corrected_case.reproduction([attempt_id]) == reproduced:
             return True, [*repeats, attempt_id]
     return False, repeats
 
@@ -954,16 +976,14 @@ def validate(report, cases):
     eligible, supporting = correction_result(correction, cohorts, assessed)
     if "comparison" in entries:
         need(eligible, "comparison requires a persistent corrected-build mandatory failure")
-        if assessed["comparison"][0].status == "pass":
+        if assessed["comparison"].readiness.status == "pass":
             comparison = cohorts["comparison"]
             need(matching_conditions(cohorts["baseline"], comparison, allow_shell_change=True)
                  and matching_conditions(cohorts["corrected"], comparison, allow_shell_change=True),
                  "comparison must reuse the fixture and physical conditions on a different signed shell build")
-            matching_recipes(cohorts["baseline"], comparison, require_original=True)
-            matching_recipes(cohorts["corrected"], comparison)
 
-    role = "corrected" if correction and assessed["corrected"][0].status == "pass" else "baseline"
-    readiness, rows = assessed[role]
+    role = "corrected" if correction and assessed["corrected"].readiness.status == "pass" else "baseline"
+    readiness, rows = assessed[role].readiness, assessed[role].rows
     if readiness.status != "pass":
         status = "inconclusive" if cohorts[role].get("attempts") else "setup-hold"
         disposition = "inconclusive"
@@ -972,8 +992,8 @@ def validate(report, cases):
         supporting = [attempt_id for row in rows.values() for attempt_id in row.support]
     elif eligible:
         status, disposition = "failing", "comparison-eligible"
-        comparison_rows = assessed["comparison"][1]
-        if all(row.passed for row in comparison_rows.values()):
+        comparison_rows = assessed["comparison"].rows
+        if comparison_recipes_match(assessed) and all(row.passed for row in comparison_rows.values()):
             disposition = "review-comparison"
             supporting.extend(attempt_id for row in comparison_rows.values() for attempt_id in row.support)
     else:
