@@ -118,7 +118,8 @@ def make_recipes(cohort, cases):
         }
         recipe["id"] = evidence.fingerprint(recipe)
         recipe["rehearsals"] = [
-            {"id": f"{cohort['tuple']['source_revision']}-{case_id}-rehearsal-{i}", "ref": "synthetic rehearsal",
+            {"id": f"{cohort['tuple']['source_revision']}-{case_id}-rehearsal-{i}",
+             "ref": f"synthetic capture {cohort['tuple']['source_revision']}/{case_id}/{i}",
              "cohort_fingerprint": cohort["fingerprint"], "recipe_id": recipe["id"],
              "preedit": preedit.copy(), "end_state": recipe["end_state"]}
             for i in range(2)
@@ -678,16 +679,23 @@ class EvidenceTest(unittest.TestCase):
     def test_fresh_recovery_cannot_reuse_a_bound_before_identity(self):
         case = self.cases["app-switch"]
         first = self.sample(case["id"])
-        second = add_attempt(self.baseline, case, "fresh")
-        report = report_for(self.baseline, support=[first["id"], second["id"]])
-        recovery = second["recovery"]
-        for record in (recovery["before"], recovery["retained"], recovery["restart"]["previous"]):
-            record.update(attemptId=first["attemptId"], generation=first["generation"])
-        self.reject(report, f"{first['id']}: expected inconclusive .*is reused")
-        mark(first, "inconclusive")
-        self.reject(report, f"{second['id']}: expected inconclusive .*is reused")
-        mark(second, "inconclusive")
-        self.validate(report_for(self.baseline, "inconclusive", "inconclusive", []), "inconclusive")
+        add_attempt(self.baseline, case, "fresh")
+        report = report_for(self.baseline, "inconclusive", "inconclusive", [])
+        self.validate(report, "inconclusive")
+        native_id, generation = first["attemptId"], first["generation"]
+        for counters in ((native_id, generation), (native_id, generation + 1), (native_id + 1, generation)):
+            with self.subTest(old_counters=counters):
+                mutated = copy.deepcopy(report)
+                cohort = mutated["cohorts"]["baseline"]
+                reused, fresh = cohort["attempts"]
+                recovery = fresh["recovery"]
+                for record in (recovery["before"], recovery["retained"], recovery["restart"]["previous"]):
+                    record.update(attemptId=counters[0], generation=counters[1])
+                self.reject(mutated, f"{reused['id']}: expected inconclusive .*is reused")
+                mark(reused, "inconclusive")
+                self.reject(mutated, f"{fresh['id']}: expected inconclusive .*is reused")
+                mark(fresh, "inconclusive")
+                self.validate(report_for(cohort, "inconclusive", "inconclusive", []), "inconclusive")
 
     def test_fresh_recovery_requires_greater_generation_and_exact_input(self):
         row = self.sample("lock-foreground")
@@ -698,6 +706,40 @@ class EvidenceTest(unittest.TestCase):
         row["final"]["hex"] = self.cases["lock-foreground"]["expected"]["afterHex"]
         row["recovery"]["restart"]["observed"]["generation"] -= 1
         self.reject(report, "fresh attempt and generation")
+
+    def test_plausible_old_counters_need_matching_recovery_evidence_before_counting_as_reuse(self):
+        first = self.sample("app-switch")
+        second = add_attempt(self.baseline, self.cases["app-switch"], "second")
+        complete = report_for(self.baseline, "inconclusive", "inconclusive", [])
+        for defect, reason in (
+            ("case", "lacks the old native attempt"),
+            ("retained", "different attempt or generation"),
+            ("previous", "not bound to the old attempt"),
+            ("action", "missing completed foreground restart action"),
+            ("observed", "did not identify a fresh attempt and generation"),
+            ("visible", "conflicts with the visible fresh-start observation"),
+        ):
+            with self.subTest(defect=defect):
+                report = copy.deepcopy(complete)
+                row = report["cohorts"]["baseline"]["attempts"][1]
+                recovery = row["recovery"]
+                restart = recovery["restart"]
+                for record in (recovery["before"], recovery["retained"], restart["previous"]):
+                    record["attemptId"] = first["attemptId"]
+                if defect == "case":
+                    recovery["before"]["caseId"] = "lock-foreground"
+                elif defect in ("retained", "previous"):
+                    proof = recovery["retained"] if defect == "retained" else restart["previous"]
+                    proof["attemptId"] += 1
+                elif defect == "action":
+                    restart["action_completed"] = False
+                elif defect == "observed":
+                    restart["observed"]["generation"] -= 1
+                else:
+                    row["observations"].pop("started_fresh")
+                self.reject(report, f"{second['id']}: expected inconclusive .*{reason}")
+                mark(row, "inconclusive")
+                self.validate(report, "inconclusive")
 
     def test_mismatched_bytes_or_replay(self):
         row = self.sample("english-return")
@@ -819,6 +861,64 @@ class EvidenceTest(unittest.TestCase):
         mark(early, "inconclusive")
         support[support.index(later[0]["id"])] = early["id"]
         self.reject(report, "disposition must reference the attempts that establish it")
+
+    def test_conflicting_old_recovery_snapshot_cannot_poison_later_bound_measurements(self):
+        for case_id in sorted(evidence.RECOVERY):
+            cohort = bound_cohort()
+            make_recipes(cohort, self.cases)
+            early = add_attempt(cohort, self.cases[case_id], "early")
+            complete = self.complete(cohort)
+            same_case = [row for row in cohort["attempts"][1:] if row["case_id"] == case_id]
+            unrelated = [row for row in cohort["attempts"] if row["case_id"] == "english-return"]
+            self.assertEqual(len(same_case), 2)
+            self.assertEqual(len(unrelated), 2)
+            for defect, counters, reason in (
+                ("wrong case", {"attemptId": same_case[0]["attemptId"]}, "lacks the old native attempt"),
+                ("conflicting retained", {"generation": unrelated[0]["generation"]}, "different attempt or generation"),
+                ("conflicting previous", {"attemptId": same_case[-1]["attemptId"] + 10}, "not bound to the old attempt"),
+                ("non-increasing fresh", {"generation": same_case[-1]["generation"] + 10}, "fresh attempt and generation"),
+            ):
+                with self.subTest(case=case_id, defect=defect):
+                    report = copy.deepcopy(complete)
+                    invalid = report["cohorts"]["baseline"]["attempts"][0]
+                    recovery = invalid["recovery"]
+                    restart = recovery["restart"]
+                    recovery["before"].update(counters)
+                    if defect == "wrong case":
+                        recovery["before"]["caseId"] = "english-return"
+                    if defect != "conflicting retained":
+                        recovery["retained"].update(counters)
+                    if defect != "conflicting previous":
+                        restart["previous"].update(counters)
+
+                    self.reject(report, f"{early['id']}: expected inconclusive .*{reason}")
+                    mark(invalid, "inconclusive")
+                    support = report["decision"]["supporting_attempt_ids"]
+                    support.remove(early["id"])
+                    self.validate(report, "pass")
+                    for later in (*same_case, *unrelated):
+                        with self.subTest(missing_support=later["id"]):
+                            report["decision"]["supporting_attempt_ids"] = [key for key in support if key != later["id"]]
+                            self.reject(report, "disposition must reference the attempts that establish it")
+                    report["decision"]["supporting_attempt_ids"] = [*support, early["id"]]
+                    self.reject(report, "disposition must reference the attempts that establish it")
+
+    def test_bound_recovery_primary_remains_in_chronology_when_old_snapshot_conflicts(self):
+        early = self.sample("app-switch")
+        report = self.complete(self.baseline)
+        following = self.baseline["attempts"][1]
+        early["recovery"]["before"]["caseId"] = following["case_id"]
+        mark(early, "inconclusive")
+        report["decision"]["supporting_attempt_ids"].remove(early["id"])
+        self.validate(report, "pass")
+
+        measurement = self.baseline["launches"][0]["measurements"][0]
+        for value, reason in ((following["generation"], "is reused"),
+                              (following["generation"] + 1, "is out of order")):
+            with self.subTest(primary_generation=value):
+                early["generation"] = measurement["generation"] = value
+                early["recovery"]["restart"]["observed"]["generation"] = early["final"]["generation"] = value
+                self.reject(report, f"{following['id']}: expected inconclusive .*{reason}")
 
     def test_partially_bound_retained_counters_disqualify_later_passes(self):
         case = self.cases["english-return"]
@@ -1314,6 +1414,89 @@ class EvidenceTest(unittest.TestCase):
                     report["decision"].update(disposition="comparison-eligible",
                                               supporting_attempt_ids=correction_support)
                     self.validate(report, "failing")
+
+    def assert_comparison_uses_only_correction(self, report, correction_support):
+        self.reject(report, "shell disposition must be comparison-eligible")
+        report["decision"].update(disposition="comparison-eligible", supporting_attempt_ids=correction_support)
+        self.validate(report, "failing")
+        comparison = report["cohorts"]["comparison"]
+        report["decision"]["supporting_attempt_ids"] = [*correction_support, comparison["attempts"][0]["id"]]
+        self.reject(report, "disposition must reference the attempts that establish it")
+
+    def test_comparison_rejects_borrowed_recordings_even_with_the_recipient_binding(self):
+        complete, _ = self.correction_fixture()
+        correction_support = complete["decision"]["supporting_attempt_ids"].copy()
+        self.add_comparison(complete, native_cohort())
+        self.validate(complete, "failing")
+
+        case_id = "composition-cancel"
+        for role, donor in (("baseline", "corrected"), ("corrected", "comparison"), ("comparison", "baseline")):
+            for rename in (False, True):
+                with self.subTest(role=role, donor=donor, renamed=rename):
+                    report = copy.deepcopy(complete)
+                    recipient = report["cohorts"][role]
+                    recipe = recipient["recipes"][case_id]
+                    borrowed = report["cohorts"][donor]["recipes"][case_id]["rehearsals"][0]
+                    rehearsal = recipe["rehearsals"][0]
+                    rehearsal.update(id=rehearsal["id"] if rename else borrowed["id"], ref=borrowed["ref"],
+                                     cohort_fingerprint=recipient["fingerprint"], recipe_id=recipe["id"],
+                                     preedit=recipe["preedit"], end_state=recipe["end_state"])
+                    self.assert_comparison_uses_only_correction(report, correction_support)
+
+    def test_comparison_allows_shared_recordings_only_for_independent_segments(self):
+        complete, _ = self.correction_fixture()
+        correction_support = complete["decision"]["supporting_attempt_ids"].copy()
+        self.add_comparison(complete, native_cohort())
+        baseline = complete["cohorts"]["baseline"]["recipes"]
+        comparison = complete["cohorts"]["comparison"]["recipes"]
+        commit = comparison["composition-commit"]["rehearsals"]
+        cancel = comparison["composition-cancel"]["rehearsals"]
+        cancel.append(dict(cancel[-1], id=f"{cancel[-1]['id']}-additional"))
+        shared = [*commit, baseline["composition-cancel"]["rehearsals"][0], cancel[-1]]
+        for index, rehearsal in enumerate(shared):
+            rehearsal.update(ref="synthetic shared recording",
+                             capture_segment={"start_ms": index * 100, "end_ms": (index + 1) * 100})
+        self.validate(complete, "failing")
+
+        for scope, case_id, index, start in (
+            ("same recipe", "composition-commit", 1, 0),
+            ("different recipes", "composition-cancel", 2, 100),
+            ("different builds", "composition-cancel", 2, 200),
+        ):
+            for defect in ("identical", "overlapping", "missing"):
+                with self.subTest(scope=scope, defect=defect):
+                    report = copy.deepcopy(complete)
+                    candidate = report["cohorts"]["comparison"]
+                    rehearsal = candidate["recipes"][case_id]["rehearsals"][index]
+                    if defect == "missing":
+                        del rehearsal["capture_segment"]
+                    else:
+                        offset = 25 if defect == "overlapping" else 0
+                        rehearsal["capture_segment"] = {"start_ms": start + offset, "end_ms": start + offset + 100}
+                    if scope != "different builds" or defect == "missing":
+                        self.reject(report, "expected inconclusive .*rehearsal recording")
+                        for row in candidate["attempts"]:
+                            if row["case_id"] == case_id:
+                                mark(row, "inconclusive")
+                    self.assert_comparison_uses_only_correction(report, correction_support)
+
+    def test_comparison_validates_supplied_segments_even_for_unshared_recordings(self):
+        complete, _ = self.correction_fixture()
+        correction_support = complete["decision"]["supporting_attempt_ids"].copy()
+        self.add_comparison(complete, native_cohort())
+        case_id = "composition-cancel"
+        for segment in (None, [0, 10], {"start_ms": 0}, {"start_ms": True, "end_ms": 10},
+                        {"start_ms": 0, "end_ms": 10.0}, {"start_ms": -1, "end_ms": 10},
+                        {"start_ms": 0, "end_ms": 0}, {"start_ms": 10, "end_ms": 1}):
+            with self.subTest(segment=segment):
+                report = copy.deepcopy(complete)
+                candidate = report["cohorts"]["comparison"]
+                candidate["recipes"][case_id]["rehearsals"][0]["capture_segment"] = segment
+                self.reject(report, "expected inconclusive .*rehearsal capture segment")
+                for row in candidate["attempts"]:
+                    if row["case_id"] == case_id:
+                        mark(row, "inconclusive")
+                self.assert_comparison_uses_only_correction(report, correction_support)
 
     def test_comparison_requires_the_same_verified_frozen_recipes(self):
         report, _ = self.correction_fixture()
