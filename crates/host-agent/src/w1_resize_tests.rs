@@ -179,15 +179,32 @@ def until(name):
     while root.is_dir() and not (root / name).exists() and time.monotonic() < end:
         time.sleep(.005)
     return (root / name).exists()
+def key(name, pane):
+    return name if pane == "%0" else name + "-1"
+def pane_row(pane):
+    if pane == "%0" and not read("removed-0"):
+        return 'PREFIX'.split("|")
+    if pane == "%1" and not read("removed-1") and read("second-pane"):
+        return read("second-pane").split("|")
+    return None
+def panes():
+    return [(pane, row) for pane in ("%0", "%1") if (row := pane_row(pane))]
 def check(guard, pane, write_input=False):
+    row = pane_row(pane)
+    if row is None:
+        return False
+    expected = {
+        "pid": row[0], "start_time": row[1], "@rs_create_generation": row[2],
+        "session_id": row[3], "window_id": row[4], "pane_id": row[5],
+        "pane_pid": row[6], "session_name": row[7], "pane_tty": row[15],
+        "@rs_resize_epoch": read(key("epoch", pane)),
+        "@rs_paste_admission": read(key("marker", pane)),
+        "@rs_paste_launch": read(key("launch", pane)),
+    }
     match = (
-        pane == "%0" and not read("scope") and
-        ("#{==:#{@rs_resize_epoch}," + read("epoch") + "}") in guard and
-        ("#{==:#{@rs_paste_admission}," + read("marker") + "}") in guard and
-        ("#{==:#{@rs_paste_launch}," + read("launch") + "}") in guard and
-        "#{==:#{pane_id},%0}" in guard and
-        "#{==:#{pane_pid},PANE_PID}" in guard and
-        "#{==:#{@rs_create_generation},GENERATION}" in guard and not read("unsupported")
+        not read("scope") and not read("unsupported") and
+        all(("#{{==:#{{{}}},{}}}".format(field, value)) in guard
+            for field, value in expected.items())
     )
     return match and (not write_input or (
         "#{==:#{pane_input_off},0}" in guard and not read("input-off")
@@ -202,14 +219,15 @@ def send(args):
         return rejection(reject)
     assert marker[:5] == ["set-option", "-p", "-t", pane, "@rs_paste_admission"]
     assert paste[:7] == ["paste-buffer", "-p", "-r", "-S", "-d", "-b", paste[6]]
-    assert paste[7:] == ["-t", pane] and "~a~" in read("marker")
-    assert marker[5] == read("marker").replace("~a~", "~s~", 1)
+    marker_file = key("marker", pane)
+    assert paste[7:] == ["-t", pane] and "~a~" in read(marker_file)
+    assert marker[5] == read(marker_file).replace("~a~", "~s~", 1)
     assert reply[:5] == ["display-message", "-p", "-l", "-t", pane]
-    write("marker", marker[5])
+    write(marker_file, marker[5])
     data = (root / paste[6]).read_bytes()
     if read("bracketed"):
         data = b"\x1b[200~" + data + b"\x1b[201~"
-    append("pane0-bytes", data)
+    append("pane" + pane[1:] + "-bytes", data)
     (root / paste[6]).unlink()
     append("effects", b"1")
     return reply[-1]
@@ -224,36 +242,44 @@ if sys.argv[1] == "--server-send":
 
 args = sys.argv[4:]
 command = args[0]
-cols, rows = read("grid").split()
-epoch, intent, mode = read("epoch"), read("intent"), read("mode")
+pane = args[args.index("-t") + 1] if "-t" in args else "%0"
+mode = read("mode")
 if command == "list-sessions":
-    print("RUNTIME_NAME")
+    for name in dict.fromkeys(row[7] for _, row in panes()):
+        print(name)
 elif command == "list-panes":
-    print("RUNTIME_NAME", "%0", "PANE_PID", 0, cols, rows, "fixture", sep="\t")
+    for pane, row in panes():
+        cols, rows = read(key("grid", pane)).split()
+        print(row[7], pane, row[6], 0, cols, rows, "fixture", sep="\t")
 elif command == "list-commands":
     print("load-buffer (loadb) [-w] [-b buffer-name] path")
     flags = "dpr" if read("probe-mode") == "missing-flag" else "dprS"
     print(f"paste-buffer (pasteb) [-{flags}] [-b buffer-name] [-t target-pane]")
 elif command == "display-message":
-    if args[-1] == "#{pid}|#{start_time}|#{@rs_create_generation}":
+    if args[2] == "#{pid}|#{start_time}|#{@rs_create_generation}":
         print("987|123456|GENERATION")
+        if args[3:]:
+            assert args[3:] == [";", "list-panes", "-a", "-F", "#{pane_id}"]
+            if read("absence-unconfirmed"):
+                sys.exit(1)
+            for listed, _ in panes():
+                print(listed)
     else:
-        prefix = 'PREFIX'.replace('|%0|', '|%1|') if read("scope") else 'PREFIX'
-        print(prefix, cols, rows, cols, rows, epoch, intent, read("launch"),
-              read("marker"), int(bool(read("input-off"))), int(not read("unsupported")), sep="|")
-elif command == "load-buffer":
-    assert args[1] == "-b" and args[2].startswith("rs-paste-") and args[3:] == ["-"]
-    identifier = args[2].removeprefix("rs-paste-").removeprefix("probe-")
-    assert re.fullmatch("[0-9a-f]{32}", identifier)
-    (root / args[2]).write_bytes(sys.stdin.buffer.read())
-    write("last-load", args[2])
+        append("geometry-targets", (pane + "\n").encode())
+        row = pane_row(pane)
+        if row is None:
+            sys.exit(1)
+        if read("scope"):
+            row[5] = "%1"
+        cols, rows = read(key("grid", pane)).split()
+        print("|".join(row), cols, rows, cols, rows,
+              read(key("epoch", pane)), read(key("intent", pane)), read(key("launch", pane)),
+              read(key("marker", pane)), int(bool(read("input-off"))),
+              int(not read("unsupported")), sep="|")
 elif command == "save-buffer":
     assert args[1] == "-b" and args[2].startswith("rs-paste-probe-") and args[3:] == ["-"]
     data = (root / args[2]).read_bytes()
     sys.stdout.buffer.write(data[:-1] if read("probe-mode") == "truncated" else data)
-elif command == "delete-buffer":
-    assert args[1] == "-b"
-    (root / args[2]).unlink(missing_ok=True)
 elif command == "if-shell":
     _, flags, target, pane, guard, branch, *otherwise = args
     assert (flags, target) == ("-F", "-t")
@@ -269,10 +295,44 @@ elif command == "if-shell":
         if mode == "lost-after":
             sys.exit(1)
         print(reply[-1])
+    elif branch.startswith(("load-buffer", "list-buffers", "delete-buffer", "display-message")):
+        nodes = [node.split() for node in branch.split(" ; ")]
+        action, reply = nodes
+        if action[0] == "display-message":
+            action, reply = reply, action
+        assert reply[:5] == ["display-message", "-p", "-l", "-t", pane]
+        if not check(guard, pane):
+            sys.exit()
+        if action[0] == "load-buffer":
+            _, flag, buffer, source = action
+            assert (flag, source) == ("-b", "-") and buffer.startswith("rs-paste-")
+            identifier = buffer.removeprefix("rs-paste-").removeprefix("probe-")
+            assert re.fullmatch("[0-9a-f]{32}", identifier)
+            (root / buffer).write_bytes(sys.stdin.buffer.read())
+            write("last-load", buffer)
+        elif action[0] == "list-buffers":
+            assert action[1:4] == ["-F", "present", "-f"]
+            buffer = re.fullmatch(r"'#\{==:#\{buffer_name\},(rs-paste-[0-9a-f]{32})\}'",
+                                  action[4]).group(1)
+            if (root / buffer).exists():
+                print("present")
+        elif action[0] == "delete-buffer":
+            _, flag, buffer = action
+            assert flag == "-b"
+            if read("cleanup-blocked"):
+                sys.exit(1)
+            (root / buffer).unlink()
+            append("deletions", (buffer + "\n").encode())
+        else:
+            assert action == ["kill-session", "-t", "=" + pane_row(pane)[7]]
+            write("removed-" + pane[1:], "1")
+        print(reply[-1])
     elif " ; paste-buffer " in branch:
         append("submissions", b"1")
         write("last-effect-command", json.dumps(args))
         paste_mode = read("paste-mode")
+        if paste_mode == "lost-before":
+            sys.exit(1)
         if paste_mode in ("late", "timeout-before"):
             subprocess.Popen([sys.executable, __file__, "--server-send", json.dumps(args)],
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -290,7 +350,7 @@ elif command == "if-shell":
             send_keys, reply = [node.split() for node in branch.split(" ; ")]
             assert send_keys[:4] == ["send-keys", "-H", "-t", pane]
             assert reply == ["display-message", "-p", "-l", "-t", pane, "rs-input-accepted"]
-            append("pane0-bytes", bytes.fromhex(" ".join(send_keys[4:])))
+            append("pane" + pane[1:] + "-bytes", bytes.fromhex(" ".join(send_keys[4:])))
             print(reply[-1])
     elif branch.startswith("set-option"):
         if not check(guard, pane):
@@ -303,14 +363,15 @@ elif command == "if-shell":
                 assert words[:5] == ["display-message", "-p", "-l", "-t", pane]
                 print(words[-1])
             elif words[-2] == "@rs_resize_epoch":
-                write("epoch", words[-1])
+                write(key("epoch", pane), words[-1])
             elif words[-2] == "@rs_paste_launch":
-                write("launch", words[-1])
+                write(key("launch", pane), words[-1])
             elif words[-2] == "@rs_paste_admission":
-                ack_reply = read("ack-reply") if "~s~" in read("marker") and "~r~" in words[-1] else ""
+                marker_file = key("marker", pane)
+                ack_reply = read("ack-reply") if "~s~" in read(marker_file) and "~r~" in words[-1] else ""
                 if ack_reply == "before":
                     sys.exit(1)
-                write("marker", words[-1])
+                write(marker_file, words[-1])
                 if ack_reply == "after":
                     sys.exit(1)
             else:
@@ -328,8 +389,6 @@ else:
             &tmux,
             script
                 .replace("PREFIX", &prefix)
-                .replace("RUNTIME_NAME", &name)
-                .replace("PANE_PID", &pid.to_string())
                 .replace("GENERATION", &generation.to_string()),
         )
         .unwrap();
@@ -355,6 +414,72 @@ else:
             ..self.terminal.clone()
         };
         (engine, terminal)
+    }
+
+    pub(super) fn second_pane(&self, replacement: bool) -> (TerminalView, tokio::process::Child) {
+        let child = Command::new("/bin/sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let runtime_id = if replacement {
+            self.terminal.target.runtime_id
+        } else {
+            Uuid::new_v4()
+        };
+        let target = TerminalTarget {
+            runtime_id,
+            generation: self.terminal.target.generation,
+            session: "$1".into(),
+            window: "@1".into(),
+            pane: "%1".into(),
+            pid,
+            process_start: process_start(pid).unwrap(),
+        };
+        let name = tmux_name(Uuid::new_v4(), runtime_id);
+        let tty = "/dev/ttyssecond";
+        let read = GeometryReadback {
+            target: target.clone(),
+            server: ServerGeneration {
+                pid: 987,
+                start: 123456,
+                token: target.generation,
+            },
+            name: name.clone(),
+            nonce: String::new(),
+            tty: tty.into(),
+            epoch: None,
+            committed: CommittedGeometry {
+                size: ORIGINAL,
+                revision: 0,
+                intent: None,
+            },
+            paste_launch: Uuid::new_v4().to_string(),
+            paste_marker: String::new(),
+            sender_supported: true,
+            input_enabled: true,
+        };
+        let root = self.temp.path();
+        fs::write(root.join("grid-1"), "100 30").unwrap();
+        fs::write(root.join("launch-1"), &read.paste_launch).unwrap();
+        fs::write(root.join("marker-1"), read.ready_marker(None)).unwrap();
+        fs::write(
+            root.join("second-pane"),
+            format!(
+                "987|123456|{}|$1|@1|%1|{pid}|{name}|0|0||0|1|1|manual|{tty}",
+                target.generation
+            ),
+        )
+        .unwrap();
+        (
+            TerminalView {
+                target,
+                agent_epoch: self.terminal.agent_epoch,
+                view_id: Uuid::new_v4(),
+            },
+            child,
+        )
     }
 
     pub(super) async fn acquire(&self, terminal: TerminalView) -> (Uuid, ResizeEpoch) {

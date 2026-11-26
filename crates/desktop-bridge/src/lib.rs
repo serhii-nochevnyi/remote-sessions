@@ -2423,6 +2423,15 @@ mod tests {
         }
 
         async fn stage(&self, view: &View, incarnation: Uuid, operation: u64) -> PasteBinding {
+            self.stage_payload(view, incarnation, operation).await.0
+        }
+
+        async fn stage_payload(
+            &self,
+            view: &View,
+            incarnation: Uuid,
+            operation: u64,
+        ) -> (PasteBinding, Vec<u8>) {
             let task = self.invoke(
                 view,
                 incarnation,
@@ -2454,7 +2463,7 @@ mod tests {
                 },
             );
             assert_eq!(task.await.unwrap(), PasteResult::Staged {});
-            binding
+            (binding, data)
         }
 
         async fn no_request(&self) {
@@ -2935,7 +2944,8 @@ mod tests {
 
     #[tokio::test]
     async fn w1_terminal_paste_lost_reply() {
-        for witnessed in [false, true] {
+        let mut observed_effects = Vec::new();
+        for apply in [false, true] {
             let ipc = PasteIpc::new();
             let (view, _output) = ipc.attach();
             let id = view.terminal.view_id.to_string();
@@ -2948,20 +2958,18 @@ mod tests {
                     .to_string(),
                 "PasteUnavailable"
             );
-            let staged = ipc.stage(&view, incarnation, 1).await;
+            let (staged, payload) = ipc.stage_payload(&view, incarnation, 1).await;
             assert_eq!(staged.sequence, 0);
             let task = ipc.invoke(&view, incarnation, 1, PasteAction::Commit { bytes: 1 });
             let (peer, request) = ipc.receive().await;
             assert!(
                 matches!(request, Request::PasteCommit { binding, bytes: 1 } if binding == staged)
             );
-            let outcome = if witnessed {
-                PasteResult::Committed {
-                    receipt: Uuid::new_v4(),
-                }
-            } else {
-                PasteResult::Unknown {}
-            };
+            let mut delivered_bytes = Vec::new();
+            let receipt = apply.then(|| {
+                delivered_bytes.push(payload);
+                Uuid::new_v4()
+            });
             drop(peer);
             assert_eq!(task.await.unwrap(), PasteResult::Unknown {});
             ipc.release(token).await;
@@ -2987,17 +2995,14 @@ mod tests {
                     .unwrap(),
                 PasteResult::Stale {}
             );
-            let lost_receipt = match outcome {
-                PasteResult::Committed { receipt } => receipt,
-                _ => Uuid::new_v4(),
-            };
+            let unobserved_receipt = receipt.unwrap_or_else(Uuid::new_v4);
             assert_eq!(
                 ipc.invoke(
                     &view,
                     incarnation,
                     1,
                     PasteAction::Ack {
-                        receipt: lost_receipt.to_string()
+                        receipt: unobserved_receipt.to_string()
                     }
                 )
                 .await
@@ -3037,7 +3042,49 @@ mod tests {
                 PasteResult::Stale {}
             );
             ipc.no_request().await;
+            observed_effects.push(delivered_bytes);
         }
+        assert!(observed_effects[0].is_empty());
+        assert_eq!(observed_effects[1], [b"x".to_vec()]);
+
+        let ipc = PasteIpc::new();
+        let (view, _output) = ipc.attach();
+        let (_, _, incarnation) = ipc.grant(&view).await;
+        let staged = ipc.stage(&view, incarnation, 1).await;
+        let sent = ipc.invoke(&view, incarnation, 1, PasteAction::Commit { bytes: 1 });
+        let (peer, request) = ipc.receive().await;
+        assert!(matches!(request, Request::PasteCommit { binding, bytes: 1 } if binding == staged));
+        let receipt = Uuid::new_v4();
+        PasteIpc::reply(
+            peer,
+            Response::Paste {
+                paste: PasteResult::Committed { receipt },
+            },
+        );
+        assert_eq!(sent.await.unwrap(), PasteResult::Committed { receipt });
+        let acknowledged = ipc.invoke(
+            &view,
+            incarnation,
+            1,
+            PasteAction::Ack {
+                receipt: receipt.to_string(),
+            },
+        );
+        let (peer, request) = ipc.receive().await;
+        assert!(matches!(
+            request, Request::PasteAck { binding, receipt: prior } if binding == staged && prior == receipt
+        ));
+        PasteIpc::reply(
+            peer,
+            Response::Paste {
+                paste: PasteResult::Acknowledged { writable: true },
+            },
+        );
+        assert_eq!(
+            acknowledged.await.unwrap(),
+            PasteResult::Acknowledged { writable: true }
+        );
+        ipc.no_request().await;
     }
 
     #[tokio::test]

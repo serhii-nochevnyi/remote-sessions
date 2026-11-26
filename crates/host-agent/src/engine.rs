@@ -42,14 +42,118 @@ struct ResizeLane {
     confirmed: Option<(TerminalTarget, ResizeEpoch)>,
     reconcile: bool,
     pending_paste: Option<PendingPaste>,
-    paste_quarantined: bool,
+    paste_quarantines: Vec<PasteScope>,
 }
 
 struct PendingPaste {
     binding: PasteBinding,
-    expected: GeometryReadback,
+    scope: PasteScope,
     receipt: Uuid,
     released: bool,
+}
+
+struct PasteScope {
+    original: GeometryReadback,
+    buffer: Option<PasteBuffer>,
+}
+
+#[derive(PartialEq, Eq)]
+struct PasteBuffer {
+    nonce: Uuid,
+    operation: u64,
+    name: String,
+}
+
+impl PasteBuffer {
+    fn marker(&self, read: &GeometryReadback, state: char) -> String {
+        format!(
+            "{}{state}~{}~{}~{}",
+            read.paste_prefix(read.epoch),
+            self.nonce,
+            self.operation,
+            self.name
+        )
+    }
+
+    fn from_marker(read: &GeometryReadback) -> Option<Self> {
+        if !read.sender_supported || read.epoch.is_none() || parse_uuid(&read.paste_launch).is_err()
+        {
+            return None;
+        }
+        let marker = read
+            .paste_marker
+            .strip_prefix(&read.paste_prefix(read.epoch))?;
+        let mut fields = marker.split('~');
+        if !matches!(fields.next()?, "l" | "a" | "s" | "q") {
+            return None;
+        }
+        let nonce = parse_uuid(fields.next()?).ok()?;
+        let operation = fields.next()?;
+        let number: u64 = operation.parse().ok()?;
+        let name = fields.next()?;
+        let id = name.strip_prefix("rs-paste-")?;
+        if fields.next().is_some()
+            || number == 0
+            || number.to_string() != operation
+            || id.len() != 32
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return None;
+        }
+        Some(Self {
+            nonce,
+            operation: number,
+            name: name.into(),
+        })
+    }
+}
+
+impl PasteScope {
+    fn sampled(read: &GeometryReadback) -> Self {
+        Self {
+            original: read.clone(),
+            buffer: PasteBuffer::from_marker(read),
+        }
+    }
+
+    fn may_be_same_pane(&self, read: &GeometryReadback) -> bool {
+        self.original.same_pane(read)
+            || (self.original.server.pid == read.server.pid
+                && self.original.server.start == read.server.start
+                && self.original.target.pane == read.target.pane)
+    }
+}
+
+impl ResizeLane {
+    fn holds_pane(&self, read: &GeometryReadback) -> bool {
+        self.pending_paste
+            .as_ref()
+            .is_some_and(|pending| pending.scope.may_be_same_pane(read))
+            || self
+                .paste_quarantines
+                .iter()
+                .any(|scope| scope.may_be_same_pane(read))
+    }
+
+    fn has_paste_hold(&self) -> bool {
+        self.pending_paste.is_some() || !self.paste_quarantines.is_empty()
+    }
+
+    fn retain_paste(&mut self, scope: PasteScope) {
+        if let Some(previous) = self
+            .paste_quarantines
+            .iter_mut()
+            .find(|previous| previous.original.same_pane(&scope.original))
+        {
+            if previous.buffer.is_none() {
+                previous.buffer = scope.buffer;
+            }
+        } else {
+            self.paste_quarantines.push(scope);
+        }
+    }
 }
 
 struct GuardedPaste {
@@ -188,12 +292,22 @@ fn generation(line: &str) -> Option<ServerGeneration> {
     Some(ServerGeneration { pid, start, token })
 }
 
+fn canonical_tmux_id(value: &str, prefix: char) -> bool {
+    value.strip_prefix(prefix).is_some_and(|digits| {
+        digits
+            .parse::<u32>()
+            .is_ok_and(|id| id.to_string() == digits)
+    })
+}
+
 fn pane_identity(fields: &[&str]) -> Option<PaneIdentity> {
     let [session, window, pane, pid] = fields else {
         return None;
     };
     for (value, prefix) in [(session, '$'), (window, '@'), (pane, '%')] {
-        value.strip_prefix(prefix)?.parse::<u32>().ok()?;
+        if !canonical_tmux_id(value, prefix) {
+            return None;
+        }
     }
     Some(PaneIdentity {
         session: (*session).into(),
@@ -688,6 +802,7 @@ impl Engine {
             let Some((session_id, runtime_id)) = parse_name(fields[0]) else {
                 continue;
             };
+            ensure!(canonical_tmux_id(fields[1], '%'), "Invalid managed pane ID");
             ensure!(
                 !runtimes
                     .iter()
@@ -1183,6 +1298,7 @@ impl Engine {
     }
 
     async fn geometry(&self, runtime_id: Uuid, pane: &str) -> Result<GeometryReadback> {
+        ensure!(canonical_tmux_id(pane, '%'), "Invalid terminal pane ID");
         let format = format!("{GEOMETRY_FORMAT}|{}", self.sender_guard());
         let output = self
             .geometry_command(&["display-message", "-p", "-t", pane, &format])
@@ -1377,7 +1493,11 @@ impl Engine {
 
     async fn scoped_geometry(&self, terminal: &TerminalView) -> Result<GeometryReadback> {
         ensure!(
-            terminal.agent_epoch == self.agent_epoch && !terminal.view_id.is_nil(),
+            terminal.agent_epoch == self.agent_epoch
+                && !terminal.view_id.is_nil()
+                && canonical_tmux_id(&terminal.target.session, '$')
+                && canonical_tmux_id(&terminal.target.window, '@')
+                && canonical_tmux_id(&terminal.target.pane, '%'),
             "Terminal view changed"
         );
         let read = self
@@ -1442,7 +1562,7 @@ impl Engine {
                 && read.paste_marker.is_empty(),
             "Paste launch provenance is unavailable"
         );
-        self.prove_paste_buffer_io().await?;
+        self.prove_paste_buffer_io(&read).await?;
 
         let guard = format_all([self.paste_guard(&read), format_equal("pane_input_off", 0)]);
         let launch = Uuid::new_v4().to_string();
@@ -1466,7 +1586,7 @@ impl Engine {
         Ok(())
     }
 
-    async fn prove_paste_buffer_io(&self) -> Result<()> {
+    async fn prove_paste_buffer_io(&self, read: &GeometryReadback) -> Result<()> {
         let commands = self.geometry_command(&["list-commands"]).await?;
         ensure!(
             commands
@@ -1479,7 +1599,7 @@ impl Engine {
         );
         let name = format!("rs-paste-probe-{}", Uuid::new_v4().simple());
         let sample = format!("{}\n\t\u{2603}", Uuid::new_v4());
-        let loaded = self.load_paste(&name, sample.as_bytes()).await;
+        let loaded = self.load_paste(read, &name, sample.as_bytes()).await;
         let returned = match loaded {
             Ok(()) => {
                 self.geometry_command(&["save-buffer", "-b", &name, "-"])
@@ -1487,7 +1607,7 @@ impl Engine {
             }
             Err(error) => Err(error),
         };
-        let deleted = self.geometry_command(&["delete-buffer", "-b", &name]).await;
+        let deleted = self.delete_paste(read, &name, false).await;
         ensure!(returned? == sample, "Paste sender stdin readback differs");
         deleted?;
         Ok(())
@@ -1533,15 +1653,30 @@ impl Engine {
         Ok(Some(after))
     }
 
-    async fn load_paste(&self, name: &str, data: &[u8]) -> Result<()> {
+    async fn load_paste(&self, read: &GeometryReadback, name: &str, data: &[u8]) -> Result<()> {
+        ensure!(
+            self.private_sender_socket(),
+            "Paste load target unavailable"
+        );
+        let pane = &read.target.pane;
+        let witness = format!("rs-paste-loaded-{}", Uuid::new_v4());
+        let printed = pane_witness(pane, &witness);
+        let branch = format!("load-buffer -b {name} - ; {printed}");
         tokio::time::timeout(self.terminal_command_watchdog(), async {
             let mut child = Command::new(&self.tmux)
                 .args(["-N", "-S"])
                 .arg(&self.socket)
-                .args(["load-buffer", "-b", name, "-"])
+                .args([
+                    "if-shell",
+                    "-F",
+                    "-t",
+                    pane,
+                    &self.paste_guard(read),
+                    &branch,
+                ])
                 .env_remove("TMUX")
                 .stdin(Stdio::piped())
-                .stdout(Stdio::null())
+                .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .kill_on_drop(true)
                 .spawn()?;
@@ -1551,17 +1686,126 @@ impl Engine {
                 .context("Paste buffer stdin unavailable")?
                 .write_all(data)
                 .await?;
-            ensure!(child.wait().await?.success(), "Paste buffer load failed");
+            let output = child.wait_with_output().await?;
+            ensure!(
+                output.status.success()
+                    && output.stdout.strip_suffix(b"\n") == Some(witness.as_bytes()),
+                "Paste buffer load unconfirmed"
+            );
             Ok(())
         })
         .await
         .context("Paste buffer load timed out")?
     }
 
-    async fn delete_paste(&self, buffer: &str) {
-        let _ = self
-            .geometry_command(&["delete-buffer", "-b", buffer])
-            .await;
+    async fn delete_paste(
+        &self,
+        read: &GeometryReadback,
+        buffer: &str,
+        allow_absent: bool,
+    ) -> Result<()> {
+        ensure!(
+            read.sender_supported && self.private_sender_socket(),
+            "Paste cleanup unavailable"
+        );
+        let pane = &read.target.pane;
+        let witness = format!("rs-paste-cleanup-{}", Uuid::new_v4());
+        let printed = pane_witness(pane, &witness);
+        let guard = format_all([
+            self.paste_guard(read),
+            format_equal("after-list-buffers", ""),
+        ]);
+        if allow_absent {
+            let filter = format_equal("buffer_name", buffer);
+            let branch = format!("list-buffers -F present -f '{filter}' ; {printed}");
+            let reply = self
+                .geometry_command(&["if-shell", "-F", "-t", pane, &guard, &branch])
+                .await?;
+            let mut lines = reply.lines();
+            match (lines.next(), lines.next(), lines.next()) {
+                (Some(first), None, None) if first == witness => return Ok(()),
+                (Some("present"), Some(last), None) if last == witness => {}
+                _ => bail!("Paste buffer absence is unconfirmed"),
+            }
+        }
+        let branch = format!("delete-buffer -b {buffer} ; {printed}");
+        let reply = self
+            .geometry_command(&["if-shell", "-F", "-t", pane, &guard, &branch])
+            .await?;
+        ensure!(
+            reply.trim_end() == witness,
+            "Paste buffer deletion unconfirmed"
+        );
+        Ok(())
+    }
+
+    async fn reclaim_superseded_paste(
+        &self,
+        scope: &PasteScope,
+        current: &GeometryReadback,
+    ) -> Result<()> {
+        let original = &scope.original;
+        ensure!(
+            original.server == current.server && !scope.may_be_same_pane(current),
+            "Original paste server or pane is unconfirmed"
+        );
+        let output = self
+            .geometry_command(&[
+                "display-message",
+                "-p",
+                GENERATION_FORMAT,
+                ";",
+                "list-panes",
+                "-a",
+                "-F",
+                "#{pane_id}",
+            ])
+            .await?;
+        let mut lines = output.lines();
+        ensure!(
+            lines.next().and_then(generation) == Some(original.server),
+            "Original paste server changed"
+        );
+        let mut current_seen = false;
+        for pane in lines {
+            ensure!(
+                canonical_tmux_id(pane, '%') && pane != original.target.pane,
+                "Original paste pane absence is unconfirmed"
+            );
+            current_seen |= pane == current.target.pane;
+        }
+        ensure!(current_seen, "Current paste cleanup target is unconfirmed");
+        if let Some(buffer) = &scope.buffer {
+            let allow_absent = original.paste_marker != buffer.marker(original, 'l');
+            self.delete_paste(current, &buffer.name, allow_absent)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn reconcile_paste(&self, lane: &mut ResizeLane, current: &GeometryReadback) {
+        if lane
+            .pending_paste
+            .as_ref()
+            .is_some_and(|pending| !pending.scope.may_be_same_pane(current))
+        {
+            let pending = lane.pending_paste.take().expect("checked pending paste");
+            self.owners()
+                .release(current.target.runtime_id, pending.binding.token);
+            lane.retain_paste(pending.scope);
+        }
+        let mut index = 0;
+        while index < lane.paste_quarantines.len() {
+            if self
+                .reclaim_superseded_paste(&lane.paste_quarantines[index], current)
+                .await
+                .is_ok()
+            {
+                lane.paste_quarantines.swap_remove(index);
+            } else {
+                index += 1;
+            }
+        }
     }
 
     async fn paste_stage(
@@ -1576,9 +1820,6 @@ impl Engine {
             return PasteResult::Stale {};
         };
         let lane = lock.lock().await;
-        if lane.pending_paste.is_some() || lane.paste_quarantined {
-            return PasteResult::Unknown {};
-        }
         let rejected = match self.scoped_geometry(&binding.terminal).await {
             Err(_) => Some(PasteResult::Stale {}),
             Ok(read)
@@ -1589,6 +1830,7 @@ impl Engine {
             {
                 Some(PasteResult::Unavailable {})
             }
+            Ok(read) if lane.holds_pane(&read) => Some(PasteResult::Unknown {}),
             Ok(read) => match read.paste_admission_hold() {
                 Some(PasteAdmission::PriorSendUnknown) => Some(PasteResult::Unknown {}),
                 Some(PasteAdmission::Unavailable) => Some(PasteResult::Unavailable {}),
@@ -1604,8 +1846,13 @@ impl Engine {
         self.owners().stage(binding, offset, &data, self.now())
     }
 
-    fn quarantine(&self, lane: &mut ResizeLane, binding: &PasteBinding) -> PasteResult {
-        lane.paste_quarantined = true;
+    fn quarantine(
+        &self,
+        lane: &mut ResizeLane,
+        binding: &PasteBinding,
+        scope: PasteScope,
+    ) -> PasteResult {
+        lane.retain_paste(scope);
         self.owners()
             .release(binding.terminal.target.runtime_id, binding.token);
         PasteResult::Unknown {}
@@ -1615,18 +1862,25 @@ impl Engine {
         &self,
         lane: &mut ResizeLane,
         binding: &PasteBinding,
-        held: &GeometryReadback,
-        buffer: &str,
+        scope: PasteScope,
         result: PasteResult,
     ) -> PasteResult {
-        let ready = held.ready_marker(held.epoch);
-        let disarmed = self.transition_marker(held, &ready).await;
-        self.delete_paste(buffer).await;
-        if matches!(disarmed, Ok(Some(_))) {
-            result
-        } else {
-            self.quarantine(lane, binding)
+        let held = &scope.original;
+        let buffer = scope.buffer.as_ref().expect("reserved paste buffer");
+        let cleaned = async {
+            let fenced = self
+                .transition_marker(held, &buffer.marker(held, 'q'))
+                .await?
+                .context("Paste reservation was not fenced")?;
+            self.delete_paste(&fenced, &buffer.name, true).await?;
+            self.transition_marker(&fenced, &fenced.ready_marker(fenced.epoch))
+                .await?
+                .context("Paste reservation was not retired")
+        };
+        if cleaned.await.is_ok() {
+            return result;
         }
+        self.quarantine(lane, binding, scope)
     }
 
     async fn paste_commit(
@@ -1640,9 +1894,6 @@ impl Engine {
             return PasteResult::Stale {};
         };
         let mut lane = lock.lock().await;
-        if lane.pending_paste.is_some() || lane.paste_quarantined {
-            return PasteResult::Unknown {};
-        }
         let Some(data) = self.owners().take_stage(&binding) else {
             return PasteResult::Stale {};
         };
@@ -1665,37 +1916,57 @@ impl Engine {
         {
             return PasteResult::Unavailable {};
         }
+        if lane.holds_pane(&read) {
+            return PasteResult::Unknown {};
+        }
         match read.paste_admission_hold() {
-            Some(PasteAdmission::PriorSendUnknown) => return self.quarantine(&mut lane, &binding),
+            Some(PasteAdmission::PriorSendUnknown) => {
+                return self.quarantine(&mut lane, &binding, PasteScope::sampled(&read));
+            }
             Some(PasteAdmission::Unavailable) => return PasteResult::Unavailable {},
             None => {}
         }
         if !read.input_enabled {
             return PasteResult::Unavailable {};
         }
-        let buffer = format!("rs-paste-{}", Uuid::new_v4().simple());
-        let loaded = self.load_paste(&buffer, &data).await;
-        drop(data);
-        if loaded.is_err() {
-            self.delete_paste(&buffer).await;
-            return PasteResult::Unavailable {};
-        }
-        let nonce = Uuid::new_v4();
-        let prefix = read.paste_prefix(read.epoch);
-        let suffix = format!("{nonce}~{}~{buffer}", binding.operation);
-        let armed = format!("{prefix}a~{suffix}");
-        let spent = format!("{prefix}s~{suffix}");
-        let mut held = match self.transition_marker(&read, &armed).await {
-            Ok(Some(held)) => held,
-            Ok(None) => {
-                self.delete_paste(&buffer).await;
-                return PasteResult::Stale {};
-            }
+        let buffer = PasteBuffer {
+            nonce: Uuid::new_v4(),
+            operation: binding.operation,
+            name: format!("rs-paste-{}", Uuid::new_v4().simple()),
+        };
+        let loading_marker = buffer.marker(&read, 'l');
+        let loading = match self.transition_marker(&read, &loading_marker).await {
+            Ok(Some(loading)) => loading,
+            Ok(None) => return PasteResult::Stale {},
             Err(_) => {
-                self.delete_paste(&buffer).await;
-                return self.quarantine(&mut lane, &binding);
+                let mut original = read;
+                original.paste_marker = loading_marker;
+                return self.quarantine(
+                    &mut lane,
+                    &binding,
+                    PasteScope {
+                        original,
+                        buffer: None,
+                    },
+                );
             }
         };
+        let mut scope = PasteScope {
+            original: loading,
+            buffer: Some(buffer),
+        };
+        let buffer = scope.buffer.as_ref().expect("reserved paste buffer");
+        let loaded = self.load_paste(&scope.original, &buffer.name, &data).await;
+        drop(data);
+        if loaded.is_err() {
+            return self.quarantine(&mut lane, &binding, scope);
+        }
+        let armed = buffer.marker(&scope.original, 'a');
+        let spent = buffer.marker(&scope.original, 's');
+        let Ok(Some(held)) = self.transition_marker(&scope.original, &armed).await else {
+            return self.quarantine(&mut lane, &binding, scope);
+        };
+        scope.original = held;
         #[cfg(test)]
         self.paste_test.pause_before_admission().await;
         let current = self.scoped_geometry(&binding.terminal).await.ok();
@@ -1705,12 +1976,12 @@ impl Engine {
         };
         let exact = current.as_ref().filter(|read| {
             authorized
-                && read.same_pane(&held)
-                && read.epoch == held.epoch
+                && read.same_pane(&scope.original)
+                && read.epoch == scope.original.epoch
                 && read.paste_marker == armed
                 && read.sender_supported
         });
-        let send = self.guarded_paste(&held, &spent, &buffer, nonce);
+        let send = self.guarded_paste(&scope.original, &spent, &buffer.name, buffer.nonce);
         // @invariant: The serialized monotonic check is the last admission step before submission.
         let rejection = match exact {
             Some(read) if self.owners().paste_live(&binding, self.now()) => {
@@ -1720,35 +1991,29 @@ impl Engine {
         };
         if let Some(rejection) = rejection {
             return self
-                .reject_reserved(&mut lane, &binding, &held, &buffer, rejection)
+                .reject_reserved(&mut lane, &binding, scope, rejection)
                 .await;
         }
         match self.submit_paste(&send).await {
             Ok(reply) if reply.trim_end() == send.rejected => {
-                self.reject_reserved(
-                    &mut lane,
-                    &binding,
-                    &held,
-                    &buffer,
-                    PasteResult::Unavailable {},
-                )
-                .await
+                self.reject_reserved(&mut lane, &binding, scope, PasteResult::Unavailable {})
+                    .await
             }
             Ok(reply) if reply.trim_end() == send.enqueued => {
                 if !self.owners().confirm_paste(&binding) {
-                    return self.quarantine(&mut lane, &binding);
+                    return self.quarantine(&mut lane, &binding, scope);
                 }
                 let receipt = Uuid::new_v4();
-                held.paste_marker = spent;
+                scope.original.paste_marker = spent;
                 lane.pending_paste = Some(PendingPaste {
                     binding,
-                    expected: held,
+                    scope,
                     receipt,
                     released: false,
                 });
                 PasteResult::Committed { receipt }
             }
-            _ => self.quarantine(&mut lane, &binding),
+            _ => self.quarantine(&mut lane, &binding, scope),
         }
     }
 
@@ -1809,7 +2074,11 @@ impl Engine {
         };
         let mut lane = lock.lock().await;
         let Some(pending) = lane.pending_paste.as_ref() else {
-            return if lane.paste_quarantined {
+            return if lane
+                .paste_quarantines
+                .iter()
+                .any(|scope| scope.original.target == binding.terminal.target)
+            {
                 PasteResult::Unknown {}
             } else {
                 PasteResult::Stale {}
@@ -1820,22 +2089,22 @@ impl Engine {
         }
         let pending = lane.pending_paste.take().expect("matched pending paste");
         let Ok(read) = self.scoped_geometry(&binding.terminal).await else {
-            return self.quarantine(&mut lane, &binding);
+            return self.quarantine(&mut lane, &binding, pending.scope);
         };
         if !read.sender_supported
-            || !read.same_pane(&pending.expected)
+            || !read.same_pane(&pending.scope.original)
             || read.epoch != Some(binding.epoch)
-            || read.paste_marker != pending.expected.paste_marker
+            || read.paste_marker != pending.scope.original.paste_marker
             || self
                 .authorize_terminal_writer(&read, catalog)
                 .await
                 .is_err()
         {
-            return self.quarantine(&mut lane, &binding);
+            return self.quarantine(&mut lane, &binding, pending.scope);
         }
         let ready = read.ready_marker(read.epoch);
         if !matches!(self.transition_marker(&read, &ready).await, Ok(Some(_))) {
-            return self.quarantine(&mut lane, &binding);
+            return self.quarantine(&mut lane, &binding, pending.scope);
         }
         let mut owners = self.owners();
         let writable = !pending.released
@@ -1910,15 +2179,37 @@ impl Engine {
             }
         };
         let mut lane = lock.try_lock().context("Terminal mutation in progress")?;
-        if lane.pending_paste.is_some() || lane.paste_quarantined {
-            return Ok(control_hold());
-        }
-        let read = match first_read {
-            Some(read) => read,
-            None => read_scope().await?,
+        let sampled = match first_read.filter(|_| !lane.has_paste_hold()) {
+            Some(read) => Ok(read),
+            None => read_scope().await,
+        };
+        let mut read = match sampled {
+            Ok(read) => read,
+            Err(_) if lane.has_paste_hold() => return Ok(control_hold()),
+            Err(error) => return Err(error),
         };
         self.authorize_terminal_writer(&read, catalog).await?;
+        if lane.holds_pane(&read) {
+            return Ok(control_hold());
+        }
+        if lane.has_paste_hold() {
+            if terminal.is_some() {
+                let current = self
+                    .geometry_for_runtime(&self.find(runtime_id).await?)
+                    .await?;
+                ensure!(
+                    current.same_pane(&read),
+                    "Current terminal identity changed"
+                );
+                self.authorize_terminal_writer(&current, catalog).await?;
+                read = current;
+            }
+            self.reconcile_paste(&mut lane, &read).await;
+        }
         if let Some(hold) = read.paste_admission_hold() {
+            if hold == PasteAdmission::PriorSendUnknown {
+                lane.retain_paste(PasteScope::sampled(&read));
+            }
             return Ok(control_recovering(hold));
         }
         self.owners().unowned(runtime_id, self.now())?;
@@ -2017,8 +2308,7 @@ impl Engine {
         let epoch = read.epoch.context("Engine epoch unavailable")?;
         ensure!(
             !lane.reconcile
-                && lane.pending_paste.is_none()
-                && !lane.paste_quarantined
+                && !lane.holds_pane(&read)
                 && read.paste_ready()
                 && read.sender_supported
                 && lane
@@ -2095,6 +2385,136 @@ impl Engine {
         Ok(read)
     }
 
+    async fn prepare_paste_stop(
+        &self,
+        lane: &mut ResizeLane,
+        mut read: GeometryReadback,
+    ) -> Result<GeometryReadback> {
+        self.reconcile_paste(lane, &read).await;
+        ensure!(
+            read.sender_supported || read.paste_marker.is_empty() || read.paste_ready(),
+            "Original paste marker cannot be checked"
+        );
+        let sampled = PasteScope::sampled(&read);
+        let scopes = lane
+            .paste_quarantines
+            .iter()
+            .chain(lane.pending_paste.iter().map(|pending| &pending.scope));
+        for saved in scopes.filter(|scope| scope.may_be_same_pane(&read)) {
+            if saved.buffer.is_some() {
+                ensure!(
+                    saved.original.same_pane(&read)
+                        && saved.original.epoch == read.epoch
+                        && saved.buffer == sampled.buffer,
+                    "Original paste buffer identity is unconfirmed"
+                );
+            }
+        }
+        let Some(buffer) = sampled.buffer else {
+            return Ok(read);
+        };
+        lane.retain_paste(PasteScope::sampled(&read));
+        let loading = read.paste_marker == buffer.marker(&read, 'l');
+        let fenced = buffer.marker(&read, 'q');
+        if !loading && read.paste_marker != fenced {
+            read = self
+                .transition_marker(&read, &fenced)
+                .await?
+                .context("Original paste sender was not fenced")?;
+        }
+        self.delete_paste(&read, &buffer.name, !loading).await?;
+        if loading {
+            read = self
+                .transition_marker(&read, &fenced)
+                .await?
+                .context("Original paste buffer reclamation is unconfirmed")?;
+        }
+        Ok(read)
+    }
+
+    async fn stop_runtime(
+        &self,
+        runtime_id: Uuid,
+        expected_pane_id: &str,
+        catalog: Option<&CatalogLane>,
+    ) -> Result<Response> {
+        ensure!(
+            canonical_tmux_id(expected_pane_id, '%'),
+            "Invalid terminal pane ID"
+        );
+        let lock = self.lane(runtime_id);
+        let mut lane = lock.lock().await;
+        let server = self.generation().await?;
+        let runtime = self.find(runtime_id).await?;
+        let pane = &runtime.pane_id;
+        ensure!(pane == expected_pane_id, "runtime precondition failed");
+        let checked = if runtime.exited {
+            None
+        } else {
+            self.geometry_for_runtime(&runtime).await.ok()
+        };
+        let checked = match checked {
+            Some(read) => {
+                ensure!(read.server == server, "Stop target server changed");
+                self.observe_terminal(&read, catalog).await?;
+                Some(self.prepare_paste_stop(&mut lane, read).await?)
+            }
+            None => None,
+        };
+        let identity_guard = format_all([
+            format_equal("pid", server.pid),
+            format_equal("start_time", server.start),
+            format_equal(GENERATION_OPTION, server.token),
+            format_equal("session_name", &runtime.tmux_name),
+            format_equal("pane_id", pane),
+            format_equal(
+                "pane_pid",
+                runtime
+                    .pane_pid
+                    .map_or_else(String::new, |pid| pid.to_string()),
+            ),
+            format_equal("pane_dead", u8::from(runtime.exited)),
+            format_equal("after-kill-session", ""),
+            format_equal("after-display-message", ""),
+            format_equal("command-error", ""),
+        ]);
+        let guard = match &checked {
+            Some(read) => format_all([
+                identity_guard,
+                read.guard(read.epoch),
+                format_equal(PASTE_LAUNCH_OPTION, &read.paste_launch),
+                format_equal(PASTE_OPTION, &read.paste_marker),
+            ]),
+            None if !runtime.exited => format_all([identity_guard, format_equal(PASTE_OPTION, "")]),
+            None => identity_guard,
+        };
+        let witness = format!("rs-stopped-{}", Uuid::new_v4());
+        let printed = pane_witness(pane, &witness);
+        let branch = format!("{printed} ; kill-session -t ={}", runtime.tmux_name);
+        self.owners().revoke(runtime_id);
+        let reply = self
+            .command(&["if-shell", "-F", "-t", pane, &guard, &branch])
+            .await?;
+        ensure!(
+            reply.trim_end() == witness,
+            "Stop target changed or its reply was lost"
+        );
+        if let Some(read) = checked {
+            if lane
+                .pending_paste
+                .as_ref()
+                .is_some_and(|pending| pending.scope.original.same_pane(&read))
+            {
+                lane.pending_paste = None;
+            }
+            lane.paste_quarantines
+                .retain(|scope| !scope.original.same_pane(&read));
+        }
+        lane.confirmed = None;
+        lane.reconcile = false;
+        Ok(Response::Stopped { runtime_id })
+    }
+
     pub(crate) async fn handle(
         &self,
         request: Request,
@@ -2115,6 +2535,8 @@ impl Engine {
                 argv,
             } => {
                 validate_launch(&cwd, &argv)?;
+                let lock = self.lane(runtime_id);
+                let mut lane = lock.lock().await;
                 let runtimes = self.list().await?;
                 ensure!(
                     runtimes.len() < RUNTIME_LIMIT,
@@ -2161,6 +2583,17 @@ impl Engine {
                 let fields: Vec<_> = receipt.trim_end().split('|').collect();
                 if let Some(identity) = pane_identity(&fields) {
                     let _ = self.stamp_paste(&runtime, server, &identity, None).await;
+                    if lane.has_paste_hold()
+                        && let Ok(current) = self.geometry_for_runtime(&runtime).await
+                        && current.server == server
+                        && current.target.session == identity.session
+                        && current.target.window == identity.window
+                        && current.target.pane == identity.pane
+                        && current.target.pid == identity.pid
+                        && current.nonce.is_empty()
+                    {
+                        self.reconcile_paste(&mut lane, &current).await;
+                    }
                 }
                 Ok(Response::Created { runtime })
             }
@@ -2240,9 +2673,6 @@ impl Engine {
                     .existing_lane(runtime_id)
                     .context("Керування втрачено")?;
                 let lane = lock.lock().await;
-                if lane.pending_paste.is_some() || lane.paste_quarantined {
-                    return Ok(control_hold());
-                }
                 let checked = self
                     .writer_geometry(&lane, runtime_id, token, catalog)
                     .await;
@@ -2251,6 +2681,9 @@ impl Engine {
                     return Err(error);
                 }
                 let read = checked?;
+                if lane.holds_pane(&read) {
+                    return Ok(control_hold());
+                }
                 if let Some(hold) = read.paste_admission_hold() {
                     self.owners().release(runtime_id, token);
                     return Ok(control_recovering(hold));
@@ -2309,12 +2742,12 @@ impl Engine {
                     .existing_lane(runtime_id)
                     .context("Керування втрачено")?;
                 let lane = lock.lock().await;
-                if lane.pending_paste.is_some() || lane.paste_quarantined {
-                    return Ok(control_hold());
-                }
                 let read = self
                     .writer_geometry(&lane, runtime_id, token, catalog)
                     .await?;
+                if lane.holds_pane(&read) {
+                    return Ok(control_hold());
+                }
                 if let Some(hold) = read.paste_admission_hold() {
                     return Ok(control_recovering(hold));
                 }
@@ -2347,17 +2780,8 @@ impl Engine {
                 runtime_id,
                 expected_pane_id,
             } => {
-                let lane = self.lane(runtime_id);
-                let _mutation = lane.lock().await;
-                let runtime = self.find(runtime_id).await?;
-                ensure!(
-                    runtime.pane_id == expected_pane_id,
-                    "runtime precondition failed"
-                );
-                let target = format!("={}", runtime.tmux_name);
-                self.owners().revoke(runtime_id);
-                self.command(&["kill-session", "-t", &target]).await?;
-                Ok(Response::Stopped { runtime_id })
+                self.stop_runtime(runtime_id, &expected_pane_id, catalog)
+                    .await
             }
         }
     }
@@ -3283,6 +3707,230 @@ mod tests {
         assert_held(&engine, &PasteBinding { terminal, ..b }).await;
         assert_eq!(file(&changed, "pane0-bytes"), DRAFT);
         assert_eq!(file(&changed, "submissions"), b"1");
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_paste_replacement_scope() {
+        for (native, restart, committed) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            let f = Fixture::paste();
+            let old = writer(&f).await;
+            stage(&f, &old, DRAFT).await;
+            if !committed {
+                set(&f, "paste-mode", "lost-before");
+            }
+            let result = paste_reply(&f.engine, commit(&old, DRAFT.len())).await;
+            let old_receipt = if committed {
+                Some(receipt(result))
+            } else {
+                assert_eq!(result, PasteResult::Unknown {});
+                None
+            };
+            let (restarted, terminal) = f.restart();
+            let (engine, terminal) = if restart {
+                (&restarted, terminal)
+            } else {
+                (&*f.engine, old.terminal.clone())
+            };
+            assert_held(
+                engine,
+                &PasteBinding {
+                    terminal,
+                    ..old.clone()
+                },
+            )
+            .await;
+            let old_bytes = if committed { DRAFT } else { b"" };
+            assert_eq!(file(&f, "pane0-bytes"), old_bytes);
+            let (mut successor, _process) = f.second_pane(true);
+            successor.agent_epoch = engine.agent_epoch;
+            assert_ne!(old.terminal.target.pid, successor.target.pid);
+            assert_eq!(old.terminal.target.runtime_id, successor.target.runtime_id);
+            set(&f, "removed-0", "1");
+            set(&f, "absence-unconfirmed", "1");
+            let request = if native {
+                Request::AcquireTerminal {
+                    terminal: successor.clone(),
+                }
+            } else {
+                Request::Acquire {
+                    runtime_id: successor.target.runtime_id,
+                }
+            };
+            let token = match engine.handle(request, None).await.unwrap() {
+                Response::TerminalControl { token, .. } if native => token,
+                Response::Control { token } if !native => token,
+                response => panic!("Expected a checked successor grant, got {response:?}"),
+            };
+            assert_ne!(token, old.token);
+            assert!(engine.handle(ordinary(&old, 0), None).await.is_err());
+            assert_eq!(
+                paste_reply(engine, commit(&old, DRAFT.len())).await,
+                PasteResult::Stale {}
+            );
+            if let Some(receipt) = old_receipt {
+                assert_ne!(
+                    paste_reply(engine, ack(&old, receipt)).await,
+                    PasteResult::Acknowledged { writable: true }
+                );
+            }
+            let new = PasteBinding {
+                terminal: successor,
+                token,
+                ..old
+            };
+            assert!(matches!(
+                engine.handle(ordinary(&new, 0), None).await.unwrap(),
+                Response::Accepted {}
+            ));
+            assert_eq!(file(&f, "pane0-bytes"), old_bytes);
+            assert_eq!(file(&f, "pane1-bytes"), b"K");
+            assert_eq!(file(&f, "submissions"), b"1");
+            let expected_effects: &[u8] = if committed { b"1" } else { b"" };
+            assert_eq!(file(&f, "effects"), expected_effects);
+            assert!(file(&f, "deletions").is_empty());
+            if !committed {
+                let buffer = text(&f, "last-load");
+                assert_eq!(file(&f, &buffer), DRAFT);
+                set(&f, "absence-unconfirmed", "");
+                engine.handle(release(&new), None).await.unwrap();
+                assert!(matches!(
+                    engine
+                        .handle(
+                            Request::AcquireTerminal {
+                                terminal: new.terminal,
+                            },
+                            None,
+                        )
+                        .await
+                        .unwrap(),
+                    Response::TerminalControl { .. }
+                ));
+                assert!(!f.temp.path().join(&buffer).exists());
+                assert_eq!(text(&f, "deletions"), format!("{buffer}\n"));
+                assert!(file(&f, "effects").is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_paste_reclaim_bound_buffer() {
+        let f = Fixture::with_paste_watchdog(Duration::from_secs(2));
+        let old = writer(&f).await;
+        stage(&f, &old, DRAFT).await;
+        set(&f, "paste-mode", "timeout-before");
+        assert_eq!(
+            paste_reply(&f.engine, commit(&old, DRAFT.len())).await,
+            PasteResult::Unknown {}
+        );
+        witness(&f, "server-parked").await;
+        let buffer = text(&f, "last-load");
+        let unrelated = format!("rs-paste-{}", Uuid::new_v4().simple());
+        set(&f, &unrelated, "retained");
+        let (mut survivor, _process) = f.second_pane(false);
+        let stop = || Request::Stop {
+            runtime_id: old.terminal.target.runtime_id,
+            expected_pane_id: old.terminal.target.pane.clone(),
+        };
+
+        set(&f, "cleanup-blocked", "1");
+        assert!(f.engine.handle(stop(), None).await.is_err());
+        assert!(text(&f, "marker").contains("~q~"));
+        assert_eq!(file(&f, &buffer), DRAFT);
+        assert!(file(&f, "removed-0").is_empty());
+        assert_held(&f.engine, &old).await;
+        set(&f, "allow-effect", "1");
+        witness(&f, "late-result").await;
+        assert!(text(&f, "late-result").starts_with("rs-paste-rejected-"));
+        assert!(file(&f, "effects").is_empty());
+        assert_eq!(file(&f, &buffer), DRAFT);
+
+        let (engine, terminal) = f.restart();
+        assert_held(
+            &engine,
+            &PasteBinding {
+                terminal,
+                ..old.clone()
+            },
+        )
+        .await;
+        survivor.agent_epoch = engine.agent_epoch;
+        let Response::TerminalControl { token, epoch } = engine
+            .handle(
+                Request::AcquireTerminal {
+                    terminal: survivor.clone(),
+                },
+                None,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("Expected the survivor to acquire control");
+        };
+        let survivor = PasteBinding {
+            terminal: survivor,
+            token,
+            epoch,
+            ..old.clone()
+        };
+        assert!(matches!(
+            engine.handle(ordinary(&survivor, 0), None).await.unwrap(),
+            Response::Accepted {}
+        ));
+        set(&f, "cleanup-blocked", "");
+        assert!(matches!(
+            engine.handle(stop(), None).await.unwrap(),
+            Response::Stopped { .. }
+        ));
+        assert_eq!(file(&f, "removed-0"), b"1");
+        assert!(!f.temp.path().join(&buffer).exists());
+        assert_eq!(text(&f, "deletions"), format!("{buffer}\n"));
+        assert_eq!(file(&f, &unrelated), b"retained");
+        assert!(matches!(
+            engine.handle(ordinary(&survivor, 1), None).await.unwrap(),
+            Response::Accepted {}
+        ));
+        assert!(engine.handle(ordinary(&old, 0), None).await.is_err());
+        assert_eq!(file(&f, "pane1-bytes"), b"KK");
+        assert!(file(&f, "pane0-bytes").is_empty());
+        assert!(file(&f, "effects").is_empty());
+        assert_eq!(file(&f, "submissions"), b"1");
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_paste_requires_canonical_targets() {
+        let f = Fixture::paste();
+        for pane in ["%+0", "%00", "%4294967296", "-t", "%0 ; list-panes"] {
+            let mut terminal = f.terminal.clone();
+            terminal.target.pane = pane.into();
+            assert!(
+                f.engine
+                    .handle(Request::AcquireTerminal { terminal }, None)
+                    .await
+                    .is_err()
+            );
+        }
+        for (session, window) in [("$00", "@0"), ("$0", "@+0")] {
+            let mut terminal = f.terminal.clone();
+            terminal.target.session = session.into();
+            terminal.target.window = window.into();
+            assert!(
+                f.engine
+                    .handle(Request::AcquireTerminal { terminal }, None)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(file(&f, "geometry-targets").is_empty());
+        assert!(pane_identity(&["$0", "@0", "%0", "1"]).is_some());
+        assert!(pane_identity(&["$0", "@00", "%0", "1"]).is_none());
+        writer(&f).await;
+        assert!(!file(&f, "geometry-targets").is_empty());
     }
 
     #[tokio::test]
