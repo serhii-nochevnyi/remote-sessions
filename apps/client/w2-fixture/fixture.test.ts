@@ -1918,6 +1918,7 @@ async function checkCompositionRetirement(executable: string, endBeforeHide: boo
     });
     assert.equal(appends(fixture).length, 0, "late old callbacks contribute zero bytes");
     assert.equal(fixture.terminal.data.length, 0, "xterm emits no retired input");
+    assert.equal(driver.textarea.value, "", "late composition input leaves no retired text in xterm");
     assert.equal(field(fixture, "snapshot").textContent, "—");
     assert.equal(field(fixture, "retained-snapshot").textContent, "(empty)");
     await compositionVector(fixture, native, "composition-commit", 2, { attemptId: 2 });

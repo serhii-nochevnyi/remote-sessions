@@ -190,6 +190,19 @@ function mountTerminal(
     }, checkpointInterval);
   }
 
+  function clearPreedit() {
+    textarea.value = "";
+    textarea.setSelectionRange(0, 0);
+  }
+
+  function compositionInput(event: InputEvent) {
+    // The browser can update the textarea after a retired compositionend was blocked.
+    // Preserve the value only while the current xterm cycle can consume it.
+    if (!event.isComposing && event.inputType !== "insertCompositionText"
+      && event.inputType !== "deleteCompositionText" && event.inputType !== "insertFromComposition") return;
+    if (!current || (!composing && !needsCompositionDrain)) clearPreedit();
+  }
+
   function compositionStart() {
     const priorCycle = composing || needsCompositionDrain;
     composing = true;
@@ -269,6 +282,7 @@ function mountTerminal(
   textarea.addEventListener("compositionstart", compositionStart, true);
   textarea.addEventListener("compositionupdate", compositionUpdate, true);
   textarea.addEventListener("compositionend", compositionEnd, true);
+  textarea.addEventListener("input", compositionInput);
   textarea.addEventListener("blur", interrupt, true);
   document.addEventListener("visibilitychange", visibilityChanged);
 
@@ -364,8 +378,7 @@ function mountTerminal(
       const isCurrent = () =>
         lifecycleEpoch === startEpoch && !disposed && document.visibilityState === "visible";
       if (refocus) {
-        textarea.value = "";
-        textarea.setSelectionRange(0, 0);
+        clearPreedit();
         // @invariant: End abandoned preedit in xterm with stdin disabled and no attached attempt.
         if (composing) textarea.dispatchEvent(new Event("compositionend", { bubbles: true }));
         terminal.focus();
@@ -381,10 +394,7 @@ function mountTerminal(
       current = attempt;
       if (composing || needsCompositionDrain) hold(attempt, "Previous composition is still ending");
       else {
-        if (refocus || attempt.composition) {
-          textarea.value = "";
-          textarea.setSelectionRange(0, 0);
-        }
+        if (refocus || attempt.composition) clearPreedit();
         terminal.options.disableStdin = false;
       }
       publish(attempt);
@@ -429,6 +439,7 @@ function mountTerminal(
       textarea.removeEventListener("compositionstart", compositionStart, true);
       textarea.removeEventListener("compositionupdate", compositionUpdate, true);
       textarea.removeEventListener("compositionend", compositionEnd, true);
+      textarea.removeEventListener("input", compositionInput);
       textarea.removeEventListener("blur", interrupt, true);
       document.removeEventListener("visibilitychange", visibilityChanged);
       stopLayout();
