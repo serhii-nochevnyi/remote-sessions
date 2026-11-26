@@ -7,7 +7,7 @@ import "@xterm/xterm/css/xterm.css";
 import "./fixture.css";
 import manifest from "./cases.json" with { type: "json" };
 import { observeTerminalLayout, type LayoutEvent } from "./terminal-layout.ts";
-import { fixtureCaseId, registerRecorder, type Invoke, type Snapshot } from "./recorder.ts";
+import { fixtureCaseId, registerRecorder, type AppendOutcome, type Invoke, type Snapshot } from "./recorder.ts";
 
 const copyToken = "COPY-Ї";
 
@@ -22,8 +22,10 @@ const emptyHex = "(empty)";
 
 const checkpointInterval = 250;
 const traceLimit = 96;
+const compositionMarkers = ["admission", "append dispatch", "settlement", "final snapshot"] as const;
 
 type Case = typeof manifest.cases[number];
+type ReservedMarker = typeof compositionMarkers[number];
 type TraceEvent = {
   sequence: number;
   event: string;
@@ -42,10 +44,19 @@ type Attempt = {
   preedit: boolean;
   held: boolean;
   admitted: boolean;
-  pending: number;
+  pending?: { epoch: number; sequence: number; bytes: number };
   acknowledged: boolean;
   trace: TraceEvent[];
+  traceComplete: boolean;
+  traceReservation: ReservedMarker[];
   checkpoint?: { sequence: number; snapshot: Snapshot };
+};
+
+type Readback = {
+  caseId: string;
+  attemptId: number;
+  generation: number;
+  result: Snapshot | "unavailable";
 };
 
 type Interrupted = {
@@ -147,14 +158,24 @@ function mountTerminal(
   function hold(attempt: Attempt, reason: string) {
     if (current !== attempt || attempt.held) return;
     attempt.held = true;
+    if (attempt.traceReservation[0] === "append dispatch") attempt.traceReservation.length = 0;
     stopPolling();
     publishError(`Held: ${reason}`);
     publish(attempt);
   }
 
-  function record(attempt: Attempt, event: string, bytes?: number, nativeSequence?: number) {
-    if (attempt.trace.length === traceLimit) {
-      hold(attempt, "Composition trace capacity exceeded");
+  function exhaustTrace(attempt: Attempt) {
+    attempt.traceComplete = false;
+    if (attempt.held) publish(attempt);
+    else hold(attempt, "Composition trace capacity exceeded");
+  }
+
+  function record(attempt: Attempt, event: string, bytes?: number, nativeSequence?: number, reserved?: ReservedMarker) {
+    if (reserved) {
+      if (attempt.traceReservation[0] !== reserved) return;
+      attempt.traceReservation.shift();
+    } else if (attempt.trace.length + attempt.traceReservation.length >= traceLimit) {
+      exhaustTrace(attempt);
       return;
     }
     const sequence = attempt.trace.length + 1;
@@ -337,7 +358,12 @@ function mountTerminal(
             hold(attempt, "Unexpected composition input");
             return;
           }
-          if (record(attempt, "admission", bytes.length) === undefined) return;
+          if (attempt.trace.length + attempt.traceReservation.length + compositionMarkers.length > traceLimit) {
+            exhaustTrace(attempt);
+            return;
+          }
+          attempt.traceReservation.push(...compositionMarkers);
+          if (record(attempt, "admission", bytes.length, undefined, "admission") === undefined) return;
           attempt.admitted = true;
         }
         if (!attempt.held) deliver(text);
@@ -358,26 +384,26 @@ function mountTerminal(
     }
     const bytes = request.events.reduce((total, event) => total + event.length, 0);
     if (attempt.composition && attempt.acknowledged) throw new Error("Composition was already delivered");
-    if (attempt.composition && record(attempt, "append dispatch", bytes, request.sequence) === undefined) {
+    if (attempt.composition && record(attempt, "append dispatch", bytes, request.sequence, "append dispatch") === undefined) {
       throw new Error("Composition trace capacity exceeded");
     }
-    attempt.pending++;
-    try {
-      const ack = await invoke<T>(command, args, options);
-      if (current === attempt) {
-        if (ack === null) {
-          attempt.acknowledged = true;
-          if (attempt.composition || attempt.held) record(attempt, "append acknowledgment", bytes, request.sequence);
-        } else if (attempt.held) record(attempt, "append delivery unconfirmed", bytes, request.sequence);
-      }
-      return ack;
-    } catch (reason) {
-      if (current === attempt && attempt.held) record(attempt, "append delivery unconfirmed", bytes, request.sequence);
-      throw reason;
-    } finally {
-      attempt.pending--;
-    }
+    attempt.pending = { epoch: lifecycleEpoch, sequence: request.sequence, bytes };
+    return invoke<T>(command, args, options);
   };
+
+  function onAppendOutcome(outcome: AppendOutcome) {
+    const attempt = current;
+    const pending = attempt?.pending;
+    if (!attempt || !pending || pending.epoch !== lifecycleEpoch || outcome.generation !== attempt.generation
+      || outcome.sequence !== pending.sequence || outcome.bytes !== pending.bytes) return;
+    delete attempt.pending;
+    const acknowledged = outcome.status === "acknowledged";
+    if (acknowledged) attempt.acknowledged = true;
+    if (attempt.composition || attempt.held) {
+      record(attempt, acknowledged ? "append acknowledgment" : "append delivery unconfirmed",
+        outcome.bytes, outcome.sequence, attempt.composition ? "settlement" : undefined);
+    }
+  }
 
   function onCaptureError(reason: unknown) {
     if (!current) return;
@@ -385,12 +411,13 @@ function mountTerminal(
     hold(current, String(reason));
   }
 
-  const recorder = registerRecorder(input, transport, onCaptureError);
+  const recorder = registerRecorder(input, transport, onCaptureError, onAppendOutcome);
 
   publishVisibility(document.visibilityState === "visible");
 
   function detach() {
     lifecycleEpoch++;
+    if (current) current.traceReservation.length = 0;
     current = null;
     activeComposition = undefined;
     checkpointRead = undefined;
@@ -423,7 +450,8 @@ function mountTerminal(
       if (generation === undefined || !isCurrent()) return false;
       const attempt: Attempt = {
         id, selected, generation, startedAt: performance.now(), composition: selected.id.startsWith("composition-"),
-        phase: "waiting", preedit: false, held: false, admitted: false, acknowledged: false, pending: 0, trace: [],
+        phase: "waiting", preedit: false, held: false, admitted: false, acknowledged: false,
+        trace: [], traceComplete: true, traceReservation: [],
       };
       current = attempt;
       if (composing || needsCompositionDrain) hold(attempt, "Previous composition is still ending");
@@ -434,11 +462,12 @@ function mountTerminal(
       publish(attempt);
       return true;
     },
-    async read() {
+    async read(): Promise<Readback | null> {
       const attempt = current;
       if (!attempt || (attempt.composition && !attempt.held && attempt.phase !== "ended")) return null;
       const epoch = lifecycleEpoch;
       const isCurrent = () => lifecycleEpoch === epoch && current === attempt;
+      const identity = { caseId: attempt.selected.id, attemptId: attempt.id, generation: attempt.generation };
       const checkpoint = checkpointRead;
       try {
         if (settling) await settling.done;
@@ -447,26 +476,30 @@ function mountTerminal(
         if (!isCurrent()) return null;
         const snapshot = await recorder.read(isCurrent);
         if (!isCurrent()) return null;
+        if (snapshot.caseId !== identity.caseId || snapshot.generation !== identity.generation) {
+          throw new Error("Native snapshot belongs to a different attempt");
+        }
         if (attempt.composition) {
           const expected = attempt.selected.expected.afterHex;
-          if (!attempt.checkpoint || attempt.phase !== "ended" || snapshot.generation !== attempt.generation
-            || snapshot.invalid || snapshot.rejected || hex(snapshot.bytes) !== expected
+          if (!attempt.checkpoint || attempt.phase !== "ended" || snapshot.invalid || snapshot.rejected || hex(snapshot.bytes) !== expected
             || attempt.admitted !== Boolean(expected) || attempt.acknowledged !== Boolean(expected)
             || snapshot.nextSequence !== (expected ? 2 : 1)
             || snapshot.eventLengths.length !== (expected ? 1 : 0)) {
             hold(attempt, "Composition result could not be confirmed");
           }
-          record(attempt, "final snapshot", snapshot.bytes.length, snapshot.nextSequence);
+          const reserved = attempt.traceReservation[0] === "final snapshot" ? "final snapshot" : undefined;
+          record(attempt, "final snapshot", snapshot.bytes.length, snapshot.nextSequence, reserved);
         }
-        return snapshot;
+        return { ...identity, result: snapshot };
       } catch {
         if (!isCurrent()) return null;
         hold(attempt, "Native snapshot unavailable");
-        return "unavailable" as const;
+        return { ...identity, result: "unavailable" };
       }
     },
     dispose() {
       disposed = true;
+      if (current) current.traceReservation.length = 0;
       current = null;
       activeComposition = undefined;
       stopPolling();
@@ -512,7 +545,7 @@ function Fixture() {
   const [recovering, setRecovering] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
-  const [snapshot, setSnapshot] = React.useState<Snapshot | "unavailable" | null>(null);
+  const [readback, setReadback] = React.useState<Readback | null>(null);
   const [layout, setLayout] = React.useState<readonly LayoutEvent[]>([]);
   const [attempt, setAttempt] = React.useState<Attempt | null>(null);
 
@@ -525,7 +558,7 @@ function Fixture() {
       setInterrupted(evidence);
       if (!evidence.result) {
         setRecovering(true);
-        setSnapshot(null);
+        setReadback(null);
       }
     });
     controls.current = mounted;
@@ -541,7 +574,7 @@ function Fixture() {
   function selectCase(event: React.ChangeEvent<HTMLSelectElement>) {
     controls.current?.retire();
     setCaseId(event.currentTarget.value);
-    setSnapshot(null);
+    setReadback(null);
     setError("");
   }
 
@@ -550,7 +583,7 @@ function Fixture() {
     if (!mounted || !ready || busy || !visible || (recovering && !interrupted?.result)) return;
     setBusy(true);
     setError("");
-    setSnapshot(null);
+    setReadback(null);
     try {
       if (await mounted.start(selected, recovering) && controls.current === mounted) setRecovering(false);
     } catch (reason) {
@@ -564,14 +597,17 @@ function Fixture() {
     const mounted = controls.current;
     if (!mounted || !active || busy || !visible) return;
     setBusy(true);
+    setReadback(null);
     try {
       const result = await mounted.read();
-      if (controls.current === mounted && result) setSnapshot(result);
+      if (controls.current === mounted && result) setReadback(result);
     } finally {
       if (controls.current === mounted) setBusy(false);
     }
   }
 
+  const snapshot = attempt && readback && readback.attemptId === attempt.id
+    && readback.caseId === attempt.selected.id && readback.generation === attempt.generation ? readback.result : null;
   const readout = snapshot === "unavailable" ? "Unavailable" : snapshot ? hex(snapshot.bytes) || emptyHex : "—";
   const checkpoint = attempt?.checkpoint;
   return (
@@ -605,6 +641,9 @@ function Fixture() {
       </div>
       {attempt?.selected.id === "touch-selection-copy" && <VerifyCopiedToken key={attempt.id} />}
       <label htmlFor="snapshot">Native snapshot (hex)</label>{" "}
+      {attempt && <><span id="snapshot-identity">
+        {attempt.selected.id} · attempt {attempt.id} · generation {attempt.generation}
+      </span>{" · "}</>}
       <output id="snapshot">{readout}</output>
       {snapshot && snapshot !== "unavailable" && (
         <span id="snapshot-counts"> · {snapshot.eventLengths.length} accepted events · {snapshot.bytes.length} bytes</span>
@@ -644,7 +683,8 @@ function Fixture() {
       {Boolean(attempt?.trace.length) && <details>
         <summary>Attempt event trace</summary>
         <pre id="composition-trace">{JSON.stringify({
-          caseId: attempt!.selected.id, attemptId: attempt!.id, generation: attempt!.generation, events: attempt!.trace,
+          caseId: attempt!.selected.id, attemptId: attempt!.id, generation: attempt!.generation,
+          complete: attempt!.traceComplete, events: attempt!.trace,
         })}</pre>
       </details>}
       <details>

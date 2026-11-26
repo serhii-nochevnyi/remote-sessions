@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mountFixture } from "./fixture.test.ts";
-import { fixtureCaseId, type Snapshot } from "./recorder.ts";
+import { controlledClock, mountFixture } from "./fixture.test.ts";
+import { fixtureCaseId, registerRecorder, type AppendOutcome, type Invoke, type Snapshot } from "./recorder.ts";
 
 function deferred() {
   let resolve!: (value: unknown) => void;
@@ -80,6 +80,83 @@ async function startAndTrace(fixture: RecorderFixture) {
     { generation: 1, sequence: 1, events: [[0xd1, 0x97]] },
   ]);
 }
+
+test("recorder settles the current append once before a waiting Read", async t => {
+  for (const mode of ["on time", "exact deadline", "elapsed first", "timeout first", "malformed", "rejected"] as const) {
+    await t.test(mode, { timeout: 5000 }, async () => {
+      let input!: (text: string) => void;
+      const raw = deferred();
+      const readReply = deferred();
+      const reading = deferred();
+      const appends: Append[] = [];
+      const errors: string[] = [];
+      const log: (AppendOutcome | "read")[] = [];
+      const bytes = utf8("ї");
+      const snapshot: Snapshot = {
+        caseId: fixtureCaseId, generation: 1, nextSequence: 2,
+        bytes, eventLengths: [bytes.length], rejected: 0, invalid: false,
+      };
+      const invoke: Invoke = async <T,>(command: string, args?: Parameters<Invoke>[1]) => {
+        if (command === "w2_begin_attempt") return 1 as T;
+        if (command === "w2_append_input") {
+          appends.push(args as Append);
+          return await raw.promise as T;
+        }
+        assert.equal(command, "w2_read_attempt");
+        assert.deepEqual(args, { generation: 1 });
+        log.push("read");
+        reading.resolve(undefined);
+        return await readReply.promise as T;
+      };
+      const clock = controlledClock();
+      const recorder = registerRecorder({
+        onData(receive) {
+          input = receive;
+          return { dispose() {} };
+        },
+      }, invoke, reason => errors.push(String(reason)), outcome => log.push(outcome));
+      try {
+        assert.equal(await recorder.start(fixtureCaseId), 1);
+        input("ї");
+        if (mode !== "on time") input("discard pending input");
+        const read = recorder.read();
+        assert.deepEqual(log, []);
+        assert.deepEqual(appends, [{ generation: 1, sequence: 1, events: [bytes] }]);
+        switch (mode) {
+          case "on time": clock.elapse(4999); raw.resolve(null); break;
+          case "exact deadline": clock.elapse(5000); raw.resolve(null); break;
+          case "elapsed first": clock.elapse(5001); raw.resolve(null); break;
+          case "timeout first": clock.advance(5000); break;
+          case "malformed": raw.resolve({ generation: 1, sequence: 1 }); break;
+          case "rejected": raw.reject(new Error("Rejected append")); break;
+        }
+        await reading.promise;
+        const expected: AppendOutcome = {
+          generation: 1, sequence: 1, bytes: bytes.length, status: mode === "on time" ? "acknowledged" : "unconfirmed",
+        };
+        assert.deepEqual(log, [expected, "read"]);
+        assert.equal(clock.invokeTimeouts, Number(mode === "timeout first"));
+        const expectedErrors = mode === "on time" ? [] : [mode === "malformed" ? "Error: Invalid append acknowledgment"
+          : mode === "rejected" ? "Error: Rejected append" : "Error: Local invoke timed out"];
+        assert.deepEqual(errors, expectedErrors);
+        readReply.resolve(snapshot);
+        assert.deepEqual(await read, snapshot);
+        raw.resolve(null);
+        clock.advance(5000);
+        await Promise.resolve();
+        assert.equal(clock.invokeTimeouts, Number(mode === "timeout first"));
+        assert.deepEqual(log, [expected, "read"]);
+        assert.deepEqual(errors, expectedErrors);
+        assert.deepEqual(appends, [{ generation: 1, sequence: 1, events: [bytes] }]);
+        assert.deepEqual(await recorder.interrupt(), { snapshot, uncertain: mode !== "on time" });
+        assert.deepEqual(log, [expected, "read", "read"]);
+      } finally {
+        recorder.dispose();
+        clock.dispose();
+      }
+    });
+  }
+});
 
 test("bounded recorder serializes input and rejects overflow", async t => {
   await t.test("one append in flight and ordered batches", async () => {
@@ -218,6 +295,7 @@ test("late retired rejection leaves the fresh append slot occupied", async t => 
     await fixture.click("Read");
     await fixture.act(async () => { old.reply.reject("retired append rejected after the deadline"); });
     assert.equal(fixture.appends.length, 2);
+    assert.deepEqual(fixture.registrations[0]?.outcomes, [], "retired batch publishes no outcome");
     assert.equal(fixture.readout.textContent, "—");
     assert.equal(fixture.alert(), "");
     await fixture.accept(1);
@@ -225,6 +303,10 @@ test("late retired rejection leaves the fresh append slot occupied", async t => 
     await fixture.accept(2);
     assert.equal(fixture.readout.textContent, "6162");
     assert.equal(fixture.appends.length, 3);
+    assert.deepEqual(fixture.registrations[0]?.outcomes, [
+      { generation: 2, sequence: 1, bytes: 1, status: "acknowledged" },
+      { generation: 2, sequence: 2, bytes: 1, status: "acknowledged" },
+    ]);
     assert.equal(fixture.alert(), "");
   } finally {
     await fixture.dispose();
