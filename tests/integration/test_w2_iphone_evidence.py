@@ -67,8 +67,45 @@ def bound_cohort(revision_digit="1", bundle_digit="2"):
                         "scaffold_status": True, "local_inventory": True, "fixture_commands_absent": True},
         },
         "recipes": {},
+        "launches": [],
         "attempts": [],
     }
+
+
+def native_cohort():
+    cohort = bound_cohort("5", "6")
+    data = cohort["tuple"]
+    data.update(shell="native-wkwebview", app={"identifier": "dev.synthetic.comparison", "version": "0.1", "build": "1"})
+    del data["locks"], data["tools"], cohort["pre_xcode"]
+    cohort["fingerprint"] = evidence.fingerprint(data)
+    build, boundary = cohort["build"], cohort["boundary"]
+    build["installation"]["app"] = copy.deepcopy(data["app"])
+    build["generated_settings"].update(source_revision=data["source_revision"], bundle_sha256=data["bundle_sha256"])
+    entry = build["entry_validation"]
+    build["entry_validation"] = {key: entry[key] for key in (
+        "source_revision", "build_log_ref", "build_log_sha256", "inspected_bundle_sha256",
+        "installed_bundle_sha256", "verified_before_install",
+    )} | {
+        "entry_ref": "synthetic native app entry", "entry_sha256": "a" * 64, "entry_verified": True,
+        "registration_ref": "synthetic native registration", "registration_sha256": "d" * 64,
+        "registration_verified": True,
+    }
+    for key in ("config_sha256", "capabilities_sha256", "acl_sha256", "capability", "file_capabilities",
+                "resolved_grants", "handlers", "window_labels", "desktop"):
+        del boundary[key]
+    boundary.update(
+        ref="synthetic effective native boundary", package_review_ref="synthetic signed package review",
+        dependencies={"ref": "synthetic native dependencies", "sha256": "e" * 64},
+        webview={"ref": "synthetic effective WebView configuration", "sha256": "c" * 64,
+                 "bundled_origin": "fixture://local", "allowed_origins": ["fixture://local"],
+                 "bundled_assets_only": True, "main_frame_only": True},
+        registration={"ref": "synthetic native registration", "sha256": "d" * 64,
+                      "handlers": {"beginCase": "begin", "submitInput": "append", "readCase": "read"}},
+    )
+    boundary["binding"].update(registration_ref=boundary["registration"]["ref"],
+                               registration_sha256=boundary["registration"]["sha256"])
+    boundary["offline_launch"]["operations"] = ["beginCase", "submitInput", "readCase"]
+    return cohort
 
 
 def make_recipes(cohort, cases):
@@ -125,14 +162,38 @@ def composition(attempt, identity, vector):
     attempt["final"].update(ref="synthetic post-end read", nextSequence=next_seq)
 
 
+def start_launch(cohort):
+    order = len(cohort["launches"]) + 1
+    launch = {"id": f"synthetic launch {order}", "order": order,
+              "ref": f"synthetic retained launch capture {order}", "measurements": []}
+    cohort["launches"].append(launch)
+    return launch
+
+
+def retain_measurement(cohort, attempt):
+    launch = cohort["launches"][-1] if cohort["launches"] else start_launch(cohort)
+    position = launch["measurements"][-1]["position"] + 1 if launch["measurements"] else 1
+    attempt.update(launch_id=launch["id"], launch_ref=launch["ref"], measurement_position=position)
+    launch["measurements"].append({"attempt_id": attempt["id"], "position": position,
+                                   "attemptId": attempt["attemptId"], "generation": attempt["generation"]})
+
+
+def remove_attempts(cohort, *removed):
+    ids = {row["id"] for row in removed}
+    cohort["attempts"][:] = [row for row in cohort["attempts"] if row["id"] not in ids]
+    for launch in cohort["launches"]:
+        launch["measurements"][:] = [row for row in launch["measurements"] if row["attempt_id"] not in ids]
+
+
 def add_attempt(cohort, case, suffix, route=None):
     case_id = case["id"]
-    index = 2 * len(cohort["attempts"]) + 2
+    launch = cohort["launches"][-1] if cohort["launches"] else start_launch(cohort)
+    index = launch["measurements"][-1]["generation"] + 2 if launch["measurements"] else 2
     identity = {"caseId": case_id, "attemptId": index, "generation": index}
     attempt = {
         "id": f"{cohort['tuple']['source_revision'][0]}-{case_id}-{suffix}", "case_id": case_id,
         "cohort_fingerprint": cohort["fingerprint"], "attemptId": index, "generation": index,
-        "launch_id": "synthetic launch", "ref": "synthetic attempt", "status": "pass",
+        "ref": "synthetic attempt", "status": "pass",
         "keyboard_language": "uk" if case_id == "ukrainian-return" else "en", "orientation": "portrait",
         "action_order": list(range(1, len(case["actions"]) + 1)), "start_empty": True,
         "replayed": False, "capture_error": False,
@@ -156,9 +217,28 @@ def add_attempt(cohort, case, suffix, route=None):
         old_identity = dict(identity, attemptId=index - 1, generation=index - 1)
         earlier = native(old_identity, case["expected"]["beforeHex"])
         attempt["recovery"] = {"before": earlier, "retained": earlier.copy(),
-                               "delivery_uncertain": False, "old_generation_extra_event": False}
+                               "delivery_uncertain": False, "old_generation_extra_event": False,
+                               "restart": {"ref": f"{attempt['id']} restart capture", "action_completed": True,
+                                           "outcome": "fresh", "previous": old_identity, "observed": identity}}
+    retain_measurement(cohort, attempt)
     cohort["attempts"].append(attempt)
     return attempt
+
+
+def restart_without_fresh_attempt(cohort, attempt, outcome):
+    recovery = attempt["recovery"]
+    restart = recovery["restart"]
+    restart.update(outcome=outcome)
+    restart.pop("observed")
+    if outcome == "same-generation":
+        restart["observed"] = recovery["retained"].copy()
+    if outcome == "no-new-generation":
+        restart["begin_failure"] = dict(restart["previous"], ref=f"{restart['ref']} begin failure")
+    for key in ("attemptId", "generation"):
+        attempt[key] = cohort["launches"][-1]["measurements"][-1][key] = restart["previous"][key]
+    attempt.pop("final")
+    attempt["observations"]["started_fresh"] = False
+    return mark(attempt, "inconclusive" if outcome == "uncertain" else "failing")
 
 
 def mark(attempt, status):
@@ -225,6 +305,13 @@ class EvidenceTest(unittest.TestCase):
             manifest.write_bytes(MANIFEST.read_bytes() + b"\n")
             with self.assertRaisesRegex(evidence.EvidenceError, "shipped matrix"):
                 evidence.load_manifest(manifest)
+
+    def test_touch_copy_uses_in_fixture_control_and_finishes_on_same_generation(self):
+        case = self.cases["touch-selection-copy"]
+        self.assertIn("Verify copied token", case["actions"][-1])
+        self.assertIn("Read", case["actions"][-1])
+        self.assertIn("same generation", case["actions"][-1])
+        self.assertEqual(case["expected"], {"beforeHex": "", "afterHex": ""})
 
     def test_missing_or_simulator_tuple_and_mixed_attempt_fingerprint(self):
         row = self.sample()
@@ -390,6 +477,37 @@ class EvidenceTest(unittest.TestCase):
         row["checkpoint"]["hex"] = "c3a8"
         self.reject(report_for(self.baseline, "failing", "mandatory-failure", [failure]), "prefix of the final")
 
+    def test_preedit_native_checkpoint_without_ack_can_prove_failure(self):
+        for unconfirmed in (False, True):
+            with self.subTest(unconfirmed=unconfirmed):
+                row = add_attempt(self.baseline, self.cases["composition-commit"], f"unconfirmed-{unconfirmed}")
+                row["capture_error"] = True
+                trace = row["trace"]["events"]
+                receipt = [event("append delivery unconfirmed", 2, 1)] if unconfirmed else []
+                row["trace"]["events"] = events(*trace[:3], *trace[4:6], *receipt,
+                                                  event("active checkpoint", 2, 2), trace[3], trace[-1])
+                row["checkpoint"].update(sequence=6 + len(receipt), hex="c3a9", acceptedEvents=1,
+                                         nextSequence=2, eventLengths=[2])
+                row["final"]["eventLengths"] = [2]
+                failure_id = mark(row, "failing")
+                report = report_for(self.baseline, "failing", "mandatory-failure", [failure_id])
+                self.validate(report, "failing")
+                row["checkpoint"]["hex"] = "c3a8"
+                self.reject(report, "prefix of the final")
+                row["checkpoint"]["hex"] = "c3a9"
+                row["checkpoint"]["generation"] += 1
+                self.reject(report, "different attempt or generation")
+                row["checkpoint"]["generation"] -= 1
+                row["trace"]["events"] = events(*trace[:2], event("active checkpoint", 2, 2),
+                                                  *trace[4:6], trace[3], *receipt, trace[-1])
+                row["checkpoint"]["sequence"] = 3
+                self.reject(report, "checkpoint counters do not reconcile")
+                row["trace"]["events"] = events(*trace[:3], *trace[4:6], trace[3], *receipt, trace[-1])
+                row["checkpoint"].update(sequence=3, hex="", acceptedEvents=0, nextSequence=1, eventLengths=[])
+                mark(row, "inconclusive")
+                self.validate(report_for(self.baseline, "inconclusive", "inconclusive", []), "inconclusive")
+                remove_attempts(self.baseline, row)
+
     def test_unconfirmed_visual_gesture_cannot_be_measured_as_failure(self):
         for case_id, observation in (("composition-commit", "end_state_observed"),
                                      ("composition-replacement", "replaced_in_preedit")):
@@ -424,10 +542,68 @@ class EvidenceTest(unittest.TestCase):
         row["observations"]["prompt_unobscured"] = True
         row["viewports"].pop("rotated")
         self.reject(report, "rotated viewport")
-        self.baseline["attempts"].clear()
+        remove_attempts(self.baseline, row)
         row = self.sample("app-switch")
         row["recovery"]["retained"]["hex"] = "6161"
         self.reject(report_for(self.baseline), "retained native bytes")
+
+    def test_restart_failure_is_measured_and_requires_bound_old_proof(self):
+        for outcome in ("same-generation", "no-new-generation", "uncertain"):
+            with self.subTest(outcome=outcome):
+                row = self.sample("app-switch")
+                row_id = restart_without_fresh_attempt(self.baseline, row, outcome)
+                row["capture_error"] = True
+                report = (report_for(self.baseline, "inconclusive", "inconclusive", []) if outcome == "uncertain"
+                          else report_for(self.baseline, "failing", "mandatory-failure", [row_id]))
+                self.validate(report, report["status"])
+                restart = row["recovery"]["restart"]
+                if outcome != "uncertain":
+                    restart["action_completed"] = False
+                    self.reject(report, "completed foreground restart action")
+                    restart["action_completed"] = True
+                    proof = restart["observed" if outcome == "same-generation" else "begin_failure"]
+                    proof["generation"] += 1
+                    self.reject(report, "different attempt or generation|begin failure belongs to a different")
+                    proof["generation"] -= 1
+                    restart["previous"]["generation"] += 1
+                    self.reject(report, "not bound to the old attempt")
+                remove_attempts(self.baseline, row)
+
+    def test_repeated_restart_failure_requires_independent_old_attempts(self):
+        case = self.cases["lock-foreground"]
+        baseline_ids = []
+        for suffix in ("failure", "repeat"):
+            row = add_attempt(self.baseline, case, suffix)
+            baseline_ids.append(restart_without_fresh_attempt(self.baseline, row, "same-generation"))
+        corrected = bound_cohort("3", "4")
+        persistent = add_attempt(corrected, case, "persistent")
+        persistent_id = restart_without_fresh_attempt(corrected, persistent, "same-generation")
+        report = report_for(self.baseline, "failing", "comparison-eligible", [*baseline_ids, persistent_id])
+        report["cohorts"]["corrected"] = corrected
+        report["correction"] = {"case_id": case["id"], "layer": "synthetic foreground layer",
+                                "change": "synthetic scoped correction", "scope": ["synthetic source path"],
+                                "baseline_attempt_ids": baseline_ids}
+        self.validate(report, "failing")
+        original, repeat = self.baseline["attempts"]
+        original_ref = repeat["recovery"]["restart"]["ref"]
+        repeat["recovery"]["restart"]["ref"] = original["recovery"]["restart"]["ref"]
+        self.reject(report, "foreground restart observation is reused")
+        repeat["recovery"]["restart"]["ref"] = original_ref
+        for key in ("attemptId", "generation"):
+            repeat[key] = self.baseline["launches"][0]["measurements"][1][key] = original[key]
+        repeat["recovery"] = copy.deepcopy(original["recovery"])
+        repeat["recovery"]["restart"]["ref"] = "different synthetic restart reference"
+        self.reject(report, "native attempt or generation is reused")
+
+    def test_fresh_recovery_requires_greater_generation_and_exact_input(self):
+        row = self.sample("lock-foreground")
+        report = report_for(self.baseline, "inconclusive", "inconclusive", [])
+        self.validate(report, "inconclusive")
+        row["final"]["hex"] = "61"
+        self.reject(report, "final bytes differ")
+        row["final"]["hex"] = self.cases["lock-foreground"]["expected"]["afterHex"]
+        row["recovery"]["restart"]["observed"]["generation"] -= 1
+        self.reject(report, "fresh attempt and generation")
 
     def test_mismatched_bytes_or_replay(self):
         row = self.sample("english-return")
@@ -441,10 +617,10 @@ class EvidenceTest(unittest.TestCase):
         for case_id, route in (("rotation", None), ("paste-short", "native")):
             with self.subTest(case=case_id, route=route):
                 complete = self.complete(self.baseline)
-                self.baseline["attempts"] = [row for row in self.baseline["attempts"]
-                                             if (row["case_id"], row.get("route")) != (case_id, route)]
+                remove_attempts(self.baseline, *(row for row in self.baseline["attempts"]
+                                                 if (row["case_id"], row.get("route")) == (case_id, route)))
                 self.reject(complete, "report status must be inconclusive")
-                self.baseline["attempts"].clear()
+                remove_attempts(self.baseline, *self.baseline["attempts"])
 
     def test_duplicate_attempt_ids_and_duplicate_native_runs(self):
         row = self.sample()
@@ -452,6 +628,7 @@ class EvidenceTest(unittest.TestCase):
         self.baseline["attempts"].append(duplicate)
         self.reject(report_for(self.baseline), "duplicate measured attempt ID")
         duplicate["id"] += "-renamed"
+        retain_measurement(self.baseline, duplicate)
         self.reject(report_for(self.baseline), "native attempt or generation is reused")
 
     def test_failure_keeps_old_evidence_and_requires_two_fresh_passes(self):
@@ -484,10 +661,73 @@ class EvidenceTest(unittest.TestCase):
 
     def test_native_counters_can_restart_on_a_separate_app_launch(self):
         report = self.complete(self.baseline)
-        first, second = self.baseline["attempts"][:2]
-        second.update(launch_id="synthetic relaunch", attemptId=first["attemptId"], generation=first["generation"])
-        second["final"].update(attemptId=first["attemptId"], generation=first["generation"])
+        first, second = self.baseline["attempts"][-2:]
+        remove_attempts(self.baseline, second)
+        start_launch(self.baseline)
+        case = self.cases[second["case_id"]]
+        fresh = add_attempt(self.baseline, case, "relaunched")
+        self.assertLess(fresh["generation"], first["generation"])
+        report["decision"]["supporting_attempt_ids"][-1] = fresh["id"]
         self.validate(report, "pass")
+
+    def test_closed_launch_successes_cannot_clear_a_new_failure(self):
+        complete = self.complete(self.baseline)
+        case = self.cases["english-return"]
+        attempts = self.baseline["attempts"]
+        old_rows = attempts.copy()
+        first, second = old_rows[:2]
+        start_launch(self.baseline)
+        failed = add_attempt(self.baseline, case, "new-failure")
+        failed["observations"]["cursor_visible"] = False
+        failure_id = mark(failed, "failing")
+        held = report_for(self.baseline, "failing", "mandatory-failure", [failure_id])
+        self.validate(held, "failing")
+        for submitted in ([*old_rows[2:], failed, first, second], [failed, *old_rows]):
+            attempts[:] = submitted
+            forged = report_for(self.baseline, support=complete["decision"]["supporting_attempt_ids"])
+            self.reject(forged, "out of order")
+            moved = submitted[submitted.index(failed) + 1:]
+            for row in moved:
+                mark(row, "inconclusive")
+            self.validate(held, "failing")
+            for row in moved:
+                row.update(status="pass")
+                row.pop("reason")
+        attempts[:] = [*old_rows[2:], failed, first, second]
+        for row in (first, second):
+            mark(row, "inconclusive")
+        self.validate(held, "failing")
+        start_launch(self.baseline)
+        later = [add_attempt(self.baseline, case, f"later-{i}") for i in range(2)]
+        self.assertEqual(later[0]["generation"], failed["generation"])
+        support = [row["id"] for row in old_rows[2:]] + [row["id"] for row in later]
+        self.validate(report_for(self.baseline, support=support), "pass")
+
+    def test_attempt_must_match_retained_launch_and_measurement(self):
+        row = self.sample("english-return")
+        report = report_for(self.baseline)
+        for change in ({"launch_id": "unknown"}, {"launch_ref": "wrong"}, {"measurement_position": 2},
+                       {"attemptId": 23, "generation": 23}):
+            with self.subTest(change=change):
+                original = row.copy()
+                row.update(change)
+                self.reject(report, "retained launch and measurement")
+                row.update(original)
+        self.baseline["attempts"].clear()
+        self.reject(report, "retained measurement has no submitted attempt")
+
+    def test_launch_records_require_independent_references_and_order(self):
+        self.sample("english-return")
+        later = start_launch(self.baseline)
+        add_attempt(self.baseline, self.cases["english-return"], "later")
+        report = report_for(self.baseline, "inconclusive", "inconclusive", [])
+        first = self.baseline["launches"][0]
+        original = later.copy()
+        for key in ("ref", "order", "id"):
+            with self.subTest(key=key):
+                later[key] = first[key]
+                self.reject(report, "retained launches require ordered, unique labels and capture references")
+                later.update(original)
 
     def test_truthful_setup_hold_and_inconclusive_cli_modes(self):
         hold = report_for(None, "setup-hold", "inconclusive", [])
@@ -529,13 +769,13 @@ class EvidenceTest(unittest.TestCase):
     def test_correction_gate_requires_baseline_reproduction_and_persistent_corrected_failure(self):
         report, _ = self.correction_fixture()
         self.validate(report, "failing")
-        self.baseline["attempts"].pop()
+        remove_attempts(self.baseline, self.baseline["attempts"][-1])
         self.reject(report, "same unresolved measured failure twice")
 
     def test_correction_gate_rejects_comparison_without_corrected_failure(self):
         report, corrected = self.correction_fixture()
-        corrected["attempts"].clear()
-        report["cohorts"]["comparison"] = {}
+        remove_attempts(corrected, *corrected["attempts"])
+        self.add_comparison(report, native_cohort())
         self.reject(report, "persistent corrected-build mandatory failure")
 
     def test_correction_gate_distinguishes_wrong_byte_results(self):
@@ -550,9 +790,54 @@ class EvidenceTest(unittest.TestCase):
         corrected["attempts"][0]["final"]["hex"] = "6f6b0d0d"
         self.reject(report, "shell disposition must be mandatory-failure")
 
+    def test_partial_readback_with_unresolved_return_cannot_authorize_comparison(self):
+        report, corrected = self.correction_fixture()
+        for row in self.baseline["attempts"] + corrected["attempts"]:
+            row["observations"]["cursor_visible"] = True
+            row["final"]["hex"] = "6f6b"
+        self.validate(report, "failing")
+        for row in self.baseline["attempts"]:
+            row["capture_error"] = True
+            mark(row, "inconclusive")
+        self.reject(report, "same unresolved measured failure twice")
+        for row in self.baseline["attempts"]:
+            row["capture_error"] = False
+            mark(row, "failing")
+        persistent = corrected["attempts"][0]
+        persistent["capture_error"] = True
+        mark(persistent, "inconclusive")
+        report["cohorts"]["comparison"] = {}
+        self.reject(report, "persistent corrected-build mandatory failure")
+        del report["cohorts"]["comparison"]
+        report.update(status="inconclusive")
+        report["decision"].update(disposition="inconclusive",
+                                  supporting_attempt_ids=report["correction"]["baseline_attempt_ids"])
+        self.validate(report, "inconclusive")
+
+    def test_unresolved_capture_preserves_independent_measured_failures(self):
+        for case_id, failure, expected in (
+            ("english-return", {"start_empty": False}, "unexpected startup input"),
+            ("english-return", {"replayed": True}, "replayed input"),
+            ("english-return", {"observations": {"cursor_visible": False}}, "visible observation failed"),
+            ("keyboard-open-cursor", {}, "prompt or cursor obscured"),
+            ("app-switch", {}, "retained native bytes"),
+        ):
+            with self.subTest(case=case_id, expected=expected):
+                row = self.sample(case_id)
+                row.update(failure, capture_error=True)
+                row.pop("final")
+                if case_id == "keyboard-open-cursor":
+                    row["viewports"]["keyboard_open"]["cursor_visible"] = False
+                if case_id == "app-switch":
+                    row["recovery"]["retained"]["hex"] = "6161"
+                self.reject(report_for(self.baseline), expected)
+                failure_id = mark(row, "failing")
+                self.validate(report_for(self.baseline, "failing", "mandatory-failure", [failure_id]), "failing")
+                remove_attempts(self.baseline, row)
+
     def test_correction_gate_rejects_a_different_failed_case_or_mixed_conditions(self):
         report, corrected = self.correction_fixture()
-        corrected["attempts"].clear()
+        remove_attempts(corrected, *corrected["attempts"])
         other = add_attempt(corrected, self.cases["ukrainian-return"], "other")
         other["observations"]["cursor_visible"] = False
         mark(other, "failing")
@@ -588,43 +873,93 @@ class EvidenceTest(unittest.TestCase):
 
     def test_successful_correction_supports_continued_tauri_evaluation(self):
         report, corrected = self.correction_fixture()
-        corrected["attempts"].clear()
+        remove_attempts(corrected, *corrected["attempts"])
         passed = self.complete(corrected)
         report.update(status="pass", reasons=[], decision=passed["decision"])
         self.validate(report, "pass")
 
-    def test_comparison_uses_same_fixture_and_keeps_production_decisions_open(self):
-        report, _ = self.correction_fixture()
-        alternative = bound_cohort("5", "6")
-        alternative["tuple"]["shell"] = "synthetic comparison shell"
-        alternative["tuple"]["app"]["identifier"] = "dev.synthetic.comparison"
-        alternative["build"]["installation"]["app"] = copy.deepcopy(alternative["tuple"]["app"])
-        alternative["fingerprint"] = evidence.fingerprint(alternative["tuple"])
+    def add_comparison(self, report, alternative):
         make_recipes(alternative, self.cases)
         compared = self.complete(alternative)
         report["cohorts"]["comparison"] = alternative
         report["decision"]["disposition"] = "review-comparison"
         report["decision"]["rationale"] = "Synthetic comparison restored the visible cursor in the affected layer."
         report["decision"]["supporting_attempt_ids"].extend(compared["decision"]["supporting_attempt_ids"])
+
+    def test_comparison_uses_same_fixture_and_keeps_production_decisions_open(self):
+        report, _ = self.correction_fixture()
+        self.add_comparison(report, native_cohort())
         self.validate(report, "failing")
         report["decision"]["minimum_ios"] = "16.0"
         self.reject(report, "minimum iOS stay open")
 
-    def test_comparison_rejects_a_different_toolchain(self):
+    def test_comparison_requires_own_bound_provenance_and_exact_local_recorder(self):
         report, _ = self.correction_fixture()
-        alternative = bound_cohort("5", "6")
-        alternative["tuple"]["shell"] = "synthetic comparison shell"
-        alternative["tuple"]["sdk"]["build"] = "different SDK build"
-        alternative["fingerprint"] = evidence.fingerprint(alternative["tuple"])
-        make_recipes(alternative, self.cases)
-        compared = self.complete(alternative)
-        for attempt in alternative["attempts"]:
-            attempt["cohort_fingerprint"] = alternative["fingerprint"]
-        report["cohorts"]["comparison"] = alternative
-        report["decision"]["disposition"] = "review-comparison"
-        report["decision"]["rationale"] = "Synthetic comparison restored the visible cursor in the affected layer."
-        report["decision"]["supporting_attempt_ids"].extend(compared["decision"]["supporting_attempt_ids"])
-        self.reject(report, "comparison must reuse the fixture and physical conditions")
+        self.add_comparison(report, native_cohort())
+        for path, value, reason in (
+            (("build", "installation", "signature_verified"), False, "verified physical installation"),
+            (("build", "generated_settings", "configuration"), "Debug", "generated Release SDK"),
+            (("build", "generated_settings", "bundle_sha256"), "2" * 64, "settings lack signed source and bundle binding"),
+            (("build", "entry_validation", "entry_ref"), "", "native entry and registration"),
+            (("build", "entry_validation", "build_log_sha256"), "", "unbound.*entry validation"),
+            (("build", "entry_validation", "source_revision"), "1" * 40, "unbound.*entry validation"),
+            (("build", "entry_validation", "installed_bundle_sha256"), "2" * 64, "unbound.*entry validation"),
+            (("boundary", "registration", "sha256"), "1" * 64, "registration.*signed build"),
+            (("boundary", "registration", "handlers"),
+             {"one": "begin", "two": "append", "three": "read", "other": "read"}, "exactly begin, append and read"),
+            (("boundary", "webview", "allowed_origins"),
+             ["fixture://local", "https://external.invalid"], "sole bundled origin"),
+            (("boundary", "webview", "bundled_assets_only"), False, "sole bundled origin"),
+            (("boundary", "dependencies", "ref"), "", "native package or dependency"),
+            (("boundary", "no_host_provider_or_desktop_dependencies"), False, "dependency review"),
+            (("boundary", "offline_launch", "startup_hex"), "0d", "bound offline startup"),
+            (("boundary", "offline_launch", "operations"), list(evidence.COMMANDS), "actually begin, append and read"),
+            (("ci", "native", "source_revision"), "1" * 40, "CI native"),
+        ):
+            with self.subTest(path=path):
+                mutated = copy.deepcopy(report)
+                record = mutated["cohorts"]["comparison"]
+                for key in path[:-1]:
+                    record = record[key]
+                record[path[-1]] = value
+                self.reject(mutated, reason)
+
+    def test_comparison_rejects_changed_fixture_or_physical_conditions(self):
+        for key, value, message in (
+            ("sdk", {"version": "18.5", "build": "different SDK build", "root": "iPhoneOS.sdk"},
+             "comparison must reuse the fixture and physical conditions"),
+            ("device_alias", "different iPhone", "comparison must reuse the fixture and physical conditions"),
+            ("fixture_sha256", "f" * 64, "cohort fixture digest"),
+        ):
+            with self.subTest(key=key):
+                self.baseline = bound_cohort()
+                make_recipes(self.baseline, self.cases)
+                report, _ = self.correction_fixture()
+                alternative = native_cohort()
+                alternative["tuple"][key] = value
+                alternative["fingerprint"] = evidence.fingerprint(alternative["tuple"])
+                self.add_comparison(report, alternative)
+                self.reject(report, message)
+
+    def test_comparison_requires_shared_recipes_and_complete_matrix(self):
+        report, _ = self.correction_fixture()
+        alternative = native_cohort()
+        self.add_comparison(report, alternative)
+        recipe = self.baseline["recipes"].pop("composition-commit")
+        self.reject(report, "baseline's frozen composition recipes")
+        self.baseline["recipes"]["composition-commit"] = recipe
+        attempt = alternative["attempts"][-1]
+        remove_attempts(alternative, attempt)
+        self.reject(report, "shell disposition must be comparison-eligible")
+
+    def test_both_tauri_roles_require_exact_effective_acl(self):
+        report, _ = self.correction_fixture()
+        self.add_comparison(report, native_cohort())
+        for role in ("baseline", "corrected"):
+            with self.subTest(role=role):
+                mutated = copy.deepcopy(report)
+                mutated["cohorts"][role]["boundary"]["resolved_grants"] = {}
+                self.reject(mutated, "effective iOS capability")
 
 
 if __name__ == "__main__":
