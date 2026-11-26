@@ -146,6 +146,14 @@ struct Observation {
     runtime: Runtime,
 }
 
+struct PaneEvidence {
+    identity: PaneIdentity,
+    pane_pid: Option<u32>,
+    exited: bool,
+    width: u16,
+    height: u16,
+}
+
 fn unknown(issue: impl Into<Option<ProductIssue>>) -> CreateState {
     CreateState::Unknown {
         issue: issue.into(),
@@ -503,6 +511,12 @@ impl Engine {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_fixture_sender(mut self) -> Self {
+        self.paste_test.sender_fixture = true;
+        self
+    }
+
     fn now(&self) -> Instant {
         #[cfg(test)]
         if let Some(now) = *self.paste_test.now.lock().unwrap() {
@@ -752,7 +766,39 @@ impl Engine {
     }
 
     async fn observe(&self, operation: &Operation) -> Result<Observation> {
-        let session_target = format!("={}", operation.target);
+        let pane = self
+            .observe_pane(
+                &operation.target,
+                operation.generation,
+                &operation.nonce.to_string(),
+            )
+            .await?;
+        Ok(Observation {
+            runtime: Runtime {
+                session_id: operation.session_id,
+                runtime_id: operation.runtime_id,
+                tmux_name: operation.target.clone(),
+                pane_id: pane.identity.pane.clone(),
+                command: operation.profile.executable_name().into(),
+                pane_pid: pane.pane_pid,
+                exited: pane.exited,
+                width: pane.width,
+                height: pane.height,
+                origin: RuntimeOrigin::Managed,
+                workspace_id: Some(operation.workspace_id),
+                operation_id: Some(operation.id),
+            },
+            identity: pane.identity,
+        })
+    }
+
+    async fn observe_pane(
+        &self,
+        name: &str,
+        server: ServerGeneration,
+        nonce: &str,
+    ) -> Result<PaneEvidence> {
+        let session_target = format!("={name}");
         let window_target = format!("{session_target}:0");
         let output = self
             .command(&[
@@ -770,7 +816,6 @@ impl Engine {
             ])
             .await?;
         let mut lines = output.lines();
-        let nonce = operation.nonce.to_string();
         ensure!(
             lines.next() == Some(&format!("{NONCE_ENV}={nonce}")),
             "missing session launch nonce"
@@ -780,14 +825,14 @@ impl Engine {
         let fields: Vec<_> = row.split('|').collect();
         ensure!(fields.len() == 14, "invalid launch evidence");
         ensure!(
-            generation(&fields[..3].join("|")) == Some(operation.generation),
+            generation(&fields[..3].join("|")) == Some(server),
             "tmux generation changed"
         );
         let (stamped_nonce, stamp) = fields[10].split_once(':').context("missing pane nonce")?;
         let stamp: Vec<_> = stamp.split(':').collect();
         let identity = pane_identity(&stamp).context("invalid launch pane stamp")?;
         ensure!(
-            fields[7] == operation.target
+            fields[7] == name
                 && fields[8..10] == ["0", "0"]
                 && stamped_nonce == nonce
                 && fields[3..6] == stamp[..3],
@@ -804,22 +849,12 @@ impl Engine {
             pid if pid.parse::<u32>() == Ok(identity.pid) => Some(identity.pid),
             _ => bail!("mismatched or missing pane PID"),
         };
-        Ok(Observation {
-            runtime: Runtime {
-                session_id: operation.session_id,
-                runtime_id: operation.runtime_id,
-                tmux_name: operation.target.clone(),
-                pane_id: identity.pane.clone(),
-                command: operation.profile.executable_name().into(),
-                pane_pid,
-                exited,
-                width: fields[12].parse()?,
-                height: fields[13].parse()?,
-                origin: RuntimeOrigin::Managed,
-                workspace_id: Some(operation.workspace_id),
-                operation_id: Some(operation.id),
-            },
+        Ok(PaneEvidence {
             identity,
+            pane_pid,
+            exited,
+            width: fields[12].parse()?,
+            height: fields[13].parse()?,
         })
     }
 
@@ -1233,56 +1268,111 @@ impl Engine {
         })
     }
 
-    async fn geometry_for_runtime(
-        &self,
-        runtime: &Runtime,
-        catalog: Option<&CatalogLane>,
-    ) -> Result<GeometryReadback> {
+    async fn geometry_for_runtime(&self, runtime: &Runtime) -> Result<GeometryReadback> {
         let server = self.generation().await?;
         let read = self.geometry(runtime.runtime_id, &runtime.pane_id).await?;
         ensure!(
             !runtime.exited
+                && read.target.pane == runtime.pane_id
                 && Some(read.target.pid) == runtime.pane_pid
                 && read.server == server
                 && read.name == runtime.tmux_name,
             "Terminal identity changed"
         );
-        let id = runtime.runtime_id;
-        let operations = match catalog {
-            Some(lane) => match lane.run(move |db, _| db.by_runtime(&[id])).await {
-                Ok(operations) => operations,
-                Err(_) if read.nonce.is_empty() => Vec::new(),
-                Err(issue) => bail!("Managed terminal catalog unavailable: {issue:?}"),
-            },
-            None => Vec::new(),
-        };
-        if let Some(operation) = operations.first() {
-            let OperationStage::Finished(StoredOutcome::Launched { identity, .. }) =
-                &operation.stage
-            else {
-                bail!("Managed launch is unconfirmed");
-            };
-            let observed = self.observe(operation).await?;
-            ensure!(
-                observed.identity == *identity
-                    && read.server == operation.generation
-                    && (
-                        identity.session.as_str(),
-                        identity.window.as_str(),
-                        identity.pane.as_str(),
-                        identity.pid
-                    ) == (
-                        read.target.session.as_str(),
-                        read.target.window.as_str(),
-                        read.target.pane.as_str(),
-                        read.target.pid
-                    ),
-                "Managed terminal identity changed"
-            );
-        } else {
-            ensure!(read.nonce.is_empty(), "Managed terminal is uncorroborated");
-        }
         Ok(read)
+    }
+
+    async fn terminal_operation(
+        read: &GeometryReadback,
+        catalog: Option<&CatalogLane>,
+    ) -> Result<Option<Operation>, ProductIssue> {
+        let id = read.target.runtime_id;
+        match catalog {
+            Some(lane) => lane
+                .run(move |db, _| db.by_runtime(&[id]))
+                .await
+                .map(|mut operations| operations.pop()),
+            None => Err(ProductIssue::CatalogUnconfigured),
+        }
+    }
+
+    async fn corroborate_terminal(
+        &self,
+        read: &GeometryReadback,
+        nonce: &str,
+    ) -> Result<PaneIdentity> {
+        ensure!(
+            read.nonce
+                .split_once(':')
+                .is_some_and(|(stamp, _)| stamp == nonce),
+            "Managed terminal launch stamp changed"
+        );
+        let evidence = self.observe_pane(&read.name, read.server, nonce).await?;
+        let identity = evidence.identity;
+        let target = &read.target;
+        ensure!(
+            !evidence.exited
+                && identity.session == target.session
+                && identity.window == target.window
+                && identity.pane == target.pane
+                && evidence.pane_pid == Some(target.pid)
+                && process_start(target.pid)? == target.process_start,
+            "Managed terminal identity changed"
+        );
+        Ok(identity)
+    }
+
+    async fn verify_terminal_operation(
+        &self,
+        read: &GeometryReadback,
+        operation: Option<Operation>,
+    ) -> Result<()> {
+        let Some(operation) = operation else {
+            ensure!(read.nonce.is_empty(), "Managed terminal is uncorroborated");
+            return Ok(());
+        };
+        let OperationStage::Finished(StoredOutcome::Launched { identity, .. }) = &operation.stage
+        else {
+            bail!("Managed launch is unconfirmed");
+        };
+        ensure!(
+            read.server == operation.generation
+                && read.name == operation.target
+                && self
+                    .corroborate_terminal(read, &operation.nonce.to_string())
+                    .await?
+                    == *identity,
+            "Managed terminal identity changed"
+        );
+        Ok(())
+    }
+
+    async fn observe_terminal(
+        &self,
+        read: &GeometryReadback,
+        catalog: Option<&CatalogLane>,
+    ) -> Result<()> {
+        match Self::terminal_operation(read, catalog).await {
+            Ok(operation) => self.verify_terminal_operation(read, operation).await,
+            Err(_) => {
+                if let Some((nonce, _)) = read.nonce.split_once(':') {
+                    self.corroborate_terminal(read, nonce).await?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn authorize_terminal_writer(
+        &self,
+        read: &GeometryReadback,
+        catalog: Option<&CatalogLane>,
+    ) -> Result<()> {
+        match Self::terminal_operation(read, catalog).await {
+            Ok(operation) => self.verify_terminal_operation(read, operation).await,
+            Err(_) if read.nonce.is_empty() => Ok(()),
+            Err(issue) => bail!("Managed terminal catalog unavailable: {issue:?}"),
+        }
     }
 
     async fn scoped_geometry(&self, terminal: &TerminalView) -> Result<GeometryReadback> {
@@ -1479,6 +1569,7 @@ impl Engine {
         binding: PasteBinding,
         offset: usize,
         data: Vec<u8>,
+        catalog: Option<&CatalogLane>,
     ) -> PasteResult {
         let runtime = binding.terminal.target.runtime_id;
         let Some(lock) = self.existing_lane(runtime) else {
@@ -1490,6 +1581,14 @@ impl Engine {
         }
         let rejected = match self.scoped_geometry(&binding.terminal).await {
             Err(_) => Some(PasteResult::Stale {}),
+            Ok(read)
+                if self
+                    .authorize_terminal_writer(&read, catalog)
+                    .await
+                    .is_err() =>
+            {
+                Some(PasteResult::Unavailable {})
+            }
             Ok(read) => match read.paste_admission_hold() {
                 Some(PasteAdmission::PriorSendUnknown) => Some(PasteResult::Unknown {}),
                 Some(PasteAdmission::Unavailable) => Some(PasteResult::Unavailable {}),
@@ -1530,7 +1629,12 @@ impl Engine {
         }
     }
 
-    async fn paste_commit(&self, binding: PasteBinding, expected: usize) -> PasteResult {
+    async fn paste_commit(
+        &self,
+        binding: PasteBinding,
+        expected: usize,
+        catalog: Option<&CatalogLane>,
+    ) -> PasteResult {
         let runtime = binding.terminal.target.runtime_id;
         let Some(lock) = self.existing_lane(runtime) else {
             return PasteResult::Stale {};
@@ -1553,6 +1657,13 @@ impl Engine {
         };
         if read.epoch != Some(binding.epoch) {
             return PasteResult::Stale {};
+        }
+        if self
+            .authorize_terminal_writer(&read, catalog)
+            .await
+            .is_err()
+        {
+            return PasteResult::Unavailable {};
         }
         match read.paste_admission_hold() {
             Some(PasteAdmission::PriorSendUnknown) => return self.quarantine(&mut lane, &binding),
@@ -1588,8 +1699,13 @@ impl Engine {
         #[cfg(test)]
         self.paste_test.pause_before_admission().await;
         let current = self.scoped_geometry(&binding.terminal).await.ok();
+        let authorized = match &current {
+            Some(read) => self.authorize_terminal_writer(read, catalog).await.is_ok(),
+            None => false,
+        };
         let exact = current.as_ref().filter(|read| {
-            read.same_pane(&held)
+            authorized
+                && read.same_pane(&held)
                 && read.epoch == held.epoch
                 && read.paste_marker == armed
                 && read.sender_supported
@@ -1681,7 +1797,12 @@ impl Engine {
         .await
     }
 
-    async fn paste_ack(&self, binding: PasteBinding, receipt: Uuid) -> PasteResult {
+    async fn paste_ack(
+        &self,
+        binding: PasteBinding,
+        receipt: Uuid,
+        catalog: Option<&CatalogLane>,
+    ) -> PasteResult {
         let runtime = binding.terminal.target.runtime_id;
         let Some(lock) = self.existing_lane(runtime) else {
             return PasteResult::Stale {};
@@ -1705,6 +1826,10 @@ impl Engine {
             || !read.same_pane(&pending.expected)
             || read.epoch != Some(binding.epoch)
             || read.paste_marker != pending.expected.paste_marker
+            || self
+                .authorize_terminal_writer(&read, catalog)
+                .await
+                .is_err()
         {
             return self.quarantine(&mut lane, &binding);
         }
@@ -1773,7 +1898,7 @@ impl Engine {
         let read_scope = async || match &terminal {
             Some(terminal) => self.scoped_geometry(terminal).await,
             None => {
-                self.geometry_for_runtime(&self.find(runtime_id).await?, catalog)
+                self.geometry_for_runtime(&self.find(runtime_id).await?)
                     .await
             }
         };
@@ -1792,6 +1917,7 @@ impl Engine {
             Some(read) => read,
             None => read_scope().await?,
         };
+        self.authorize_terminal_writer(&read, catalog).await?;
         if let Some(hold) = read.paste_admission_hold() {
             return Ok(control_recovering(hold));
         }
@@ -1872,6 +1998,7 @@ impl Engine {
         token: Uuid,
         sequence: u64,
         size: TerminalSize,
+        catalog: Option<&CatalogLane>,
     ) -> Result<Response> {
         ensure!(
             size.supported(),
@@ -1902,6 +2029,7 @@ impl Engine {
                     ),
             "Resize authority unavailable"
         );
+        self.authorize_terminal_writer(&read, catalog).await?;
         let revision = read.committed.revision + 1;
         ensure!(revision <= MAX_REVISION, "Terminal revision exhausted");
         self.owners()
@@ -1951,6 +2079,7 @@ impl Engine {
         lane: &ResizeLane,
         runtime: Uuid,
         token: Uuid,
+        catalog: Option<&CatalogLane>,
     ) -> Result<GeometryReadback> {
         let (target, epoch) = lane.confirmed.as_ref().context("Керування втрачено")?;
         ensure!(
@@ -1962,6 +2091,7 @@ impl Engine {
             read.target == *target && read.epoch == Some(*epoch),
             "Input target changed"
         );
+        self.authorize_terminal_writer(&read, catalog).await?;
         Ok(read)
     }
 
@@ -2061,8 +2191,9 @@ impl Engine {
             } => {
                 ensure!(!view_id.is_nil(), "Invalid terminal view");
                 let read = self
-                    .geometry_for_runtime(&self.find(runtime_id).await?, catalog)
+                    .geometry_for_runtime(&self.find(runtime_id).await?)
                     .await?;
+                self.observe_terminal(&read, catalog).await?;
                 let terminal = TerminalView {
                     target: read.target.clone(),
                     agent_epoch: self.agent_epoch,
@@ -2087,6 +2218,9 @@ impl Engine {
                 if read.target != terminal.target || terminal.view_id.is_nil() {
                     return Ok(Response::TerminalChanged {});
                 }
+                if self.observe_terminal(&read, catalog).await.is_err() {
+                    return Ok(Response::TerminalChanged {});
+                }
                 let sample = self.sample_provider(&read).await.ok();
                 Ok(Response::TerminalStatus {
                     status: read.status(terminal, sample),
@@ -2097,7 +2231,10 @@ impl Engine {
                 token,
                 sequence,
                 size,
-            } => self.resize_terminal(terminal, token, sequence, size).await,
+            } => {
+                self.resize_terminal(terminal, token, sequence, size, catalog)
+                    .await
+            }
             Request::Renew { runtime_id, token } => {
                 let lock = self
                     .existing_lane(runtime_id)
@@ -2106,7 +2243,9 @@ impl Engine {
                 if lane.pending_paste.is_some() || lane.paste_quarantined {
                     return Ok(control_hold());
                 }
-                let checked = self.writer_geometry(&lane, runtime_id, token).await;
+                let checked = self
+                    .writer_geometry(&lane, runtime_id, token, catalog)
+                    .await;
                 if let Err(error) = checked {
                     self.owners().release(runtime_id, token);
                     return Err(error);
@@ -2144,13 +2283,13 @@ impl Engine {
                 offset,
                 data,
             } => Ok(Response::Paste {
-                paste: self.paste_stage(binding, offset, data).await,
+                paste: self.paste_stage(binding, offset, data, catalog).await,
             }),
             Request::PasteCommit { binding, bytes } => Ok(Response::Paste {
-                paste: self.paste_commit(binding, bytes).await,
+                paste: self.paste_commit(binding, bytes, catalog).await,
             }),
             Request::PasteAck { binding, receipt } => Ok(Response::Paste {
-                paste: self.paste_ack(binding, receipt).await,
+                paste: self.paste_ack(binding, receipt, catalog).await,
             }),
             Request::Input {
                 runtime_id,
@@ -2173,7 +2312,9 @@ impl Engine {
                 if lane.pending_paste.is_some() || lane.paste_quarantined {
                     return Ok(control_hold());
                 }
-                let read = self.writer_geometry(&lane, runtime_id, token).await?;
+                let read = self
+                    .writer_geometry(&lane, runtime_id, token, catalog)
+                    .await?;
                 if let Some(hold) = read.paste_admission_hold() {
                     return Ok(control_recovering(hold));
                 }
