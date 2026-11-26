@@ -546,7 +546,6 @@ def check_recovery(attempt, identity, expected, started_fresh, recovery_prefix):
             if before_hex == retained_hex and before_count == retained_count and not extra_event:
                 observed_input += (tuple(before["eventLengths"]), tuple(retained["eventLengths"]))
             raise MeasuredFailure("retained native bytes or events changed", observed_input)
-        # Action 1 and the bound old snapshots establish the read. The capture flag confirms delivery.
         if attempt.get("capture_error") is False:
             measured(before_hex == expected, "initial bytes differ from the manifest", before_hex)
     restart = obj(old.get("restart"), "foreground restart observation")
@@ -628,7 +627,6 @@ def evaluate_attempt(attempt, case, cohort, qualification):
         except MeasuredFailure:
             raise
         except EvidenceError as error:
-            # The shorter order is eligible only through a corroborated failed restart.
             if recovery_prefix:
                 raise
             capture_issue = error
@@ -823,7 +821,6 @@ def assess_cohort(cohort, role, cases, ids):
     need(records.keys() <= {attempt["id"] for attempt in attempts}, "retained measurement has no submitted attempt")
     bound_positions = measurement_positions(attempts, records)
     moved = moved_attempts(attempts, bound_positions)
-    # Retained records place holds even if their submitted rows cannot be evaluated.
     ordered = sorted((attempt for attempt in attempts if attempt["id"] in records),
                      key=lambda attempt: records[attempt["id"]][:2])
     unpositioned = [attempt for attempt in attempts if attempt["id"] not in records]

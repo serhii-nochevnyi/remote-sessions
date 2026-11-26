@@ -608,7 +608,6 @@ class EvidenceTest(unittest.TestCase):
                             row.clear()
                             row.update(copy.deepcopy(saved))
                             restart = row["recovery"]["restart"]
-                            # A separate observation cannot qualify an unproven action prefix.
                             row["replayed"] = True
                             mutate()
                             self.reject(failed, reason)
@@ -772,11 +771,9 @@ class EvidenceTest(unittest.TestCase):
         support.remove(early["id"])
         early.pop("launch_ref")
         mark(early, "inconclusive")
-        # Submitted placement cannot move the early hold after the two retained passes.
         attempts.append(attempts.pop(0))
         self.validate(report, "pass")
 
-        # Conflicting claims cannot count or affect the bound rows' native identity and restart checks.
         early.update(launch_ref="conflicting capture", attemptId=later[0]["attemptId"],
                      generation=later[0]["generation"], recovery=copy.deepcopy(later[0]["recovery"]))
         self.validate(report, "pass")
@@ -983,7 +980,6 @@ class EvidenceTest(unittest.TestCase):
                 recovery = row["recovery"]
                 recovery["before"] = native(recovery["restart"]["previous"], "")
                 recovery["retained"] = recovery["before"].copy()
-                # Retain the legacy full-order baseline, alongside a truthful corrected prefix.
                 if cohort is corrected:
                     row["action_order"] = [1, 2]
                 restart_without_fresh_attempt(cohort, row, "same-generation")
