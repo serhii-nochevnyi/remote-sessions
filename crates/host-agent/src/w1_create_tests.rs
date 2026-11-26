@@ -1,9 +1,13 @@
 use super::*;
 use crate::{
     catalog::{Operation, OperationStage, ServerGeneration},
-    model::{CreateState, PaneLiveness, ProviderProfile, RuntimeOrigin, tmux_name},
+    model::{
+        CreateState, ObservationState, PaneLiveness, PasteBinding, PasteResult, ProviderProfile,
+        RuntimeOrigin, TerminalSize, TerminalStatus, tmux_name,
+    },
     product_launch::{LAUNCH_COMMAND, LaunchGuard, NONCE_ENV, read_setup_fault},
 };
+use std::io::{Error, ErrorKind};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -14,11 +18,46 @@ token=""
 if test -f generation; then token=$(cat generation); fi
 case "$4" in
   display-message)
+    if test "${6-}" = -t; then
+      for name in $(cat names); do
+        IFS='|' read -r session window pane pid < "$name.pane"
+        if test "$pane" != "$7"; then continue; fi
+        nonce=$(cat "$name.nonce")
+        stamp=$(cat "$name.stamp")
+        epoch=$(cat epoch 2>/dev/null || :)
+        launch=$(cat paste-launch 2>/dev/null || :)
+        marker=$(cat marker 2>/dev/null || :)
+        printf '42|100|%s|%s|%s|0|0|%s:%s|%s|1|1|manual|%s|100|30|100|30|%s||%s|%s|0|1\n' \
+          "$token" "$(cat "$name.pane")" "$name" "$nonce" "$stamp" "$(cat "$name.dead")" \
+          "$(cat tty)" "$epoch" "$launch" "$marker"
+        exit 0
+      done
+      exit 1
+    fi
     printf '42|100|%s\n' "$token"
     if test "$#" -gt 6; then
       if test -f names; then cat names; fi
     fi ;;
   if-shell)
+    if test "$6" = -t; then
+      case "$9" in
+        'set-option -p -o -t '*' @rs_paste_launch '*)
+          printf '%s\n' "$9" | awk '{print $7}' > paste-launch
+          printf '%s\n' "$9" | awk '{for(i=1;i<NF;i++) if ($i=="@rs_paste_admission") print $(i+1)}' > marker ;;
+        'set-option -p '*' @rs_resize_epoch '*)
+          printf '%s\n' "$9" | awk '{for(i=1;i<NF;i++) if ($i=="@rs_resize_epoch") print $(i+1)}' > epoch
+          printf '%s\n' "$9" | awk '{for(i=1;i<NF;i++) if ($i=="@rs_paste_admission") print $(i+1)}' > marker
+          printf 'rs-fenced\n' ;;
+        'resize-window '*)
+          printf '%s\n' "$9" >> resizes
+          printf 'rs-committed\n' ;;
+        'send-keys '*)
+          printf '%s\n' "$9" >> inputs
+          printf 'rs-input-accepted\n' ;;
+        *) printf '%s\n' "$9" >> unexpected-terminal-mutations; exit 1 ;;
+      esac
+      exit 0
+    fi
     case "$7" in
       'set-option -s @rs_create_generation '*)
         test -z "$token"
@@ -42,7 +81,9 @@ case "$4" in
         count=$(wc -l < dispatched | tr -d ' ')
         printf '%s\n' "$name" >> names
         printf '%s\n' "$nonce" > "$name.nonce"
-        printf '$%s|@%s|%%%s|%s\n' "$count" "$count" "$count" "$((300 + count))" > "$name.pane"
+        pid=$((300 + count))
+        if test -f pane-pid; then pid=$(cat pane-pid); fi
+        printf '$%s|@%s|%%%s|%s\n' "$count" "$count" "$count" "$pid" > "$name.pane"
         tr '|' ':' < "$name.pane" > "$name.stamp"
         printf '0\n' > "$name.dead"
         receipt=$(cat "$name.pane")
@@ -71,6 +112,20 @@ case "$4" in
       IFS='|' read -r session window pane pid < "$name.pane"
       printf '%s\t%s\t%s\t%s\t100\t30\tfixture\n' "$name" "$pane" "$pid" "$(cat "$name.dead")"
     done ;;
+  list-commands)
+    printf 'paste-buffer [-dprS]\nload-buffer path\n' ;;
+  load-buffer)
+    printf 'load\n' >> buffer-loads
+    cat > buffer ;;
+  save-buffer)
+    cat buffer ;;
+  delete-buffer)
+    rm buffer ;;
+  capture-pane)
+    test "$6" = -t
+    name=$(cat names)
+    test "$7" = "=$name:0.0"
+    cat output ;;
   *) exit 1 ;;
 esac
 "#;
@@ -110,24 +165,58 @@ impl Fixture {
     }
 
     async fn serve(&self, lane: CatalogLane) -> JoinHandle<Result<()>> {
+        self.serve_engine(self.engine(), lane).await
+    }
+
+    fn engine(&self) -> Engine {
+        Engine::new(self.root.join("tmux"), self.root.join("tmux.sock"))
+    }
+
+    async fn serve_engine(&self, engine: Engine, lane: CatalogLane) -> JoinHandle<Result<()>> {
         let job = tokio::spawn(serve_local(
-            self.root.clone(),
-            self.root.join("tmux"),
+            engine,
+            Arc::new(AgentLock::acquire(&self.root).unwrap()),
             Some(lane),
         ));
+        self.wait_listening(&job).await;
+        job
+    }
+
+    async fn wait_listening(&self, job: &JoinHandle<Result<()>>) {
         tokio::time::timeout(Duration::from_secs(3), async {
-            while !self.root.join("agent.sock").exists() {
-                assert!(!job.is_finished());
+            loop {
+                assert!(!job.is_finished(), "fixture agent stopped before readiness");
+                match request(&self.root, &Request::Health {}).await {
+                    Ok(Response::Health {
+                        agent_pid,
+                        remote_execution_enabled: false,
+                    }) if agent_pid == std::process::id() => return,
+                    Ok(response) => {
+                        panic!("unexpected fixture agent health response: {response:?}")
+                    }
+                    Err(error)
+                        if error.downcast_ref::<Error>().is_some_and(|cause| {
+                            matches!(
+                                cause.kind(),
+                                ErrorKind::NotFound | ErrorKind::ConnectionRefused
+                            )
+                        }) => {}
+                    Err(error) => panic!("fixture agent health request failed: {error:#}"),
+                }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .unwrap();
-        job
+        .expect("fixture agent did not answer health within three seconds");
     }
 
     async fn restart(&self, job: JoinHandle<Result<()>>) -> JoinHandle<Result<()>> {
         stop(job).await;
+        self.wait_catalog_released().await;
+        self.serve(self.lane()).await
+    }
+
+    async fn wait_catalog_released(&self) {
         let file = File::open(self.catalog.join("catalog.lock")).unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
             while file.try_lock().is_err() {
@@ -136,8 +225,6 @@ impl Fixture {
         })
         .await
         .unwrap();
-        drop(file);
-        self.serve(self.lane()).await
     }
 
     async fn register(&self) -> Uuid {
@@ -214,12 +301,424 @@ async fn stop(job: JoinHandle<Result<()>>) {
     assert!(job.await.unwrap_err().is_cancelled());
 }
 
+fn observation_pty() -> (File, File, String) {
+    use nix::libc;
+    use std::{
+        ffi::CStr,
+        os::fd::{AsRawFd, FromRawFd},
+    };
+
+    let (mut master, mut slave) = (-1, -1);
+    let mut size = libc::winsize {
+        ws_col: 100,
+        ws_row: 30,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let result = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &raw mut size,
+        )
+    };
+    assert_eq!(result, 0);
+    let (master, slave) = unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
+    let mut tty = [0; 128];
+    assert_eq!(
+        unsafe { libc::ttyname_r(slave.as_raw_fd(), tty.as_mut_ptr(), tty.len()) },
+        0
+    );
+    let tty = unsafe { CStr::from_ptr(tty.as_ptr()) }
+        .to_str()
+        .unwrap()
+        .to_owned();
+    (master, slave, tty)
+}
+
 fn create(key: Uuid, workspace_id: Uuid, reservation: Option<Uuid>) -> ProductRequest {
     ProductRequest::CreateManaged {
         key,
         workspace_id,
         profile: ProviderProfile::Codex,
         reservation,
+    }
+}
+
+#[tokio::test]
+async fn w1_create_catalog_fault_read_only() {
+    let fixture = Fixture::new();
+    let (_master, _slave, tty) = observation_pty();
+    fixture.set("tty", tty);
+    fixture.set("pane-pid", std::process::id().to_string());
+    let local = async |message| request(&fixture.root, &message).await.unwrap();
+    let read = |path| fs::read_to_string(fixture.root.join(path)).unwrap();
+    let lane = fixture.lane();
+    let job = fixture
+        .serve_engine(fixture.engine().with_fixture_sender(), lane.clone())
+        .await;
+    let workspace_id = fixture.register().await;
+    let CreateState::Confirmed {
+        outcome,
+        current: PaneLiveness::Live,
+        ..
+    } = fixture
+        .call(&create(Uuid::new_v4(), workspace_id, None))
+        .await
+    else {
+        panic!("fixture did not create a live pane");
+    };
+    let runtime = outcome.runtime;
+    let runtime_id = runtime.runtime_id;
+    let original_size = TerminalSize {
+        cols: 100,
+        rows: 30,
+    };
+    let open = async || -> TerminalStatus {
+        let response = local(Request::OpenTerminal {
+            runtime_id,
+            view_id: Uuid::new_v4(),
+        })
+        .await;
+        let Response::TerminalOpened { status } = response else {
+            panic!("managed observation unavailable: {response:?}");
+        };
+        status
+    };
+    let before = open().await;
+    assert_eq!(before.observation, ObservationState::Observed);
+    assert_eq!(before.provider.unwrap().size, original_size);
+    let target = &before.terminal.target;
+    assert_eq!(target.runtime_id, runtime_id);
+    assert_eq!(target.generation.to_string(), read("generation").trim());
+    assert_eq!(
+        (&*target.session, &*target.window, &*target.pane),
+        ("$1", "@1", "%1")
+    );
+    assert_eq!(target.pid, std::process::id());
+    assert!(target.process_start > 0);
+    let acquire = || Request::AcquireTerminal {
+        terminal: before.terminal.clone(),
+    };
+    let response = local(acquire()).await;
+    let Response::TerminalControl { token, epoch } = response else {
+        panic!("healthy pane did not grant control: {response:?}");
+    };
+    let binding = PasteBinding {
+        terminal: before.terminal.clone(),
+        token,
+        epoch,
+        incarnation: Uuid::new_v4(),
+        operation: 1,
+        sequence: 0,
+    };
+    let ordinary = |token| Request::Input {
+        runtime_id,
+        token,
+        sequence: 0,
+        data: b"x".to_vec(),
+        paste: false,
+    };
+    let release = |token| Request::Release { runtime_id, token };
+    let stage = Request::PasteStage {
+        binding: binding.clone(),
+        offset: 0,
+        data: b"x".to_vec(),
+    };
+    assert!(matches!(
+        local(stage).await,
+        Response::Paste {
+            paste: PasteResult::Staged {}
+        }
+    ));
+
+    let path = fixture.catalog.join("catalog.sqlite3");
+    let retained = fixture.catalog.join("retained.sqlite3");
+    fs::rename(&path, &retained).unwrap();
+    let blocked_key = Uuid::new_v4();
+    assert_eq!(
+        fixture.call(&create(blocked_key, workspace_id, None)).await,
+        CreateState::Unknown {
+            issue: Some(ProductIssue::CatalogMissing)
+        }
+    );
+    let Response::TerminalStatus { status } = local(Request::TerminalStatus {
+        terminal: before.terminal.clone(),
+    })
+    .await
+    else {
+        panic!("current observer lost status");
+    };
+    assert_eq!(status.terminal, before.terminal);
+    assert_eq!(status.provider.unwrap().size, original_size);
+    let fault = open().await;
+    assert_eq!(&fault.terminal.target, target);
+    assert_eq!(fault.committed, status.committed);
+    assert_eq!(fault.observation, ObservationState::Observed);
+    let mut stale = fault.terminal;
+    stale.target.process_start += 1;
+    assert!(matches!(
+        local(Request::TerminalStatus { terminal: stale }).await,
+        Response::TerminalChanged {}
+    ));
+    let Response::Runtimes { runtimes } = local(Request::List {}).await else {
+        panic!("managed pane missing from inventory");
+    };
+    assert_eq!(runtimes.len(), 1);
+    assert_eq!(
+        (runtimes[0].session_id, runtimes[0].runtime_id),
+        (runtime.session_id, runtime_id)
+    );
+    assert_eq!(
+        (runtimes[0].workspace_id, runtimes[0].operation_id),
+        (None, None)
+    );
+    for frame in ["first frame\n", "next frame\n"] {
+        fixture.set("output", frame);
+        let Response::Snapshot { text } = local(Request::Snapshot { runtime_id }).await else {
+            panic!("pane output unavailable");
+        };
+        assert_eq!(text, frame);
+    }
+
+    let resize = Request::ResizeTerminal {
+        terminal: before.terminal.clone(),
+        token,
+        sequence: 0,
+        size: TerminalSize {
+            cols: 117,
+            rows: 39,
+        },
+    };
+    let marker = read("marker");
+    let epoch = read("epoch");
+    for mutation in [resize, ordinary(token)] {
+        let response = local(mutation).await;
+        assert!(
+            matches!(&response, Response::Error { message } if message == "Managed terminal catalog unavailable: CatalogMissing"),
+            "{response:?}"
+        );
+    }
+    let commit = Request::PasteCommit { binding, bytes: 1 };
+    assert!(matches!(
+        local(commit).await,
+        Response::Paste {
+            paste: PasteResult::Unavailable {}
+        }
+    ));
+    assert!(matches!(local(release(token)).await, Response::Accepted {}));
+    for mutation in [acquire(), Request::Acquire { runtime_id }] {
+        let response = local(mutation).await;
+        assert!(
+            matches!(&response, Response::Error { message } if message == "Managed terminal catalog unavailable: CatalogMissing"),
+            "{response:?}"
+        );
+    }
+    assert_eq!(read("marker"), marker);
+    assert_eq!(read("epoch"), epoch);
+    assert_eq!(read("buffer-loads"), "load\n");
+    for effect in ["resizes", "inputs", "unexpected-terminal-mutations"] {
+        assert!(!fixture.root.join(effect).exists());
+    }
+    assert_eq!(fixture.dispatches(), 1);
+
+    fs::rename(&retained, &path).unwrap();
+    drop(lane);
+    stop(job).await;
+    fixture.wait_catalog_released().await;
+    let lane = fixture.lane();
+    let job = fixture
+        .serve_engine(fixture.engine().with_fixture_sender(), lane.clone())
+        .await;
+    let restored = open().await;
+    assert_eq!(&restored.terminal.target, target);
+    assert!(matches!(
+        fixture.status(blocked_key).await,
+        CreateState::Absent {}
+    ));
+    let restored_acquire = || Request::AcquireTerminal {
+        terminal: restored.terminal.clone(),
+    };
+    let response = local(restored_acquire()).await;
+    let Response::TerminalControl {
+        token: restored_token,
+        ..
+    } = response
+    else {
+        panic!("restored pane did not grant control: {response:?}");
+    };
+    assert_ne!(restored_token, token);
+    assert!(matches!(
+        local(Request::Acquire { runtime_id }).await,
+        Response::Error { .. }
+    ));
+    assert!(matches!(
+        local(ordinary(token)).await,
+        Response::Error { .. }
+    ));
+    assert!(matches!(
+        local(ordinary(restored_token)).await,
+        Response::Accepted {}
+    ));
+    assert_eq!(read("inputs").lines().count(), 1);
+    assert!(matches!(
+        local(release(restored_token)).await,
+        Response::Accepted {}
+    ));
+    let Response::Control { token: cli_token } = local(Request::Acquire { runtime_id }).await
+    else {
+        panic!("restored pane did not grant command line control");
+    };
+    assert!(matches!(
+        local(release(cli_token)).await,
+        Response::Accepted {}
+    ));
+
+    let changed_generation = serde_json::to_string(&ServerGeneration {
+        pid: 42,
+        start: 100,
+        token: Uuid::new_v4(),
+    })
+    .unwrap();
+    lane.run(move |db, _| {
+        assert_eq!(
+            db.connection_for_test()
+                .execute(
+                    "UPDATE runtime_attempts SET generation = ?1 WHERE id = ?2",
+                    rusqlite::params![changed_generation, runtime_id.to_string()],
+                )
+                .unwrap(),
+            1
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let readiness = ProductRequest::WorkspaceReadiness {
+        workspace_id,
+        profile: ProviderProfile::Codex,
+    };
+    assert_eq!(
+        product_request(&fixture.root, &readiness).await.unwrap(),
+        ProductResponse::Ready {}
+    );
+    for mutation in [
+        Request::OpenTerminal {
+            runtime_id,
+            view_id: Uuid::new_v4(),
+        },
+        restored_acquire(),
+        Request::Acquire { runtime_id },
+    ] {
+        let response = local(mutation).await;
+        assert!(
+            matches!(&response, Response::Error { message } if message == "Managed terminal identity changed"),
+            "{response:?}"
+        );
+    }
+    let mismatched_view = Request::TerminalStatus {
+        terminal: restored.terminal,
+    };
+    assert!(matches!(
+        local(mismatched_view).await,
+        Response::TerminalChanged {}
+    ));
+    assert_eq!(fixture.dispatches(), 1);
+    stop(job).await;
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn w1_create_state_guard_precedes_catalog() {
+    use tokio::sync::oneshot;
+
+    async fn start(
+        fixture_start: bool,
+        root: PathBuf,
+        catalog: PathBuf,
+        on_catalog: impl FnOnce() + Send + 'static,
+    ) -> Result<()> {
+        let tmux = root.join("tmux");
+        let path = root.clone();
+        if fixture_start {
+            serve_catalog_fixture_with(root, tmux, catalog, path.as_os_str(), move |directory| {
+                on_catalog();
+                catalog::provision(directory)
+            })
+            .await
+        } else {
+            serve_with_catalog_directory(
+                root,
+                tmux,
+                move || {
+                    on_catalog();
+                    Ok(catalog)
+                },
+                ServiceProfiles::new(Some(path.as_os_str())),
+            )
+            .await
+        }
+    }
+
+    for fixture_wins in [false, true] {
+        let fixture = Fixture::new();
+        let catalog = if fixture_wins {
+            fixture.root.join("unprovisioned")
+        } else {
+            fixture.catalog.clone()
+        };
+        let (reached, pending) = oneshot::channel();
+        let (release, resume) = std::sync::mpsc::sync_channel(1);
+        let winner = tokio::spawn(start(
+            fixture_wins,
+            fixture.root.clone(),
+            catalog.clone(),
+            move || {
+                reached.send(()).unwrap();
+                resume.recv_timeout(Duration::from_secs(5)).unwrap();
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(3), pending)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (opened, loser_work) = oneshot::channel();
+        let loser = start(!fixture_wins, fixture.root.clone(), catalog, move || {
+            let _ = opened.send(());
+        })
+        .await;
+        assert!(
+            loser
+                .unwrap_err()
+                .to_string()
+                .contains("another agent already owns this state directory")
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), loser_work)
+                .await
+                .unwrap()
+                .is_err(),
+            "a losing start attempted catalog work"
+        );
+        release.send(()).unwrap();
+        fixture.wait_listening(&winner).await;
+        let workspace = fixture.register().await;
+        assert_eq!(
+            product_request(
+                &fixture.root,
+                &ProductRequest::WorkspaceReadiness {
+                    workspace_id: workspace,
+                    profile: ProviderProfile::Codex,
+                }
+            )
+            .await
+            .unwrap(),
+            ProductResponse::Ready {}
+        );
+        stop(winner).await;
     }
 }
 

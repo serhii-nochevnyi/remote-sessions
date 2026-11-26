@@ -15,6 +15,7 @@ use nix::unistd::geteuid;
 use product_launch::ServiceProfiles;
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
+    cell::Cell,
     fs::{self, File, OpenOptions},
     os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -183,16 +184,35 @@ async fn exchange_on<T: Serialize, R: DeserializeOwned>(
 }
 
 pub async fn serve(directory: PathBuf, tmux: PathBuf) -> Result<()> {
-    serve_local(directory, tmux, None).await
+    let guard = Arc::new(AgentLock::acquire(&directory)?);
+    serve_local(Engine::new(tmux, directory.join("tmux.sock")), guard, None).await
 }
 
 pub async fn serve_with_catalog(directory: PathBuf, tmux: PathBuf, catalog: PathBuf) -> Result<()> {
     let service_path = std::env::var_os("PATH");
-    let lane = CatalogLane::start(
+    serve_with_catalog_directory(
+        directory,
+        tmux,
         move || product_catalog_directory(&catalog),
         ServiceProfiles::new(service_path.as_deref()),
-    );
-    serve_local(directory, tmux, Some(lane)).await
+    )
+    .await
+}
+
+async fn serve_with_catalog_directory(
+    directory: PathBuf,
+    tmux: PathBuf,
+    open_directory: impl FnOnce() -> Result<PathBuf> + Send + 'static,
+    profiles: ServiceProfiles,
+) -> Result<()> {
+    let guard = Arc::new(AgentLock::acquire(&directory)?);
+    let lane = start_catalog_worker(&guard, open_directory, profiles);
+    serve_local(
+        Engine::new(tmux, directory.join("tmux.sock")),
+        guard,
+        Some(lane),
+    )
+    .await
 }
 
 #[cfg(debug_assertions)]
@@ -203,12 +223,48 @@ pub async fn serve_catalog_fixture(
     catalog: PathBuf,
     service_path: &std::ffi::OsStr,
 ) -> Result<()> {
-    catalog::provision(&catalog).map_err(|issue| anyhow::anyhow!("fixture catalog: {issue:?}"))?;
-    let lane = CatalogLane::start(
+    serve_catalog_fixture_with(directory, tmux, catalog, service_path, catalog::provision).await
+}
+
+#[cfg(debug_assertions)]
+async fn serve_catalog_fixture_with(
+    directory: PathBuf,
+    tmux: PathBuf,
+    catalog: PathBuf,
+    service_path: &std::ffi::OsStr,
+    provision: impl FnOnce(&Path) -> Result<(), ProductIssue>,
+) -> Result<()> {
+    let guard = Arc::new(AgentLock::acquire(&directory)?);
+    provision(&catalog).map_err(|issue| anyhow::anyhow!("fixture catalog: {issue:?}"))?;
+    let lane = start_catalog_worker(
+        &guard,
         move || Ok(catalog),
         ServiceProfiles::new(Some(service_path)),
     );
-    serve_local(directory, tmux, Some(lane)).await
+    serve_local(
+        Engine::new(tmux, directory.join("tmux.sock")),
+        guard,
+        Some(lane),
+    )
+    .await
+}
+
+fn start_catalog_worker(
+    guard: &Arc<AgentLock>,
+    open_directory: impl FnOnce() -> Result<PathBuf> + Send + 'static,
+    profiles: ServiceProfiles,
+) -> CatalogLane {
+    let guard = Arc::clone(guard);
+    CatalogLane::start(
+        move || {
+            thread_local! {
+                static AGENT_LOCK: Cell<Option<Arc<AgentLock>>> = const { Cell::new(None) };
+            }
+            AGENT_LOCK.set(Some(guard));
+            open_directory()
+        },
+        profiles,
+    )
 }
 
 async fn dispatch(
@@ -269,14 +325,13 @@ async fn dispatch(
 }
 
 async fn serve_local(
-    directory: PathBuf,
-    tmux: PathBuf,
+    engine: Engine,
+    guard: Arc<AgentLock>,
     catalog: Option<CatalogLane>,
 ) -> Result<()> {
-    let guard = AgentLock::acquire(&directory)?;
     let listener = UnixListener::bind(&guard.socket)?;
     fs::set_permissions(&guard.socket, fs::Permissions::from_mode(0o600))?;
-    let engine = Arc::new(Engine::new(tmux, directory.join("tmux.sock")));
+    let engine = Arc::new(engine);
     let creations = Arc::new(Mutex::new(()));
     let permits = Arc::new(Semaphore::new(16));
     let mut jobs = JoinSet::new();
@@ -312,6 +367,8 @@ async fn serve_local(
     jobs.abort_all();
     while jobs.join_next().await.is_some() {}
     // Deliberately no tmux/session stop: the separate service owns all runtimes.
+    drop(listener);
+    drop(catalog);
     drop(guard);
     Ok(())
 }
@@ -397,11 +454,12 @@ mod tests {
         );
         let search = std::env::join_paths([Path::new("."), root]).unwrap();
         let fixture_catalog = catalog_dir.clone();
-        let lane = CatalogLane::start(
+        let mut server = tokio::spawn(serve_with_catalog_directory(
+            root.to_owned(),
+            tmux,
             move || Ok(fixture_catalog),
             ServiceProfiles::new(Some(&search)),
-        );
-        let mut server = tokio::spawn(serve_local(root.to_owned(), tmux, Some(lane)));
+        ));
         tokio::time::timeout(Duration::from_secs(2), async {
             while !root.join("agent.sock").exists() {
                 if server.is_finished() {
