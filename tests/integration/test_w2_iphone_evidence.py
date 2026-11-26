@@ -1231,6 +1231,62 @@ class EvidenceTest(unittest.TestCase):
                         self.reject(report, f"{row['id']}: expected inconclusive .*{diagnostic}")
                         self.assert_correction_is_incomplete(report, row)
 
+    def test_cross_build_recording_windows_apply_across_launch_and_measurement_refs(self):
+        original, _ = self.correction_fixture()
+        for donor_role, recipient_role in (
+            ("baseline", "corrected"), ("baseline", "comparison"), ("corrected", "comparison"),
+        ):
+            for earlier_is_launch in (True, False):
+                for segment in ("missing", "overlapping", "adjacent"):
+                    with self.subTest(donor=donor_role, recipient=recipient_role,
+                                      earlier_is_launch=earlier_is_launch, segment=segment):
+                        report = copy.deepcopy(original)
+                        correction_support = report["decision"]["supporting_attempt_ids"].copy()
+                        recipient = report["cohorts"]["corrected"]
+                        if recipient_role == "comparison":
+                            recipient = native_cohort()
+                            self.add_comparison(report, recipient)
+                        row = recipient["attempts"][-1]
+                        launch = recipient["launches"][-1]
+                        if recipient_role == "comparison" and not earlier_is_launch:
+                            remove_attempts(recipient, row)
+                            launch = start_launch(recipient)
+                            retain_measurement(recipient, row)
+                            recipient["attempts"].append(row)
+                        donor = report["cohorts"][donor_role]
+                        if earlier_is_launch:
+                            earlier = donor["launches"][0]
+                            later, field = retained_record(recipient, row), "ref"
+                        else:
+                            earlier = retained_record(donor, donor["attempts"][0])
+                            later, field = launch, "launch_ref"
+                        later["ref"] = row[field] = earlier["ref"]
+                        if segment != "missing":
+                            earlier["capture_segment"] = {"start_ms": 0, "end_ms": 100}
+                            later["capture_segment"] = {
+                                "start_ms": 100 if segment == "adjacent" else 99, "end_ms": 200,
+                            }
+                        if segment == "adjacent":
+                            self.validate(report, "failing")
+                        else:
+                            self.reject(report, f"{row['id']}: expected inconclusive .*shared launch and measurement")
+                            if recipient_role == "corrected":
+                                self.assert_correction_is_incomplete(report, row)
+                            else:
+                                mark(row, "inconclusive")
+                                self.assert_comparison_uses_only_correction(report, correction_support)
+
+    def test_same_signed_launch_context_can_overlap_its_distinct_measurement_windows(self):
+        report, _ = self.correction_fixture()
+        launch = self.baseline["launches"][0]
+        launch["capture_segment"] = {"start_ms": 0, "end_ms": 200}
+        for index, row in enumerate(self.baseline["attempts"]):
+            row["ref"] = launch["ref"]
+            retained_record(self.baseline, row).update(
+                ref=launch["ref"], capture_segment={"start_ms": index * 100, "end_ms": (index + 1) * 100},
+            )
+        self.validate(report, "failing")
+
     def test_each_cohort_holds_missing_or_wrong_retained_source_and_bundle(self):
         original, corrected = self.correction_fixture()
         first, second = self.baseline["attempts"]

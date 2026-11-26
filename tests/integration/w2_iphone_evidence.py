@@ -919,10 +919,18 @@ class MeasuredCaptures:
         need(all(previous_pair == pair or disjoint_segments(previous_window, launch_window)
                  for previous_pair, previous_window in launch_captures),
              "shared launch recording across signed builds requires disjoint capture segments")
-        need(all(disjoint_segments(previous_window, observation_window) for previous_window in observations),
+        need(all(disjoint_segments(previous_window, observation_window)
+                 for _, previous_window in observations),
              "shared measured observation requires disjoint capture segments")
+        for window, previous_captures in (
+            (launch_window, self.observations.get(launch_ref, ())),
+            (observation_window, self.launches.get(observation_ref, ())),
+        ):
+            need(all(previous_pair == pair or disjoint_segments(previous_window, window)
+                     for previous_pair, previous_window in previous_captures),
+                 "shared launch and measurement recording across signed builds requires disjoint capture segments")
         self.launches.setdefault(launch_ref, set()).add((pair, launch_window))
-        self.observations.setdefault(observation_ref, []).append(observation_window)
+        self.observations.setdefault(observation_ref, []).append((pair, observation_window))
 
 
 def moved_attempts(attempts, positions):
