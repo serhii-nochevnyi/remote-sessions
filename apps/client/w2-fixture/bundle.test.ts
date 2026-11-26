@@ -1,27 +1,27 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { build } from "vite";
 
 const configFile = fileURLToPath(new URL("./vite.config.ts", import.meta.url));
 const desktopModule = fileURLToPath(new URL("../src/session-state.ts", import.meta.url));
-const repoRoot = fileURLToPath(new URL("../../../", import.meta.url));
+const nodeModules = fileURLToPath(new URL("../../../node_modules", import.meta.url));
 
 test("guarded bundle rejects desktop modules and external assets", async () => {
   const root = mkdtempSync(join(tmpdir(), "w2-bundle-"));
   const write = (name: string, source: string) => writeFileSync(join(root, name), source);
-  symlinkSync(join(repoRoot, "node_modules"), join(root, "node_modules"), "dir");
   const html = '<!doctype html><style>body { color: black; }</style>'
     + '<img src="./marker.svg"><script type="module" src="./entry.tsx"></script>';
   const entry = 'import "./local.css"; document.body.dataset.fixture = "local-control";';
   const bundle = () => build({
-    configFile, root, logLevel: "silent", build: { write: false },
+    configFile, configLoader: "native", root, logLevel: "silent", build: { write: false },
   });
 
   try {
+    symlinkSync(nodeModules, join(root, "node_modules"), "dir");
     write("index.html", html);
     write("entry.tsx", entry);
     write("local.css", "body { background-image: url(./marker.svg); }");
@@ -71,6 +71,59 @@ test("guarded bundle rejects desktop modules and external assets", async () => {
     write("entry.tsx", '<img src="./marker.svg" alt="local" />;');
     const localJsx = await bundle();
     assert("output" in localJsx, "Vite emits a local JSX asset control");
+
+    const rendered = (reactImport: string, element: string) => `
+      ${reactImport}
+      import { createRoot } from "react-dom/client";
+      createRoot(document.body).render(${element});
+    `;
+    write("react-marker.svg", '<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"/>');
+    write("entry.tsx", rendered('import React from "react";',
+      `React.createElement("img", {
+        src: new URL("./react-marker.svg", import.meta.url).href,
+        alt: "rendered-local",
+        style: { backgroundImage: "url(./marker.svg)", opacity: 1 }
+      })`));
+    const localReact = await bundle();
+    assert("output" in localReact, "Vite emits a rendered local React asset control");
+    const reactAsset = localReact.output.find(file => file.type === "asset"
+      && file.fileName.endsWith(".svg") && file.originalFileNames.includes("react-marker.svg"));
+    assert(reactAsset, "Vite emits the SVG used by React");
+    assert(localReact.output.some(file => file.type === "chunk" && file.code.includes("rendered-local")
+      && file.code.includes(basename(reactAsset.fileName))), "The application chunk references the emitted React SVG");
+
+    for (const [reactImport, element, diagnostic] of [
+      ['import React from "react";',
+        'React.createElement("img", { src: "https://example.invalid/remote.svg" })',
+        /External asset is forbidden in the fixture: .*remote\.svg/],
+      ['import * as React from "react";',
+        'React.createElement("img", { srcSet: "./marker.svg 1x, //example.invalid/remote.svg 2x" })',
+        /External asset is forbidden in the fixture: .*remote\.svg/],
+      ['import { createElement as element } from "react";',
+        'element("div", { style: { backgroundImage: "url(https://example.invalid/remote.png)" } })',
+        /External asset is forbidden in the fixture: .*remote\.png/],
+      ['import { createElement } from "react";',
+        'createElement("img", { ...window.assetProps })',
+        /Opaque React props are forbidden in the offline fixture/],
+      ['import { createElement } from "react";',
+        'createElement("div", { style: { ...window.assetStyles } })',
+        /Opaque React style props are forbidden in the offline fixture/],
+      ['import { createElement } from "react";',
+        'createElement("div", { style: window.assetStyles })',
+        /Opaque React style props are forbidden in the offline fixture/],
+      ['import { createElement } from "react";',
+        'createElement("div", { style: { backgroundImage: window.assetStyle } })',
+        /Dynamic React asset reference is forbidden in the offline fixture: style/],
+      ['import React from "react";',
+        'React.createElement("img", window.assetProps)',
+        /Opaque React props are forbidden in the offline fixture/],
+      ['import React from "react";',
+        'React.createElement("img", { src: window.assetUrl })',
+        /Dynamic React asset reference is forbidden in the offline fixture: src/],
+    ] as const) {
+      write("entry.tsx", rendered(reactImport, element));
+      await assert.rejects(bundle, diagnostic);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
