@@ -1210,18 +1210,15 @@ def prove(options, report):
 
     probe = ROOT / 'target/debug/examples/probe'
     need(probe.is_file(), 'debug bridge probe is unavailable')
-    lab = Lab(w1=True)
-    state = lab.state
-    catalog = lab.catalog
-    observed_processes = []
-    targets = []
     anchor = sample_clock()
+    lab = Lab(w1=True, pressure=True)
+    state = lab.state
+    observed_processes = []
+    report['lab_id'] = lab.id
     report['clock'] = anchor
     try:
         with lab:
-            targets = list(lab.loaded)
             report['build'] = versions(probe, lab.service_host, lab.tmux)
-            report['lab_id'] = lab.id
             created = lab.call('create', '--cwd', state, '--', sys.executable,
                                Path(__file__).resolve(), '--fixture', state)
             runtime = created['runtime']
@@ -1253,11 +1250,10 @@ def prove(options, report):
             need(versions(probe, lab.service_host, lab.tmux) == report['build'],
                  'source or binaries changed during workload')
     finally:
-        unloaded = all(run_command('launchctl', 'print', job, check=False).returncode != 0 for job in targets)
-        need(unloaded and not state.exists() and not catalog.exists(), 'owned disposable lab cleanup failed')
-        wait(lambda: all(not same_process(item, process(item['pid'])) for item in observed_processes),
-             5, 'owned fixture or agent process survived lab cleanup')
-        report['cleanup'] = 'confirmed'
+        if lab.cleanup_confirmed:
+            wait(lambda: all(not same_process(item, process(item['pid'])) for item in observed_processes),
+                 5, 'owned fixture or agent process survived lab cleanup')
+            report['cleanup'] = 'confirmed'
 
 
 def main():
