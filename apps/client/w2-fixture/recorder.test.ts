@@ -136,6 +136,101 @@ test("bounded recorder serializes input and rejects overflow", async t => {
   }
 });
 
+test("retired append counts against fresh pending capacity", async t => {
+  for (const [name, inFlight, queued] of [
+    ["events", ["a", "b"], Array.from({ length: 254 }, () => "c")],
+    ["UTF-8 bytes", ["ї".repeat(512), "ї"],
+      [...Array.from({ length: 14 }, () => "ї".repeat(512)), "a".repeat(1022)]],
+  ] as const) {
+    for (const overflow of [false, true]) {
+      await t.test(`${name} ${overflow ? "overflow" : "at the limit"}`, async () => {
+        const fixture = await mountRecorder();
+        try {
+          await startAndTrace(fixture);
+          await fixture.act(async () => {
+            for (const text of inFlight) fixture.terminal.input(text);
+          });
+          await fixture.accept(0);
+          const old = fixture.appends[1];
+          assert(old);
+          assert.deepEqual(old.args, { generation: 1, sequence: 2, events: inFlight.map(utf8) });
+          await fixture.input("discard retired queue");
+          await fixture.click("Restart");
+          await fixture.act(async () => {
+            for (const text of queued) fixture.terminal.input(text);
+          });
+          assert.equal(fixture.appends.length, 2, "fresh input waits behind the entire retired batch");
+          assert.equal(fixture.alert(), "", "the combined capacity is allowed");
+          if (overflow) {
+            await fixture.input("+");
+            assert.equal(fixture.alert(), "Held: Pending input capacity exceeded");
+          }
+          await fixture.click("Read");
+          if (!overflow) {
+            assert.equal(fixture.readout.textContent, "—");
+            assert(!fixture.ipc.some(call => call.command === "w2_read_attempt"));
+          }
+          await fixture.act(async () => { old.reply.reject("retired append rejected"); });
+          if (overflow) {
+            assert.equal(fixture.appends.length, 2, "overflow discards all fresh queued input");
+            assert.equal(fixture.readout.textContent, "(empty)");
+            assert.equal(fixture.alert(), "Held: Pending input capacity exceeded");
+            await fixture.click("Restart");
+            await fixture.input("new");
+            assert.deepEqual(fixture.appends[2]?.args, { generation: 3, sequence: 1, events: [utf8("new")] });
+            await fixture.accept(2);
+            await fixture.click("Read");
+            assert.equal(fixture.readout.textContent, "6e6577");
+            assert.equal(fixture.appends.length, 3);
+          } else {
+            const dispatched: number[][] = [];
+            for (let index = 2; dispatched.length < queued.length; index++) {
+              const append = fixture.appends[index];
+              assert(append, "retired rejection releases the fresh queue");
+              dispatched.push(...append.args.events);
+              await fixture.accept(index);
+            }
+            assert.deepEqual(dispatched, queued.map(utf8));
+            assert.equal(fixture.readout.textContent, Buffer.from(queued.join("")).toString("hex"));
+            assert.equal(fixture.alert(), "", "retired rejection leaves the fresh attempt valid");
+          }
+        } finally {
+          await fixture.dispose();
+        }
+      });
+    }
+  }
+});
+
+test("late retired rejection leaves the fresh append slot occupied", async t => {
+  const fixture = await mountRecorder();
+  try {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    await startAndTrace(fixture);
+    const old = fixture.appends[0];
+    assert(old);
+    await fixture.click("Restart");
+    await fixture.input("a");
+    assert.equal(fixture.appends.length, 1);
+    await fixture.act(async () => { t.mock.timers.tick(5000); });
+    assert.deepEqual(fixture.appends[1]?.args, { generation: 2, sequence: 1, events: [utf8("a")] });
+    await fixture.input("b");
+    await fixture.click("Read");
+    await fixture.act(async () => { old.reply.reject("retired append rejected after the deadline"); });
+    assert.equal(fixture.appends.length, 2);
+    assert.equal(fixture.readout.textContent, "—");
+    assert.equal(fixture.alert(), "");
+    await fixture.accept(1);
+    assert.deepEqual(fixture.appends[2]?.args, { generation: 2, sequence: 2, events: [utf8("b")] });
+    await fixture.accept(2);
+    assert.equal(fixture.readout.textContent, "6162");
+    assert.equal(fixture.appends.length, 3);
+    assert.equal(fixture.alert(), "");
+  } finally {
+    await fixture.dispose();
+  }
+});
+
 test("invoke failure retires pending input without replay", async t => {
   for (const [mode, message] of [
     ["rejection", "native rejected append"],

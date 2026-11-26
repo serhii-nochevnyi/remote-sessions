@@ -970,7 +970,7 @@ function controlledClock() {
   let order = 0;
   const work = new Map<object, { run: () => void; due: number; order: number }>();
   const restoreSet = installGlobal("setTimeout", (callback: () => void, ms = 0) => {
-    if (ms !== 0 && ms !== 250) return realSet(callback, ms);
+    if (ms !== 0 && ms !== 250 && ms !== 5000) return realSet(callback, ms);
     const handle = {};
     work.set(handle, { run: callback, due: now + ms, order: ++order });
     return handle;
@@ -1081,6 +1081,84 @@ function assertTrace(fixture: Mounted, caseId: CaseId, generation: number, event
   assert.deepEqual(actual.events.map(entry => entry.event), events, "composition trace phases");
   assert.deepEqual(actual.events.map(entry => entry.sequence), events.map((_, i) => i + 1));
   return actual.events;
+}
+
+async function checkUnattributedComposition(route: "live" | "expired" | "normal end" | "mutation" | "key" | "paste") {
+  const caseId = "composition-commit";
+  const { text } = requiredVectors[caseId];
+  const snapshot: Snapshot = {
+    caseId, generation: 1, nextSequence: 1, bytes: [], eventLengths: [], rejected: 0, invalid: false,
+  };
+  const fixture = await mountFixture({
+    browserPaste: true,
+    suppressCompositionEnd: route === "live" || route === "expired",
+    invoke(command, args) {
+      if (command === "w2_begin_attempt") {
+        assert.deepEqual(args, { caseId });
+        return 1;
+      }
+      if (command === "w2_read_attempt") {
+        assert.deepEqual(args, { generation: 1 });
+        return structuredClone(snapshot);
+      }
+      assert.equal(command, "w2_append_input");
+      const { generation, sequence, events } = args as { generation: number; sequence: number; events: number[][] };
+      assert.equal(generation, snapshot.generation);
+      assert.equal(sequence, snapshot.nextSequence++);
+      snapshot.bytes.push(...events.flat());
+      snapshot.eventLengths.push(...events.map(event => event.length));
+      return null;
+    },
+  });
+  const driver = await compositionDriver(fixture);
+  const host = field(fixture, "terminal");
+  try {
+    await startCase(fixture, caseId);
+    await fixture.act(async () => {
+      driver.start();
+      driver.update("draft");
+      driver.clock.advance(250);
+    });
+    assert.match(field(fixture, "checkpoint").textContent, /generation 1 .*active and focused .*· [(]empty[)]$/);
+    assert.equal(fixture.document.activeElement, driver.textarea);
+    assert.deepEqual(fixture.terminal.data, []);
+    await fixture.act(async () => {
+      driver.end(route === "mutation" ? "other value" : text);
+      if (route === "expired") driver.clock.advance(0);
+      assert.deepEqual(fixture.terminal.data, [], "composition has emitted no synchronous input");
+      if (route === "mutation") {
+        driver.textarea.value = text;
+      } else if (route === "key") {
+        driver.textarea.dispatchEvent(Object.assign(new Event("keypress", { bubbles: true, cancelable: true }), {
+          key: text, charCode: text.charCodeAt(0),
+        }));
+        assert.deepEqual(fixture.terminal.data, [text], "the key synchronously reaches public onData");
+      } else if (route === "paste") {
+        driver.textarea.dispatchEvent(Object.assign(new Event("paste", { bubbles: true, cancelable: true }), {
+          clipboardData: { getData: () => text },
+        }));
+        assert.deepEqual(fixture.terminal.data, [text], "paste synchronously reaches public onData");
+      } else {
+        driver.type(text);
+        assert.deepEqual(fixture.terminal.data, [text], "ordinary insertText synchronously reaches public onData");
+      }
+      driver.clock.advance(0);
+    });
+    assert.deepEqual(fixture.terminal.data, route === "normal end" || route === "key" ? [text, text] : [text]);
+    await finalRead(fixture);
+    assert.deepEqual(appends(fixture), [], "unattributed text cannot append");
+    assert.deepEqual(reads(fixture), Array.from({ length: 2 }, () => ({
+      command: "w2_read_attempt", args: { generation: 1 },
+    })));
+    assert.equal(field(fixture, "snapshot").textContent, "(empty)");
+    assert.match(fixture.container.find(node => node.getAttribute("role") === "alert")?.textContent ?? "", /^Held:/);
+  } finally {
+    await fixture.dispose();
+    driver.clock.dispose();
+  }
+  for (const event of ["input", "keydown", "keypress", "paste"]) {
+    assert.equal(host.listenerCount(event), 0, `${event} listener is disposed`);
+  }
 }
 
 async function compositionVector(
@@ -1489,6 +1567,79 @@ function deferred() {
   return { promise, resolve };
 }
 
+async function checkRestartWithPendingAppend(executable: string, release: "acknowledgment" | "deadline") {
+  const native = connectNative(executable, "requests");
+  const old = deferred();
+  const fresh = deferred();
+  const oldReturned = deferred();
+  const fixture = await mountFixture({
+    browserPaste: true,
+    async invoke(command, args) {
+      const reply = await native.invoke(command, args);
+      if (command === "w2_append_input") {
+        if (args && "generation" in args && args.generation === 1) {
+          await old.promise;
+          oldReturned.resolve();
+        } else await fresh.promise;
+      }
+      return reply;
+    },
+  });
+  const driver = await compositionDriver(fixture);
+  try {
+    await startCase(fixture, "english-return");
+    const focuses = driver.textarea.focusCount;
+    await fixture.act(async () => { driver.type("old"); driver.type("retired queue"); });
+    const oldOnly = [{ command: "w2_append_input", args: { generation: 1, sequence: 1, events: [[111, 108, 100]] } }];
+    assert.deepEqual(appends(fixture), oldOnly);
+    await fixture.click("Restart");
+    await fixture.waitFor(() => !fixture.button("Read").disabled, "Restart opens the fresh generation");
+    assert.equal(driver.textarea.focusCount, focuses, "ordinary Restart preserves focus");
+    assert.equal(fixture.document.activeElement, driver.textarea);
+    await fixture.act(async () => { driver.type("ok"); driver.type("\r"); });
+    assert.deepEqual(appends(fixture), oldOnly, "retired append still owns the slot");
+    await fixture.click("Read");
+    assert.deepEqual(reads(fixture), [], "Read waits while fresh input is queued");
+    if (release === "deadline") {
+      await fixture.act(async () => { driver.clock.advance(4999); });
+      assert.deepEqual(appends(fixture), oldOnly, "the slot stays occupied before its deadline");
+      await fixture.act(async () => { driver.clock.advance(1); });
+    } else await fixture.act(async () => { old.resolve(); await oldReturned.promise; });
+
+    const expected = [...oldOnly, {
+      command: "w2_append_input", args: { generation: 2, sequence: 1, events: [[111, 107], [13]] },
+    }];
+    assert.deepEqual(appends(fixture), expected, "only the fresh batch dispatches at sequence one");
+    assert.deepEqual(reads(fixture), [], "Read waits for the fresh acknowledgment");
+    assert.equal(field(fixture, "snapshot").textContent, "—");
+    if (release === "deadline") {
+      await fixture.act(async () => { old.resolve(); await oldReturned.promise; });
+      assert.deepEqual(appends(fixture), expected, "late acknowledgment leaves the fresh slot occupied");
+      assert.deepEqual(reads(fixture), []);
+      assert.equal(field(fixture, "snapshot").textContent, "—");
+    }
+    assert.equal(fixture.container.find(node => node.getAttribute("role") === "alert"), undefined);
+    await fixture.act(async () => { fresh.resolve(); });
+    await fixture.waitFor(() => field(fixture, "snapshot").textContent !== "—", "fresh Read completes");
+    assert.deepEqual(reads(fixture), [{ command: "w2_read_attempt", args: { generation: 2 } }]);
+    assert.deepEqual(appends(fixture), expected);
+    assert.equal(field(fixture, "snapshot").textContent, "6f6b0d");
+    assert.deepEqual(native.snapshot(), {
+      caseId: "english-return", generation: 2, nextSequence: 2, bytes: [111, 107, 13],
+      eventLengths: [2, 1], rejected: 0, invalid: false,
+    });
+    await native.finish();
+  } catch (error) {
+    await native.abort();
+    throw error;
+  } finally {
+    old.resolve();
+    fresh.resolve();
+    await fixture.dispose();
+    driver.clock.dispose();
+  }
+}
+
 async function checkCheckpoint(executable: string, transformEntry?: MountOptions["transformEntry"]) {
   const native = connectNative(executable, "requests");
   const gate = deferred();
@@ -1823,12 +1974,12 @@ async function checkForegroundRecovery(
       "recovery control begins a fresh generation");
     await fixture.waitFor(() => !fixture.button("Read").disabled, "fresh attempt enables Read");
     assert.equal(fixture.terminal.focuses, focuses + 1, "recovery explicitly refocuses");
+    await fixture.act(async () => { late.resolve(); });
     assert.equal(appends(fixture).length, oldAppends.length, "recovery invokes no append for queued input");
     await finalRead(fixture);
     assert.equal(field(fixture, "snapshot").textContent, "(empty)", "fresh generation starts empty");
     assert.equal(retained.textContent, retainedHex, "starting fresh preserves the old readout");
 
-    await fixture.act(async () => { late.resolve(); });
     await fixture.input(String.fromCharCode(...after));
     await fixture.click("Read");
     await fixture.waitFor(() => !fixture.button("Read").disabled, "fresh read completes");
@@ -2487,6 +2638,16 @@ if (import.meta.main) {
   test("viewport updates keep one terminal and dispose listeners", viewportUpdates);
   test("mounted fixture wires layout without remounting its terminal", mountedLayout);
   test("mounted composition checkpoint reads native bytes before commit without moving focus", checkpointControls);
+  test("mounted composition rejects matching ordinary input during settlement", () => checkUnattributedComposition("live"));
+  test("mounted composition rejects matching ordinary input after settlement", () => checkUnattributedComposition("expired"));
+  test("mounted composition rejects intervening ordinary input after a normal end", () => checkUnattributedComposition("normal end"));
+  test("mounted composition rejects a textarea change without a matching commit input", () => checkUnattributedComposition("mutation"));
+  test("mounted composition rejects intervening key input", () => checkUnattributedComposition("key"));
+  test("mounted composition rejects intervening paste", () => checkUnattributedComposition("paste"));
+  test("mounted Restart serializes fresh input past an outstanding append", () => withNativeExecutable(async executable => {
+    await checkRestartWithPendingAppend(executable, "acknowledgment");
+    await checkRestartWithPendingAppend(executable, "deadline");
+  }));
   test("foreground restart preserves evidence without replay", foregroundRecovery);
   test("touch copy verifies the pasted token with an empty same-generation read", touchCopyVerification);
   test("native tracer rejects disconnected command wrappers", disconnectedWrapperControls);
