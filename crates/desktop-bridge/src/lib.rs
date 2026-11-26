@@ -16,8 +16,8 @@ pub use remote_sessions_host::model::{ResizeEpoch, ResizeResult, TerminalSize, T
 use remote_sessions_host::{
     engine::set_local_pty_nonblocking,
     model::{
-        INPUT_CHUNK_LIMIT, INPUT_LEASE_TTL, ObservationState, PasteAdmission, PasteBinding,
-        ProductRequest, ProductResponse, Request, Response, Runtime, TerminalView,
+        INPUT_CHUNK_LIMIT, INPUT_LEASE_TTL, PasteAdmission, PasteBinding, ProductRequest,
+        ProductResponse, Request, Response, Runtime, TerminalView,
     },
     product_launch::workspace_locator,
     product_request, request,
@@ -31,12 +31,15 @@ use std::{
     process::Stdio,
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
+
+#[cfg(test)]
+use remote_sessions_host::model::ObservationState;
 
 #[derive(Serialize)]
 pub struct Inventory {
@@ -68,17 +71,25 @@ pub struct Chunk {
 }
 
 impl Chunk {
-    fn closed(closure: TerminalClosure) -> Self {
+    fn empty() -> Self {
         Self {
             writable: false,
             data: Vec::new(),
-            closed: true,
+            closed: false,
             status: None,
             geometry: None,
             paste_incarnation: None,
             paste_completion: None,
             paste_admission: None,
+            closure: None,
+        }
+    }
+
+    fn closed(closure: TerminalClosure) -> Self {
+        Self {
+            closed: true,
             closure: Some(closure),
+            ..Self::empty()
         }
     }
 }
@@ -95,6 +106,7 @@ pub enum TerminalClosure {
 #[derive(Clone, Copy)]
 enum Retirement {
     Typed(TerminalClosure),
+    Eof,
     ReceiverClosed,
     Failed,
 }
@@ -102,14 +114,18 @@ enum Retirement {
 const VIEW_LIMIT: usize = 8;
 const OUTPUT_SLOTS: usize = 16;
 const NOTICE_TTL: Duration = Duration::from_secs(120);
+const EOF_TTL: Duration = Duration::from_secs(10);
+const ATTACH_PROOF_TIMEOUT: Duration = Duration::from_secs(2);
+const STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(150);
 const CLEANUP_BUDGET: Duration = Duration::from_secs(2);
 const CLEANUP_POLL: Duration = Duration::from_millis(5);
 
 #[derive(Default)]
 struct Views {
     live: HashMap<Uuid, Arc<View>>,
+    drains: HashMap<Uuid, EofDrain>,
     notices: VecDeque<ClosureNotice>,
-    allocated: usize,
+    allocated: Arc<AtomicUsize>,
     paste_holds: HashMap<Uuid, PasteAdmission>,
     control_samples: HashMap<Uuid, ControlSample>,
     #[cfg(test)]
@@ -128,7 +144,36 @@ struct ClosureNotice {
     expires: Instant,
 }
 
+struct EofDrain {
+    view: Arc<View>,
+    allocation: Arc<Allocation>,
+    expires: Instant,
+}
+
+impl EofDrain {
+    fn discard(self) {
+        if let Ok(mut output) = self.view.output.try_lock() {
+            output.discard();
+            return;
+        }
+        let Self {
+            view, allocation, ..
+        } = self;
+        let handle = view.handle.clone();
+        handle.spawn(async move {
+            view.output.lock().await.discard();
+            drop(allocation);
+        });
+    }
+}
+
 impl Views {
+    fn readable_view(&self, id: &Uuid) -> Option<&Arc<View>> {
+        self.live
+            .get(id)
+            .or_else(|| self.drains.get(id).map(|drain| &drain.view))
+    }
+
     fn prune(&mut self, now: Instant) {
         self.notices.retain(|notice| notice.expires > now);
     }
@@ -144,6 +189,30 @@ impl Views {
             closure,
             expires: now + NOTICE_TTL,
         });
+    }
+
+    fn expire_eof(&mut self, id: Uuid, now: Instant) {
+        if let Some(drain) = self.drains.get(&id)
+            && drain.expires <= now
+        {
+            let view = drain.view.clone();
+            view.retire_locked(self, Retirement::ReceiverClosed);
+        }
+    }
+
+    fn reclaim_eof_slot(&mut self) {
+        if let Some(drain) = self
+            .drains
+            .values()
+            .filter(|drain| {
+                Arc::strong_count(&drain.allocation) == 1
+                    && !drain.view.reading.load(Ordering::Relaxed)
+            })
+            .min_by_key(|drain| drain.expires)
+        {
+            let view = drain.view.clone();
+            view.retire_locked(self, Retirement::ReceiverClosed);
+        }
     }
 
     fn publish_control(&mut self, view: Uuid, control: &Control) {
@@ -190,11 +259,39 @@ struct LeaseSample {
     pending_paste: Option<(Uuid, u64)>,
 }
 
-struct Allocation(Arc<Mutex<Views>>);
+struct Allocation(Arc<AtomicUsize>);
 
 impl Drop for Allocation {
     fn drop(&mut self) {
-        self.0.lock().unwrap().allocated -= 1;
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct AttachmentChild {
+    owned: Option<(Box<dyn Child + Send + Sync>, Arc<Allocation>)>,
+    handle: tokio::runtime::Handle,
+}
+
+impl AttachmentChild {
+    fn new(child: Box<dyn Child + Send + Sync>, allocation: Arc<Allocation>) -> Self {
+        Self {
+            owned: Some((child, allocation)),
+            handle: tokio::runtime::Handle::current(),
+        }
+    }
+}
+
+impl Drop for AttachmentChild {
+    fn drop(&mut self) {
+        if let Some((mut child, allocation)) = self.owned.take() {
+            self.handle.spawn_blocking(move || {
+                let mut signalled = false;
+                while !poll_child(child.as_mut(), &mut signalled) {
+                    std::thread::sleep(CLEANUP_POLL);
+                }
+                drop(allocation);
+            });
+        }
     }
 }
 
@@ -419,6 +516,34 @@ struct Output {
     drain_started: Option<Instant>,
     writable: bool,
 }
+
+impl Output {
+    fn discard(&mut self) {
+        self.receiver.close();
+        while self.receiver.try_recv().is_ok() {}
+        self.pending = None;
+        self.drain_started = None;
+        self.writable = false;
+    }
+
+    fn drain_eof(&mut self) -> Result<Chunk> {
+        ensure!(
+            self.drain_started.is_none()
+                && self.pending.is_none()
+                && self.status.committed.revision == self.applied_revision,
+            DRAIN_TIMEOUT_ERROR
+        );
+        match self.receiver.try_recv() {
+            Ok(PtyEvent::Bytes(data)) => Ok(Chunk {
+                data: std::mem::take(&mut *data.lock().unwrap()),
+                ..Chunk::empty()
+            }),
+            Ok(PtyEvent::Boundary) => bail!(DRAIN_TIMEOUT_ERROR),
+            Err(_) => Ok(Chunk::closed(TerminalClosure::Eof)),
+        }
+    }
+}
+
 struct View {
     terminal: TerminalView,
     directory: PathBuf,
@@ -432,6 +557,7 @@ struct View {
     drain_revision: AtomicU64,
     reader_state: Arc<AtomicU64>,
     views: Weak<Mutex<Views>>,
+    allocation: Weak<Allocation>,
     retirement: watch::Sender<Option<Retirement>>,
     reading: AtomicBool,
     handle: tokio::runtime::Handle,
@@ -499,6 +625,10 @@ impl View {
         self.reader_state.load(Ordering::Acquire) == CLOSE
     }
 
+    fn eof_draining(&self) -> bool {
+        matches!(*self.retirement.borrow(), Some(Retirement::Eof))
+    }
+
     fn publish(&self, publisher: &mut PtyPublisher, event: PtyRead<'_>) -> bool {
         let Some(registry) = self.views.upgrade() else {
             return false;
@@ -532,7 +662,44 @@ impl View {
 
     fn retire_locked(&self, views: &mut Views, reason: Retirement) -> Option<u64> {
         let id = self.terminal.view_id;
-        views.live.remove(&id)?;
+        let reason = if matches!(reason, Retirement::Eof) {
+            if !views.live.contains_key(&id) {
+                return None;
+            }
+            match self.reader_state.swap(CLOSE, Ordering::AcqRel) {
+                DRAIN | PAUSE => Retirement::Typed(TerminalClosure::GeometryTimeout),
+                _ => reason,
+            }
+        } else {
+            reason
+        };
+        if matches!(reason, Retirement::Eof) {
+            let allocation = self.allocation.upgrade()?;
+            let view = views.live.remove(&id)?;
+            let expires = Instant::now() + EOF_TTL;
+            views.drains.insert(
+                id,
+                EofDrain {
+                    view: view.clone(),
+                    allocation,
+                    expires,
+                },
+            );
+            self.handle.spawn(async move {
+                tokio::select! {
+                    _ = view.discarded() => {},
+                    _ = tokio::time::sleep_until(expires.into()) => {
+                        if let Some(views) = view.views.upgrade() {
+                            views.lock().unwrap().expire_eof(id, Instant::now());
+                        }
+                    }
+                }
+            });
+        } else if let Some(drain) = views.drains.remove(&id) {
+            drain.discard();
+        } else {
+            views.live.remove(&id)?;
+        }
         views.paste_holds.remove(&id);
         views.control_samples.remove(&id);
         self.reader_state.store(CLOSE, Ordering::Release);
@@ -550,6 +717,13 @@ impl View {
     async fn retired(&self) {
         let mut retirement = self.retirement.subscribe();
         let _ = retirement.wait_for(Option::is_some).await;
+    }
+
+    async fn discarded(&self) {
+        let mut retirement = self.retirement.subscribe();
+        let _ = retirement
+            .wait_for(|reason| matches!(reason, Some(reason) if !matches!(reason, Retirement::Eof)))
+            .await;
     }
 
     fn trace_pressure(&self, event: &str) {
@@ -592,11 +766,24 @@ struct PendingRead<'a> {
 
 impl PendingRead<'_> {
     fn finish(mut self, result: Result<Chunk>) -> Result<Chunk> {
-        let _views = self.views.lock().unwrap();
+        let mut views = self.views.lock().unwrap();
         self.view.reading.store(false, Ordering::Relaxed);
         self.finished = true;
-        match *self.view.retirement.borrow() {
+        let retirement = *self.view.retirement.borrow();
+        match retirement {
             Some(Retirement::Typed(closure)) => Ok(Chunk::closed(closure)),
+            Some(Retirement::Eof) => {
+                let chunk = result?;
+                if chunk.closure == Some(TerminalClosure::Eof) {
+                    self.view
+                        .retire_locked(&mut views, Retirement::ReceiverClosed);
+                    return Ok(chunk);
+                }
+                Ok(Chunk {
+                    data: chunk.data,
+                    ..Chunk::empty()
+                })
+            }
             Some(_) if result.is_ok() => bail!("View detached"),
             _ => result,
         }
@@ -619,20 +806,18 @@ impl Drop for PendingRead<'_> {
 
 fn supervise(
     view: Arc<View>,
-    mut child: Box<dyn Child + Send + Sync>,
+    mut child: AttachmentChild,
     reader: Option<std::thread::JoinHandle<()>>,
-    allocation: Allocation,
 ) {
+    let (mut child, allocation) = child.owned.take().unwrap();
     view.handle.block_on(view.retired());
     let deadline = Instant::now() + CLEANUP_BUDGET;
     view.master.lock().unwrap().take();
-    let cleanup = view.clone();
-    let output_cleanup = view.handle.spawn(async move {
-        let mut output = cleanup.output.lock().await;
-        output.receiver.close();
-        while output.receiver.try_recv().is_ok() {}
-        output.pending = None;
-        output.drain_started = None;
+    let output_cleanup = (!view.eof_draining()).then(|| {
+        let cleanup = view.clone();
+        view.handle.spawn(async move {
+            cleanup.output.lock().await.discard();
+        })
     });
 
     let cleanup = view.clone();
@@ -659,22 +844,13 @@ fn supervise(
             view.cleanup_confirmations.fetch_or(1, Ordering::Release);
             view.trace_pressure("reader_exit");
         }
-        if !reap {
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    reap = true;
-                    #[cfg(test)]
-                    view.cleanup_confirmations.fetch_or(2, Ordering::Release);
-                    view.trace_pressure("child_reaped");
-                }
-                Ok(None) if !signalled => {
-                    signalled = true;
-                    let _ = child.kill();
-                }
-                _ => {}
-            }
+        if !reap && poll_child(child.as_mut(), &mut signalled) {
+            reap = true;
+            #[cfg(test)]
+            view.cleanup_confirmations.fetch_or(2, Ordering::Release);
+            view.trace_pressure("child_reaped");
         }
-        if reap && reader.is_none() && output_cleanup.is_finished() {
+        if reap && reader.is_none() && output_cleanup.as_ref().is_none_or(|job| job.is_finished()) {
             drop(allocation);
             view.trace_pressure("cleanup_complete");
             return;
@@ -685,6 +861,18 @@ fn supervise(
         }
         std::thread::sleep(CLEANUP_POLL);
     }
+}
+
+fn poll_child(child: &mut dyn Child, signalled: &mut bool) -> bool {
+    match child.try_wait() {
+        Ok(Some(_)) => return true,
+        Ok(None) if !*signalled => {
+            *signalled = true;
+            let _ = child.kill();
+        }
+        _ => {}
+    }
+    false
 }
 
 fn pty_size(size: TerminalSize) -> PtySize {
@@ -803,11 +991,11 @@ fn read_pty(
                     }
                     std::thread::sleep(CLEANUP_POLL);
                 }
-                Err(_) => break,
+                Err(_) => return retire(Retirement::Failed),
             },
         }
     }
-    retire(Retirement::Typed(TerminalClosure::Eof));
+    retire(Retirement::Eof);
 }
 
 async fn refresh_control(view: &View) {
@@ -984,6 +1172,35 @@ async fn client_grid(view: &View) -> Result<GridSample> {
     })
 }
 
+async fn prove_attachment(view: &View, opened: &TerminalStatus) -> Result<TerminalStatus> {
+    ensure!(
+        view.client_pid != 0,
+        "Attachment client identity unavailable"
+    );
+    tokio::time::timeout(ATTACH_PROOF_TIMEOUT, async {
+        loop {
+            if let Ok(grid) = client_grid(view).await
+                && grid.size == opened.committed.size
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let status = terminal_status(view).await?;
+        ensure!(
+            status.committed == opened.committed,
+            "Terminal geometry changed during attachment proof"
+        );
+        ensure!(
+            client_grid(view).await?.size == status.committed.size,
+            "Attachment client grid changed during proof"
+        );
+        Ok(status)
+    })
+    .await
+    .context("Terminal attachment proof timed out")?
+}
+
 async fn prepare_grid(view: &View, status: TerminalStatus) -> Result<GeometryEvent> {
     let size = status.committed.size;
     let bridge_pty = {
@@ -1060,7 +1277,7 @@ async fn redraw_view(view: &View, boundary: &GeometryEvent) -> Result<GeometryEv
 
 fn expire_drain(registry: &Mutex<Views>, id: Uuid, revision: u64) {
     let mut views = registry.lock().unwrap();
-    if let Some(view) = views.live.get(&id).cloned()
+    if let Some(view) = views.readable_view(&id).cloned()
         && view.drain_revision.load(Ordering::Relaxed) == revision
     {
         view.retire_locked(
@@ -1071,75 +1288,69 @@ fn expire_drain(registry: &Mutex<Views>, id: Uuid, revision: u64) {
 }
 
 async fn read_chunk(view: &View, output: &mut Output, now: impl Fn() -> Instant) -> Result<Chunk> {
+    if view.eof_draining() {
+        return output.drain_eof();
+    }
     ensure!(
         output.pending.is_none(),
         "Terminal grid acknowledgement required"
     );
-    let mut chunk = Chunk {
-        writable: false,
-        data: Vec::new(),
-        closed: false,
-        status: None,
-        geometry: None,
-        paste_incarnation: None,
-        paste_completion: None,
-        paste_admission: None,
-        closure: None,
-    };
+    let mut chunk = Chunk::empty();
     let reading_at = now();
     let remaining = drain_budget(output.drain_started, reading_at)?;
-    let mut scope_sampled = true;
     if reading_at >= output.refresh_at {
         let status = terminal_status_during_drain(view, remaining).await;
         drain_budget(output.drain_started, now())?;
-        match status {
-            Ok(status) if status.committed.revision >= output.status.committed.revision => {
-                output.status = status
-            }
-            Ok(_) => scope_sampled = false,
-            Err(_) => {
-                scope_sampled = false;
-                output.status.provider = None;
-                output.status.observation = ObservationState::Unavailable;
-            }
-        }
-        output.refresh_at = now()
-            + if scope_sampled {
-                Duration::from_millis(150)
-            } else {
-                Duration::ZERO
-            };
+        let status = status?;
+        ensure!(
+            status.committed.revision >= output.status.committed.revision,
+            "Terminal geometry revision went backwards"
+        );
+        output.status = status;
+        output.refresh_at = now() + STATUS_REFRESH_INTERVAL;
         chunk.status = Some(output.status.clone());
     }
     let draining_at = now();
-    if output.status.committed.revision > output.applied_revision
-        && view
+    if output.status.committed.revision > output.applied_revision {
+        match view
             .reader_state
             .compare_exchange(RESUME, DRAIN, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    {
-        output.drain_started = Some(draining_at);
-        let revision = output.status.committed.revision;
-        view.drain_revision.store(revision, Ordering::Relaxed);
-        let deadline = draining_at + DRAIN_TIMEOUT;
-        let active = view.views.clone();
-        let id = view.terminal.view_id;
-        view.handle.spawn(async move {
-            tokio::time::sleep_until(deadline.into()).await;
-            if let Some(views) = active.upgrade() {
-                expire_drain(&views, id, revision);
+        {
+            Ok(_) => {
+                output.drain_started = Some(draining_at);
+                let revision = output.status.committed.revision;
+                view.drain_revision.store(revision, Ordering::Relaxed);
+                let deadline = draining_at + DRAIN_TIMEOUT;
+                let active = view.views.clone();
+                let id = view.terminal.view_id;
+                view.handle.spawn(async move {
+                    tokio::time::sleep_until(deadline.into()).await;
+                    if let Some(views) = active.upgrade() {
+                        expire_drain(&views, id, revision);
+                    }
+                });
             }
-        });
+            Err(CLOSE) => bail!(DRAIN_TIMEOUT_ERROR),
+            Err(_) => {}
+        }
     }
     let poll = Duration::from_millis(150);
     let wait = drain_budget(output.drain_started, draining_at)?
         .unwrap_or(poll)
         .min(poll);
-    let event = tokio::time::timeout(wait, output.receiver.recv()).await;
+    let event = tokio::select! {
+        biased;
+        _ = view.retired() => {
+            ensure!(view.eof_draining(), "View detached");
+            return output.drain_eof();
+        }
+        event = tokio::time::timeout(wait, output.receiver.recv()) => event,
+    };
     let remaining = drain_budget(output.drain_started, now())?;
     match event {
         Ok(Some(PtyEvent::Bytes(data))) => chunk.data = std::mem::take(&mut *data.lock().unwrap()),
         Ok(Some(PtyEvent::Boundary)) => {
+            ensure!(!view.eof_draining(), DRAIN_TIMEOUT_ERROR);
             let status = terminal_status_during_drain(view, remaining).await?;
             let remaining =
                 drain_budget(output.drain_started, now())?.context(DRAIN_TIMEOUT_ERROR)?;
@@ -1156,9 +1367,11 @@ async fn read_chunk(view: &View, output: &mut Output, now: impl Fn() -> Instant)
             chunk.status = None;
             chunk.geometry = Some(event);
         }
+        Ok(None) if view.eof_draining() => return output.drain_eof(),
         Ok(None) => {
             view.retire(Retirement::ReceiverClosed);
         }
+        Err(_) if view.eof_draining() => return output.drain_eof(),
         Err(_) => {}
     }
     let control_sample = view.views.upgrade().and_then(|views| {
@@ -1177,8 +1390,7 @@ async fn read_chunk(view: &View, output: &mut Output, now: impl Fn() -> Instant)
                     incarnation,
                     operation,
                 });
-            } else if scope_sampled
-                && output.status.terminal == view.terminal
+            } else if output.status.terminal == view.terminal
                 && Some(lease.epoch) == output.status.epoch
                 && lease.deadline > now()
             {
@@ -1341,11 +1553,12 @@ impl DesktopBridge {
         command.env("TERM", "xterm-256color");
         command.env_remove("TMUX");
         let reader = pair.master.try_clone_reader()?;
-        let child = pair.slave.spawn_command(command)?;
-        let client_pid = child.process_id().unwrap_or(0);
+        let slot = Arc::downgrade(&allocation);
+        let child = AttachmentChild::new(pair.slave.spawn_command(command)?, allocation);
+        let client_pid = child.owned.as_ref().unwrap().0.process_id().unwrap_or(0);
         drop(pair.slave);
         let (sender, receiver) = mpsc::channel(OUTPUT_SLOTS);
-        let view = Arc::new(View {
+        let mut view = View {
             terminal: status.terminal.clone(),
             directory: directory.clone(),
             tmux: self.tmux.clone(),
@@ -1366,13 +1579,19 @@ impl DesktopBridge {
             drain_revision: AtomicU64::new(0),
             reader_state: Arc::new(AtomicU64::new(RESUME)),
             views: Arc::downgrade(&self.views),
+            allocation: slot,
             retirement: watch::channel(None).0,
             reading: AtomicBool::new(false),
             handle: tokio::runtime::Handle::current(),
             #[cfg(test)]
             cleanup_confirmations: AtomicU64::new(0),
-        });
-        self.start_attachment(generation, view.clone(), allocation, child, reader, sender)?;
+        };
+        let status = prove_attachment(&view, &status).await?;
+        let output = view.output.get_mut();
+        output.status = status.clone();
+        output.refresh_at = Instant::now() + STATUS_REFRESH_INTERVAL;
+        let view = Arc::new(view);
+        self.start_attachment(generation, view.clone(), child, reader, sender)?;
         view.trace_pressure("attached");
         #[cfg(test)]
         {
@@ -1404,67 +1623,54 @@ impl DesktopBridge {
         })
     }
 
-    fn reserve(&self, generation: u64) -> Result<Allocation> {
+    fn reserve(&self, generation: u64) -> Result<Arc<Allocation>> {
         let mut views = self.views.lock().unwrap();
         ensure!(
             generation == self.generation.load(Ordering::SeqCst),
             "View context changed"
         );
+        if views.allocated.load(Ordering::Relaxed) == VIEW_LIMIT {
+            views.reclaim_eof_slot();
+        }
         ensure!(
-            views.allocated < VIEW_LIMIT,
+            views.allocated.load(Ordering::Relaxed) < VIEW_LIMIT,
             "At most 8 local views may be attached"
         );
-        views.allocated += 1;
-        Ok(Allocation(self.views.clone()))
+        views.allocated.fetch_add(1, Ordering::Relaxed);
+        Ok(Arc::new(Allocation(views.allocated.clone())))
     }
 
     fn start_attachment(
         &self,
         generation: u64,
         view: Arc<View>,
-        allocation: Allocation,
-        child: Box<dyn Child + Send + Sync>,
+        child: AttachmentChild,
         reader: Box<dyn Read + Send>,
         sender: mpsc::Sender<PtyEvent>,
     ) -> Result<()> {
         let mut views = self.views.lock().unwrap();
-        let current = generation == self.generation.load(Ordering::SeqCst);
-        views.live.insert(view.terminal.view_id, view.clone());
+        ensure!(
+            generation == self.generation.load(Ordering::SeqCst),
+            "View context changed"
+        );
         let producer = view.clone();
         let (start, begin) = std::sync::mpsc::channel();
-        let reader = if !current || view.client_pid == 0 {
-            drop(reader);
-            drop(sender);
-            Err(if !current {
-                anyhow::anyhow!("View context changed")
-            } else {
-                anyhow::anyhow!("Attachment client identity unavailable")
+        let reader = std::thread::Builder::new()
+            .spawn(move || {
+                if begin.recv().is_ok() {
+                    let mut publisher = PtyPublisher::new(sender);
+                    read_pty(
+                        reader,
+                        &producer.reader_state,
+                        |event| producer.publish(&mut publisher, event),
+                        |reason| producer.retire(reason),
+                    );
+                }
             })
-        } else {
-            std::thread::Builder::new()
-                .spawn(move || {
-                    if begin.recv().is_ok() {
-                        let mut publisher = PtyPublisher::new(sender);
-                        read_pty(
-                            reader,
-                            &producer.reader_state,
-                            |event| producer.publish(&mut publisher, event),
-                            |reason| producer.retire(reason),
-                        );
-                    }
-                })
-                .context("Start attachment reader")
-        };
-        let (reader, error) = match reader {
-            Ok(reader) => (Some(reader), None),
-            Err(error) => (None, Some(error)),
-        };
+            .context("Start attachment reader")?;
+        views.live.insert(view.terminal.view_id, view.clone());
         let owner = view.clone();
-        tokio::task::spawn_blocking(move || supervise(owner, child, reader, allocation));
-        if let Some(error) = error {
-            let _ = view.retire_locked(&mut views, Retirement::Failed);
-            return Err(error);
-        }
+        tokio::task::spawn_blocking(move || supervise(owner, child, Some(reader)));
         let _ = start.send(());
         Ok(())
     }
@@ -1487,7 +1693,13 @@ impl DesktopBridge {
     pub async fn status(&self, view_id: &str) -> Result<TerminalStatus> {
         let view = self.view(view_id)?;
         ensure!(!view.closed(), "View detached");
-        terminal_status(&view).await
+        let status = terminal_status(&view).await;
+        if status.is_err() {
+            view.retire(Retirement::Failed);
+            return status;
+        }
+        ensure!(!view.closed(), "View detached");
+        status
     }
 
     pub async fn read(&self, view_id: &str) -> Result<Chunk> {
@@ -1498,8 +1710,10 @@ impl DesktopBridge {
         let id = Uuid::parse_str(view_id).context("View detached")?;
         let view = {
             let mut views = self.views.lock().unwrap();
-            views.prune(Instant::now());
-            let Some(view) = views.live.get(&id) else {
+            let at = Instant::now();
+            views.prune(at);
+            views.expire_eof(id, at);
+            let Some(view) = views.readable_view(&id) else {
                 let index = views
                     .notices
                     .iter()
@@ -1526,7 +1740,7 @@ impl DesktopBridge {
             };
             tokio::select! {
                 biased;
-                _ = view.retired() => Err(anyhow::anyhow!("View detached")),
+                _ = view.discarded() => Err(anyhow::anyhow!("View detached")),
                 result = read_chunk(&view, &mut output, now) => result,
             }
         };
@@ -1884,15 +2098,26 @@ impl DesktopBridge {
         PasteResult::Unknown {}
     }
     pub fn detach(&self, view_id: &str) {
-        if let Ok(view) = self.view(view_id) {
-            view.retire(Retirement::Typed(TerminalClosure::Detached));
+        let Ok(id) = Uuid::parse_str(view_id) else {
+            return;
+        };
+        let mut views = self.views.lock().unwrap();
+        if let Some(view) = views.readable_view(&id).cloned() {
+            let at = view.retire_locked(&mut views, Retirement::Typed(TerminalClosure::Detached));
+            drop(views);
+            view.trace_pressure_at("detached", None, at);
         }
     }
 
     pub fn detach_all(&self) {
         let mut views = self.views.lock().unwrap();
         self.generation.fetch_add(1, Ordering::SeqCst);
-        let live = views.live.values().cloned().collect::<Vec<_>>();
+        let live = views
+            .live
+            .values()
+            .chain(views.drains.values().map(|drain| &drain.view))
+            .cloned()
+            .collect::<Vec<_>>();
         for view in live {
             let _ = view.retire_locked(&mut views, Retirement::Typed(TerminalClosure::Detached));
         }
@@ -1997,6 +2222,7 @@ mod tests {
                 drain_revision: AtomicU64::new(0),
                 reader_state: Arc::new(AtomicU64::new(RESUME)),
                 views: Arc::downgrade(&self.bridge.views),
+                allocation: Weak::new(),
                 retirement: watch::channel(None).0,
                 reading: AtomicBool::new(false),
                 handle: tokio::runtime::Handle::current(),
@@ -2779,6 +3005,15 @@ mod tests {
     }
     #[tokio::test]
     async fn w1_resize_w1_terminal_private_ipc_admission_and_ordered_independent_grids() {
+        ordered_independent_grids(false).await;
+    }
+
+    #[tokio::test]
+    async fn w1_resize_w1_terminal_eof_during_pending_geometry() {
+        ordered_independent_grids(true).await;
+    }
+
+    async fn ordered_independent_grids(eof_while_pending: bool) {
         use remote_sessions_host::{
             decode_local_fixture, encode_local_observation,
             model::{CommittedGeometry, ProviderSample, ResizeIntent, TerminalTarget},
@@ -2821,7 +3056,14 @@ case "$4" in
     printf 'initial stream\033['
     while [ ! -f "$root/suffix" ]; do /bin/sleep 0.01; done
     printf '2H'
-    while [ ! -f "$root/redraw" ]; do /bin/sleep 0.01; done
+    while [ ! -f "$root/redraw" ]; do
+      if [ -f "$root/end-while-paused" ]; then
+        printf 'unacknowledged grid output'
+        : > "$root/final-written"
+        exit 0
+      fi
+      /bin/sleep 0.01
+    done
     printf 'redraw stream'
     exec /bin/sleep 30
     ;;
@@ -3044,6 +3286,34 @@ esac
                 assert_eq!(live.reader_state.load(Ordering::Acquire), PAUSE);
             }
             assert!(!fixture.0.join("redraw").exists());
+            if eof_while_pending {
+                fs::write(fixture.0.join("end-while-paused"), b"").unwrap();
+                while !fixture.0.join("final-written").exists() {
+                    tokio::time::sleep(CLEANUP_POLL).await;
+                }
+                {
+                    let output = live.output.lock().await;
+                    assert_eq!(output.pending.as_ref().unwrap().status, event.status);
+                    assert!(output.receiver.is_empty());
+                    assert_eq!(output.applied_revision, 0);
+                    assert_eq!(live.reader_state.load(Ordering::Acquire), PAUSE);
+                }
+                live.retire(Retirement::Eof);
+                assert!(bridge.acknowledge_grid(key, acknowledgement).await.is_err());
+                let closed = bridge.read(key).await.unwrap();
+                assert_eq!(closed.closure, Some(TerminalClosure::GeometryTimeout));
+                assert!(closed.closed && !closed.writable && closed.data.is_empty());
+                assert!(closed.geometry.is_none() && closed.status.is_none());
+                assert!(bridge.read(key).await.is_err());
+                assert!(
+                    bridge
+                        .input(key, b"after close".to_vec(), false)
+                        .await
+                        .is_err()
+                );
+                assert!(!fixture.0.join("redraw").exists());
+                return;
+            }
             provider_reached.store(1, Ordering::Relaxed);
             let observed = bridge.acknowledge_grid(key, acknowledgement).await.unwrap();
             assert_eq!(observed.status.provider.unwrap().size, desired);
