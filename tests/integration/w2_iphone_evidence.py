@@ -523,11 +523,11 @@ def check_layout(attempt, case_id):
 
 def same_native_input(first, second):
     return (first["hex"] == second["hex"] and first["acceptedEvents"] == second["acceptedEvents"]
-            and ("eventLengths" not in first or "eventLengths" not in second
+            and (first.get("eventLengths") is None or second.get("eventLengths") is None
                  or first["eventLengths"] == second["eventLengths"]))
 
 
-def check_recovery(attempt, identity, expected, started_fresh):
+def check_recovery(attempt, identity, expected, started_fresh, recovery_prefix):
     old = obj(attempt.get("recovery"), "foreground recovery")
     initial = obj(old.get("before"), "pre-interruption native snapshot")
     old_id = attempt_identity(initial)
@@ -537,10 +537,17 @@ def check_recovery(attempt, identity, expected, started_fresh):
     retained = snapshot(old.get("retained"), old_id)
     need(old.get("delivery_uncertain") is False and type(old.get("old_generation_extra_event")) is bool,
          "retained snapshot or delivery is uncertain")
-    measured(before["hex"] == retained["hex"] == expected and before["acceptedEvents"] == retained["acceptedEvents"]
-             and not old["old_generation_extra_event"], "retained native bytes or events changed",
-             before["hex"], retained["hex"], before["acceptedEvents"], retained["acceptedEvents"],
-             old["old_generation_extra_event"])
+    if not recovery_prefix:
+        extra_event = old["old_generation_extra_event"]
+        before_hex, retained_hex = before["hex"], retained["hex"]
+        if not same_native_input(before, retained) or extra_event:
+            before_count, retained_count = before["acceptedEvents"], retained["acceptedEvents"]
+            observed_input = (before_hex, retained_hex, before_count, retained_count, extra_event)
+            if before_hex == retained_hex and before_count == retained_count and not extra_event:
+                observed_input += (tuple(before["eventLengths"]), tuple(retained["eventLengths"]))
+            raise MeasuredFailure("retained native bytes or events changed", observed_input)
+        if attempt.get("capture_error") is False:
+            measured(before_hex == expected, "initial bytes differ from the manifest", before_hex)
     restart = obj(old.get("restart"), "foreground restart observation")
     previous = obj(restart.get("previous"), "restart's old attempt identity")
     need(named(restart, "ref") and attempt_identity(previous) == old_id
@@ -550,7 +557,7 @@ def check_recovery(attempt, identity, expected, started_fresh):
     need(outcome in ("fresh", "same-generation", "no-new-generation"), "foreground restart outcome is uncertain")
     need(restart.get("action_completed") is True, "missing completed foreground restart action")
     expected_fresh = outcome == "fresh"
-    need(started_fresh is None or started_fresh is expected_fresh,
+    need(started_fresh is expected_fresh or (started_fresh is None and not recovery_prefix),
          "foreground restart conflicts with the visible fresh-start observation")
     if outcome == "no-new-generation":
         failure = obj(restart.get("begin_failure"), "recorded begin failure")
@@ -570,15 +577,16 @@ def check_recovery(attempt, identity, expected, started_fresh):
          and number(observed.get("generation"), 1)
          and old_id[1] < identity[1] and old_id[2] < identity[2] and "begin_failure" not in restart,
          "foreground restart did not identify a fresh attempt and generation")
+    need(not recovery_prefix, "fresh foreground restart requires all prescribed actions")
 
 
-def check_capture(attempt, case, cohort, qualification, observed, identity):
+def check_capture(attempt, case, cohort, qualification, observed, identity, recovery_prefix):
     case_id = case["id"]
     expected = case["expected"]["afterHex"]
     if case_id in RECOVERY:
         transition = OBSERVATIONS[case_id][0]
         need(observed.get(transition) is True, "foreground transition was not established")
-        check_recovery(attempt, identity, case["expected"]["beforeHex"], observed.get("started_fresh"))
+        check_recovery(attempt, identity, case["expected"]["beforeHex"], observed.get("started_fresh"), recovery_prefix)
     final = None
     if case_id in COMPOSITION:
         need(not qualification.detail, qualification.detail)
@@ -607,16 +615,20 @@ def evaluate_attempt(attempt, case, cohort, qualification):
             order = [1] if attempt["route"] == "sample" else [2]
         else:
             order = list(range(1, len(case["actions"]) + 1))
-        need(attempt.get("action_order") == order and all(type(i) is int for i in attempt["action_order"]),
+        actions = attempt.get("action_order")
+        recovery_prefix = case_id in RECOVERY and actions == order[:-1]
+        need((actions == order or recovery_prefix) and all(type(i) is int for i in actions),
              "missing or unordered prescribed actions")
         observed = obj(attempt.get("observations"), "visible observations")
         identity = (case_id, attempt["attemptId"], attempt["generation"])
         final, capture_issue = None, None
         try:
-            final = check_capture(attempt, case, cohort, qualification, observed, identity)
+            final = check_capture(attempt, case, cohort, qualification, observed, identity, recovery_prefix)
         except MeasuredFailure:
             raise
         except EvidenceError as error:
+            if recovery_prefix:
+                raise
             capture_issue = error
         measured(attempt.get("start_empty") is not False, "unexpected startup input")
         measured(attempt.get("replayed") is not True, "replayed input")
@@ -807,22 +819,23 @@ def assess_cohort(cohort, role, cases, ids):
 
     records = retained_measurements(cohort)
     need(records.keys() <= {attempt["id"] for attempt in attempts}, "retained measurement has no submitted attempt")
-    positions = measurement_positions(attempts, records)
-    moved = moved_attempts(attempts, positions)
-    ordered = sorted((attempt for attempt in attempts if attempt["id"] in positions),
-                     key=lambda attempt: positions[attempt["id"]])
-    unbound = [attempt for attempt in attempts if attempt["id"] not in positions]
-    keys = [key for attempt in ordered for key in native_keys(attempt)]
+    bound_positions = measurement_positions(attempts, records)
+    moved = moved_attempts(attempts, bound_positions)
+    ordered = sorted((attempt for attempt in attempts if attempt["id"] in records),
+                     key=lambda attempt: records[attempt["id"]][:2])
+    unpositioned = [attempt for attempt in attempts if attempt["id"] not in records]
+    bound = [attempt for attempt in ordered if attempt["id"] in bound_positions]
+    keys = [key for attempt in bound for key in native_keys(attempt)]
     attempt_ids = Counter((launch, attempt_id) for launch, attempt_id, _ in keys)
     generations = Counter((launch, generation) for launch, _, generation in keys)
-    restarts = Counter(ref for attempt in ordered if (ref := restart_reference(attempt)) is not None)
-    out_of_order = out_of_order_attempts(ordered)
-    for attempt in [*ordered, *unbound]:
+    restarts = Counter(ref for attempt in bound if (ref := restart_reference(attempt)) is not None)
+    out_of_order = out_of_order_attempts(bound)
+    for attempt in [*ordered, *unpositioned]:
         attempt_id = attempt["id"]
         case_id = attempt["case_id"]
         if readiness.status != "pass":
             result = readiness
-        elif attempt_id not in positions:
+        elif attempt_id not in bound_positions:
             result = Result("inconclusive", "attempt does not match its retained launch and measurement")
         elif any(attempt_ids[launch, native_id] > 1 or generations[launch, generation] > 1
                  for launch, native_id, generation in native_keys(attempt)):

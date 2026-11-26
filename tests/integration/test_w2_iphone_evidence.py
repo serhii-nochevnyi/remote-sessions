@@ -234,8 +234,10 @@ def restart_without_fresh_attempt(cohort, attempt, outcome):
         restart["observed"] = recovery["retained"].copy()
     if outcome == "no-new-generation":
         restart["begin_failure"] = dict(restart["previous"], ref=f"{restart['ref']} begin failure")
+    measurement = next(record for launch in cohort["launches"] for record in launch["measurements"]
+                       if record["attempt_id"] == attempt["id"])
     for key in ("attemptId", "generation"):
-        attempt[key] = cohort["launches"][-1]["measurements"][-1][key] = restart["previous"][key]
+        attempt[key] = measurement[key] = restart["previous"][key]
     attempt.pop("final")
     attempt["observations"]["started_fresh"] = False
     return mark(attempt, "inconclusive" if outcome == "uncertain" else "failing")
@@ -569,6 +571,62 @@ class EvidenceTest(unittest.TestCase):
                     self.reject(report, "not bound to the old attempt")
                 remove_attempts(self.baseline, row)
 
+    def test_completed_recovery_prefix_requires_proven_restart_failure(self):
+        for case_id in sorted(evidence.RECOVERY):
+            for outcome, proof_key in (("same-generation", "observed"), ("no-new-generation", "begin_failure")):
+                with self.subTest(case=case_id, outcome=outcome):
+                    row = self.sample(case_id)
+                    row_id = restart_without_fresh_attempt(self.baseline, row, outcome)
+                    row.update(action_order=[1, 2], capture_error=True)
+                    failed = report_for(self.baseline, "failing", "mandatory-failure", [row_id])
+                    self.validate(failed, "failing")
+                    saved = copy.deepcopy(row)
+                    transition = evidence.OBSERVATIONS[case_id][0]
+                    for label, mutate, reason in (
+                        ("uncertain", lambda: restart.update(outcome="uncertain"), "restart outcome is uncertain"),
+                        ("absent proof", lambda: restart.pop(proof_key), "requires an object"),
+                        ("mismatched proof", lambda: restart[proof_key].update(generation=row["generation"] + 1),
+                         "different attempt or generation|begin failure belongs to a different"),
+                        ("unbound restart", lambda: restart["previous"].update(generation=row["generation"] + 1),
+                         "not bound to the old attempt"),
+                        ("incomplete gesture", lambda: restart.update(action_completed=False),
+                         "completed foreground restart action"),
+                        ("contradictory visible start", lambda: row["observations"].update(started_fresh=True),
+                         "conflicts with the visible"),
+                        ("missing visible result", lambda: row["observations"].pop("started_fresh"),
+                         "visible fresh-start observation"),
+                        ("missing return", lambda: row["observations"].pop(transition), "transition was not established"),
+                        ("fresh final", lambda: row.update(final=native(
+                            dict(restart["previous"], attemptId=row["attemptId"] + 1, generation=row["generation"] + 1),
+                            self.cases[case_id]["expected"]["afterHex"])),
+                         "conflicts with a new generation|does not match the retained"),
+                        ("reordered", lambda: row.update(action_order=[2, 1]), "unordered prescribed actions"),
+                        ("boolean action", lambda: row.update(action_order=[True, 2]), "unordered prescribed actions"),
+                        ("float action", lambda: row.update(action_order=[1, 2.0]), "unordered prescribed actions"),
+                    ):
+                        with self.subTest(control=label):
+                            row.clear()
+                            row.update(copy.deepcopy(saved))
+                            restart = row["recovery"]["restart"]
+                            row["replayed"] = True
+                            mutate()
+                            self.reject(failed, reason)
+                            mark(row, "inconclusive")
+                            self.validate(report_for(self.baseline, "inconclusive", "inconclusive", []), "inconclusive")
+                    remove_attempts(self.baseline, row)
+
+    def test_fresh_recovery_needs_the_full_action_order(self):
+        for case_id in sorted(evidence.RECOVERY):
+            with self.subTest(case=case_id):
+                row = self.sample(case_id)
+                report = report_for(self.baseline, "inconclusive", "inconclusive", [])
+                self.validate(report, "inconclusive")
+                row["action_order"] = [1, 2]
+                self.reject(report, "fresh foreground restart requires all prescribed actions")
+                mark(row, "inconclusive")
+                self.validate(report, "inconclusive")
+                remove_attempts(self.baseline, row)
+
     def test_repeated_restart_failure_requires_independent_old_attempts(self):
         case = self.cases["lock-foreground"]
         baseline_ids = []
@@ -703,6 +761,44 @@ class EvidenceTest(unittest.TestCase):
         support = [row["id"] for row in old_rows[2:]] + [row["id"] for row in later]
         self.validate(report_for(self.baseline, support=support), "pass")
 
+    def test_partially_bound_history_precedes_later_independent_passes(self):
+        early = self.sample("app-switch")
+        report = self.complete(self.baseline)
+        attempts = self.baseline["attempts"]
+        later = [row for row in attempts[1:] if row["case_id"] == early["case_id"]]
+        self.assertEqual(len(later), 2)
+        support = report["decision"]["supporting_attempt_ids"]
+        support.remove(early["id"])
+        early.pop("launch_ref")
+        mark(early, "inconclusive")
+        attempts.append(attempts.pop(0))
+        self.validate(report, "pass")
+
+        early.update(launch_ref="conflicting capture", attemptId=later[0]["attemptId"],
+                     generation=later[0]["generation"], recovery=copy.deepcopy(later[0]["recovery"]))
+        self.validate(report, "pass")
+        early["status"] = "pass"
+        self.reject(report, "does not match its retained launch and measurement")
+        mark(early, "inconclusive")
+        support[support.index(later[0]["id"])] = early["id"]
+        self.reject(report, "disposition must reference the attempts that establish it")
+
+    def test_later_and_unpositioned_partial_rows_still_hold_the_case(self):
+        self.complete(self.baseline)
+        start_launch(self.baseline)
+        late = self.sample("app-switch")
+        late.pop("launch_ref")
+        mark(late, "inconclusive")
+        attempts = self.baseline["attempts"]
+        attempts.insert(0, attempts.pop())
+        held = report_for(self.baseline, "inconclusive", "inconclusive", [])
+        self.validate(held, "inconclusive")
+        self.reject(report_for(self.baseline, support=[row["id"] for row in attempts if row is not late]),
+                    "report status must be inconclusive")
+
+        self.baseline["launches"][-1]["measurements"].clear()
+        self.validate(held, "inconclusive")
+
     def test_attempt_must_match_retained_launch_and_measurement(self):
         row = self.sample("english-return")
         report = report_for(self.baseline)
@@ -743,12 +839,12 @@ class EvidenceTest(unittest.TestCase):
             self.assertEqual(evidence.main([*argv, "--check-report"]), 0)
             self.assertEqual(evidence.main([*argv, "--require-pass"]), 1)
 
-    def correction_fixture(self):
-        case = self.cases["english-return"]
+    def correction_fixture(self, case_id="english-return", failed_observation="cursor_visible"):
+        case = self.cases[case_id]
         baseline_ids = []
         for tag in ("original", "repeat"):
             row = add_attempt(self.baseline, case, tag)
-            row["observations"]["cursor_visible"] = False
+            row["observations"][failed_observation] = False
             baseline_ids.append(mark(row, "failing"))
         corrected = bound_cohort("3", "4")
         corrected["tuple"]["app"]["version"] = "0.1.1"
@@ -757,7 +853,7 @@ class EvidenceTest(unittest.TestCase):
         corrected["fingerprint"] = evidence.fingerprint(corrected["tuple"])
         make_recipes(corrected, self.cases)
         row = add_attempt(corrected, case, "corrected")
-        row["observations"]["cursor_visible"] = False
+        row["observations"][failed_observation] = False
         corrected_id = mark(row, "failing")
         report = report_for(self.baseline, "failing", "comparison-eligible", [*baseline_ids, corrected_id])
         report["cohorts"]["corrected"] = corrected
@@ -813,6 +909,81 @@ class EvidenceTest(unittest.TestCase):
         report["decision"].update(disposition="inconclusive",
                                   supporting_attempt_ids=report["correction"]["baseline_attempt_ids"])
         self.validate(report, "inconclusive")
+
+    def test_unchanged_recovery_read_requires_confirmed_initial_delivery_for_comparison(self):
+        report, corrected = self.correction_fixture("app-switch", "prompt_visible")
+        baseline_rows = self.baseline["attempts"]
+        persistent = corrected["attempts"][0]
+        baseline_ids = report["correction"]["baseline_attempt_ids"]
+        for vector in ("", "78"):
+            with self.subTest(initial_hex=vector):
+                for row in [*baseline_rows, persistent]:
+                    recovery = row["recovery"]
+                    row.update(capture_error=False)
+                    row["observations"]["prompt_visible"] = True
+                    initial = native(recovery["restart"]["previous"], vector)
+                    recovery.update(before=initial, retained=initial.copy())
+                    mark(row, "failing")
+                self.validate(report, "failing")
+                mark(baseline_rows[0], "inconclusive")
+                self.reject(report, "initial bytes differ from the manifest")
+                mark(baseline_rows[0], "failing")
+
+                for row in baseline_rows:
+                    row["capture_error"] = True
+                    mark(row, "inconclusive")
+                self.validate(report_for(self.baseline, "inconclusive", "inconclusive", []), "inconclusive")
+                self.reject(report, "same unresolved measured failure twice")
+
+                for row in baseline_rows:
+                    row["capture_error"] = False
+                    mark(row, "failing")
+                persistent.pop("capture_error")
+                mark(persistent, "inconclusive")
+                report["cohorts"]["comparison"] = {}
+                self.reject(report, "persistent corrected-build mandatory failure")
+                del report["cohorts"]["comparison"]
+                held = dict(report, status="inconclusive", decision=dict(
+                    report["decision"], disposition="inconclusive", supporting_attempt_ids=baseline_ids))
+                self.validate(held, "inconclusive")
+
+    def test_bound_retained_changes_count_with_unresolved_initial_delivery(self):
+        for label, before_hex, retained_hex, before_lengths, retained_lengths, extra in (
+            ("bytes", "78", "79", [1], [1], False),
+            ("event count", "6162", "6162", [2], [1, 1], False),
+            ("event lengths", "616263", "616263", [1, 2], [2, 1], False),
+            ("observed extra input", "78", "78", [1], [1], True),
+        ):
+            with self.subTest(change=label):
+                row = self.sample("app-switch")
+                row["capture_error"] = True
+                recovery = row["recovery"]
+                identity = recovery["restart"]["previous"]
+                recovery["before"] = dict(native(identity, before_hex), acceptedEvents=len(before_lengths),
+                                          eventLengths=before_lengths)
+                recovery["retained"] = dict(native(identity, retained_hex), acceptedEvents=len(retained_lengths),
+                                            eventLengths=retained_lengths)
+                recovery["old_generation_extra_event"] = extra
+                self.reject(report_for(self.baseline), "retained native bytes or events changed")
+                row_id = mark(row, "failing")
+                self.validate(report_for(self.baseline, "failing", "mandatory-failure", [row_id]), "failing")
+                recovery["retained"]["generation"] += 1
+                self.reject(report_for(self.baseline), "different attempt or generation")
+                remove_attempts(self.baseline, row)
+
+    def test_failed_restart_reproduces_with_unresolved_initial_delivery(self):
+        report, corrected = self.correction_fixture("lock-foreground", "prompt_visible")
+        for cohort in (self.baseline, corrected):
+            for row in cohort["attempts"]:
+                row.update(capture_error=True)
+                row["observations"]["prompt_visible"] = True
+                recovery = row["recovery"]
+                recovery["before"] = native(recovery["restart"]["previous"], "")
+                recovery["retained"] = recovery["before"].copy()
+                if cohort is corrected:
+                    row["action_order"] = [1, 2]
+                restart_without_fresh_attempt(cohort, row, "same-generation")
+        self.validate(report, "failing")
 
     def test_unresolved_capture_preserves_independent_measured_failures(self):
         for case_id, failure, expected in (
