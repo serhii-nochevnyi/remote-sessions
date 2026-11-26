@@ -165,8 +165,10 @@ def composition(attempt, identity, vector):
 
 def start_launch(cohort):
     order = len(cohort["launches"]) + 1
+    binding = {key: cohort["tuple"][key] for key in ("source_revision", "bundle_sha256")}
     launch = {"id": f"synthetic launch {order}", "order": order,
-              "ref": f"synthetic retained launch capture {order}", "measurements": []}
+              "ref": f"synthetic launch capture {binding['source_revision']}/{binding['bundle_sha256']}/{order}",
+              "binding": binding, "measurements": []}
     cohort["launches"].append(launch)
     return launch
 
@@ -175,8 +177,21 @@ def retain_measurement(cohort, attempt):
     launch = cohort["launches"][-1] if cohort["launches"] else start_launch(cohort)
     position = launch["measurements"][-1]["position"] + 1 if launch["measurements"] else 1
     attempt.update(launch_id=launch["id"], launch_ref=launch["ref"], measurement_position=position)
+    attempt.setdefault("ref", f"{launch['ref']}/measurement/{position}")
     launch["measurements"].append({"attempt_id": attempt["id"], "position": position,
-                                   "attemptId": attempt["attemptId"], "generation": attempt["generation"]})
+                                   "attemptId": attempt["attemptId"], "generation": attempt["generation"],
+                                   "ref": attempt["ref"]})
+
+
+def retained_record(cohort, attempt):
+    return next(record for launch in cohort["launches"] for record in launch["measurements"]
+                if record["attempt_id"] == attempt["id"])
+
+
+def set_measurement_counters(cohort, attempt, **counters):
+    attempt.update(counters)
+    attempt["final"].update(counters)
+    retained_record(cohort, attempt).update(counters)
 
 
 def remove_attempts(cohort, *removed):
@@ -194,7 +209,7 @@ def add_attempt(cohort, case, suffix, route=None):
     attempt = {
         "id": f"{cohort['tuple']['source_revision'][0]}-{case_id}-{suffix}", "case_id": case_id,
         "cohort_fingerprint": cohort["fingerprint"], "attemptId": index, "generation": index,
-        "ref": "synthetic attempt", "status": "pass",
+        "status": "pass",
         "keyboard_language": "uk" if case_id == "ukrainian-return" else "en", "orientation": "portrait",
         "action_order": list(range(1, len(case["actions"]) + 1)), "start_empty": True,
         "replayed": False, "capture_error": False,
@@ -235,8 +250,7 @@ def restart_without_fresh_attempt(cohort, attempt, outcome):
         restart["observed"] = recovery["retained"].copy()
     if outcome == "no-new-generation":
         restart["begin_failure"] = dict(restart["previous"], ref=f"{restart['ref']} begin failure")
-    measurement = next(record for launch in cohort["launches"] for record in launch["measurements"]
-                       if record["attempt_id"] == attempt["id"])
+    measurement = retained_record(cohort, attempt)
     for key in ("attemptId", "generation"):
         attempt[key] = measurement[key] = restart["previous"][key]
     attempt.pop("final")
@@ -1018,6 +1032,17 @@ class EvidenceTest(unittest.TestCase):
                 row.update(change)
                 self.reject(report, "retained launch and measurement")
                 row.update(original)
+        for ref in (None, "different observation"):
+            with self.subTest(retained_ref=ref):
+                record = retained_record(self.baseline, row)
+                record.pop("ref")
+                if ref is not None:
+                    record["ref"] = ref
+                self.reject(report, "retained measurement observation reference")
+                mark(row, "inconclusive")
+                self.validate(report_for(self.baseline, "inconclusive", "inconclusive", []), "inconclusive")
+                record["ref"] = row["ref"]
+                mark(row, "pass")
         self.baseline["attempts"].clear()
         self.reject(report, "retained measurement has no submitted attempt")
 
@@ -1048,12 +1073,15 @@ class EvidenceTest(unittest.TestCase):
             self.assertEqual(evidence.main([*argv, "--check-report"]), 0)
             self.assertEqual(evidence.main([*argv, "--require-pass"]), 1)
 
-    def correction_fixture(self, case_id="english-return", failed_observation="cursor_visible"):
+    def correction_fixture(self, case_id="english-return", failed_observation="cursor_visible", *, route=None):
         case = self.cases[case_id]
         baseline_ids = []
         for tag in ("original", "repeat"):
-            row = add_attempt(self.baseline, case, tag)
-            row["observations"][failed_observation] = False
+            row = add_attempt(self.baseline, case, tag, route)
+            if failed_observation is None:
+                row["start_empty"] = False
+            else:
+                row["observations"][failed_observation] = False
             baseline_ids.append(mark(row, "failing"))
         corrected = bound_cohort("3", "4")
         corrected["tuple"]["app"]["version"] = "0.1.1"
@@ -1061,8 +1089,11 @@ class EvidenceTest(unittest.TestCase):
         corrected["build"]["installation"]["app"] = copy.deepcopy(corrected["tuple"]["app"])
         corrected["fingerprint"] = evidence.fingerprint(corrected["tuple"])
         make_recipes(corrected, self.cases)
-        row = add_attempt(corrected, case, "corrected")
-        row["observations"][failed_observation] = False
+        row = add_attempt(corrected, case, "corrected", route)
+        if failed_observation is None:
+            row["start_empty"] = False
+        else:
+            row["observations"][failed_observation] = False
         corrected_id = mark(row, "failing")
         report = report_for(self.baseline, "failing", "comparison-eligible", [*baseline_ids, corrected_id])
         report["cohorts"]["corrected"] = corrected
@@ -1070,6 +1101,335 @@ class EvidenceTest(unittest.TestCase):
                                 "change": "synthetic scoped correction", "scope": ["synthetic source path"],
                                 "baseline_attempt_ids": baseline_ids}
         return report, corrected
+
+    def test_correction_rejects_the_same_measurement_under_relabeling(self):
+        original, corrected = self.correction_fixture()
+        first = self.baseline["attempts"][0]
+        independent = corrected["attempts"][0]
+        for key in ("attemptId", "generation"):
+            self.assertEqual(first[key], independent[key])
+        self.validate(original, "failing")
+
+        for relabel in ("none", "report ID", "cohort fingerprint", "launch label", "distinct launch"):
+            with self.subTest(relabel=relabel):
+                report = copy.deepcopy(original)
+                before, after = (report["cohorts"][role] for role in ("baseline", "corrected"))
+                first = before["attempts"][0]
+                row = after["attempts"][0]
+                launch = after["launches"][0]
+                record = retained_record(after, row)
+                record["ref"] = row["ref"] = first["ref"]
+                if relabel != "distinct launch":
+                    launch["ref"] = row["launch_ref"] = first["launch_ref"]
+                if relabel == "report ID":
+                    record["attempt_id"] = row["id"] = "relabeled corrected observation"
+                    report["decision"]["supporting_attempt_ids"][-1] = row["id"]
+                if relabel == "cohort fingerprint":
+                    after["tuple"]["app"]["build"] = "3"
+                    after["build"]["installation"]["app"]["build"] = "3"
+                    after["fingerprint"] = row["cohort_fingerprint"] = evidence.fingerprint(after["tuple"])
+                    for recipe in after["recipes"].values():
+                        for rehearsal in recipe["rehearsals"]:
+                            rehearsal["cohort_fingerprint"] = after["fingerprint"]
+                if relabel == "launch label":
+                    launch["id"] = row["launch_id"] = "relabeled corrected launch"
+                diagnostic = "shared measured observation" if relabel == "distinct launch" else "shared launch recording"
+                self.reject(report, f"{row['id']}: expected inconclusive .*{diagnostic}")
+                self.assert_correction_is_incomplete(report, row)
+
+    def assert_correction_is_incomplete(self, report, held):
+        baseline_ids = report["correction"]["baseline_attempt_ids"]
+        mark(held, "inconclusive")
+        self.reject(report, "report status must be inconclusive")
+        forged = copy.deepcopy(report)
+        self.add_comparison(forged, native_cohort())
+        self.reject(forged, "persistent corrected-build mandatory failure")
+        report["status"] = "inconclusive"
+        report["decision"].update(disposition="inconclusive", supporting_attempt_ids=baseline_ids.copy())
+        self.validate(report, "inconclusive")
+        report["decision"]["supporting_attempt_ids"].append(held["id"])
+        self.reject(report, "disposition must reference the attempts that establish it")
+
+    def assert_only_first_baseline_failure(self, report, first, held):
+        mark(held, "inconclusive")
+        self.reject(report, "same unresolved measured failure twice on the baseline")
+        baseline = report["cohorts"]["baseline"]
+        honest = report_for(baseline, "failing", "mandatory-failure", [first["id"]])
+        self.validate(honest, "failing")
+        honest["decision"]["supporting_attempt_ids"].append(held["id"])
+        self.reject(honest, "disposition must reference the attempts that establish it")
+
+    def test_shared_measured_recording_requires_independent_windows_in_every_signed_build(self):
+        original, _ = self.correction_fixture()
+        self.validate(original, "failing")
+        for role in ("baseline", "corrected"):
+            for defect, start, end in (
+                ("adjacent", 100, 200), ("disjoint", 120, 200), ("identical", 0, 100),
+                ("overlapping", 99, 200), ("missing earlier", 100, 200), ("missing later", None, None),
+                ("both missing", None, None),
+                ("negative", -1, 100), ("boolean", False, 100), ("fractional", 100, 200.5),
+                ("empty", 100, 100), ("reversed", 200, 100),
+            ):
+                with self.subTest(role=role, segment=defect):
+                    report = copy.deepcopy(original)
+                    before = report["cohorts"]["baseline"]
+                    after = report["cohorts"][role]
+                    first, row = before["attempts"][0], after["attempts"][-1]
+                    earlier, later = retained_record(before, first), retained_record(after, row)
+                    if role == "baseline":
+                        later["attempt_id"] = row["id"] = "relabeled baseline observation"
+                        later["position"] = row["measurement_position"] = 7
+                        set_measurement_counters(after, row, attemptId=10, generation=11)
+                        report["correction"]["baseline_attempt_ids"][1] = row["id"]
+                        report["decision"]["supporting_attempt_ids"][1] = row["id"]
+                    if role == "corrected":
+                        before["launches"][0]["capture_segment"] = {"start_ms": 0, "end_ms": 300}
+                        after["launches"][0].update(ref=first["launch_ref"],
+                                                   capture_segment={"start_ms": 300, "end_ms": 600})
+                        row["launch_ref"] = first["launch_ref"]
+                    later["ref"] = row["ref"] = first["ref"]
+                    if defect not in ("missing earlier", "both missing"):
+                        earlier["capture_segment"] = {"start_ms": 0, "end_ms": 100}
+                    if defect not in ("missing later", "both missing"):
+                        later["capture_segment"] = {"start_ms": start, "end_ms": end}
+                    if defect in ("adjacent", "disjoint"):
+                        self.validate(report, "failing")
+                    else:
+                        diagnostic = ("shared measured observation" if defect in
+                                      ("identical", "overlapping", "missing earlier", "missing later", "both missing")
+                                      else "retained measurement capture segment")
+                        self.reject(report, f"{row['id']}: expected inconclusive .*{diagnostic}")
+                        if role == "baseline":
+                            self.assert_only_first_baseline_failure(report, first, row)
+                        else:
+                            self.assert_correction_is_incomplete(report, row)
+
+    def test_shared_launch_recording_requires_independent_windows_across_builds(self):
+        original, _ = self.correction_fixture()
+        for equal_counter in ("attemptId", "generation"):
+            for defect in ("missing", "identical", "overlapping", "malformed", "adjacent"):
+                with self.subTest(equal_counter=equal_counter, launch_segment=defect):
+                    report = copy.deepcopy(original)
+                    before, after = (report["cohorts"][role] for role in ("baseline", "corrected"))
+                    first, row = before["attempts"][0], after["attempts"][0]
+                    changed_counter = "generation" if equal_counter == "attemptId" else "attemptId"
+                    set_measurement_counters(after, row, **{changed_counter: 6})
+                    self.assertEqual(first[equal_counter], row[equal_counter])
+                    self.assertNotEqual(first["ref"], row["ref"])
+                    self.validate(report, "failing")
+
+                    before["launches"][0]["capture_segment"] = {"start_ms": 0, "end_ms": 100}
+                    launch = after["launches"][0]
+                    launch["ref"] = row["launch_ref"] = first["launch_ref"]
+                    if defect != "missing":
+                        start = {"identical": 0, "overlapping": 99, "malformed": True, "adjacent": 100}[defect]
+                        launch["capture_segment"] = {"start_ms": start, "end_ms": 100 if defect == "identical" else 200}
+                    if defect == "adjacent":
+                        self.validate(report, "failing")
+                    else:
+                        diagnostic = "retained launch capture segment" if defect == "malformed" else "shared launch recording"
+                        self.reject(report, f"{row['id']}: expected inconclusive .*{diagnostic}")
+                        self.assert_correction_is_incomplete(report, row)
+
+    def test_cross_build_recording_windows_apply_across_launch_and_measurement_refs(self):
+        original, _ = self.correction_fixture()
+        for donor_role, recipient_role in (
+            ("baseline", "corrected"), ("baseline", "comparison"), ("corrected", "comparison"),
+        ):
+            for earlier_is_launch in (True, False):
+                for segment in ("missing", "overlapping", "adjacent"):
+                    with self.subTest(donor=donor_role, recipient=recipient_role,
+                                      earlier_is_launch=earlier_is_launch, segment=segment):
+                        report = copy.deepcopy(original)
+                        correction_support = report["decision"]["supporting_attempt_ids"].copy()
+                        recipient = report["cohorts"]["corrected"]
+                        if recipient_role == "comparison":
+                            recipient = native_cohort()
+                            self.add_comparison(report, recipient)
+                        row = recipient["attempts"][-1]
+                        launch = recipient["launches"][-1]
+                        if recipient_role == "comparison" and not earlier_is_launch:
+                            remove_attempts(recipient, row)
+                            launch = start_launch(recipient)
+                            retain_measurement(recipient, row)
+                            recipient["attempts"].append(row)
+                        donor = report["cohorts"][donor_role]
+                        if earlier_is_launch:
+                            earlier = donor["launches"][0]
+                            later, field = retained_record(recipient, row), "ref"
+                        else:
+                            earlier = retained_record(donor, donor["attempts"][0])
+                            later, field = launch, "launch_ref"
+                        later["ref"] = row[field] = earlier["ref"]
+                        if segment != "missing":
+                            earlier["capture_segment"] = {"start_ms": 0, "end_ms": 100}
+                            later["capture_segment"] = {
+                                "start_ms": 100 if segment == "adjacent" else 99, "end_ms": 200,
+                            }
+                        if segment == "adjacent":
+                            self.validate(report, "failing")
+                        else:
+                            self.reject(report, f"{row['id']}: expected inconclusive .*shared launch and measurement")
+                            if recipient_role == "corrected":
+                                self.assert_correction_is_incomplete(report, row)
+                            else:
+                                mark(row, "inconclusive")
+                                self.assert_comparison_uses_only_correction(report, correction_support)
+
+    def test_same_signed_launch_context_can_overlap_its_distinct_measurement_windows(self):
+        report, _ = self.correction_fixture()
+        launch = self.baseline["launches"][0]
+        launch["capture_segment"] = {"start_ms": 0, "end_ms": 200}
+        for index, row in enumerate(self.baseline["attempts"]):
+            row["ref"] = launch["ref"]
+            retained_record(self.baseline, row).update(
+                ref=launch["ref"], capture_segment={"start_ms": index * 100, "end_ms": (index + 1) * 100},
+            )
+        self.validate(report, "failing")
+
+    def test_each_cohort_holds_missing_or_wrong_retained_source_and_bundle(self):
+        original, corrected = self.correction_fixture()
+        first, second = self.baseline["attempts"]
+        remove_attempts(self.baseline, second)
+        start_launch(self.baseline)
+        retain_measurement(self.baseline, second)
+        self.baseline["attempts"].append(second)
+        set_measurement_counters(self.baseline, second, attemptId=first["attemptId"])
+        support = original["decision"]["supporting_attempt_ids"].copy()
+        self.add_comparison(original, native_cohort())
+        comparison = original["cohorts"]["comparison"]
+        last = comparison["attempts"][-1]
+        remove_attempts(comparison, last)
+        start_launch(comparison)
+        retain_measurement(comparison, last)
+        comparison["attempts"].append(last)
+        self.validate(original, "failing")
+
+        for role in ("baseline", "corrected", "comparison"):
+            for key in ("binding", "source_revision", "bundle_sha256"):
+                for defect in ("missing", "foreign"):
+                    with self.subTest(role=role, binding_key=key, defect=defect):
+                        report = copy.deepcopy(original)
+                        cohort = report["cohorts"][role]
+                        launch, row = cohort["launches"][-1], cohort["attempts"][-1]
+                        foreign = self.baseline if role != "baseline" else corrected
+                        if key == "binding":
+                            if defect == "missing":
+                                launch.pop("binding")
+                            else:
+                                launch["binding"] = foreign["launches"][0]["binding"].copy()
+                                if role == "baseline":
+                                    launch["ref"] = row["launch_ref"] = foreign["launches"][0]["ref"]
+                                    ref = foreign["attempts"][0]["ref"]
+                                    retained_record(cohort, row)["ref"] = row["ref"] = ref
+                        elif defect == "missing":
+                            launch["binding"].pop(key)
+                        else:
+                            launch["binding"][key] = foreign["tuple"][key]
+                        self.reject(report, f"{row['id']}: expected inconclusive .*retained launch signed binding")
+                        if role == "baseline":
+                            self.assert_only_first_baseline_failure(report, first, row)
+                        elif role == "corrected":
+                            del report["cohorts"]["comparison"]
+                            report["decision"].update(disposition="comparison-eligible", supporting_attempt_ids=support.copy())
+                            self.assert_correction_is_incomplete(report, row)
+                        else:
+                            mark(row, "inconclusive")
+                            self.assert_comparison_uses_only_correction(report, support)
+
+    def test_unknown_trailing_conditions_hold_baseline_and_corrected_support(self):
+        for case_id, failure, route, changes in (
+            ("english-return", "cursor_visible", None,
+             (("keyboard_language", None), ("keyboard_language", "uk"), ("orientation", None),
+              ("orientation", "landscape"))),
+            ("paste-short", "focused_prompt", "sample",
+             (("route", None), ("route", "unknown"), ("route", "native"))),
+            ("composition-commit", None, None,
+             (("recipe_id", None), ("recipe_id", "unqualified gesture"))),
+        ):
+            self.setUp()
+            original, _ = self.correction_fixture(case_id, failure, route=route)
+            self.validate(original, "failing")
+            for role in ("baseline", "corrected"):
+                for positioned in (True, False):
+                    for key, value in changes:
+                        with self.subTest(case=case_id, role=role, positioned=positioned, condition=key, value=value):
+                            report = copy.deepcopy(original)
+                            cohort = report["cohorts"][role]
+                            hold = add_attempt(cohort, self.cases[case_id], "trailing-hold", route)
+                            hold["capture_error"] = True
+                            if value is None:
+                                hold.pop(key)
+                            else:
+                                hold[key] = value
+                            if not positioned:
+                                cohort["launches"][-1]["measurements"].pop()
+                            mark(hold, "inconclusive")
+                            cohort["attempts"].insert(0, cohort["attempts"].pop())
+                            support = report["decision"]["supporting_attempt_ids"].copy()
+                            if role == "baseline":
+                                self.reject(report, "same unresolved measured failure twice on the baseline")
+                                honest = report_for(cohort, "failing", "mandatory-failure", support[:2])
+                            else:
+                                self.reject(report, "shell disposition must be mandatory-failure")
+                                self.add_comparison(report, native_cohort())
+                                self.reject(report, "persistent corrected-build mandatory failure")
+                                del report["cohorts"]["comparison"]
+                                report["decision"].update(disposition="mandatory-failure", supporting_attempt_ids=support)
+                                honest = report
+                            self.validate(honest, "failing")
+                            honest["decision"]["supporting_attempt_ids"].append(hold["id"])
+                            self.reject(honest, "disposition must reference the attempts that establish it")
+
+    def test_only_fresh_independent_failures_support_correction_after_historical_holds(self):
+        report, _ = self.correction_fixture()
+        case = self.cases["english-return"]
+        stale = report["decision"]["supporting_attempt_ids"].copy()
+        fresh = {}
+        for role, cohort in report["cohorts"].items():
+            hold = add_attempt(cohort, case, "historical-hold")
+            hold.pop("launch_id")
+            hold.pop("keyboard_language")
+            mark(hold, "inconclusive")
+            fresh[role] = []
+            for index in range(2 if role == "baseline" else 1):
+                failure = add_attempt(cohort, case, f"fresh-{index}")
+                failure["observations"]["cursor_visible"] = False
+                fresh[role].append(mark(failure, "failing"))
+        report["correction"]["baseline_attempt_ids"] = fresh["baseline"]
+        support = [*fresh["baseline"], *fresh["corrected"]]
+        report["decision"]["supporting_attempt_ids"] = support.copy()
+        self.validate(report, "failing")
+        report["correction"]["baseline_attempt_ids"] = [stale[0], fresh["baseline"][1]]
+        self.reject(report, "same unresolved measured failure twice on the baseline")
+        report["correction"]["baseline_attempt_ids"] = fresh["baseline"]
+        report["decision"]["supporting_attempt_ids"][-1] = stale[-1]
+        self.reject(report, "disposition must reference the attempts that establish it")
+
+    def test_only_a_retained_verified_different_paste_route_can_exclude_a_hold(self):
+        report, _ = self.correction_fixture("paste-short", "focused_prompt", route="sample")
+        for role, cohort in report["cohorts"].items():
+            hold = add_attempt(cohort, self.cases["paste-short"], "native-hold", "native")
+            hold["capture_error"] = True
+            mark(hold, "inconclusive")
+            self.validate(report, "failing")
+            record = cohort["launches"][-1]["measurements"].pop()
+            diagnostic = ("same unresolved measured failure twice on the baseline" if role == "baseline"
+                          else "shell disposition must be mandatory-failure")
+            self.reject(report, diagnostic)
+            cohort["launches"][-1]["measurements"].append(record)
+        self.validate(report, "failing")
+
+    def test_a_measured_composition_failure_needs_the_verified_procedure_for_reproduction(self):
+        report, corrected = self.correction_fixture("composition-commit", None)
+        self.validate(report, "failing")
+        persistent = corrected["attempts"][0]
+        persistent.pop("checkpoint")
+        self.reject(report, "shell disposition must be mandatory-failure")
+        report["decision"]["disposition"] = "mandatory-failure"
+        self.validate(report, "failing")
+        self.add_comparison(report, native_cohort())
+        self.reject(report, "persistent corrected-build mandatory failure")
 
     def test_correction_gate_requires_baseline_reproduction_and_persistent_corrected_failure(self):
         report, _ = self.correction_fixture()
@@ -1535,6 +1895,59 @@ class EvidenceTest(unittest.TestCase):
         comparison = report["cohorts"]["comparison"]
         report["decision"]["supporting_attempt_ids"] = [*correction_support, comparison["attempts"][0]["id"]]
         self.reject(report, "disposition must reference the attempts that establish it")
+
+    def test_candidate_matrix_cannot_count_a_shared_measured_observation_twice(self):
+        complete, _ = self.correction_fixture()
+        correction_support = complete["decision"]["supporting_attempt_ids"].copy()
+        self.add_comparison(complete, native_cohort())
+        self.validate(complete, "failing")
+        for scope in ("baseline", "corrected", "same case", "different case", "different paste route"):
+            with self.subTest(scope=scope):
+                report = copy.deepcopy(complete)
+                candidate = report["cohorts"]["comparison"]
+                english = [row for row in candidate["attempts"] if row["case_id"] == "english-return"]
+                ukrainian = [row for row in candidate["attempts"] if row["case_id"] == "ukrainian-return"]
+                paste = [row for row in candidate["attempts"] if row["case_id"] == "paste-short"]
+                donor = report["cohorts"].get(scope, candidate)
+                if scope in ("baseline", "corrected"):
+                    source, row = donor["attempts"][0], english[1]
+                elif scope == "same case":
+                    source, row = english
+                elif scope == "different case":
+                    source, row = english[0], ukrainian[1]
+                else:
+                    source = next(row for row in paste if row["route"] == "sample")
+                    row = [row for row in paste if row["route"] == "native"][-1]
+                earlier, later = retained_record(donor, source), retained_record(candidate, row)
+                support = report["decision"]["supporting_attempt_ids"]
+                support[support.index(row["id"])] = "relabeled candidate observation"
+                later["attempt_id"] = row["id"] = "relabeled candidate observation"
+                later["ref"] = row["ref"] = source["ref"]
+                earlier["capture_segment"] = {"start_ms": 0, "end_ms": 100}
+                later["capture_segment"] = {"start_ms": 100, "end_ms": 200}
+                self.validate(report, "failing")
+
+                later["capture_segment"] = earlier["capture_segment"].copy()
+                self.reject(report, f"{row['id']}: expected inconclusive .*shared measured observation")
+                mark(row, "inconclusive")
+                self.assert_comparison_uses_only_correction(report, correction_support)
+
+    def test_shared_recording_is_checked_against_all_earlier_admitted_measurements(self):
+        report, corrected = self.correction_fixture()
+        correction_support = report["decision"]["supporting_attempt_ids"].copy()
+        candidate = native_cohort()
+        self.add_comparison(report, candidate)
+        first, second = self.baseline["attempts"][0], corrected["attempts"][0]
+        third = next(row for row in candidate["attempts"] if row["case_id"] == "english-return")
+        shared = first["ref"]
+        for cohort, row, start in ((self.baseline, first, 0), (corrected, second, 100), (candidate, third, 200)):
+            row["ref"] = shared
+            retained_record(cohort, row).update(ref=shared, capture_segment={"start_ms": start, "end_ms": start + 100})
+        self.validate(report, "failing")
+        retained_record(candidate, third)["capture_segment"] = {"start_ms": 1, "end_ms": 99}
+        self.reject(report, f"{third['id']}: expected inconclusive .*shared measured observation")
+        mark(third, "inconclusive")
+        self.assert_comparison_uses_only_correction(report, correction_support)
 
     def test_comparison_rejects_borrowed_recordings_even_with_the_recipient_binding(self):
         complete, _ = self.correction_fixture()
