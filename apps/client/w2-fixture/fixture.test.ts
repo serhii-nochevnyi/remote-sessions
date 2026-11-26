@@ -208,9 +208,11 @@ class Element {
     const path: Element[] = [];
     for (let node: Element | null = this; node; node = node.parentNode) path.push(node);
     let stopped = false;
+    let immediate = false;
     Object.defineProperties(event, {
       target: { value: this },
       stopPropagation: { value: () => { stopped = true; } },
+      stopImmediatePropagation: { value: () => { stopped = immediate = true; } },
     });
     for (const capture of [true, false]) {
       for (const element of capture ? path.toReversed() : event.bubbles ? path : [this]) {
@@ -219,6 +221,7 @@ class Element {
           if (listener.capture !== capture) continue;
           if (!capture && event.type === "compositionend" && this.ownerDocument?.suppressCompositionEnd) continue;
           listener.callback(event as unknown as Parameters<Listener>[0]);
+          if (immediate) return !event.defaultPrevented;
         }
       }
     }
@@ -1082,7 +1085,7 @@ async function compositionVector(
   native: ReturnType<typeof connectNative>,
   id: CaseId,
   generation: number,
-  options: { hostile?: boolean; keepPreedit?: boolean; overlap?: () => void; repeat?: boolean; attemptId?: number } = {},
+  options: { hostile?: boolean; keepPreedit?: boolean; overlap?: () => void; repeat?: boolean; attemptId?: number; earlyRead?: () => void } = {},
 ) {
   const vector = requiredVectors[id];
   const driver = await compositionDriver(fixture);
@@ -1132,12 +1135,27 @@ async function compositionVector(
       driver.end(options.keepPreedit ? driver.textarea.value : vector.text);
       assert.equal(fixture.terminal.data.length, initialData + Number(Boolean(options.hostile)));
       assert.equal(appends(fixture).length, initialAppends);
-      driver.clock.advance(0);
     });
+    const checkpointReadCount = reads(fixture).length;
+    if (options.earlyRead) {
+      assert.equal(fixture.button("Read").disabled, false);
+      await fixture.click("Read");
+      assert.equal(reads(fixture).length, checkpointReadCount, "final Read waits for xterm");
+      assert.equal(field(fixture, "snapshot").textContent, "—");
+    }
+    await act(async () => { driver.clock.advance(0); });
 
     assert.deepEqual(fixture.terminal.data.slice(initialData),
       [...(options.hostile ? ["unexpected"] : []), ...(vector.text ? [vector.text] : [])], "public composition emissions");
-    await finalRead(fixture);
+    if (options.earlyRead) {
+      if (vector.text) {
+        assert.equal(appends(fixture).length, initialAppends + 1, "guarded composition appends before final Read");
+        assert.equal(reads(fixture).length, checkpointReadCount, "final Read waits for append acknowledgment");
+        assert.equal(field(fixture, "snapshot").textContent, "—");
+      }
+      await act(async () => { options.earlyRead!(); });
+      await fixture.waitFor(() => field(fixture, "snapshot").textContent !== "—", "early Read completes");
+    } else await finalRead(fixture);
     const accepted = vector.text && !options.hostile;
     const bytes = accepted ? [...Buffer.from(vector.afterHex, "hex")] : [];
     assert.deepEqual(appends(fixture).slice(initialAppends), accepted ? [
@@ -1471,12 +1489,14 @@ async function checkCheckpoint(executable: string, transformEntry?: MountOptions
   const native = connectNative(executable, "requests");
   const gate = deferred();
   let delayRead = true;
+  const appendGate = deferred();
   const fixture = await mountFixture({
     browserPaste: true,
     ...(transformEntry === undefined ? {} : { transformEntry }),
     async invoke(command, args) {
       const result = await native.invoke(command, args);
       if (delayRead && command === "w2_read_attempt") await gate.promise;
+      if (command === "w2_append_input") await appendGate.promise;
       return result;
     },
   });
@@ -1484,9 +1504,10 @@ async function checkCheckpoint(executable: string, transformEntry?: MountOptions
     await startCase(fixture, "composition-commit");
     await compositionVector(fixture, native, "composition-commit", 1, {
       overlap() { delayRead = false; gate.resolve(); },
+      earlyRead: appendGate.resolve,
     });
     await startCase(fixture, "composition-cancel");
-    await compositionVector(fixture, native, "composition-cancel", 2, { attemptId: 2, repeat: true });
+    await compositionVector(fixture, native, "composition-cancel", 2, { attemptId: 2, repeat: true, earlyRead() {} });
     await startCase(fixture, "composition-commit");
     await compositionVector(fixture, native, "composition-commit", 3, { hostile: true, attemptId: 3 });
     await startCase(fixture, "composition-commit");
@@ -1497,6 +1518,7 @@ async function checkCheckpoint(executable: string, transformEntry?: MountOptions
     throw error;
   } finally {
     gate.resolve();
+    appendGate.resolve();
     await fixture.dispose();
   }
 }
@@ -1846,8 +1868,75 @@ async function checkLateBegin(executable: string) {
   }
 }
 
+async function checkCompositionRetirement(executable: string, endBeforeHide: boolean) {
+  const native = connectNative(executable, "requests");
+  const fixture = await mountFixture({ browserPaste: true, invoke: native.invoke });
+  await startCase(fixture, "composition-commit");
+  const driver = await compositionDriver(fixture);
+  const compositionView = field(fixture, "terminal").find(node => node.classList.contains("composition-view"));
+  assert(compositionView, "xterm mounts its preedit view");
+  async function visibility(state: string) {
+    await act(async () => {
+      fixture.document.visibilityState = state;
+      fixture.document.dispatch("visibilitychange");
+    });
+  }
+  try {
+    await act(async () => {
+      driver.start();
+      driver.update("draft");
+      driver.clock.advance(250);
+    });
+    await fixture.waitFor(() => field(fixture, "checkpoint").textContent.includes("active and focused"), "focused checkpoint");
+    assert(compositionView.classList.contains("active"));
+    await act(async () => {
+      driver.update("abandoned");
+      if (endBeforeHide) driver.end("é");
+    });
+    if (endBeforeHide) {
+      await fixture.click("Read");
+      assert.equal(reads(fixture).length, 1, "early Read is still settling before hide");
+    }
+    await visibility("hidden");
+    await fixture.waitFor(() => field(fixture, "retained-snapshot").textContent === "(empty)", "retained interruption result");
+    await visibility("visible");
+    assert.equal(field(fixture, "snapshot").textContent, "—", "retired Read cannot publish");
+    assert.equal(reads(fixture).length, 2, "only checkpoint and interruption read the retired generation");
+
+    await fixture.click("Start fresh and refocus");
+    assert(fixture.terminal.options.disableStdin, "stdin is disabled while old xterm callbacks drain");
+    assert.equal(fixture.ipc.filter(call => call.command === "w2_begin_attempt").length, 1);
+    assert(!compositionView.classList.contains("active"), "recovery ends xterm preedit without an OS event");
+    assert.equal(driver.textarea.value, "");
+    assert.equal(fixture.document.activeElement, driver.textarea);
+    await act(async () => { driver.clock.advance(0); });
+    await fixture.waitFor(() => Boolean(fixture.container.find(node =>
+      node.localName === "button" && node.textContent === "Restart" && !node.disabled)), "recovery opens a new native generation");
+    await act(async () => {
+      driver.end("old commit");
+      driver.clock.advance(250);
+    });
+    assert.equal(appends(fixture).length, 0, "late old callbacks contribute zero bytes");
+    assert.equal(fixture.terminal.data.length, 0, "xterm emits no retired input");
+    assert.equal(driver.textarea.value, "", "late composition input leaves no retired text in xterm");
+    assert.equal(field(fixture, "snapshot").textContent, "—");
+    assert.equal(field(fixture, "retained-snapshot").textContent, "(empty)");
+    await compositionVector(fixture, native, "composition-commit", 2, { attemptId: 2 });
+    assert.equal(field(fixture, "retained-snapshot").textContent, "(empty)");
+    await native.finish();
+  } catch (error) {
+    await native.abort();
+    throw error;
+  } finally {
+    await fixture.dispose();
+    driver.clock.dispose();
+  }
+}
+
 async function foregroundRecovery() {
   await withNativeExecutable(async executable => {
+    await checkCompositionRetirement(executable, false);
+    await checkCompositionRetirement(executable, true);
     await checkLateBegin(executable);
     await checkForegroundRecovery(executable, "app-switch");
     await checkForegroundRecovery(executable, "lock-foreground");
@@ -1862,6 +1951,66 @@ async function foregroundRecovery() {
     await assert.rejects(checkForegroundRecovery(executable, "app-switch", source => replaceOnce(source,
       'terminal.options.disableStdin = false;', 'terminal.options.disableStdin = false; if (refocus) terminal.paste("queued old input");')),
     /recovery invokes no append for queued input/);
+  });
+}
+
+
+async function touchCopyVerification() {
+  await withNativeExecutable(async executable => {
+    const native = connectNative(executable, "requests");
+    const fixture = await mountFixture({ browserPaste: true, invoke: native.invoke });
+    try {
+      await startCase(fixture, "touch-selection-copy");
+      await fixture.click("Focus");
+      const terminal = fixture.terminal.browserTerminal!;
+      const textarea = fixture.terminal.textarea as unknown as Element;
+      const token = "COPY-Ї";
+      const buffer = terminal.buffer.active;
+      const lines = Array.from({ length: buffer.length }, (_, row) => buffer.getLine(row)?.translateToString(true));
+      const row = lines.findIndex(line => line?.includes(token));
+      assert(row >= 0, "copy target is visible in the xterm buffer");
+      terminal.select(lines[row]!.indexOf(token), row, token.length);
+      const clipboard = new Map<string, string>();
+      const clipboardData = { setData: clipboard.set.bind(clipboard), getData: clipboard.get.bind(clipboard) };
+      const clipboardEvent = (type: string) =>
+        Object.assign(new Event(type, { bubbles: true, cancelable: true }), { clipboardData });
+      textarea.dispatchEvent(clipboardEvent("copy"));
+      assert.equal(clipboard.get("text/plain"), token, "xterm copies the selected token");
+      const verify = field(fixture, "verify-copied-token");
+      assert(!field(fixture, "terminal").contains(verify));
+      assert(fixture.container.find(node => node.localName === "label" && node.textContent === "Verify copied token"));
+      await act(async () => {
+        verify.focus();
+        verify.dispatchEvent(clipboardEvent("paste"));
+      });
+      assert.equal(field(fixture, "copy-verification").textContent, "Match");
+      clipboard.set("text/plain", `${token} `);
+      await act(async () => { verify.dispatchEvent(clipboardEvent("paste")); });
+      assert.equal(field(fixture, "copy-verification").textContent, "No match");
+      assert.equal(verify.value, "", "clipboard text is discarded");
+      clipboard.set("text/plain", token);
+      await act(async () => { verify.dispatchEvent(clipboardEvent("paste")); });
+      await finalRead(fixture);
+      assert.equal(field(fixture, "copy-verification").textContent, "Match");
+      assert.equal(field(fixture, "snapshot").textContent, "(empty)");
+      assert.match(field(fixture, "snapshot-counts").textContent, /0 accepted events · 0 bytes/);
+      assert.deepEqual(fixture.ipc, [
+        { command: "w2_begin_attempt", args: { caseId: "touch-selection-copy" } },
+        { command: "w2_read_attempt", args: { generation: 1 } },
+      ]);
+      assert.deepEqual(native.snapshot(), {
+        caseId: "touch-selection-copy", generation: 1, nextSequence: 1,
+        bytes: [], eventLengths: [], rejected: 0, invalid: false,
+      });
+      await fixture.click("Restart");
+      await fixture.waitFor(() => field(fixture, "copy-verification").textContent === "", "restart clears copy verification");
+      await native.finish();
+    } catch (error) {
+      await native.abort();
+      throw error;
+    } finally {
+      await fixture.dispose();
+    }
   });
 }
 
@@ -2271,6 +2420,7 @@ if (import.meta.main) {
   test("mounted fixture wires layout without remounting its terminal", mountedLayout);
   test("mounted composition checkpoint reads native bytes before commit without moving focus", checkpointControls);
   test("foreground restart preserves evidence without replay", foregroundRecovery);
+  test("touch copy verifies the pasted token with an empty same-generation read", touchCopyVerification);
   test("native tracer rejects disconnected command wrappers", disconnectedWrapperControls);
   test("declared fixture boundary matches the iOS-only contract", () => assertBoundary(readBoundary()));
   test("declared fixture boundary rejects broadened declarations", declarationControls);

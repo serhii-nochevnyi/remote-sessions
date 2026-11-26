@@ -9,10 +9,12 @@ import manifest from "./cases.json" with { type: "json" };
 import { observeTerminalLayout, type LayoutEvent } from "./terminal-layout.ts";
 import { fixtureCaseId, registerRecorder, type Invoke, type Snapshot } from "./recorder.ts";
 
+const copyToken = "COPY-Ї";
+
 const transcript = [
   "\x1b[?2004l\x1b[1;36mOffline terminal fixture\x1b[0m",
   ...Array.from({ length: 24 }, (_, index) => `History line ${index + 1} · Україна`),
-  "Selection target: COPY-Ї",
+  `Selection target: ${copyToken}`,
   "> ",
 ].join("\r\n");
 
@@ -88,7 +90,34 @@ function mountTerminal(
   let pollEpoch = 0;
   let disposed = false;
   let composing = false;
-  let settling: ReturnType<typeof setTimeout> | undefined;
+  let needsCompositionDrain = false;
+  let settling: { done: Promise<void>; cancel: () => void } | undefined;
+
+  function settleComposition() {
+    settling?.cancel();
+    needsCompositionDrain = true;
+    const epoch = lifecycleEpoch;
+    const attempt = current;
+    let timer: ReturnType<typeof setTimeout>;
+    let finish!: () => void;
+    const done = new Promise<void>(resolve => { finish = resolve; });
+    const cycle = {
+      done,
+      cancel() {
+        clearTimeout(timer);
+        if (settling === cycle) settling = undefined;
+        finish();
+      },
+    };
+    settling = cycle;
+    timer = setTimeout(() => {
+      timer = setTimeout(() => {
+        if (epoch === lifecycleEpoch && current === attempt) needsCompositionDrain = false;
+        cycle.cancel();
+      }, 0);
+    }, 0);
+    return done;
+  }
 
   function publish(attempt: Attempt) {
     if (current === attempt) publishAttempt({ ...attempt, trace: [...attempt.trace] });
@@ -161,8 +190,19 @@ function mountTerminal(
     }, checkpointInterval);
   }
 
+  function clearPreedit() {
+    textarea.value = "";
+    textarea.setSelectionRange(0, 0);
+  }
+
+  function compositionInput(event: InputEvent) {
+    if (!event.isComposing && event.inputType !== "insertCompositionText"
+      && event.inputType !== "deleteCompositionText" && event.inputType !== "insertFromComposition") return;
+    if (!current || (!composing && !needsCompositionDrain)) clearPreedit();
+  }
+
   function compositionStart() {
-    const priorCycle = composing || settling !== undefined;
+    const priorCycle = composing || needsCompositionDrain;
     composing = true;
     const attempt = current;
     if (!attempt) return;
@@ -182,7 +222,7 @@ function mountTerminal(
 
   function compositionUpdate(event: CompositionEvent) {
     if (!composing) {
-      event.stopPropagation();
+      event.stopImmediatePropagation();
       return;
     }
     const attempt = current;
@@ -200,14 +240,11 @@ function mountTerminal(
 
   function compositionEnd(event: CompositionEvent) {
     if (!composing) {
-      event.stopPropagation();
+      event.stopImmediatePropagation();
       return;
     }
     composing = false;
-    clearTimeout(settling);
-    settling = setTimeout(() => {
-      settling = setTimeout(() => { settling = undefined; }, 0);
-    }, 0);
+    settleComposition();
     const attempt = current;
     if (!attempt?.composition) return;
     stopPolling();
@@ -243,6 +280,7 @@ function mountTerminal(
   textarea.addEventListener("compositionstart", compositionStart, true);
   textarea.addEventListener("compositionupdate", compositionUpdate, true);
   textarea.addEventListener("compositionend", compositionEnd, true);
+  textarea.addEventListener("input", compositionInput);
   textarea.addEventListener("blur", interrupt, true);
   document.addEventListener("visibilitychange", visibilityChanged);
 
@@ -317,6 +355,7 @@ function mountTerminal(
     lifecycleEpoch++;
     current = null;
     checkpointRead = undefined;
+    settling?.cancel();
     stopPolling();
     terminal.options.disableStdin = true;
     publishAttempt(null);
@@ -330,33 +369,29 @@ function mountTerminal(
     },
     async start(selected: Case, refocus: boolean) {
       if (document.visibilityState !== "visible") return false;
-      if (refocus && (composing || settling !== undefined)) {
-        publishError("Held: Previous composition is still ending. Try recovery again after it ends.");
-        return false;
-      }
       detach();
       const startEpoch = lifecycleEpoch;
       terminal.scrollToBottom();
       const id = ++nextId;
+      const isCurrent = () =>
+        lifecycleEpoch === startEpoch && !disposed && document.visibilityState === "visible";
       if (refocus) {
-        textarea.value = "";
+        clearPreedit();
+        if (composing) textarea.dispatchEvent(new Event("compositionend", { bubbles: true }));
         terminal.focus();
       }
-      const generation = await recorder.start(selected.id, () =>
-        lifecycleEpoch === startEpoch && !disposed && document.visibilityState === "visible");
-      if (generation === undefined || disposed || id !== nextId || lifecycleEpoch !== startEpoch
-        || document.visibilityState !== "visible") return false;
+      if (needsCompositionDrain) await (settling?.done ?? settleComposition());
+      if (!isCurrent()) return false;
+      const generation = await recorder.start(selected.id, isCurrent);
+      if (generation === undefined || !isCurrent()) return false;
       const attempt: Attempt = {
         id, selected, generation, startedAt: performance.now(), composition: selected.id.startsWith("composition-"),
         phase: "waiting", preedit: false, held: false, admitted: false, acknowledged: false, pending: 0, trace: [],
       };
       current = attempt;
-      if (composing || settling !== undefined) hold(attempt, "Previous composition is still ending");
+      if (composing || needsCompositionDrain) hold(attempt, "Previous composition is still ending");
       else {
-        if (attempt.composition) {
-          textarea.value = "";
-          textarea.setSelectionRange(0, 0);
-        }
+        if (refocus || attempt.composition) clearPreedit();
         terminal.options.disableStdin = false;
       }
       publish(attempt);
@@ -365,11 +400,16 @@ function mountTerminal(
     async read() {
       const attempt = current;
       if (!attempt || (attempt.composition && !attempt.held && attempt.phase !== "ended")) return null;
+      const epoch = lifecycleEpoch;
+      const isCurrent = () => lifecycleEpoch === epoch && current === attempt;
+      const checkpoint = checkpointRead;
       try {
-        if (checkpointRead) await checkpointRead.catch(() => {});
-        if (current !== attempt) return null;
-        const snapshot = await recorder.read();
-        if (current !== attempt) return null;
+        if (settling) await settling.done;
+        if (!isCurrent()) return null;
+        if (checkpoint) await checkpoint.catch(() => {});
+        if (!isCurrent()) return null;
+        const snapshot = await recorder.read(isCurrent);
+        if (!isCurrent()) return null;
         if (attempt.composition) {
           const expected = attempt.selected.expected.afterHex;
           if (!attempt.checkpoint || attempt.phase !== "ended" || snapshot.generation !== attempt.generation
@@ -383,7 +423,7 @@ function mountTerminal(
         }
         return snapshot;
       } catch {
-        if (current !== attempt) return null;
+        if (!isCurrent()) return null;
         hold(attempt, "Native snapshot unavailable");
         return "unavailable" as const;
       }
@@ -392,10 +432,11 @@ function mountTerminal(
       disposed = true;
       current = null;
       stopPolling();
-      clearTimeout(settling);
+      settling?.cancel();
       textarea.removeEventListener("compositionstart", compositionStart, true);
       textarea.removeEventListener("compositionupdate", compositionUpdate, true);
       textarea.removeEventListener("compositionend", compositionEnd, true);
+      textarea.removeEventListener("input", compositionInput);
       textarea.removeEventListener("blur", interrupt, true);
       document.removeEventListener("visibilitychange", visibilityChanged);
       stopLayout();
@@ -403,6 +444,20 @@ function mountTerminal(
       terminal.dispose();
     },
   };
+}
+
+function VerifyCopiedToken() {
+  const [match, setMatch] = React.useState<boolean | null>(null);
+  return (
+    <div>
+      <label htmlFor="verify-copied-token">Verify copied token</label>{" "}
+      <input id="verify-copied-token" value="" onChange={() => {}} onPaste={event => {
+        event.preventDefault();
+        setMatch(event.clipboardData.getData("text/plain") === copyToken);
+      }} />
+      <output id="copy-verification">{match === null ? "" : match ? "Match" : "No match"}</output>
+    </div>
+  );
 }
 
 function Fixture() {
@@ -507,6 +562,7 @@ function Fixture() {
           </div>
         )}
       </div>
+      {attempt?.selected.id === "touch-selection-copy" && <VerifyCopiedToken key={attempt.id} />}
       <label htmlFor="snapshot">Native snapshot (hex)</label>{" "}
       <output id="snapshot">{readout}</output>
       {snapshot && snapshot !== "unavailable" && (
