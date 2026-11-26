@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  localClient, mergeCreateOperations, parseCreateStatus, parseCreateSubmission, parseWorkspaceReadiness,
+  CreateReadiness, localClient, mergeCreateOperations, parseCreateStatus, parseCreateSubmission, parseWorkspaceReadiness,
   parseWorkspaceSelection, selectCreatedRuntime, workspaceIssueText,
 } from "./local-client.ts";
 import { closeView, openView } from "./session-state.ts";
@@ -120,6 +120,7 @@ test("w1_readiness accepts typed failures with recovery text", () => {
 test("w1_readiness uses the picker without inputs and sends only ID and profile for checks", async () => {
   const calls: unknown[] = [];
   let cancelled = true;
+  let providerAvailable = false;
   const windowDescriptor = Object.getOwnPropertyDescriptor(globalThis, "window");
   Object.defineProperty(globalThis, "window", {
     configurable: true,
@@ -128,7 +129,8 @@ test("w1_readiness uses the picker without inputs and sends only ID and profile 
         invoke(command: string, args?: unknown) {
           calls.push([command, args]);
           if (command === "local_pick_workspace") return cancelled ? { result: "cancelled" } : { result: "selected", workspace };
-          if (command === "local_workspace_readiness") return { result: "ready" };
+          if (command === "local_workspace_readiness") return providerAvailable ? { result: "ready" } :
+            { result: "blocked", issue: "provider_missing" };
           throw Error("Unexpected native command");
         },
       },
@@ -139,11 +141,14 @@ test("w1_readiness uses the picker without inputs and sends only ID and profile 
     assert.deepEqual(calls, [["local_pick_workspace", {}]]);
     cancelled = false;
     assert.deepEqual(await localClient.pickWorkspace(), { result: "selected", workspace });
+    assert.deepEqual(await localClient.workspaceReadiness(workspaceId, "codex"), { result: "blocked", issue: "provider_missing" });
+    providerAvailable = true;
     assert.deepEqual(await localClient.workspaceReadiness(workspaceId, "claude_code"), { result: "ready" });
     assert.deepEqual(await localClient.workspaceReadiness(workspaceId, "codex"), { result: "ready" });
     assert.deepEqual(calls, [
       ["local_pick_workspace", {}],
       ["local_pick_workspace", {}],
+      ["local_workspace_readiness", { workspaceId, profile: "codex" }],
       ["local_workspace_readiness", { workspaceId, profile: "claude_code" }],
       ["local_workspace_readiness", { workspaceId, profile: "codex" }],
     ]);
@@ -151,4 +156,32 @@ test("w1_readiness uses the picker without inputs and sends only ID and profile 
     if (windowDescriptor) Object.defineProperty(globalThis, "window", windowDescriptor);
     else Reflect.deleteProperty(globalThis, "window");
   }
+});
+
+test("draft readiness permits one current create and rejects blocked, stale and cancelled checks", () => {
+  const gate = new CreateReadiness();
+  const calls: string[] = [];
+  const submit = (id: string, profile: "claude_code" | "codex") => {
+    if (gate.take(id, profile)) calls.push(profile);
+  };
+
+  const missing = gate.begin(workspaceId, "claude_code");
+  assert.equal(gate.finish(missing, { result: "blocked", issue: "provider_missing" }), true);
+  submit(workspaceId, "claude_code");
+  const stale = gate.begin(workspaceId, "claude_code");
+  const otherFolder = gate.begin(separateReference, "claude_code");
+  const current = gate.begin(workspaceId, "codex");
+  assert.equal(gate.finish(stale, { result: "ready" }), false);
+  assert.equal(gate.finish(otherFolder, { result: "ready" }), false);
+  submit(workspaceId, "codex");
+  assert.equal(gate.finish(current, { result: "ready" }), true);
+  submit(separateReference, "codex");
+  submit(workspaceId, "claude_code");
+  submit(workspaceId, "codex");
+  submit(workspaceId, "codex");
+  const cancelled = gate.begin(workspaceId, "codex");
+  gate.invalidate();
+  assert.equal(gate.finish(cancelled, { result: "ready" }), false);
+  submit(workspaceId, "codex");
+  assert.deepEqual(calls, ["codex"]);
 });

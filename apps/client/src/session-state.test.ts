@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { canRestoreTerminalFocus, closeView, demoSessions, focusAfterClose, moveView, openView, parseScaffoldStatus, restoreFullscreenExitFocus, tabKey, tabStop } from "./session-state.ts";
+import type { RuntimeInfo } from "./local-client.ts";
+import { canRestoreTerminalFocus, closeView, demoSessions, focusAfterClose, mountedTerminal, moveView, openView, parseScaffoldStatus, restoreFullscreenExitFocus, tabKey, tabStop } from "./session-state.ts";
 
 test("closing every view preserves the session catalog and allows reopening", () => {
   const catalogBefore = structuredClone(demoSessions);
@@ -125,4 +126,43 @@ test("native boundary validates the shared status fixture and fails closed", () 
   for (const bad of [null, {}, { protocolVersion: 2, appVersion: "0.1.0", stage: "scaffold", capabilities: [] }, { protocolVersion: 1, appVersion: "0.1.0", stage: "scaffold", capabilities: ["remote-exec"] }]) {
     assert.throws(() => parseScaffoldStatus(bad));
   }
+});
+
+test("only the current checked target can keep its renderer during metadata loss and restoration", () => {
+  const runtime = { runtime_id: "A", session_id: "S", pane_pid: 42, pane_id: "%2", operation_id: "op", exited: false,
+    command: "codex", width: 80, height: 24 };
+  const terminal = { view_id: "view", agent_epoch: "agent", target: {
+    runtime_id: "A", generation: "engine", session: "$0", window: "@1", pane: "%2", pid: 42, process_start: 123,
+  } };
+  const bound = { agentPid: 12, terminal };
+  const inventory = (entry: RuntimeInfo = runtime, agent_pid = 12) => ({ agent_pid, runtimes: [entry] });
+  const fallback = { ...runtime, operation_id: null };
+  const expected = { operationId: "op", sessionId: "S" };
+  const live = mountedTerminal("A", inventory(), expected, bound, undefined, false);
+  const pending = mountedTerminal("A", inventory(fallback), expected, bound, undefined, true);
+  const observing = mountedTerminal("A", inventory(fallback), expected, bound, terminal, true);
+  const restored = mountedTerminal("A", inventory(), expected, bound, terminal, true);
+  assert.equal(live.mode, "live");
+  assert.equal(pending.mode, "pending");
+  assert.equal(observing.mode, "observe");
+  assert.equal(restored.mode, "live");
+  assert.equal(mountedTerminal("A", inventory(), expected, bound, undefined, true).mode, "pending");
+  assert.equal(mountedTerminal("A", null, expected, bound, undefined, true).key, live.key);
+  assert.ok(live.key);
+  assert.deepEqual([pending.key, observing.key, restored.key], [live.key, live.key, live.key]);
+  assert.equal(mountedTerminal("A", inventory(fallback), expected, null, undefined, true).key, undefined);
+  assert.equal(mountedTerminal("A", { agent_pid: 12, runtimes: [] }, expected, bound, terminal, true).mode, "missing");
+  assert.equal(mountedTerminal("A", inventory({ ...fallback, pane_pid: 43 }), expected, bound, terminal, true).mode, "missing");
+  assert.equal(mountedTerminal("A", inventory({ ...fallback, session_id: "another" }), expected, bound, terminal, true).mode, "missing");
+  assert.equal(mountedTerminal("A", inventory({ ...runtime, operation_id: "another" }), expected, bound, terminal, true).mode, "missing");
+  assert.equal(mountedTerminal("A", inventory(runtime, 13), expected, bound, terminal, true).mode, "missing");
+  assert.equal(mountedTerminal("A", inventory(fallback), expected, bound, null, true).mode, "missing");
+  assert.notEqual(mountedTerminal("A", inventory(runtime, 13), expected, null, undefined, false).key, live.key);
+  for (const changed of [
+    { ...terminal, view_id: "replacement" },
+    { ...terminal, agent_epoch: "replacement" },
+    { ...terminal, target: { ...terminal.target, generation: "replacement" } },
+    { ...terminal, target: { ...terminal.target, pane: "%3" } },
+    { ...terminal, target: { ...terminal.target, process_start: 124 } },
+  ]) assert.equal(mountedTerminal("A", inventory(fallback), expected, bound, changed, true).mode, "missing");
 });
