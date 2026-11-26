@@ -91,9 +91,15 @@ function mountTerminal(
   let disposed = false;
   let composing = false;
   let needsCompositionDrain = false;
-  let settling: { done: Promise<void>; cancel: () => void } | undefined;
+  type CompositionOwner = { attempt: Attempt; epoch: number };
+  let activeComposition: CompositionOwner | undefined;
+  let settling: { owner: CompositionOwner | undefined; done: Promise<void>; cancel: () => void } | undefined;
 
-  function settleComposition() {
+  function ownsComposition(owner: CompositionOwner | undefined) {
+    return owner !== undefined && owner.attempt === current && owner.epoch === lifecycleEpoch;
+  }
+
+  function settleComposition(owner?: CompositionOwner) {
     settling?.cancel();
     needsCompositionDrain = true;
     const epoch = lifecycleEpoch;
@@ -102,6 +108,7 @@ function mountTerminal(
     let finish!: () => void;
     const done = new Promise<void>(resolve => { finish = resolve; });
     const cycle = {
+      owner,
       done,
       cancel() {
         clearTimeout(timer);
@@ -195,10 +202,14 @@ function mountTerminal(
     textarea.setSelectionRange(0, 0);
   }
 
-  function compositionInput(event: InputEvent) {
+  function compositionInput(inputEvent: Event) {
+    if (inputEvent.target !== textarea) return;
+    const event = inputEvent as InputEvent;
     if (!event.isComposing && event.inputType !== "insertCompositionText"
       && event.inputType !== "deleteCompositionText" && event.inputType !== "insertFromComposition") return;
-    if (!current || (!composing && !needsCompositionDrain)) clearPreedit();
+    if (ownsComposition(activeComposition) || ownsComposition(settling?.owner)) return;
+    clearPreedit();
+    event.stopImmediatePropagation();
   }
 
   function compositionStart() {
@@ -206,6 +217,7 @@ function mountTerminal(
     composing = true;
     const attempt = current;
     if (!attempt) return;
+    activeComposition = { attempt, epoch: lifecycleEpoch };
     if (!attempt.composition) {
       if (attempt.pending) record(attempt, "in-flight append uncertain");
       hold(attempt, "Unexpected composition");
@@ -221,7 +233,7 @@ function mountTerminal(
   }
 
   function compositionUpdate(event: CompositionEvent) {
-    if (!composing) {
+    if (!ownsComposition(activeComposition)) {
       event.stopImmediatePropagation();
       return;
     }
@@ -239,12 +251,13 @@ function mountTerminal(
   }
 
   function compositionEnd(event: CompositionEvent) {
-    if (!composing) {
+    if (!ownsComposition(activeComposition) && (current || !composing)) {
       event.stopImmediatePropagation();
       return;
     }
     composing = false;
-    settleComposition();
+    settleComposition(activeComposition);
+    activeComposition = undefined;
     const attempt = current;
     if (!attempt?.composition) return;
     stopPolling();
@@ -280,7 +293,7 @@ function mountTerminal(
   textarea.addEventListener("compositionstart", compositionStart, true);
   textarea.addEventListener("compositionupdate", compositionUpdate, true);
   textarea.addEventListener("compositionend", compositionEnd, true);
-  textarea.addEventListener("input", compositionInput);
+  host.addEventListener("input", compositionInput, true);
   textarea.addEventListener("blur", interrupt, true);
   document.addEventListener("visibilitychange", visibilityChanged);
 
@@ -354,6 +367,7 @@ function mountTerminal(
   function detach() {
     lifecycleEpoch++;
     current = null;
+    activeComposition = undefined;
     checkpointRead = undefined;
     settling?.cancel();
     stopPolling();
@@ -431,12 +445,13 @@ function mountTerminal(
     dispose() {
       disposed = true;
       current = null;
+      activeComposition = undefined;
       stopPolling();
       settling?.cancel();
       textarea.removeEventListener("compositionstart", compositionStart, true);
       textarea.removeEventListener("compositionupdate", compositionUpdate, true);
       textarea.removeEventListener("compositionend", compositionEnd, true);
-      textarea.removeEventListener("input", compositionInput);
+      host.removeEventListener("input", compositionInput, true);
       textarea.removeEventListener("blur", interrupt, true);
       document.removeEventListener("visibilitychange", visibilityChanged);
       stopLayout();

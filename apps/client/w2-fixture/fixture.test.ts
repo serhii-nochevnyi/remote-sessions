@@ -1035,6 +1035,9 @@ async function compositionDriver(fixture: Mounted) {
     premature(text: string) {
       textarea.dispatchEvent(new FixtureInputEvent("insertText", text, true));
     },
+    type(text: string) {
+      change(text, "insertText", false);
+    },
     end(value: string) {
       composition("compositionend", "end event data is not the committed value");
       change(value, value ? "insertFromComposition" : "deleteCompositionText", false);
@@ -1458,6 +1461,7 @@ async function checkMountedLayout(transformEntry?: MountOptions["transformEntry"
     window.dispatchEvent(new Event("orientationchange"));
     assert.equal(fixture.frames.size, pendingAfterDispose);
     assert.equal(terminal.disposals, 1);
+    assert.equal(host.listenerCount("input"), 0);
     assert.equal(textarea.listenerCount("compositionstart"), 0);
     assert.equal(textarea.listenerCount("blur"), 0);
 
@@ -1651,7 +1655,7 @@ async function checkUnexpectedCompositionWithAppend(executable: string) {
   const driver = await compositionDriver(fixture);
   try {
     await act(async () => {
-      driver.premature("ok");
+      driver.type("ok");
       driver.start();
       driver.update("draft");
       driver.premature("unexpected");
@@ -1868,7 +1872,11 @@ async function checkLateBegin(executable: string) {
   }
 }
 
-async function checkCompositionRetirement(executable: string, endBeforeHide: boolean) {
+async function checkCompositionRetirement(
+  executable: string,
+  endBeforeHide: boolean,
+  freshCase: "composition-commit" | "ukrainian-return" = "composition-commit",
+) {
   const native = connectNative(executable, "requests");
   const fixture = await mountFixture({ browserPaste: true, invoke: native.invoke });
   await startCase(fixture, "composition-commit");
@@ -1903,6 +1911,7 @@ async function checkCompositionRetirement(executable: string, endBeforeHide: boo
     assert.equal(field(fixture, "snapshot").textContent, "—", "retired Read cannot publish");
     assert.equal(reads(fixture).length, 2, "only checkpoint and interruption read the retired generation");
 
+    if (freshCase !== "composition-commit") await fixture.selectCase(freshCase);
     await fixture.click("Start fresh and refocus");
     assert(fixture.terminal.options.disableStdin, "stdin is disabled while old xterm callbacks drain");
     assert.equal(fixture.ipc.filter(call => call.command === "w2_begin_attempt").length, 1);
@@ -1912,16 +1921,38 @@ async function checkCompositionRetirement(executable: string, endBeforeHide: boo
     await act(async () => { driver.clock.advance(0); });
     await fixture.waitFor(() => Boolean(fixture.container.find(node =>
       node.localName === "button" && node.textContent === "Restart" && !node.disabled)), "recovery opens a new native generation");
+    assert.equal(fixture.terminal.options.disableStdin, false);
     await act(async () => {
       driver.end("old commit");
       driver.clock.advance(250);
+      driver.textarea.value = "old preedit";
+      driver.premature("old preedit");
     });
-    assert.equal(appends(fixture).length, 0, "late old callbacks contribute zero bytes");
     assert.equal(fixture.terminal.data.length, 0, "xterm emits no retired input");
+    assert.equal(appends(fixture).length, 0, "late old callbacks contribute zero bytes");
     assert.equal(driver.textarea.value, "", "late composition input leaves no retired text in xterm");
+    assert.equal(fixture.document.getElementById("composition-trace"), null, "retired input leaves no fresh trace");
+    assert.equal(fixture.container.find(node => node.getAttribute("role") === "alert"), undefined);
     assert.equal(field(fixture, "snapshot").textContent, "—");
     assert.equal(field(fixture, "retained-snapshot").textContent, "(empty)");
-    await compositionVector(fixture, native, "composition-commit", 2, { attemptId: 2 });
+    assert.deepEqual(await native.invoke("w2_read_attempt", { generation: 2 }), {
+      caseId: freshCase, generation: 2, nextSequence: 1, bytes: [], eventLengths: [], rejected: 0, invalid: false,
+    });
+    if (freshCase === "composition-commit") {
+      await compositionVector(fixture, native, freshCase, 2, { attemptId: 2 });
+    } else {
+      await act(async () => { driver.type("ї"); });
+      await finalRead(fixture);
+      assert.deepEqual(fixture.terminal.data, ["ї"]);
+      assert.deepEqual(appends(fixture), [
+        { command: "w2_append_input", args: { generation: 2, sequence: 1, events: [[0xd1, 0x97]] } },
+      ]);
+      assert.deepEqual(native.snapshot(), {
+        caseId: freshCase, generation: 2, nextSequence: 2, bytes: [0xd1, 0x97],
+        eventLengths: [2], rejected: 0, invalid: false,
+      });
+      assert.equal(field(fixture, "snapshot").textContent, "d197");
+    }
     assert.equal(field(fixture, "retained-snapshot").textContent, "(empty)");
     await native.finish();
   } catch (error) {
@@ -1937,6 +1968,7 @@ async function foregroundRecovery() {
   await withNativeExecutable(async executable => {
     await checkCompositionRetirement(executable, false);
     await checkCompositionRetirement(executable, true);
+    await checkCompositionRetirement(executable, false, "ukrainian-return");
     await checkLateBegin(executable);
     await checkForegroundRecovery(executable, "app-switch");
     await checkForegroundRecovery(executable, "lock-foreground");
