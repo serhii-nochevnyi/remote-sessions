@@ -1,6 +1,7 @@
 """Stdlib checks for lab scoping and the native recovery evidence contract."""
 import argparse
-from contextlib import closing
+from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
+from copy import deepcopy
 import io
 import json
 import os
@@ -486,10 +487,12 @@ class ManifestTests(unittest.TestCase):
                 with (patch.object(runtime_lab, 'run', side_effect=fake_run),
                       patch.object(w1_recovery, 'FIXTURE_MANIFEST', manifest),
                       patch.object(w1_terminal_pressure, 'ROOT', self.manifest.parent),
+                      patch.object(w1_terminal_pressure, 'lab_host_artifact', return_value={}),
                       patch.object(w1_terminal_pressure, 'sample_clock', return_value={})):
                     with self.assertRaises(subprocess.TimeoutExpired):
                         if pressure:
-                            w1_terminal_pressure.prove(SimpleNamespace(), report)
+                            w1_terminal_pressure.prove(SimpleNamespace(), report,
+                                                       {'artifacts': {'probe': {'path': str(probe)}}})
                         else:
                             with w1_recovery.fixture_jobs():
                                 self.fail('Fixture startup unexpectedly succeeded')
@@ -581,6 +584,72 @@ class LossTests(unittest.TestCase):
 
 
 class EvidenceTests(unittest.TestCase):
+    def picker_case(self, request=None, recorder_failed=False, connected=True):
+        recovery = w1_recovery
+        case = {'checks': {}, 'commands': []}
+        report = {'cases': {'R3-picker-cancel': case}}
+        recorder = None
+
+        @contextmanager
+        def proxy(lab, client, loss):
+            nonlocal recorder
+            recorder = loss
+            if connected:
+                loss.response({'op': 'list'}, request_frame({'result': 'runtimes'}))
+            yield
+
+        def cancel(case, name, prompt):
+            case['checks'][name] = True
+            if request:
+                with patch.object(recovery, 'exchange', return_value=request_frame({'result': 'error'})):
+                    recorder.relay(io.BytesIO(request_frame({'product': {'op': request}})), Path('/unused'))
+            if recorder_failed:
+                recorder.failures += 1
+
+        def wait_for_poll(check, timeout):
+            if not check() and connected:
+                recorder.response({'op': 'list'}, request_frame({'result': 'runtimes'}))
+            ready = check()
+            if not ready:
+                raise TimeoutError
+            return ready
+
+        with tempfile.TemporaryDirectory() as directory:
+            lab = SimpleNamespace(state=Path(directory), tmux='/tmux')
+            with (patch.object(recovery, 'agent_proxy', proxy),
+                  patch.object(recovery, 'app_binary', return_value=Path('/app')),
+                  patch.object(recovery.subprocess, 'Popen') as launch,
+                  patch.object(recovery, 'observe', side_effect=cancel),
+                  patch.object(recovery, 'wait_for', side_effect=wait_for_poll),
+                  patch.object(recovery, 'input', return_value='', create=True),
+                  patch.object(recovery, 'pending_records', return_value={}),
+                  patch.object(recovery, 'inventory', return_value={}),
+                  patch.object(recovery, 'catalog_snapshot', return_value={'workspace_ids': []})):
+                launch.return_value.poll.return_value = None
+                recovery.cancel_picker(report, lab)
+            self.assertNotEqual(launch.call_args.kwargs['env']['RS_STATE_DIR'], str(lab.state))
+        return case
+
+    def test_picker_cancel_requires_quiet_recorded_traffic(self):
+        print(self._testMethodName, flush=True)
+        case = self.picker_case()
+        self.assertEqual(case['status'], Verdict.PASS)
+        self.assertTrue(case['recorder']['connected'])
+        for op in w1_recovery.CANCEL_OPERATIONS:
+            with self.subTest(op=op):
+                case = self.picker_case(request=op)
+                self.assertEqual(case['status'], Verdict.FAIL)
+                self.assertEqual(case['recorder']['deltas'][op], 1)
+                self.assertTrue(case['checks']['no_effect'])
+
+    def test_picker_cancel_holds_on_recorder_failure(self):
+        print(self._testMethodName, flush=True)
+        failed = self.picker_case(recorder_failed=True)
+        self.assertTrue(failed['checks']['no_effect'])
+        for case in (failed, self.picker_case(connected=False)):
+            self.assertEqual(case['status'], Verdict.FAIL)
+            self.assertFalse(case['checks']['no_requests'])
+
     def test_repeated_kingston_runs_create_distinct_reported_workspaces(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -657,6 +726,425 @@ class EvidenceTests(unittest.TestCase):
                 self.assertEqual(case_status(case, incomplete), Verdict.UNRUN)
                 self.assertEqual(case_status(case, {**complete, checks[0]: False}), Verdict.FAIL)
                 self.assertEqual(case_status(case, {**complete, checks[0]: 1}), Verdict.UNRUN)
+
+
+class PressureNativeTests(unittest.TestCase):
+    def setUp(self):
+        self.pressure = w1_terminal_pressure
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.state = Path(scratch.name)
+        self.anchor = {'mono_ns': 100_000, 'wall_us': 100}
+        self.uid = lambda value: str(UUID(int=value))
+        self.args_target = {'runtime_id': self.uid(1), 'generation': self.uid(2), 'session': '$1',
+                            'window': '@1', 'pane': '%1', 'pid': 506, 'process_start': 1}
+        self.grid = {'cols': 80, 'rows': 24}
+        self.epoch = {'agent': self.uid(3), 'owner': self.uid(4)}
+        self.pause = {'owner_view': self.uid(5), 'owner_renderer': self.uid(6),
+                      'victim_view': self.uid(7), 'victim_renderer': self.uid(8)}
+        self.replacement = self.uid(9)
+        self.renderer = self.uid(10)
+        self.run_id = self.uid(11)
+        self.original = {}
+        for role, pid in (('owner', 400), ('victim', 401)):
+            path = self.state / f'{role}.log'
+            path.touch()
+            self.original[role] = {'pid': pid, 'started': 'Thu Nov 26 13:57:46 2026', 'role': role,
+                                   'stderr': str(path), 'build': {'bundle_id': role}}
+
+    def grid_record(self, view, renderer, revision, at):
+        status = {'terminal': {'target': self.args_target, 'view_id': view, 'agent_epoch': self.epoch['agent']},
+                  'epoch': self.epoch, 'observation': 'observed',
+                  'provider': {'size': self.grid, 'sampled_at_us': at},
+                  'committed': {'size': self.grid, 'revision': revision,
+                                'intent': {'epoch': self.epoch, 'id': self.uid(20)}}}
+        return {'event': {'status': status, 'bridge_pty': status['provider'], 'client': status['provider']},
+                'renderer': {'renderer_id': renderer, 'epoch': self.epoch, 'revision': revision,
+                             'size': self.grid, 'focused': True}}
+
+    def test_pressure_attachment_must_follow_closure(self):
+        print(self._testMethodName, flush=True)
+        pressure = self.pressure
+        witness = {'retirement': {'times_ns': {'full': 120_000}},
+                   'workload': {'started_ns': 110_000, 'finished_ns': 130_000, 'bursts': 750},
+                   'owner_convergence': {'grid': self.grid_record(self.pause['owner_view'],
+                                                                  self.pause['owner_renderer'], 1, 122)}}
+        recovery = {'resumed_at_ns': 150_000, 'resumed_controls': True,
+                    'closure': {'view_id': self.pause['victim_view'], 'at_ns': 160_000, 'closed': True,
+                                'writable': False, 'data_empty': True, 'status_null': True, 'geometry_null': True,
+                                'reason': 'overflow', 'high_water': 16},
+                    'redraw': {'view_id': self.replacement, 'renderer_id': self.renderer, 'at_ns': 180_000,
+                               'marker': pressure.MARKERS['native'], 'revision': 1, 'size': self.grid,
+                               'automatic': True, 'old_renderer_disposed': True, 'tab_preserved': True,
+                               'old_work_absent': True},
+                    'progress': {'before_ns': 113_000, 'after_ns': 124_000, 'first_burst': 1, 'last_burst': 9,
+                                 'view_id': self.pause['owner_view'], 'renderer_id': self.pause['owner_renderer']}}
+        victim = pressure.Trace(self.state / 'victim.log')
+        victim.failures = [{'view_id': self.pause['victim_view'], 'stage': stage, 'reason': 'stream_closed'}
+                           for stage in ('read', 'renderer_detach')]
+        victim.grids.append(self.grid_record(self.replacement, self.renderer, 2, 200))
+        attached = {'pid': 501, 'at_us': 170}
+        victim.pressure[self.replacement] = {'attached': attached}
+        args = (self.args_target, self.pause, witness, victim, self.anchor, 140_000, {'pid': 501})
+        self.assertEqual(pressure.validate_replacement(recovery, *args), victim.grids[0])
+        bad = deepcopy(recovery)
+        attached['at_us'] = 154
+        bad['redraw']['at_ns'] = 156_000
+        with self.assertRaisesRegex(pressure.ProofError, 'does not follow actual victim closure'):
+            pressure.validate_replacement(bad, *args)
+
+    def captured(self, role):
+        pressure = self.pressure
+        writer = role == 'owner'
+        view, renderer = self.pause[role + '_view'], self.pause[role + '_renderer']
+        trace = pressure.Trace(Path(self.original[role]['stderr']))
+        trace.pressure[view] = {'attached': {'pid': 501, 'at_us': 105}}
+        grid = self.grid_record(view, renderer, 1, 110)
+        trace.grids.append(grid)
+        trace._retain_provider(grid['event']['status'])
+        capture = {'run_id': self.run_id, 'capture_id': self.uid(40 if writer else 41),
+                   'inspector_target': self.uid(42 if writer else 43),
+                   'inspector_window': 114 if writer else 115, 'window': 'main',
+                   'app': self.original[role], 'captured_ns': 115_000, 'view_id': view,
+                   'renderer_id': renderer, 'target': self.args_target, 'epoch': self.epoch,
+                   'read_sample_us': 110, 'writable': writer, 'grant_sha256': 'a' * 64 if writer else None,
+                   'acknowledgement': None if writer else grid['renderer']}
+        invocation = {key: value for key, value in capture.items()
+                      if key not in {'captured_ns', 'writable', 'acknowledgement'}}
+        invocation.update({'invoked_ns': 130_000, 'finished_ns': 140_000, 'input_result': 'View detached',
+                           'traced_result': 'View detached', 'traced_stage': pressure.TRACE_STAGE[role]})
+        gate = {'capture_id': capture['capture_id'], 'inspector_target': capture['inspector_target'],
+                'inspector_window': capture['inspector_window'], 'issued_ns': 125_000, 'log_cursor': 50}
+        trace.offset = 100
+        trace.detached_failure = {'view_id': view, 'stage': pressure.TRACE_STAGE[role],
+                                  'reason': 'view_detached', 'offset': 55, 'end_offset': 100, 'observed_ns': 135_000}
+        return trace, capture, gate, invocation, grid
+
+    def test_pressure_operator_native_input_capture(self):
+        print(self._testMethodName, flush=True)
+        pressure = self.pressure
+        guide = pressure.NATIVE_INSTRUCTIONS
+        for literal in ('chunk.paste_incarnation', 'const viewId = view',
+                        '"terminal_input", { viewId, incarnation, data, paste: false }',
+                        '"terminal_read", { viewId }',
+                        '"terminal_acknowledge_grid", { viewId, acknowledgement }',
+                        'victim-captured before pausing', 'owner-captured before closing',
+                        'RS-SPECTATOR-STALE', 'RS-WRITER-STALE', pressure.SYNTHETIC_INCARNATION):
+            self.assertIn(literal, guide)
+        for role in ('victim', 'owner'):
+            trace, capture, gate, invocation, grid = self.captured(role)
+            args = (self.run_id, role, self.original[role], trace, self.args_target, self.anchor, 100_000, 120_000,
+                    (capture['view_id'], capture['renderer_id']))
+            self.assertEqual(pressure.validate_capture(capture, *args), grid)
+            self.assertEqual(pressure.validate_invocation(invocation, capture, gate, trace, 150_000),
+                             trace.detached_failure)
+            for variant in ({**capture, 'view_id': self.replacement},
+                            {key: value for key, value in capture.items() if key != 'grant_sha256'},
+                            {**capture, 'grant_sha256': 'b' * 64 if role == 'victim' else None}):
+                with self.assertRaises(pressure.ProofError):
+                    pressure.validate_capture(variant, *args)
+            with self.assertRaises(pressure.ProofError):
+                pressure.validate_invocation({**invocation, 'input_result': 'invalid args'}, capture, gate, trace,
+                                             150_000)
+            trace.pressure[capture['view_id']]['detached'] = {'at_us': 114, 'pid': 501}
+            with self.assertRaises(pressure.ProofError):
+                pressure.validate_capture(capture, *args)
+        ledger = self.state / 'pressure-input.bin'
+        expected = pressure.BRIDGE_INPUT + pressure.NATIVE_INPUT
+        ledger.write_bytes(expected)
+        self.assertEqual(pressure.ledger(self.state, expected), {'exact': True, 'fresh_count': 1, 'stale_count': 0})
+        for wrong in (*pressure.STALE_INPUT.values(), pressure.NATIVE_INPUT):
+            ledger.write_bytes(expected + wrong)
+            with self.assertRaisesRegex(pressure.ProofError, 'input mismatch or replay'):
+                pressure.ledger(self.state, expected)
+
+    def test_pressure_rejects_wrong_input_process(self):
+        print(self._testMethodName, flush=True)
+        pressure = self.pressure
+        owner, capture, gate, invocation, _ = self.captured('owner')
+        victim, _, _, _, _ = self.captured('victim')
+
+        def line(view, stage):
+            item = {'view_id': view, 'stage': stage, 'reason': 'view_detached'}
+            return pressure.PREFIX + b'FAILURE ' + json.dumps(item).encode() + b'\n'
+
+        owner.offset = 0
+        owner.detached_failure = None
+        owner.path.write_bytes(line(capture['view_id'], 'read'))
+        owner.read()
+        gate['log_cursor'] = owner.offset
+        owner.retired_witness = capture['view_id'], 'read'
+        with owner.path.open('ab') as stream:
+            stream.write(line(capture['view_id'], 'acknowledge'))
+            stream.write(line(self.pause['victim_view'], 'read'))
+            stream.write(line(capture['view_id'], 'read'))
+        with patch.object(pressure, 'ns', return_value=135_000):
+            owner.read()
+        self.assertTrue(pressure.validate_invocation(invocation, capture, gate, owner, 150_000))
+        victim_pid = {**capture['app'], 'pid': self.original['victim']['pid'],
+                      'started': self.original['victim']['started']}
+        for change in ({'app': victim_pid},
+                       {'app': {**capture['app'], 'started': 'Thu Nov 26 13:57:47 2026'}},
+                       {'inspector_target': self.uid(21)}, {'inspector_window': 999},
+                       {'view_id': self.pause['victim_view']},
+                       {'grant_sha256': 'b' * 64}):
+            with self.subTest(change=change), self.assertRaises(pressure.ProofError):
+                pressure.validate_invocation({**invocation, **change}, capture, gate, owner, 150_000)
+        with self.assertRaises(pressure.ProofError):
+            pressure.validate_capture({**capture, 'app': self.original['victim']}, self.run_id, 'owner',
+                                      self.original['owner'], owner, self.args_target, self.anchor, 100_000, 120_000)
+        with self.assertRaises(pressure.ProofError):
+            pressure.validate_invocation(invocation, capture, gate, victim, 150_000)
+        owner.detached_failure = None
+        with self.assertRaises(pressure.ProofError):
+            pressure.validate_invocation(invocation, capture, gate, owner, 150_000)
+
+
+class PressureBuildTests(unittest.TestCase):
+    def setUp(self):
+        self.pressure = w1_terminal_pressure
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        directory = Path(scratch.name).resolve()
+        self.checkout = directory / 'checkout'
+        self.checkout.mkdir()
+        self.outputs = directory / 'private'
+        self.outputs.mkdir(mode=0o700)
+        self.commit, self.tree = '1' * 40, '2' * 40
+        self.status = ''
+        self.builds = []
+        self.fail_build = False
+        self.tools = {name: {'path': f'/mock/{name}', 'version': 'fixture'}
+                      for name in ('git', 'make', 'cargo', 'rustc', 'node', 'npm', 'codesign')}
+        for name in self.pressure.LOCKFILES:
+            (self.checkout / name).write_bytes(b'locked')
+        self.start_patch(self.pressure, 'ROOT', self.checkout)
+        self.start_patch(self.pressure, 'run_command', side_effect=self.command)
+        self.start_patch(self.pressure, 'build_tools', side_effect=lambda *args: deepcopy(self.tools))
+        self.start_patch(self.pressure, 'tauri_tool', return_value={'path': '/mock/tauri', 'version': 'fixture'})
+        self.start_patch(self.pressure, 'signed_app', side_effect=self.signed_app)
+        self.start_patch(self.pressure.sys, 'platform', 'darwin')
+
+    def start_patch(self, obj, field, *args, **kwargs):
+        mocked = patch.object(obj, field, *args, **kwargs)
+        self.addCleanup(mocked.stop)
+        return mocked.start()
+
+    def command(self, *args, **kwargs):
+        if args[0] == '/usr/bin/git':
+            if '--show-toplevel' in args:
+                output = str(self.checkout)
+            elif 'rev-parse' in args:
+                output = f'{self.commit}\n{self.tree}\n'
+            elif 'ls-files' in args:
+                output = 'H Cargo.lock\0H crates/host-agent/src/engine.rs\0'
+            elif 'status' in args:
+                output = self.status
+            else:
+                self.fail(f'Unexpected fixture git arguments {args}')
+            return subprocess.CompletedProcess(args, 0, output, '')
+        if args[:2] == ('/usr/bin/codesign', '-d'):
+            return subprocess.CompletedProcess(args, 1, '', '')
+        self.builds.append(tuple(map(str, args)))
+        if self.fail_build:
+            raise self.pressure.ProofError('controlled fixture build failed')
+        if args[:2] == ('/mock/cargo', 'build'):
+            for path in (self.pressure.HOST_PATH, self.pressure.PROBE_PATH):
+                binary = self.checkout / path
+                binary.parent.mkdir(parents=True, exist_ok=True)
+                binary.write_bytes(str(path).encode())
+                binary.chmod(0o755)
+        if args[:2] == ('/mock/npm', 'run'):
+            bundle = self.checkout / self.pressure.APP_PATH
+            binary = bundle / 'Contents/MacOS/client'
+            binary.parent.mkdir(parents=True, exist_ok=True)
+            binary.write_bytes(b'compiled app')
+            binary.chmod(0o755)
+            (bundle / 'Contents/Info.plist').write_bytes(plistlib.dumps({
+                'CFBundleExecutable': 'client', 'CFBundleIdentifier': 'dev.test',
+            }))
+        return subprocess.CompletedProcess(args, 0, '', '')
+
+    def signed_app(self, bundle, scratch, role):
+        metadata = plistlib.loads((bundle / 'Contents/Info.plist').read_bytes())
+        binary = bundle / 'Contents/MacOS' / metadata['CFBundleExecutable']
+        checksum = self.pressure.digest(binary)
+        return binary, {'bundle_id': metadata['CFBundleIdentifier'], 'binary_sha256': checksum,
+                        'code_hash': checksum[:40], 'unsigned_sha256': checksum}
+
+    def produce(self, mode, suffix=''):
+        self.builds.clear()
+        shutil.rmtree(self.checkout / 'target', ignore_errors=True)
+        record = self.outputs / f'{mode}{suffix}.json'
+        owner = self.outputs / f'{mode}{suffix}-owner.app'
+        victim = self.outputs / f'{mode}{suffix}-victim.app'
+        paths = [] if mode == 'bridge' else ['--owner-app', str(owner)]
+        if mode == 'installed':
+            paths.extend(('--victim-app', str(victim)))
+        argv = ['--controlled-build', mode, '--build-record', str(record), *paths]
+        with redirect_stdout(io.StringIO()) as completion, redirect_stderr(io.StringIO()):
+            result = self.pressure.main(argv)
+        if self.fail_build:
+            self.assertNotEqual(result, 0)
+            self.assertFalse(record.exists())
+            self.assertNotIn('BUILD_RECORD_SHA256=', completion.getvalue())
+            return None
+        self.assertEqual(result, 0)
+        self.assertEqual(stat.S_IMODE(record.stat().st_mode), 0o600)
+        prefix, checksum = completion.getvalue().strip().split('=')
+        self.assertEqual(prefix, 'BUILD_RECORD_SHA256')
+        self.assertEqual(self.pressure.digest(record), checksum)
+        receipt = self.pressure.capture_json(record)
+        self.assertEqual(receipt['mode'], mode)
+        self.assertEqual(self.builds, [tuple(argv) for argv in receipt['argv']])
+        self.assertEqual(bool([argv for argv in self.builds if argv[:2] == ('/mock/npm', 'ci')]), mode != 'bridge')
+        self.assertEqual(bool([argv for argv in self.builds if argv[-2:] == ('--', '--locked')]), mode != 'bridge')
+        if mode == 'installed':
+            paths.extend(('--native-evidence', str(self.outputs / f'{mode}{suffix}-native.json')))
+        elif mode == 'paste':
+            paths.extend(('--paste', '--paste-native', str(self.outputs / f'{mode}-native.json')))
+        return ['--build-record', str(record), '--build-record-sha256', checksum, *paths], receipt
+
+    def successful_pressure(self, options, report, build):
+        report.update(bridge={'outcome': 'passed'}, native={'outcome': 'passed'}, cleanup='confirmed')
+
+    def successful_paste(self, options, report, build, stack, observe):
+        observe(42, 51, {42: ('fixture', None), 43: ('host', None)})
+        report.update(paste={'outcome': 'passed'}, cleanup='confirmed')
+
+    def consume(self, argv, pressure_work=None, paste_work=None, observed=None):
+        pressure = self.pressure
+        report = self.outputs / f'report-{uuid4().hex}.json'
+        expected = {
+            42: self.checkout / pressure.PROBE_PATH, 43: self.checkout / pressure.HOST_PATH,
+            51: self.outputs / 'paste-owner.app/Contents/MacOS/client',
+        }
+        calls = []
+
+        def running(pid, artifact, original=None):
+            calls.append(pid)
+            path = (observed or {}).get((pid, calls.count(pid)), expected[pid])
+            if str(path) != artifact['path'] or pressure.file_identity(path) != artifact:
+                raise pressure.ProvenanceHold('running fixture or WebView did not match')
+            return {'pid': pid, 'started': 'original'}
+
+        with (patch.object(pressure, 'prove', side_effect=pressure_work or self.successful_pressure),
+              patch.object(pressure, 'paste_workload',
+                           side_effect=pressure.paste_workload if paste_work is False
+                           else paste_work or self.successful_paste),
+              patch.object(pressure, 'running_artifact', side_effect=running),
+              redirect_stdout(io.StringIO())):
+            result = pressure.main([*argv, '--report', str(report)])
+        return result, json.loads(report.read_text())
+
+    def require_pass(self, argv):
+        code, report = self.consume(argv)
+        self.assertEqual(code, 0, report)
+        self.assertTrue(report['passed'])
+
+    def require_hold(self, argv, **kwargs):
+        code, report = self.consume(argv, **kwargs)
+        self.assertNotEqual(code, 0)
+        self.assertFalse(report['passed'])
+        self.assertEqual(report['provenance'], 'hold', report)
+
+    def test_pressure_rejects_dirty_build_inputs(self):
+        print(self._testMethodName, flush=True)
+        for mode in self.pressure.BUILD_MODES:
+            with self.subTest(mode=mode):
+                argv, _ = self.produce(mode)
+                self.require_pass(argv)
+                for entry in ('M  ', ' M ', '?? '):
+                    with self.subTest(status=entry):
+                        self.status = entry + 'crates/host-agent/src/engine.rs\0'
+                        self.require_hold(argv)
+                self.status = ''
+                self.commit = 'a' * 40
+                self.require_hold(argv)
+                self.commit = '1' * 40
+                self.tree = 'b' * 40
+                self.require_hold(argv)
+                self.tree = '2' * 40
+
+                def dirty_pressure(options, report, build):
+                    self.successful_pressure(options, report, build)
+                    self.status = ' M crates/host-agent/src/engine.rs\0'
+
+                def dirty_paste(options, report, build, stack, observe):
+                    self.successful_paste(options, report, build, stack, observe)
+                    self.status = ' M crates/host-agent/src/engine.rs\0'
+
+                self.require_hold(argv, pressure_work=dirty_pressure, paste_work=dirty_paste)
+                self.status = ''
+        cache = self.checkout / '.cache'
+        cache.mkdir()
+        manifest = cache / 'runtime-lab-w1-pressure-012345abcdef.json'
+        recovery = manifest.with_suffix('.recovery.json')
+        recovery.touch()
+        self.status = '!! .cache/\0'
+        lab = SimpleNamespace(manifest=manifest, recovery_path=recovery)
+        self.pressure.source_snapshot(labs=(lab,))
+        with self.assertRaises(self.pressure.ProofError):
+            self.pressure.source_snapshot()
+
+    def test_pressure_rejects_stale_binary_provenance(self):
+        print(self._testMethodName, flush=True)
+        for mode in self.pressure.BUILD_MODES:
+            with self.subTest(mode=mode):
+                argv, receipt = self.produce(mode)
+                self.require_pass(argv)
+                self.require_hold(argv[2:])
+                self.require_hold(argv[:2] + argv[4:])
+                self.require_hold(argv[:3] + ['0' * 64] + argv[4:])
+                record = self.outputs / f'{mode}.json'
+                wrong = self.outputs / f'{mode}-wrong.json'
+                checksum = self.pressure.write_json(wrong, {**receipt, 'mode': 'paste' if mode == 'bridge' else 'bridge'})
+                self.require_hold([argv[0], str(wrong), argv[2], checksum, *argv[4:]])
+                self.require_hold([argv[0], str(record.with_suffix('.missing')), *argv[2:]])
+                probe = self.checkout / self.pressure.PROBE_PATH
+                if mode == 'paste':
+                    self.require_hold(argv, paste_work=False)
+                    substituted = self.outputs / 'other-live-executable'
+                    substituted.write_bytes(b'elsewhere')
+                    for pid, sample in ((42, 1), (42, 2), (43, 2), (51, 1), (51, 2)):
+                        with self.subTest(pid=pid, sample=sample):
+                            self.require_hold(argv, observed={(pid, sample): substituted})
+                else:
+                    def changed(options, report, build):
+                        self.successful_pressure(options, report, build)
+                        original = probe.read_bytes()
+                        probe.write_bytes(b'changed during collection')
+                        probe.write_bytes(original)
+
+                    if mode == 'bridge':
+                        self.require_hold(argv, pressure_work=changed)
+                if mode == 'installed':
+                    alternative = self.outputs / 'other-signed-copy.app'
+                    shutil.copytree(Path(receipt['artifacts']['owner']['path']), alternative)
+                    self.require_hold([str(alternative) if value == receipt['artifacts']['owner']['path'] else value
+                                       for value in argv])
+                    for role in ('owner', 'victim'):
+                        signed_argv, signed_build = self.produce(mode, '-' + role)
+                        self.require_pass(signed_argv)
+                        signed = Path(signed_build['artifacts'][role]['executable']['path'])
+                        if role == 'owner':
+                            signed.write_bytes(b'changed signed executable')
+                            self.require_hold(signed_argv)
+                        else:
+                            def changed_signed(options, report, build):
+                                self.successful_pressure(options, report, build)
+                                signed.write_bytes(b'changed signed executable')
+
+                            self.require_hold(signed_argv, pressure_work=changed_signed)
+                else:
+                    probe.write_bytes(b'stale probe')
+                    self.require_hold(argv)
+
+    def test_pressure_failed_controlled_build_has_no_completion_receipt(self):
+        self.fail_build = True
+        for mode in self.pressure.BUILD_MODES:
+            with self.subTest(mode=mode):
+                self.produce(mode)
 
 
 if __name__ == '__main__':
