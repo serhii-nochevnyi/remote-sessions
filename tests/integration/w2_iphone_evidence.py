@@ -84,6 +84,7 @@ class Qualification:
     rehearsals: set
     detail: str = ""
     fingerprint: str = ""
+    captures: tuple = ()
 
 
 def need(condition, detail):
@@ -319,6 +320,29 @@ def cohort_readiness(cohort, role):
     return Result("pass")
 
 
+def rehearsal_segment(rehearsal):
+    if "capture_segment" not in rehearsal:
+        return None
+    segment = obj(rehearsal["capture_segment"], "rehearsal capture segment")
+    start, end = segment.get("start_ms"), segment.get("end_ms")
+    need(number(start) and number(end) and start < end,
+         "rehearsal capture segment requires increasing integer milliseconds")
+    return start, end
+
+
+def check_independent_captures(captures):
+    recordings = {}
+    for ref, segment in captures:
+        recordings.setdefault(ref, []).append(segment)
+    for segments in recordings.values():
+        if len(segments) < 2:
+            continue
+        need(all(segment is not None for segment in segments), "shared rehearsal recording requires capture segments")
+        segments.sort()
+        need(all(first[1] <= second[0] for first, second in zip(segments, segments[1:])),
+             "shared rehearsal recording has overlapping capture segments")
+
+
 def qualify(recipe, case, data, cohort_fingerprint):
     preedit, end_action = COMPOSITION[case["id"]]
     language = recipe.get("keyboard_language")
@@ -336,6 +360,7 @@ def qualify(recipe, case, data, cohort_fingerprint):
     need(recipe.get("id") == verified_fingerprint, "recipe ID does not match its frozen procedure")
     rehearsals = items(recipe.get("rehearsals"), "recipe rehearsals")
     seen = set()
+    captures = []
     for rehearsal in rehearsals:
         rehearsal = obj(rehearsal, "rehearsal")
         need(rehearsal.get("cohort_fingerprint") == cohort_fingerprint,
@@ -345,8 +370,9 @@ def qualify(recipe, case, data, cohort_fingerprint):
              and rehearsal.get("preedit") == preedit and rehearsal.get("end_state") == recipe["end_state"],
              "rehearsal has missing, duplicate or different visible outcomes")
         seen.add(rehearsal["id"])
+        captures.append((rehearsal["ref"], rehearsal_segment(rehearsal)))
     need(len(seen) >= 2, "two distinct observable rehearsals are required")
-    return Qualification(seen, fingerprint=verified_fingerprint)
+    return Qualification(seen, fingerprint=verified_fingerprint, captures=tuple(captures))
 
 
 def attempt_identity(record):
@@ -540,7 +566,9 @@ def same_native_input(first, second):
                  or first["eventLengths"] == second["eventLengths"]))
 
 
-def check_recovery(attempt, identity, expected, started_fresh, recovery_prefix):
+def recovery_snapshots(attempt, identity, observed):
+    transition = OBSERVATIONS[identity[0]][0]
+    need(observed.get(transition) is True, "foreground transition was not established")
     old = obj(attempt.get("recovery"), "foreground recovery")
     initial = obj(old.get("before"), "pre-interruption native snapshot")
     old_id = attempt_identity(initial)
@@ -550,8 +578,45 @@ def check_recovery(attempt, identity, expected, started_fresh, recovery_prefix):
     retained = snapshot(old.get("retained"), old_id)
     need(old.get("delivery_uncertain") is False and type(old.get("old_generation_extra_event")) is bool,
          "retained snapshot or delivery is uncertain")
+    return before, retained
+
+
+def corroborate_restart(attempt, identity, retained, started_fresh, recovery_prefix):
+    old_id = attempt_identity(retained)
+    restart = obj(attempt["recovery"].get("restart"), "foreground restart observation")
+    previous = obj(restart.get("previous"), "restart's old attempt identity")
+    need(named(restart, "ref") and attempt_identity(previous) == old_id
+         and number(previous.get("attemptId"), 1) and number(previous.get("generation"), 1),
+         "foreground restart observation is not bound to the old attempt")
+    outcome = restart.get("outcome")
+    need(outcome in ("fresh", "same-generation", "no-new-generation"), "foreground restart outcome is uncertain")
+    need(restart.get("action_completed") is True, "missing completed foreground restart action")
+    need(started_fresh is (outcome == "fresh"),
+         "foreground restart conflicts with the visible fresh-start observation")
+    if outcome == "no-new-generation":
+        failure = obj(restart.get("begin_failure"), "recorded begin failure")
+        need(identity == old_id and attempt_identity(failure) == old_id and named(failure, "ref")
+             and number(failure.get("attemptId"), 1) and number(failure.get("generation"), 1)
+             and "observed" not in restart and "final" not in attempt,
+             "begin failure belongs to a different attempt or conflicts with a new generation")
+    elif outcome == "same-generation":
+        observed = snapshot(restart.get("observed"), old_id)
+        need(identity == old_id and "final" not in attempt and same_native_input(observed, retained)
+             and "begin_failure" not in restart, "unchanged generation does not match the retained native snapshot")
+    else:
+        observed = obj(restart.get("observed"), "restart's fresh attempt identity")
+        need(attempt_identity(observed) == identity and number(observed.get("attemptId"), 1)
+             and number(observed.get("generation"), 1)
+             and old_id[1] < identity[1] and old_id[2] < identity[2] and "begin_failure" not in restart,
+             "foreground restart did not identify a fresh attempt and generation")
+        need(not recovery_prefix, "fresh foreground restart requires all prescribed actions")
+    return outcome
+
+
+def check_recovery(attempt, identity, expected, observed, recovery_prefix):
+    before, retained = recovery_snapshots(attempt, identity, observed)
     if not recovery_prefix:
-        extra_event = old["old_generation_extra_event"]
+        extra_event = attempt["recovery"]["old_generation_extra_event"]
         before_hex, retained_hex = before["hex"], retained["hex"]
         if not same_native_input(before, retained) or extra_event:
             before_count, retained_count = before["acceptedEvents"], retained["acceptedEvents"]
@@ -561,45 +626,18 @@ def check_recovery(attempt, identity, expected, started_fresh, recovery_prefix):
             raise MeasuredFailure("retained native bytes or events changed", observed_input)
         if attempt.get("capture_error") is False:
             measured(before_hex == expected, "initial bytes differ from the manifest", before_hex)
-    restart = obj(old.get("restart"), "foreground restart observation")
-    previous = obj(restart.get("previous"), "restart's old attempt identity")
-    need(named(restart, "ref") and attempt_identity(previous) == old_id
-         and number(previous.get("attemptId"), 1) and number(previous.get("generation"), 1),
-         "foreground restart observation is not bound to the old attempt")
-    outcome = restart.get("outcome")
-    need(outcome in ("fresh", "same-generation", "no-new-generation"), "foreground restart outcome is uncertain")
-    need(restart.get("action_completed") is True, "missing completed foreground restart action")
-    expected_fresh = outcome == "fresh"
-    need(started_fresh is expected_fresh or (started_fresh is None and not recovery_prefix),
-         "foreground restart conflicts with the visible fresh-start observation")
+    outcome = corroborate_restart(attempt, identity, retained, observed.get("started_fresh"), recovery_prefix)
     if outcome == "no-new-generation":
-        failure = obj(restart.get("begin_failure"), "recorded begin failure")
-        need(identity == old_id and attempt_identity(failure) == old_id and named(failure, "ref")
-             and number(failure.get("attemptId"), 1) and number(failure.get("generation"), 1)
-             and "observed" not in restart and "final" not in attempt,
-             "begin failure belongs to a different attempt or conflicts with a new generation")
         raise MeasuredFailure("foreground restart produced no new generation", ())
     if outcome == "same-generation":
-        observed = snapshot(restart.get("observed"), old_id)
-        need(identity == old_id and "final" not in attempt and same_native_input(observed, retained)
-             and "begin_failure" not in restart, "unchanged generation does not match the retained native snapshot")
         raise MeasuredFailure("foreground restart kept the same generation", ())
-
-    observed = obj(restart.get("observed"), "restart's fresh attempt identity")
-    need(attempt_identity(observed) == identity and number(observed.get("attemptId"), 1)
-         and number(observed.get("generation"), 1)
-         and old_id[1] < identity[1] and old_id[2] < identity[2] and "begin_failure" not in restart,
-         "foreground restart did not identify a fresh attempt and generation")
-    need(not recovery_prefix, "fresh foreground restart requires all prescribed actions")
 
 
 def check_capture(attempt, case, cohort, qualification, observed, identity, recovery_prefix):
     case_id = case["id"]
     expected = case["expected"]["afterHex"]
     if case_id in RECOVERY:
-        transition = OBSERVATIONS[case_id][0]
-        need(observed.get(transition) is True, "foreground transition was not established")
-        check_recovery(attempt, identity, case["expected"]["beforeHex"], observed.get("started_fresh"), recovery_prefix)
+        check_recovery(attempt, identity, case["expected"]["beforeHex"], observed, recovery_prefix)
     final = None
     if case_id in COMPOSITION:
         need(not qualification.detail, qualification.detail)
@@ -618,24 +656,29 @@ def check_capture(attempt, case, cohort, qualification, observed, identity, reco
     return final if final is not None else snapshot(attempt.get("final"), identity)
 
 
+def check_attempt_context(attempt, case, cohort):
+    case_id = case["id"]
+    need(attempt.get("cohort_fingerprint") == cohort["fingerprint"], "attempt belongs to a different cohort tuple")
+    need(named(attempt, "ref"), "missing attempt observation reference")
+    language = attempt.get("keyboard_language")
+    need(language == cohort["tuple"]["keyboard"]["scenario_languages"][case_id]
+         and attempt.get("orientation") == cohort["tuple"]["orientation"], "mixed keyboard or orientation conditions")
+    if case_id in PASTE:
+        need(attempt.get("route") in ("sample", "native"), "record sample or native paste route")
+        order = [1] if attempt["route"] == "sample" else [2]
+    else:
+        order = list(range(1, len(case["actions"]) + 1))
+    actions = attempt.get("action_order")
+    recovery_prefix = case_id in RECOVERY and actions == order[:-1]
+    need((actions == order or recovery_prefix) and all(type(i) is int for i in actions),
+         "missing or unordered prescribed actions")
+    return obj(attempt.get("observations"), "visible observations"), recovery_prefix
+
+
 def evaluate_attempt(attempt, case, cohort, qualification):
     case_id = case["id"]
     try:
-        need(attempt.get("cohort_fingerprint") == cohort["fingerprint"], "attempt belongs to a different cohort tuple")
-        need(named(attempt, "ref"), "missing attempt observation reference")
-        language = attempt.get("keyboard_language")
-        need(language == cohort["tuple"]["keyboard"]["scenario_languages"][case_id]
-             and attempt.get("orientation") == cohort["tuple"]["orientation"], "mixed keyboard or orientation conditions")
-        if case_id in PASTE:
-            need(attempt.get("route") in ("sample", "native"), "record sample or native paste route")
-            order = [1] if attempt["route"] == "sample" else [2]
-        else:
-            order = list(range(1, len(case["actions"]) + 1))
-        actions = attempt.get("action_order")
-        recovery_prefix = case_id in RECOVERY and actions == order[:-1]
-        need((actions == order or recovery_prefix) and all(type(i) is int for i in actions),
-             "missing or unordered prescribed actions")
-        observed = obj(attempt.get("observations"), "visible observations")
+        observed, recovery_prefix = check_attempt_context(attempt, case, cohort)
         identity = (case_id, attempt["attemptId"], attempt["generation"])
         final, capture_issue = None, None
         try:
@@ -675,12 +718,15 @@ def qualifications(cohort, cases):
     recipes = obj(cohort.get("recipes", {}), "composition recipes")
     result = {}
     all_rehearsals = set()
+    all_captures = []
     for case_id in COMPOSITION:
         try:
             recipe = obj(recipes.get(case_id), f"{case_id} recipe")
             qualified = qualify(recipe, cases[case_id], cohort["tuple"], cohort["fingerprint"])
             need(not (qualified.rehearsals & all_rehearsals), "rehearsal ID is reused across recipes")
+            check_independent_captures([*all_captures, *qualified.captures])
             all_rehearsals.update(qualified.rehearsals)
+            all_captures.extend(qualified.captures)
             result[case_id] = qualified
         except EvidenceError as error:
             result[case_id] = Qualification(set(), detail=str(error))
@@ -780,17 +826,20 @@ def moved_attempts(attempts, positions):
     return moved
 
 
-def native_keys(attempt, record, bound):
+def native_keys(attempt, record, case, cohort, check_old):
     """The fixture counters can reset only on a separately identified app launch."""
     _, _, launch, _, native_id, generation = record
     primary = (launch, native_id, generation)
-    if (bound and attempt["case_id"] in RECOVERY and isinstance(attempt.get("recovery"), dict)
-            and isinstance(attempt["recovery"].get("before"), dict)):
-        _, before_id, before_generation = attempt_identity(attempt["recovery"]["before"])
-        if number(before_id, 1) and number(before_generation, 1):
-            before = (launch, before_id, before_generation)
-            if before != primary:
-                return (before, primary)
+    if check_old:
+        identity = (case["id"], native_id, generation)
+        try:
+            observed, recovery_prefix = check_attempt_context(attempt, case, cohort)
+            before, retained = recovery_snapshots(attempt, identity, observed)
+            outcome = corroborate_restart(attempt, identity, retained, observed.get("started_fresh"), recovery_prefix)
+        except EvidenceError:
+            return (primary,)
+        if outcome == "fresh":
+            return ((launch, before["attemptId"], before["generation"]), primary)
     return (primary,)
 
 
@@ -844,14 +893,16 @@ def assess_cohort(cohort, role, cases, ids):
                      key=lambda attempt: records[attempt["id"]][:2])
     unpositioned = [attempt for attempt in attempts if attempt["id"] not in records]
     bound = [attempt for attempt in ordered if attempt["id"] in bound_positions]
+    restarts = Counter(ref for attempt in bound if (ref := restart_reference(attempt)) is not None)
     identities = {}
     for attempt in ordered:
         attempt_id = attempt["id"]
-        identities[attempt_id] = native_keys(attempt, records[attempt_id], attempt_id in bound_positions)
+        check_old = (readiness.status == "pass" and attempt_id in bound_positions
+                     and restarts[restart_reference(attempt)] == 1)
+        identities[attempt_id] = native_keys(attempt, records[attempt_id], cases[attempt["case_id"]], cohort, check_old)
     keys = [key for row_keys in identities.values() for key in row_keys]
     attempt_ids = Counter((launch, attempt_id) for launch, attempt_id, _ in keys)
     generations = Counter((launch, generation) for launch, _, generation in keys)
-    restarts = Counter(ref for attempt in bound if (ref := restart_reference(attempt)) is not None)
     out_of_order = out_of_order_attempts(identities)
     for attempt in [*ordered, *unpositioned]:
         attempt_id = attempt["id"]
@@ -906,10 +957,17 @@ def matching_conditions(original, updated, allow_shell_change=False):
 def comparison_recipes_match(assessed):
     if any(assessed[role].readiness.status != "pass" for role in COHORTS):
         return False
+    captures = []
     for case_id in COMPOSITION:
-        original, corrected, comparison = (assessed[role].recipes[case_id].fingerprint for role in COHORTS)
+        recipes = [assessed[role].recipes[case_id] for role in COHORTS]
+        original, corrected, comparison = (recipe.fingerprint for recipe in recipes)
         if not original or original != corrected or original != comparison:
             return False
+        captures.extend(capture for recipe in recipes for capture in recipe.captures)
+    try:
+        check_independent_captures(captures)
+    except EvidenceError:
+        return False
     return True
 
 
