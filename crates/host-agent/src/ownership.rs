@@ -7,6 +7,17 @@ use anyhow::{Result, ensure};
 use std::{collections::HashMap, time::Instant};
 use uuid::Uuid;
 
+#[derive(Debug)]
+pub(crate) struct ResizeDeadlineReached;
+
+impl std::fmt::Display for ResizeDeadlineReached {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Resize authority changed")
+    }
+}
+
+impl std::error::Error for ResizeDeadlineReached {}
+
 struct Lease {
     token: Uuid,
     deadline: Instant,
@@ -99,11 +110,16 @@ impl Ownership {
             .ok_or_else(|| anyhow::anyhow!("Керування втрачено"))?;
         ensure!(
             lease.token == token
-                && lease.deadline > now
                 && lease.terminal.as_ref() == Some(terminal)
                 && lease.epoch == Some(epoch),
             "Resize authority changed"
         );
+        if now >= lease.deadline {
+            if lease.next_resize == sequence && sequence < u64::MAX {
+                return Err(ResizeDeadlineReached.into());
+            }
+            anyhow::bail!("Resize authority changed");
+        }
         ensure!(lease.next_resize == sequence, "Resize sequence rejected");
         lease.next_resize = sequence
             .checked_add(1)

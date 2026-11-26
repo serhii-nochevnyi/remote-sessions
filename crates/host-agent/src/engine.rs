@@ -33,6 +33,8 @@ pub struct Engine {
     agent_epoch: Uuid,
     ownership: Arc<Mutex<crate::ownership::Ownership>>,
     lanes: Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<ResizeLane>>>>,
+    #[cfg(debug_assertions)]
+    resize_fixture_target: Option<TerminalTarget>,
     #[cfg(test)]
     paste_test: PasteTest,
 }
@@ -620,9 +622,31 @@ impl Engine {
             agent_epoch: Uuid::new_v4(),
             ownership: Arc::default(),
             lanes: Mutex::default(),
+            #[cfg(debug_assertions)]
+            resize_fixture_target: None,
             #[cfg(test)]
             paste_test: PasteTest::default(),
         }
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) async fn for_resize_fixture(mut self, target: TerminalTarget) -> Result<Self> {
+        ensure!(
+            self.private_sender_socket(),
+            "Resize fixture requires a private real tmux socket"
+        );
+        let read = self.geometry(target.runtime_id, &target.pane).await?;
+        ensure!(
+            read.target == target && read.sender_supported,
+            "Resize fixture target or sender changed"
+        );
+        self.resize_fixture_target = Some(target);
+        Ok(self)
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn resize_fixture_target(&self) -> Option<&TerminalTarget> {
+        self.resize_fixture_target.as_ref()
     }
 
     #[cfg(test)]
@@ -1361,6 +1385,13 @@ impl Engine {
             pid: identity.pid,
             process_start: process_start(identity.pid)?,
         };
+        #[cfg(debug_assertions)]
+        ensure!(
+            self.resize_fixture_target
+                .as_ref()
+                .is_none_or(|expected| *expected == target),
+            "Resize fixture target changed"
+        );
         let epoch = parse_epoch(fields[20])?;
         let committed = parse_committed(fields[21], size)?;
         ensure!(
@@ -2283,13 +2314,14 @@ impl Engine {
         Ok(Some(after))
     }
 
-    async fn resize_terminal(
+    pub(crate) async fn resize_terminal(
         &self,
         terminal: TerminalView,
         token: Uuid,
         sequence: u64,
         size: TerminalSize,
         catalog: Option<&CatalogLane>,
+        expected_epoch: Option<ResizeEpoch>,
     ) -> Result<Response> {
         ensure!(
             size.supported(),
@@ -2307,7 +2339,8 @@ impl Engine {
         let read = self.scoped_geometry(&terminal).await?;
         let epoch = read.epoch.context("Engine epoch unavailable")?;
         ensure!(
-            !lane.reconcile
+            expected_epoch.is_none_or(|expected| expected == epoch)
+                && !lane.reconcile
                 && !lane.holds_pane(&read)
                 && read.paste_ready()
                 && read.sender_supported
@@ -2665,7 +2698,7 @@ impl Engine {
                 sequence,
                 size,
             } => {
-                self.resize_terminal(terminal, token, sequence, size, catalog)
+                self.resize_terminal(terminal, token, sequence, size, catalog, None)
                     .await
             }
             Request::Renew { runtime_id, token } => {

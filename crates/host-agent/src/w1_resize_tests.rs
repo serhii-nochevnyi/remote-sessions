@@ -241,6 +241,12 @@ if sys.argv[1] == "--server-send":
     sys.exit()
 
 args = sys.argv[4:]
+if read("private-fixture"):
+    import socket
+    assert sys.argv[1:4] == ["-N", "-S", str(root / "tmux.sock")]
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+        conn.connect(sys.argv[3])
+        assert conn.recv(1) == b"1"
 command = args[0]
 pane = args[args.index("-t") + 1] if "-t" in args else "%0"
 mode = read("mode")
@@ -528,6 +534,258 @@ else:
             Response::TerminalStatus { status } => status,
             response => panic!("Expected a scoped status, got {response:?}"),
         }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn w1_resize_private_fixture_socket() {
+    use std::os::unix::fs::{DirBuilderExt, symlink};
+    use tokio::net::UnixListener;
+
+    let f = Fixture::new();
+    let root = f.temp.path();
+    let private_dir = |name| {
+        let directory = root.join(name);
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        directory
+    };
+    fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = private_dir("agent");
+    let alias = private_dir("alias").join("tmux.sock");
+    let exposed_directory = private_dir("exposed");
+    let exposed = exposed_directory.join("tmux.sock");
+    fs::set_permissions(&exposed_directory, fs::Permissions::from_mode(0o755)).unwrap();
+    let _exposed_socket = UnixListener::bind(&exposed).unwrap();
+    let tmux = UnixListener::bind(&f.engine.socket).unwrap();
+    symlink(&f.engine.socket, &alias).unwrap();
+    fs::write(root.join("private-fixture"), "1").unwrap();
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = tmux.accept().await {
+            stream.write_all(b"1").await.unwrap();
+        }
+    });
+    let mut wrong = f.terminal.target.clone();
+    wrong.generation = Uuid::new_v4();
+    for (directory, socket, target, expected) in [
+        (
+            &endpoint,
+            &alias,
+            &f.terminal.target,
+            "private real tmux socket",
+        ),
+        (
+            &endpoint,
+            &exposed,
+            &f.terminal.target,
+            "private real tmux socket",
+        ),
+        (
+            &endpoint,
+            &f.engine.socket,
+            &wrong,
+            "fixture target or sender changed",
+        ),
+    ] {
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::serve_resize_fixture(
+                directory.clone(),
+                f.engine.tmux.clone(),
+                socket.clone(),
+                target.clone(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+        assert!(!endpoint.join("agent.sock").exists());
+    }
+    let error = crate::serve_resize_fixture(
+        root.into(),
+        f.engine.tmux.clone(),
+        f.engine.socket.clone(),
+        f.terminal.target.clone(),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("isolated agent directory"));
+
+    let agent = tokio::spawn(crate::serve_resize_fixture(
+        endpoint.clone(),
+        f.engine.tmux.clone(),
+        f.engine.socket.clone(),
+        f.terminal.target.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !endpoint.join("agent.sock").exists() {
+            assert!(!agent.is_finished());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let blocked = crate::serve_resize_fixture(
+        endpoint.clone(),
+        f.engine.tmux.clone(),
+        f.engine.socket.clone(),
+        f.terminal.target.clone(),
+    )
+    .await
+    .unwrap_err();
+    assert!(blocked.to_string().contains("another agent already owns"));
+
+    let open = |runtime_id| Request::OpenTerminal {
+        runtime_id,
+        view_id: Uuid::new_v4(),
+    };
+    assert!(matches!(
+        crate::request(&endpoint, &open(Uuid::new_v4()))
+            .await
+            .unwrap(),
+        Response::Error { .. }
+    ));
+    let Response::TerminalOpened { status } =
+        crate::request(&endpoint, &open(f.terminal.target.runtime_id))
+            .await
+            .unwrap()
+    else {
+        panic!("Expected a view from the isolated fixture");
+    };
+    assert_eq!(status.terminal.target, f.terminal.target);
+    let terminal = status.terminal;
+    let mut wrong = terminal.clone();
+    wrong.target.window = "@1".into();
+    assert!(matches!(
+        crate::request(&endpoint, &Request::AcquireTerminal { terminal: wrong })
+            .await
+            .unwrap(),
+        Response::Error { .. }
+    ));
+    assert!(!root.join("last-write").exists());
+    let Response::TerminalControl { token, epoch } = crate::request(
+        &endpoint,
+        &Request::AcquireTerminal {
+            terminal: terminal.clone(),
+        },
+    )
+    .await
+    .unwrap() else {
+        panic!("Expected the exact first writer grant");
+    };
+    assert!(!token.is_nil());
+    let Response::TerminalStatus { status } = crate::request(
+        &endpoint,
+        &Request::TerminalStatus {
+            terminal: terminal.clone(),
+        },
+    )
+    .await
+    .unwrap() else {
+        panic!("Expected independent exact fixture readback");
+    };
+    assert_eq!(status.terminal, terminal);
+    assert_eq!(status.epoch, Some(epoch));
+    assert_eq!(status.provider.unwrap().size, ORIGINAL);
+    assert!(f.engine.socket.exists());
+    agent.abort();
+    let _ = agent.await;
+    server.abort();
+    let _ = server.await;
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn w1_resize_exact_expiry_admission() {
+    let mut f = Fixture::new();
+    Arc::get_mut(&mut f.engine).unwrap().resize_fixture_target = Some(f.terminal.target.clone());
+    let now = Instant::now();
+    *f.engine.paste_test.now.lock().unwrap() = Some(now);
+    let (token, epoch) = f.acquire(f.terminal.clone()).await;
+    let resize = |terminal, token, sequence, size| Request::ResizeTerminal {
+        terminal,
+        token,
+        sequence,
+        size,
+    };
+    let exact = |sequence, size| resize(f.terminal.clone(), token, sequence, size);
+    let exchange = async |resize_probe, epoch, attempt| {
+        let frame = serde_json::to_vec(&crate::ResizeProbeRequest {
+            resize_probe,
+            epoch,
+            attempt,
+        })
+        .unwrap();
+        let response =
+            crate::dispatch(&frame, &f.engine, &tokio::sync::Mutex::new(()), None).await?;
+        Ok::<Response, anyhow::Error>(serde_json::from_slice(&response)?)
+    };
+    let deadline = now + INPUT_LEASE_TTL;
+    *f.engine.paste_test.now.lock().unwrap() = Some(deadline - Duration::from_nanos(1));
+    let Response::Resize {
+        resize: ResizeResult::Committed { status: before, .. },
+    } = exchange(exact(0, DESIRED), epoch, Uuid::new_v4())
+        .await
+        .unwrap()
+    else {
+        panic!("Exact resize before the deadline must commit");
+    };
+    let root = f.temp.path();
+    let last_write = fs::read(root.join("last-write")).unwrap();
+    let mut wrong_view = f.terminal.clone();
+    wrong_view.view_id = Uuid::new_v4();
+    let mut wrong_target = f.terminal.clone();
+    wrong_target.target.generation = Uuid::new_v4();
+    let wrong_epoch = ResizeEpoch {
+        owner: Uuid::new_v4(),
+        ..epoch
+    };
+    for now in [deadline, deadline + Duration::from_nanos(1)] {
+        *f.engine.paste_test.now.lock().unwrap() = Some(now);
+        for (request, claimed_epoch) in [
+            (resize(wrong_view.clone(), token, 1, ORIGINAL), epoch),
+            (resize(wrong_target.clone(), token, 1, ORIGINAL), epoch),
+            (
+                resize(f.terminal.clone(), Uuid::new_v4(), 1, ORIGINAL),
+                epoch,
+            ),
+            (exact(1, ORIGINAL), wrong_epoch),
+            (exact(0, ORIGINAL), epoch),
+            (exact(2, ORIGINAL), epoch),
+            (exact(1, TerminalSize { cols: 1, rows: 2 }), epoch),
+        ] {
+            assert!(
+                exchange(request, claimed_epoch, Uuid::new_v4())
+                    .await
+                    .is_err()
+            );
+        }
+        let lane = f
+            .engine
+            .existing_lane(f.terminal.target.runtime_id)
+            .unwrap();
+        let busy = lane.lock().await;
+        assert!(
+            exchange(exact(1, ORIGINAL), epoch, Uuid::new_v4())
+                .await
+                .is_err()
+        );
+        drop(busy);
+        let attempt = Uuid::new_v4();
+        assert!(matches!(
+            exchange(exact(1, ORIGINAL), epoch, attempt).await.unwrap(),
+            Response::Error { message } if message == format!("resize admission expired: {attempt}")
+        ));
+        assert_eq!(fs::read(root.join("last-write")).unwrap(), last_write);
+        let after = f.status(&f.engine, f.terminal.clone()).await;
+        assert_eq!(after.terminal, before.terminal);
+        assert_eq!(after.epoch, before.epoch);
+        assert_eq!(after.committed, before.committed);
+        assert_eq!(after.provider.unwrap().size, ORIGINAL);
     }
 }
 
