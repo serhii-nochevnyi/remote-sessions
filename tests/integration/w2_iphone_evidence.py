@@ -11,7 +11,7 @@ import re
 import sys
 
 
-MANIFEST_SHA256 = "8c08369864c9dd4ee6de19c8cf86171b179e928f276eebe2f9f89389ea353056"
+MANIFEST_SHA256 = "3825bfd16e9380d222b4a07b24966758cc090ed93bbc4ab6951e18a6cac5580c"
 COMMANDS = ("w2_begin_attempt", "w2_append_input", "w2_read_attempt")
 GRANTS = {"allow-" + command.replace("_", "-"): [command] for command in COMMANDS}
 CAPABILITY = {
@@ -46,6 +46,7 @@ VIEWPORTS = {
 }
 PASTE = {"paste-short", "paste-multiline"}
 RECOVERY = {"app-switch", "lock-foreground"}
+RECORDER_OPERATIONS = ("begin", "append", "read")
 LAYOUT_CASES = PASTE | RECOVERY | VIEWPORTS.keys() | {"touch-selection-copy", "touch-scroll"}
 LAYOUT_EVENTS = {
     "mounted", "container resize", "window resize", "orientation change", "focus",
@@ -169,8 +170,9 @@ def check_tuple(data, role):
     need(data.get("fixture_sha256") == MANIFEST_SHA256, "cohort fixture digest differs from the shipped matrix")
     app = obj(data.get("app"), "signed app identity")
     need(named(app, "identifier", "version", "build"), "app identifier, version and build are required")
-    if role != "comparison":
-        need(app["identifier"] == "dev.remotesessions.w2fixture", "unexpected signed fixture identifier")
+    if role == "comparison":
+        return
+    need(app["identifier"] == "dev.remotesessions.w2fixture", "unexpected signed fixture identifier")
     locks = obj(data.get("locks"), "lockfile digests")
     need(all(digest(locks.get(path)) for path in LOCKS), "missing locked input fingerprints")
     tools = obj(data.get("tools"), "locked tool versions")
@@ -204,23 +206,33 @@ def check_build(build, data, role):
          and version_tuple(settings.get("minimum_os_version")) == version_tuple(data["deployment_target"])
          and named(settings, "ref"), "generated Release SDK or minimum OS differs from the tested tuple")
     entry = obj(build.get("entry_validation"), "generated entry validation")
-    need(named(entry, "build_log_ref", "archive_ref", "symbol") and digest(entry.get("build_log_sha256"))
+    need(named(entry, "build_log_ref") and digest(entry.get("build_log_sha256"))
          and entry.get("source_revision") == data["source_revision"]
          and entry.get("inspected_bundle_sha256") == data["bundle_sha256"]
          and entry.get("installed_bundle_sha256") == install["installed_bundle_sha256"]
-         and entry.get("verified_before_install") is True and entry.get("launcher_link_verified") is True
-         and entry.get("defined_global_symbol") is True and type(entry.get("cli_exit_status")) is int
-         and entry["cli_exit_status"] == 0, "missing or unbound pre-install generated entry validation")
-    if role != "comparison":
-        need(entry["symbol"] == "_start_app" and entry.get("cli_start_app_validation") is True,
-             "locked CLI and linked archive must both verify the generated start_app entry")
-    return {key: entry[key] for key in ("build_log_ref", "build_log_sha256", "source_revision")} | {
+         and entry.get("verified_before_install") is True, "missing or unbound pre-install generated entry validation")
+    binding = {key: entry[key] for key in ("build_log_ref", "build_log_sha256", "source_revision")} | {
         "bundle_sha256": data["bundle_sha256"],
     }
+    if role == "comparison":
+        need(settings.get("source_revision") == data["source_revision"]
+             and settings.get("bundle_sha256") == install["installed_bundle_sha256"],
+             "generated native settings lack signed source and bundle binding")
+        need(named(entry, "entry_ref", "registration_ref")
+             and digest(entry.get("entry_sha256")) and digest(entry.get("registration_sha256"))
+             and entry.get("entry_verified") is True and entry.get("registration_verified") is True,
+             "missing verified native entry and registration provenance")
+        binding.update(registration_ref=entry["registration_ref"], registration_sha256=entry["registration_sha256"])
+    else:
+        need(named(entry, "archive_ref", "symbol") and entry.get("launcher_link_verified") is True
+             and entry.get("defined_global_symbol") is True and number(entry.get("cli_exit_status"))
+             and entry["cli_exit_status"] == 0, "missing generated entry validation from the linked archive and locked CLI")
+        need(entry["symbol"] == "_start_app" and entry.get("cli_start_app_validation") is True,
+             "locked CLI and linked archive must both verify the generated start_app entry")
+    return binding
 
 
-def check_boundary(boundary, binding):
-    need(boundary.get("binding") == binding and named(boundary, "ref"), "effective boundary lacks signed build binding")
+def check_tauri_boundary(boundary, binding):
     need(all(digest(boundary.get(key)) for key in ("config_sha256", "capabilities_sha256", "acl_sha256")),
          "effective config and generated ACL digests are required")
     need(boundary.get("capability") == CAPABILITY and boundary.get("capability", {}).get("local") is True
@@ -228,6 +240,43 @@ def check_boundary(boundary, binding):
          and boundary.get("resolved_grants") == GRANTS
          and boundary.get("handlers") == list(COMMANDS)
          and boundary.get("window_labels") == ["w2-fixture"], "effective iOS capability or command boundary differs")
+    desktop = obj(boundary.get("desktop"), "same-worktree Mac regression")
+    need(desktop.get("binding") == binding and named(desktop, "ref")
+         and desktop.get("inventory") in ("empty", "synthetic")
+         and all(desktop.get(key) is True for key in ("scaffold_status", "local_inventory", "fixture_commands_absent")),
+         "safe desktop invokes and registry separation must be verified on the signed worktree")
+    return COMMANDS
+
+
+def check_native_boundary(boundary, binding):
+    webview = obj(boundary.get("webview"), "effective native WebView configuration")
+    origin = webview.get("bundled_origin")
+    local_origin = string(origin) and (origin == "file://" or (
+        re.fullmatch(r"[a-z][a-z0-9+.-]*://[a-z0-9][a-z0-9.-]*", origin)
+        and origin.split(":", 1)[0] not in {"file", "http", "https", "ws", "wss", "ftp", "ftps"}
+    ))
+    need(named(webview, "ref") and digest(webview.get("sha256"))
+         and local_origin and webview.get("allowed_origins") == [origin]
+         and webview.get("bundled_assets_only") is True and webview.get("main_frame_only") is True,
+         "effective native WebView requires the sole bundled origin and main frame")
+    registration = obj(boundary.get("registration"), "effective native handler registration")
+    need(registration.get("ref") == binding["registration_ref"]
+         and registration.get("sha256") == binding["registration_sha256"],
+         "effective native registration does not match the signed build")
+    handlers = obj(registration.get("handlers"), "registered native handlers")
+    need(len(handlers) == len(RECORDER_OPERATIONS) and all(string(name) for name in handlers)
+         and all(operation in RECORDER_OPERATIONS for operation in handlers.values())
+         and set(handlers.values()) == set(RECORDER_OPERATIONS), "native handlers must map to exactly begin, append and read")
+    dependencies = obj(boundary.get("dependencies"), "effective native dependency review")
+    need(named(boundary, "package_review_ref") and named(dependencies, "ref") and digest(dependencies.get("sha256")),
+         "missing native package or dependency review references")
+    by_operation = {operation: handler for handler, operation in handlers.items()}
+    return tuple(by_operation[operation] for operation in RECORDER_OPERATIONS)
+
+
+def check_boundary(boundary, binding, role):
+    need(boundary.get("binding") == binding and named(boundary, "ref"), "effective boundary lacks signed build binding")
+    commands = check_native_boundary(boundary, binding) if role == "comparison" else check_tauri_boundary(boundary, binding)
     need(all(boundary.get(key) is True for key in (
         "plist_reviewed", "entitlements_reviewed", "no_extra_network_or_url_access",
         "ios_dependency_tree_reviewed", "no_host_provider_or_desktop_dependencies",
@@ -238,13 +287,9 @@ def check_boundary(boundary, binding):
          and offline.get("startup_hex") == "" and offline.get("tracer_hex") == "d1970d",
          "missing bound offline startup silence or exact tracer")
     ops = items(offline.get("operations"), "offline recorder operations")
-    need(3 <= len(ops) <= 5 and ops == [COMMANDS[0], *([COMMANDS[1]] * (len(ops) - 2)), COMMANDS[2]],
+    begin, append, read = commands
+    need(3 <= len(ops) <= 5 and ops == [begin, *([append] * (len(ops) - 2)), read],
          "offline run must actually begin, append and read")
-    desktop = obj(boundary.get("desktop"), "same-worktree Mac regression")
-    need(desktop.get("binding") == binding and named(desktop, "ref")
-         and desktop.get("inventory") in ("empty", "synthetic")
-         and all(desktop.get(key) is True for key in ("scaffold_status", "local_inventory", "fixture_commands_absent")),
-         "safe desktop invokes and registry separation must be verified on the signed worktree")
 
 
 def cohort_readiness(cohort, role):
@@ -252,10 +297,11 @@ def cohort_readiness(cohort, role):
         data = obj(cohort.get("tuple"), "measured tuple")
         check_tuple(data, role)
         need(cohort.get("fingerprint") == fingerprint(data), "cohort fingerprint does not match the measured tuple")
-        check_pre_xcode(obj(cohort.get("pre_xcode"), "pre-Xcode gate"), data["source_revision"])
+        if role != "comparison":
+            check_pre_xcode(obj(cohort.get("pre_xcode"), "pre-Xcode gate"), data["source_revision"])
         check_ci(obj(cohort.get("ci"), "repository CI"), data["source_revision"])
         binding = check_build(obj(cohort.get("build"), "signed build provenance"), data, role)
-        check_boundary(obj(cohort.get("boundary"), "effective boundary"), binding)
+        check_boundary(obj(cohort.get("boundary"), "effective boundary"), binding, role)
     except EvidenceError as error:
         return Result("inconclusive", str(error))
     return Result("pass")
@@ -376,30 +422,44 @@ def check_composition(attempt, final, identity, expected):
          and number(checkpoint.get("nextSequence"), 1)
          and last_sample["nativeSequence"] == checkpoint.get("nextSequence"),
          "trace checkpoint counters do not match the native checkpoint")
-    need(not events["append delivery unconfirmed"], "native append delivery is uncertain")
-    need(all(event["bytes"] > 0 for name in ("admission", "rejection", "append dispatch", "append acknowledgment")
+    need(all(event["bytes"] > 0 for name in ("admission", "rejection", "append dispatch",
+                                             "append acknowledgment", "append delivery unconfirmed")
              for event in events[name]), "input or append evidence must identify nonempty data")
 
     admissions = events["admission"]
     dispatches = events["append dispatch"]
     acks = events["append acknowledgment"]
-    need(len(admissions) == len(dispatches) == len(acks), "incomplete admission, dispatch or acknowledgment sequence")
-    previous_ack = start
-    for index, (admit, dispatch, ack) in enumerate(zip(admissions, dispatches, acks), 1):
-        need(previous_ack < admit["sequence"] < dispatch["sequence"] < ack["sequence"] < trace_length
-             and dispatch["nativeSequence"] == ack["nativeSequence"] == index
-             and admit["bytes"] == dispatch["bytes"] == ack["bytes"], "append order, byte counts or native sequence is inconsistent")
-        previous_ack = ack["sequence"]
-    lengths = [event["bytes"] for event in acks]
+    unconfirmed = events["append delivery unconfirmed"]
+    need(len(admissions) == len(dispatches), "incomplete admission or dispatch sequence")
+    receipts = {}
+    for receipt in acks + unconfirmed:
+        index = receipt["nativeSequence"]
+        need(index <= len(dispatches) and index not in receipts, "append receipt has an unknown or repeated native sequence")
+        receipts[index] = receipt
+    previous = start
+    for index, (admit, dispatch) in enumerate(zip(admissions, dispatches), 1):
+        need(previous < admit["sequence"] < dispatch["sequence"] < trace_length
+             and dispatch["nativeSequence"] == index and admit["bytes"] == dispatch["bytes"],
+             "append order, byte counts or native sequence is inconsistent")
+        receipt = receipts.get(index)
+        previous = dispatch["sequence"]
+        if receipt is not None:
+            need(previous < receipt["sequence"] < trace_length and receipt["bytes"] == dispatch["bytes"],
+                 "append receipt order or byte count is inconsistent")
+            previous = receipt["sequence"]
+    lengths = [event["bytes"] for event in dispatches]
+    final_count = final["acceptedEvents"]
+    final_lengths = lengths[:final_count]
     need(named(final, "ref") and final["ref"] != checkpoint["ref"]
          and final_event["bytes"] * 2 == len(final["hex"]) and number(final.get("nextSequence"), 1)
-         and final_event["nativeSequence"] == final["nextSequence"] == len(acks) + 1
-         and final["acceptedEvents"] == len(acks) and sum(lengths) == final_event["bytes"]
-         and final.get("eventLengths", lengths) == lengths,
-         "final native snapshot does not reconcile with acknowledged appends")
+         and final_event["nativeSequence"] == final["nextSequence"] == final_count + 1
+         and final_count <= len(dispatches) and all(ack["nativeSequence"] <= final_count for ack in acks)
+         and sum(final_lengths) == final_event["bytes"]
+         and final.get("eventLengths", final_lengths) == final_lengths,
+         "final native snapshot does not reconcile with dispatched appends")
     accepted = 0
     for sample in samples:
-        acknowledged = sum(ack["sequence"] < sample["sequence"] for ack in acks)
+        acknowledged = max((ack["nativeSequence"] for ack in acks if ack["sequence"] < sample["sequence"]), default=0)
         dispatched = sum(dispatch["sequence"] < sample["sequence"] for dispatch in dispatches)
         count = sample["nativeSequence"] - 1
         need(max(accepted, acknowledged) <= count <= dispatched
@@ -409,9 +469,12 @@ def check_composition(attempt, final, identity, expected):
     need(final["hex"].startswith(checkpoint["hex"])
          and checkpoint.get("eventLengths", lengths[:accepted]) == lengths[:accepted],
          "checkpoint is not a prefix of the final native snapshot")
-    pre_end_count = max(accepted, sum(ack["sequence"] < end for ack in acks))
+    pre_end_ack = max((ack["nativeSequence"] for ack in acks if ack["sequence"] < end), default=0)
+    pre_end_count = max(accepted, pre_end_ack)
     pre_end_hex = final["hex"][:2 * sum(lengths[:pre_end_count])]
     measured(pre_end_count == 0, "native input accepted before compositionend", pre_end_hex)
+    need(not unconfirmed, "native append delivery is uncertain")
+    need(len(acks) == len(dispatches), "incomplete admission, dispatch or acknowledgment sequence")
     need(all(admit["sequence"] > end for admit in admissions)
          and all(event["sequence"] > end for event in events["rejection"]),
          "premature onData or uncertain pre-end native acceptance")
@@ -458,29 +521,84 @@ def check_layout(attempt, case_id):
     return all(clear)
 
 
-def check_recovery(attempt, identity, expected):
+def same_native_input(first, second):
+    return (first["hex"] == second["hex"] and first["acceptedEvents"] == second["acceptedEvents"]
+            and ("eventLengths" not in first or "eventLengths" not in second
+                 or first["eventLengths"] == second["eventLengths"]))
+
+
+def check_recovery(attempt, identity, expected, started_fresh):
     old = obj(attempt.get("recovery"), "foreground recovery")
     initial = obj(old.get("before"), "pre-interruption native snapshot")
     old_id = attempt_identity(initial)
-    need(old_id[0] == identity[0] and number(old_id[1], 1) and number(old_id[2], 1)
-         and old_id[1] < identity[1] and old_id[2] < identity[2], "foreground restart did not identify a fresh attempt and generation")
+    need(old_id[0] == identity[0] and number(old_id[1], 1) and number(old_id[2], 1),
+         "foreground restart lacks the old native attempt and generation")
     before = snapshot(initial, old_id)
     retained = snapshot(old.get("retained"), old_id)
     need(old.get("delivery_uncertain") is False and type(old.get("old_generation_extra_event")) is bool,
          "retained snapshot or delivery is uncertain")
-    measured(before["hex"] == retained["hex"] == expected
-             and before["acceptedEvents"] == retained["acceptedEvents"]
+    measured(before["hex"] == retained["hex"] == expected and before["acceptedEvents"] == retained["acceptedEvents"]
              and not old["old_generation_extra_event"], "retained native bytes or events changed",
              before["hex"], retained["hex"], before["acceptedEvents"], retained["acceptedEvents"],
              old["old_generation_extra_event"])
+    restart = obj(old.get("restart"), "foreground restart observation")
+    previous = obj(restart.get("previous"), "restart's old attempt identity")
+    need(named(restart, "ref") and attempt_identity(previous) == old_id
+         and number(previous.get("attemptId"), 1) and number(previous.get("generation"), 1),
+         "foreground restart observation is not bound to the old attempt")
+    outcome = restart.get("outcome")
+    need(outcome in ("fresh", "same-generation", "no-new-generation"), "foreground restart outcome is uncertain")
+    need(restart.get("action_completed") is True, "missing completed foreground restart action")
+    expected_fresh = outcome == "fresh"
+    need(started_fresh is None or started_fresh is expected_fresh,
+         "foreground restart conflicts with the visible fresh-start observation")
+    if outcome == "no-new-generation":
+        failure = obj(restart.get("begin_failure"), "recorded begin failure")
+        need(identity == old_id and attempt_identity(failure) == old_id and named(failure, "ref")
+             and number(failure.get("attemptId"), 1) and number(failure.get("generation"), 1)
+             and "observed" not in restart and "final" not in attempt,
+             "begin failure belongs to a different attempt or conflicts with a new generation")
+        raise MeasuredFailure("foreground restart produced no new generation", ())
+    if outcome == "same-generation":
+        observed = snapshot(restart.get("observed"), old_id)
+        need(identity == old_id and "final" not in attempt and same_native_input(observed, retained)
+             and "begin_failure" not in restart, "unchanged generation does not match the retained native snapshot")
+        raise MeasuredFailure("foreground restart kept the same generation", ())
+
+    observed = obj(restart.get("observed"), "restart's fresh attempt identity")
+    need(attempt_identity(observed) == identity and number(observed.get("attemptId"), 1)
+         and number(observed.get("generation"), 1)
+         and old_id[1] < identity[1] and old_id[2] < identity[2] and "begin_failure" not in restart,
+         "foreground restart did not identify a fresh attempt and generation")
+
+
+def check_capture(attempt, case, cohort, qualification, observed, identity):
+    case_id = case["id"]
+    expected = case["expected"]["afterHex"]
+    if case_id in RECOVERY:
+        transition = OBSERVATIONS[case_id][0]
+        need(observed.get(transition) is True, "foreground transition was not established")
+        check_recovery(attempt, identity, case["expected"]["beforeHex"], observed.get("started_fresh"))
+    final = None
+    if case_id in COMPOSITION:
+        need(not qualification.detail, qualification.detail)
+        recipe = cohort["recipes"][case_id]
+        need(attempt.get("recipe_id") == recipe["id"] and attempt["keyboard_language"] == recipe["keyboard_language"],
+             "measured gesture does not use the frozen qualified recipe")
+        need(all(observed.get(key) is True for key in OBSERVATIONS[case_id]),
+             "measured preedit and end state do not establish the qualified gesture")
+        need(attempt["id"] not in qualification.rehearsals, "qualification rehearsal is not a fresh measured attempt")
+        final = snapshot(attempt.get("final"), identity)
+        check_composition(attempt, final, identity, expected)
+    need(attempt.get("capture_error") is False, "native capture reported an unresolved error")
+    return final if final is not None else snapshot(attempt.get("final"), identity)
 
 
 def evaluate_attempt(attempt, case, cohort, qualification):
     case_id = case["id"]
     try:
         need(attempt.get("cohort_fingerprint") == cohort["fingerprint"], "attempt belongs to a different cohort tuple")
-        need(named(attempt, "launch_id", "ref") and number(attempt.get("attemptId"), 1)
-             and number(attempt.get("generation"), 1), "missing native attempt identity or observation reference")
+        need(named(attempt, "ref"), "missing attempt observation reference")
         language = attempt.get("keyboard_language")
         need(language == cohort["tuple"]["keyboard"]["scenario_languages"][case_id]
              and attempt.get("orientation") == cohort["tuple"]["orientation"], "mixed keyboard or orientation conditions")
@@ -492,31 +610,31 @@ def evaluate_attempt(attempt, case, cohort, qualification):
         need(attempt.get("action_order") == order and all(type(i) is int for i in attempt["action_order"]),
              "missing or unordered prescribed actions")
         observed = obj(attempt.get("observations"), "visible observations")
+        identity = (case_id, attempt["attemptId"], attempt["generation"])
+        final, capture_issue = None, None
+        try:
+            final = check_capture(attempt, case, cohort, qualification, observed, identity)
+        except MeasuredFailure:
+            raise
+        except EvidenceError as error:
+            capture_issue = error
+        measured(attempt.get("start_empty") is not False, "unexpected startup input")
+        measured(attempt.get("replayed") is not True, "replayed input")
+        if final is not None:
+            measured(final["hex"] == case["expected"]["afterHex"],
+                     "final bytes differ from the manifest", final["hex"])
+        for key in OBSERVATIONS[case_id]:
+            if case_id in COMPOSITION or key == "started_fresh":
+                continue
+            measured(observed.get(key) is not False, f"visible observation failed: {key}")
+        viewport_clear = check_layout(attempt, case_id) if case_id in LAYOUT_CASES else True
+        measured(viewport_clear, "prompt or cursor obscured in a measured viewport")
+        if capture_issue is not None:
+            raise capture_issue
         need(all(type(observed.get(key)) is bool for key in OBSERVATIONS[case_id]),
              "missing or ambiguous required visible observation")
-        viewport_clear = check_layout(attempt, case_id) if case_id in LAYOUT_CASES else True
-        identity = (case_id, attempt["attemptId"], attempt["generation"])
-        final = snapshot(attempt.get("final"), identity)
-        need(type(attempt.get("start_empty")) is bool and type(attempt.get("replayed")) is bool
-             and type(attempt.get("capture_error")) is bool, "missing start, replay or capture-error observation")
-        if case_id in COMPOSITION:
-            need(not qualification.detail, qualification.detail)
-            recipe = cohort["recipes"][case_id]
-            need(attempt.get("recipe_id") == recipe["id"] and language == recipe["keyboard_language"],
-                 "measured gesture does not use the frozen qualified recipe")
-            need(all(observed[key] for key in OBSERVATIONS[case_id]),
-                 "measured preedit and end state do not establish the qualified gesture")
-            need(attempt["id"] not in qualification.rehearsals, "qualification rehearsal is not a fresh measured attempt")
-            check_composition(attempt, final, identity, case["expected"]["afterHex"])
-        if case_id in RECOVERY:
-            check_recovery(attempt, identity, case["expected"]["beforeHex"])
-        measured(attempt["start_empty"], "unexpected startup input")
-        measured(not attempt["replayed"], "replayed input")
-        measured(final["hex"] == case["expected"]["afterHex"], "final bytes differ from the manifest", final["hex"])
-        need(not attempt["capture_error"], "native capture reported an unresolved error")
-        for key in OBSERVATIONS[case_id]:
-            measured(observed[key], f"visible observation failed: {key}")
-        measured(viewport_clear, "prompt or cursor obscured in a measured viewport")
+        need(type(attempt.get("start_empty")) is bool and type(attempt.get("replayed")) is bool,
+             "missing start or replay observation")
     except MeasuredFailure as error:
         return Result("failing", str(error), error.observed)
     except EvidenceError as error:
@@ -587,16 +705,78 @@ class CaseRecord:
         return None
 
 
+def retained_measurements(cohort):
+    """Index rows by the launch and position recorded during measurement."""
+    measurements = {}
+    launch_ids, launch_refs = set(), set()
+    last_order = 0
+    for launch in items(cohort.get("launches", []), "retained app launches"):
+        launch = obj(launch, "retained app launch")
+        order = launch.get("order")
+        need(named(launch, "id", "ref") and number(order, last_order + 1)
+             and launch["id"] not in launch_ids and launch["ref"] not in launch_refs,
+             "retained launches require ordered, unique labels and capture references")
+        launch_ids.add(launch["id"])
+        launch_refs.add(launch["ref"])
+        last_order = order
+        last_position = 0
+        for record in items(launch.get("measurements"), "retained launch measurements"):
+            record = obj(record, "retained launch measurement")
+            position = record.get("position")
+            need(named(record, "attempt_id") and record["attempt_id"] not in measurements
+                 and number(position, last_position + 1)
+                 and number(record.get("attemptId"), 1) and number(record.get("generation"), 1),
+                 "retained measurements require unique attempt IDs and increasing positions")
+            measurements[record["attempt_id"]] = (order, position, launch["id"], launch["ref"],
+                                                   record["attemptId"], record["generation"])
+            last_position = position
+    return measurements
+
+
+def measurement_positions(attempts, records):
+    positions = {}
+    for attempt in attempts:
+        record = records.get(attempt["id"])
+        position, native_id, generation = (attempt.get(key) for key in ("measurement_position", "attemptId", "generation"))
+        if (record and all(number(value, 1) for value in (position, native_id, generation))
+                and record[1:] == (position, attempt.get("launch_id"), attempt.get("launch_ref"), native_id, generation)):
+            positions[attempt["id"]] = record[:2]
+    return positions
+
+
+def moved_attempts(attempts, positions):
+    latest = (0, 0)
+    moved = set()
+    for attempt in attempts:
+        attempt_id = attempt["id"]
+        if attempt_id in positions:
+            position = positions[attempt_id]
+            if position < latest:
+                moved.add(attempt_id)
+            latest = max(latest, position)
+    return moved
+
+
 def native_keys(attempt):
     """The fixture counters can reset only on a separately identified app launch."""
     pairs = []
-    if isinstance(attempt.get("recovery"), dict) and isinstance(attempt["recovery"].get("before"), dict):
+    if (attempt["case_id"] in RECOVERY and isinstance(attempt.get("recovery"), dict)
+            and isinstance(attempt["recovery"].get("before"), dict)):
         _, native_id, generation = attempt_identity(attempt["recovery"]["before"])
         pairs.append((native_id, generation))
     pairs.append((attempt.get("attemptId"), attempt.get("generation")))
-    for native_id, generation in pairs:
-        if number(native_id, 1) and number(generation, 1) and named(attempt, "launch_id"):
-            yield attempt["launch_id"], native_id, generation
+    keys = [(attempt["launch_id"], native_id, generation) for native_id, generation in pairs
+            if number(native_id, 1) and number(generation, 1)]
+    return tuple(dict.fromkeys(keys))
+
+
+def restart_reference(attempt):
+    recovery = attempt.get("recovery")
+    if attempt["case_id"] in RECOVERY and isinstance(recovery, dict):
+        restart = recovery.get("restart")
+        if isinstance(restart, dict) and named(restart, "ref"):
+            return restart["ref"]
+    return None
 
 
 def out_of_order_attempts(attempts):
@@ -625,21 +805,38 @@ def assess_cohort(cohort, role, cases, ids):
         case_id = attempt.get("case_id")
         need(string(case_id) and case_id in rows, "unknown or missing mandatory case ID")
 
-    keys = [key for attempt in attempts for key in native_keys(attempt)]
+    records = retained_measurements(cohort)
+    need(records.keys() <= {attempt["id"] for attempt in attempts}, "retained measurement has no submitted attempt")
+    positions = measurement_positions(attempts, records)
+    moved = moved_attempts(attempts, positions)
+    ordered = sorted((attempt for attempt in attempts if attempt["id"] in positions),
+                     key=lambda attempt: positions[attempt["id"]])
+    unbound = [attempt for attempt in attempts if attempt["id"] not in positions]
+    keys = [key for attempt in ordered for key in native_keys(attempt)]
     attempt_ids = Counter((launch, attempt_id) for launch, attempt_id, _ in keys)
     generations = Counter((launch, generation) for launch, _, generation in keys)
-    out_of_order = out_of_order_attempts(attempts)
-    for attempt in attempts:
+    restarts = Counter(ref for attempt in ordered if (ref := restart_reference(attempt)) is not None)
+    out_of_order = out_of_order_attempts(ordered)
+    for attempt in [*ordered, *unbound]:
+        attempt_id = attempt["id"]
         case_id = attempt["case_id"]
         if readiness.status != "pass":
             result = readiness
+        elif attempt_id not in positions:
+            result = Result("inconclusive", "attempt does not match its retained launch and measurement")
         elif any(attempt_ids[launch, native_id] > 1 or generations[launch, generation] > 1
                  for launch, native_id, generation in native_keys(attempt)):
             result = Result("inconclusive", "native attempt or generation is reused within an app launch")
-        elif attempt["id"] in out_of_order:
+        elif attempt_id in out_of_order:
             result = Result("inconclusive", "native attempt or generation is out of order within an app launch")
+        elif restarts[restart_reference(attempt)] > 1:
+            result = Result("inconclusive", "foreground restart observation is reused")
         else:
             result = evaluate_attempt(attempt, cases[case_id], cohort, recipes.get(case_id))
+            # Keep verified failures at their retained positions and disqualify moved passes.
+            if result.status == "pass" and attempt_id in moved:
+                result = Result("inconclusive",
+                                "native attempt or generation is out of order in the submitted measurements")
         need(attempt.get("status") == result.status,
              f"{attempt['id']}: expected {result.status}" + (f" ({result.detail})" if result.detail else ""))
         if result.status != "pass":
@@ -658,8 +855,8 @@ def matching_conditions(original, updated, allow_shell_change=False):
         stable.pop("source_revision", None)
         stable.pop("bundle_sha256", None)
         if allow_shell_change:
-            stable.pop("shell", None)
-            stable.pop("app", None)
+            for key in ("shell", "app", "locks", "tools"):
+                stable.pop(key, None)
         else:
             app = dict(stable.get("app", {}))
             app.pop("version", None)
@@ -670,9 +867,11 @@ def matching_conditions(original, updated, allow_shell_change=False):
     return stable_conditions(before) == stable_conditions(after)
 
 
-def matching_recipes(original, updated):
+def matching_recipes(original, updated, require_original=False):
     recipes = obj(original.get("recipes", {}), "original composition recipes")
     for case_id, recipe in obj(updated.get("recipes", {}), "updated composition recipes").items():
+        if require_original and case_id in COMPOSITION:
+            need(case_id in recipes, "comparison requires the baseline's frozen composition recipes")
         if case_id in recipes:
             need(isinstance(recipe, dict) and isinstance(recipes[case_id], dict)
                  and recipe.get("id") == recipes[case_id].get("id"), "another build changed a frozen composition recipe")
@@ -742,7 +941,7 @@ def validate(report, cases):
             need(matching_conditions(cohorts["baseline"], comparison, allow_shell_change=True)
                  and matching_conditions(cohorts["corrected"], comparison, allow_shell_change=True),
                  "comparison must reuse the fixture and physical conditions on a different signed shell build")
-            matching_recipes(cohorts["baseline"], comparison)
+            matching_recipes(cohorts["baseline"], comparison, require_original=True)
             matching_recipes(cohorts["corrected"], comparison)
 
     role = "corrected" if correction and assessed["corrected"][0].status == "pass" else "baseline"

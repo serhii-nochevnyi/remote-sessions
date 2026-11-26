@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "fixture_sha256": "8c08369864c9dd4ee6de19c8cf86171b179e928f276eebe2f9f89389ea353056",
+  "fixture_sha256": "3825bfd16e9380d222b4a07b24966758cc090ed93bbc4ab6951e18a6cac5580c",
   "status": "setup-hold",
   "reasons": [
     "The active developer directory is /Library/Developer/CommandLineTools. Full Xcode, the iPhoneOS SDK, devicectl and simctl are absent on this Mac.",

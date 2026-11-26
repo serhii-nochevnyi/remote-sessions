@@ -135,7 +135,7 @@
       "title": "Touch selection and copy",
       "actions": [
         "Select COPY-Ї using touch handles and use Copy.",
-        "Verify the clipboard text in a separate text field outside the fixture."
+        "Keep the fixture foregrounded, paste into Verify copied token, and confirm that it matches COPY-Ї. Use Read last and verify the native snapshot is empty on the same generation."
       ],
       "observations": [
         "The handles select exactly COPY-Ї and the clipboard contains that token.",
