@@ -3053,9 +3053,7 @@ mod tests {
         let staged = ipc.stage(&view, incarnation, 1).await;
         let sent = ipc.invoke(&view, incarnation, 1, PasteAction::Commit { bytes: 1 });
         let (peer, request) = ipc.receive().await;
-        assert!(
-            matches!(request, Request::PasteCommit { binding, bytes: 1 } if binding == staged)
-        );
+        assert!(matches!(request, Request::PasteCommit { binding, bytes: 1 } if binding == staged));
         let receipt = Uuid::new_v4();
         PasteIpc::reply(
             peer,

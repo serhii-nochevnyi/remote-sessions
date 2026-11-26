@@ -96,7 +96,9 @@ impl PasteBuffer {
             || number == 0
             || number.to_string() != operation
             || id.len() != 32
-            || !id.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
             return None;
         }
@@ -1652,7 +1654,10 @@ impl Engine {
     }
 
     async fn load_paste(&self, read: &GeometryReadback, name: &str, data: &[u8]) -> Result<()> {
-        ensure!(self.private_sender_socket(), "Paste load target unavailable");
+        ensure!(
+            self.private_sender_socket(),
+            "Paste load target unavailable"
+        );
         let pane = &read.target.pane;
         let witness = format!("rs-paste-loaded-{}", Uuid::new_v4());
         let printed = pane_witness(pane, &witness);
@@ -1661,7 +1666,14 @@ impl Engine {
             let mut child = Command::new(&self.tmux)
                 .args(["-N", "-S"])
                 .arg(&self.socket)
-                .args(["if-shell", "-F", "-t", pane, &self.paste_guard(read), &branch])
+                .args([
+                    "if-shell",
+                    "-F",
+                    "-t",
+                    pane,
+                    &self.paste_guard(read),
+                    &branch,
+                ])
                 .env_remove("TMUX")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -1765,7 +1777,8 @@ impl Engine {
         ensure!(current_seen, "Current paste cleanup target is unconfirmed");
         if let Some(buffer) = &scope.buffer {
             let allow_absent = original.paste_marker != buffer.marker(original, 'l');
-            self.delete_paste(current, &buffer.name, allow_absent).await?;
+            self.delete_paste(current, &buffer.name, allow_absent)
+                .await?;
         }
         Ok(())
     }
@@ -1928,7 +1941,14 @@ impl Engine {
             Err(_) => {
                 let mut original = read;
                 original.paste_marker = loading_marker;
-                return self.quarantine(&mut lane, &binding, PasteScope { original, buffer: None });
+                return self.quarantine(
+                    &mut lane,
+                    &binding,
+                    PasteScope {
+                        original,
+                        buffer: None,
+                    },
+                );
             }
         };
         let mut scope = PasteScope {
@@ -1976,13 +1996,8 @@ impl Engine {
         }
         match self.submit_paste(&send).await {
             Ok(reply) if reply.trim_end() == send.rejected => {
-                self.reject_reserved(
-                    &mut lane,
-                    &binding,
-                    scope,
-                    PasteResult::Unavailable {},
-                )
-                .await
+                self.reject_reserved(&mut lane, &binding, scope, PasteResult::Unavailable {})
+                    .await
             }
             Ok(reply) if reply.trim_end() == send.enqueued => {
                 if !self.owners().confirm_paste(&binding) {
@@ -2182,7 +2197,10 @@ impl Engine {
                 let current = self
                     .geometry_for_runtime(&self.find(runtime_id).await?)
                     .await?;
-                ensure!(current.same_pane(&read), "Current terminal identity changed");
+                ensure!(
+                    current.same_pane(&read),
+                    "Current terminal identity changed"
+                );
                 self.authorize_terminal_writer(&current, catalog).await?;
                 read = current;
             }
@@ -2451,7 +2469,9 @@ impl Engine {
             format_equal("pane_id", pane),
             format_equal(
                 "pane_pid",
-                runtime.pane_pid.map_or_else(String::new, |pid| pid.to_string()),
+                runtime
+                    .pane_pid
+                    .map_or_else(String::new, |pid| pid.to_string()),
             ),
             format_equal("pane_dead", u8::from(runtime.exited)),
             format_equal("after-kill-session", ""),
@@ -2759,7 +2779,10 @@ impl Engine {
             Request::Stop {
                 runtime_id,
                 expected_pane_id,
-            } => self.stop_runtime(runtime_id, &expected_pane_id, catalog).await,
+            } => {
+                self.stop_runtime(runtime_id, &expected_pane_id, catalog)
+                    .await
+            }
         }
     }
 }

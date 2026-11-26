@@ -416,10 +416,7 @@ else:
         (engine, terminal)
     }
 
-    pub(super) fn second_pane(
-        &self,
-        replacement: bool,
-    ) -> (TerminalView, tokio::process::Child) {
+    pub(super) fn second_pane(&self, replacement: bool) -> (TerminalView, tokio::process::Child) {
         let child = Command::new("/bin/sleep")
             .arg("60")
             .kill_on_drop(true)
@@ -469,7 +466,10 @@ else:
         fs::write(root.join("marker-1"), read.ready_marker(None)).unwrap();
         fs::write(
             root.join("second-pane"),
-            format!("987|123456|{}|$1|@1|%1|{pid}|{name}|0|0||0|1|1|manual|{tty}", target.generation),
+            format!(
+                "987|123456|{}|$1|@1|%1|{pid}|{name}|0|0||0|1|1|manual|{tty}",
+                target.generation
+            ),
         )
         .unwrap();
         (
