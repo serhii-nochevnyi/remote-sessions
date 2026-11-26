@@ -382,6 +382,8 @@ fn controlled_view(
         provider: None,
         observation: ObservationState::Unavailable,
     };
+    let generation = bridge.generation.load(Ordering::SeqCst);
+    let allocation = bridge.reserve(generation).unwrap();
     let view = Arc::new(View {
         terminal,
         directory: bridge.directory.clone().unwrap_or_default(),
@@ -403,19 +405,17 @@ fn controlled_view(
         drain_revision: AtomicU64::new(0),
         reader_state,
         views: Arc::downgrade(&bridge.views),
+        allocation: Arc::downgrade(&allocation),
         retirement: watch::channel(None).0,
         reading: AtomicBool::new(false),
         handle: tokio::runtime::Handle::current(),
         cleanup_confirmations: AtomicU64::new(0),
     });
-    let generation = bridge.generation.load(Ordering::SeqCst);
-    let allocation = bridge.reserve(generation).unwrap();
     bridge
         .start_attachment(
             generation,
             view.clone(),
-            allocation,
-            Box::new(ControlledChild(child.clone())),
+            AttachmentChild::new(Box::new(ControlledChild(child.clone())), allocation),
             Box::new(ControlledReader {
                 steps: commands,
                 requests,
@@ -740,7 +740,7 @@ async fn w1_terminal_byte_and_marker_full_evict_before_a_first_pull() {
         assert!(bridge.view(&id).is_err());
         assert_eq!(bridge.views.lock().unwrap().notices.len(), 1);
         bridge.detach(&id);
-        view.retire(Retirement::Typed(TerminalClosure::Eof));
+        view.retire(Retirement::Eof);
         let closed = bridge.read(&id).await.unwrap();
         assert_eq!(closed.closure, Some(FULL));
         assert!(closed.closed && !closed.writable && closed.data.is_empty());
@@ -748,7 +748,7 @@ async fn w1_terminal_byte_and_marker_full_evict_before_a_first_pull() {
         assert!(bridge.read(&id).await.is_err());
         until(|| child.signals.load(Ordering::Relaxed) == 1).await;
         reader.finish();
-        until(|| bridge.views.lock().unwrap().allocated == 0).await;
+        until(|| allocation_counts(&bridge) == (0, 0)).await;
         assert!(child.reaped.load(Ordering::Acquire));
         assert_eq!(child.signals.load(Ordering::Relaxed), 1);
     }
@@ -787,6 +787,197 @@ async fn w1_terminal_eof_detach_and_dropped_receiver_are_distinct() {
         assert!(bridge.read(&id).await.is_err());
         reader.finish();
     }
+}
+
+#[tokio::test]
+async fn w1_terminal_detach_supersedes_eof_with_a_read_in_flight() {
+    let bridge = DesktopBridge::new(None, "/unused/tmux".into());
+    let (view, mut reader, _) = controlled_view(&bridge, &target(), Uuid::new_v4(), 0);
+    let id = view.terminal.view_id.to_string();
+    let mut pending = std::pin::pin!(bridge.read(&id));
+    std::future::poll_fn(|cx| {
+        use std::future::Future;
+        assert!(pending.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    reader.requested().await;
+    reader.data(b"discard on detach");
+    reader.requested().await;
+    reader.data(b"");
+    view.retired().await;
+    assert!(view.eof_draining());
+    bridge.detach(&id);
+    let closed = pending.as_mut().await.unwrap();
+    assert_eq!(closed.closure, Some(TerminalClosure::Detached));
+    assert!(closed.closed && closed.data.is_empty());
+    assert_read_only_drain(&closed);
+    assert!(bridge.read(&id).await.is_err());
+    reader.finish();
+    until(|| allocation_counts(&bridge) == (0, 0)).await;
+    assert!(view.output.lock().await.receiver.is_empty());
+}
+
+#[tokio::test]
+async fn w1_terminal_eof_fifo() {
+    for parked in [false, true] {
+        let fixture = AgentFixture::new();
+        let listener = UnixListener::bind(fixture.0.join("agent.sock")).unwrap();
+        let bridge = DesktopBridge::new(Some(fixture.0.clone()), "/unused/tmux".into());
+        let (view, mut reader, child) = controlled_view(&bridge, &target(), Uuid::new_v4(), 0);
+        let id = view.terminal.view_id.to_string();
+        let epoch = view.output.lock().await.status.epoch.unwrap();
+        let token = Uuid::new_v4();
+        let acquire = {
+            let view = view.clone();
+            tokio::spawn(async move { refresh_control(&view).await })
+        };
+        let (mut peer, Request::AcquireTerminal { terminal }) = receive(&listener).await else {
+            panic!("expected scoped acquisition");
+        };
+        assert_eq!(terminal, view.terminal);
+        respond(&mut peer, Response::TerminalControl { token, epoch }).await;
+        acquire.await.unwrap();
+        assert!(bridge.read(&id).await.unwrap().writable);
+
+        let mut pending = std::pin::pin!(bridge.read(&id));
+        if parked {
+            std::future::poll_fn(|cx| {
+                use std::future::Future;
+                assert!(pending.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        reader.requested().await;
+        for frame in 0..OUTPUT_SLOTS {
+            reader.data(&[b'A' + frame as u8; OUTPUT_CHUNK_SIZE]);
+            reader.requested().await;
+        }
+        reader.data(b"\xe1\x80");
+        assert_eq!(reader.requested().await, OUTPUT_CHUNK_SIZE - 2);
+        child.allow_reap.store(true, Ordering::Release);
+        reader.data(b"");
+        view.retired().await;
+        assert!(view.eof_draining());
+        assert_eq!(allocation_counts(&bridge), (0, 1));
+        assert!(bridge.status(&id).await.is_err());
+        assert!(
+            bridge
+                .input(&id, b"after EOF".to_vec(), false)
+                .await
+                .is_err()
+        );
+        let (
+            mut peer,
+            Request::Release {
+                runtime_id,
+                token: released,
+            },
+        ) = receive(&listener).await
+        else {
+            panic!("expected exact EOF lease release");
+        };
+        assert_eq!(
+            (runtime_id, released),
+            (view.terminal.target.runtime_id, token)
+        );
+        respond(&mut peer, Response::Accepted {}).await;
+        until(|| view.allocation.strong_count() == 1).await;
+        assert!(child.reaped.load(Ordering::Acquire));
+        assert_eq!(view.cleanup_confirmations.load(Ordering::Acquire), 3);
+        assert!(view.master.lock().unwrap().is_none());
+
+        assert_eof_frame(pending.as_mut().await.unwrap(), 0);
+        for index in 1..OUTPUT_SLOTS {
+            assert_eof_frame(bridge.read(&id).await.unwrap(), index);
+        }
+        let eof = bridge.read(&id).await.unwrap();
+        assert_eq!(eof.closure, Some(TerminalClosure::Eof));
+        assert!(eof.closed && eof.data.is_empty());
+        assert_read_only_drain(&eof);
+        assert!(bridge.read(&id).await.is_err());
+        assert_eq!(allocation_counts(&bridge), (0, 0));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), listener.accept())
+                .await
+                .is_err()
+        );
+        reader.finish();
+    }
+}
+
+fn assert_eof_frame(chunk: Chunk, index: usize) {
+    assert_eq!(chunk.data, [b'A' + index as u8; OUTPUT_CHUNK_SIZE]);
+    assert!(!chunk.closed && chunk.closure.is_none());
+    assert_read_only_drain(&chunk);
+}
+
+fn assert_read_only_drain(chunk: &Chunk) {
+    assert!(!chunk.writable && chunk.status.is_none() && chunk.geometry.is_none());
+    assert!(chunk.paste_incarnation.is_none() && chunk.paste_completion.is_none());
+    assert!(chunk.paste_admission.is_none());
+}
+
+#[tokio::test]
+async fn w1_terminal_abandoned_eof_capacity() {
+    let bridge = DesktopBridge::new(None, "/unused/tmux".into());
+    let target = target();
+    let agent = Uuid::new_v4();
+    let mut abandoned = VecDeque::new();
+    for cycle in 0..(VIEW_LIMIT * 3) {
+        let (view, mut reader, child) = controlled_view(&bridge, &target, agent, 0);
+        let id = view.terminal.view_id;
+        if abandoned.len() == VIEW_LIMIT {
+            let evicted: Arc<View> = abandoned.pop_front().unwrap();
+            assert!(
+                bridge
+                    .read(&evicted.terminal.view_id.to_string())
+                    .await
+                    .is_err()
+            );
+            assert!(evicted.output.lock().await.receiver.is_empty());
+        }
+        reader.requested().await;
+        reader.data(&[b'Z'; OUTPUT_CHUNK_SIZE]);
+        reader.requested().await;
+        child.allow_reap.store(true, Ordering::Release);
+        reader.data(b"");
+        view.retired().await;
+        until(|| view.allocation.strong_count() == 1).await;
+        assert_eq!(view.cleanup_confirmations.load(Ordering::Acquire), 3);
+        assert!(child.reaped.load(Ordering::Acquire));
+        assert_eq!(view.output.lock().await.receiver.len(), 1);
+        assert_eq!(allocation_counts(&bridge), (0, (cycle + 1).min(VIEW_LIMIT)));
+        assert_eq!(
+            bridge.views.lock().unwrap().drains.len(),
+            (cycle + 1).min(VIEW_LIMIT)
+        );
+        assert!(bridge.view(&id.to_string()).is_err());
+        reader.finish();
+        abandoned.push_back(view);
+    }
+
+    let detached = abandoned.pop_front().unwrap();
+    let id = detached.terminal.view_id.to_string();
+    bridge.detach(&id);
+    assert!(bridge.read(&id).await.is_err());
+    assert!(detached.output.lock().await.receiver.is_empty());
+
+    for view in abandoned {
+        let id = view.terminal.view_id;
+        {
+            let mut views = bridge.views.lock().unwrap();
+            let expires = views.drains[&id].expires;
+            views.expire_eof(id, expires - Duration::from_nanos(1));
+            assert!(views.drains.contains_key(&id));
+            views.expire_eof(id, expires);
+            assert!(!views.drains.contains_key(&id));
+        }
+        assert!(bridge.read(&id.to_string()).await.is_err());
+        assert!(view.output.lock().await.receiver.is_empty());
+    }
+    assert_eq!(allocation_counts(&bridge), (0, 0));
 }
 
 #[test]
@@ -840,6 +1031,296 @@ async fn receive(listener: &UnixListener) -> (UnixStream, Request) {
 async fn respond(peer: &mut UnixStream, reply: Response) {
     let line = encode_local_observation(&reply).unwrap() + "\n";
     peer.write_all(line.as_bytes()).await.unwrap();
+}
+
+fn attachment_tmux(fixture: &AgentFixture, generation: Uuid, flags: &str) -> PathBuf {
+    let tmux = fixture.0.join("tmux");
+    fs::write(
+        &tmux,
+        format!(
+            r#"#!/bin/sh
+set -eu
+root=$(dirname "$0")
+case "$4" in
+  attach-session)
+    test "$5" = -f && test "$6" = ignore-size && test "$7" = -E
+    test "$8" = -t && test "$9" = '$0'
+    printf '%s\n%s\n' "$$" "$(tty)" > "$root/client-next"
+    mv "$root/client-next" "$root/client"
+    if [ -f "$root/flood" ]; then
+      while [ ! -f "$root/continue" ]; do /bin/sleep 0.01; done
+      exec /bin/dd if=/dev/zero bs=8192 count=32 2>/dev/null
+    fi
+    printf 'buffered attachment output'
+    if [ -f "$root/hold" ]; then
+      while [ ! -f "$root/continue" ]; do /bin/sleep 0.01; done
+      printf 'output before failed refresh'
+      while [ ! -f "$root/finish" ]; do /bin/sleep 0.01; done
+      exit 0
+    fi
+    exec /bin/sleep 30
+    ;;
+  list-clients)
+    test ! -f "$root/client-changed" || exit 1
+    {{ read -r pid; read -r tty; }} < "$root/client"
+    set -- $(stty size < "$tty")
+    printf '%s|%s|$0|@0|%%0|{generation}|{flags}|%s|%s\n' "$pid" "$tty" "$2" "$1"
+    ;;
+  *) exit 1 ;;
+esac
+"#,
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    tmux
+}
+
+async fn open_fixture(listener: &UnixListener, target: &TerminalTarget) -> TerminalStatus {
+    let (
+        mut peer,
+        Request::OpenTerminal {
+            runtime_id,
+            view_id,
+        },
+    ) = receive(listener).await
+    else {
+        panic!("expected an opening request");
+    };
+    assert_eq!(runtime_id, target.runtime_id);
+    let status = TerminalStatus {
+        terminal: TerminalView {
+            target: target.clone(),
+            view_id,
+            agent_epoch: Uuid::new_v4(),
+        },
+        committed: CommittedGeometry {
+            size: TerminalSize {
+                cols: 100,
+                rows: 30,
+            },
+            revision: 0,
+            intent: None,
+        },
+        epoch: None,
+        provider: None,
+        observation: ObservationState::Unavailable,
+    };
+    respond(
+        &mut peer,
+        Response::TerminalOpened {
+            status: status.clone(),
+        },
+    )
+    .await;
+    status
+}
+
+async fn attachment_status_peer(listener: &UnixListener, status: &TerminalStatus) -> UnixStream {
+    let (peer, Request::TerminalStatus { terminal }) = receive(listener).await else {
+        panic!("expected a full terminal scope check");
+    };
+    assert_eq!(terminal, status.terminal);
+    peer
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttachmentProof {
+    Verified,
+    ReplacementServer,
+    WrongClientRole,
+    RefreshUnavailable,
+    ClientChanged,
+    ProcessReused,
+    Timeout,
+    Cancelled,
+    Detached,
+}
+
+#[tokio::test]
+async fn w1_terminal_exact_attachment() {
+    use AttachmentProof::*;
+    for proof in [
+        Verified,
+        ReplacementServer,
+        WrongClientRole,
+        RefreshUnavailable,
+        ClientChanged,
+        ProcessReused,
+        Timeout,
+        Cancelled,
+        Detached,
+    ] {
+        let fixture = AgentFixture::new();
+        let target = target();
+        let generation = if proof == ReplacementServer {
+            Uuid::new_v4()
+        } else {
+            target.generation
+        };
+        let flags = if proof == WrongClientRole {
+            "read-only"
+        } else {
+            "ignore-size"
+        };
+        let tmux = attachment_tmux(&fixture, generation, flags);
+        if proof == Verified {
+            fs::write(fixture.0.join("hold"), "").unwrap();
+        }
+        let listener = UnixListener::bind(fixture.0.join("agent.sock")).unwrap();
+        let bridge = Arc::new(DesktopBridge::new(Some(fixture.0.clone()), tmux));
+        let runtime = target.runtime_id.to_string();
+        let attaching = {
+            let bridge = bridge.clone();
+            tokio::spawn(async move {
+                if proof == Verified {
+                    bridge.attach_observer(&runtime).await
+                } else {
+                    bridge.attach(&runtime).await
+                }
+            })
+        };
+        let opened = open_fixture(&listener, &target).await;
+        let id = opened.terminal.view_id.to_string();
+        let client = fixture.0.join("client");
+        until(|| client.exists()).await;
+        let identity = fs::read_to_string(client).unwrap();
+        let pid = identity.lines().next().unwrap();
+        assert!(pid.parse::<u32>().unwrap() > 0);
+
+        let mut refreshed = opened.clone();
+        let mut proof_peer = match proof {
+            ReplacementServer | WrongClientRole => None,
+            _ => Some(attachment_status_peer(&listener, &opened).await),
+        };
+        assert!(!attaching.is_finished(), "{proof:?}");
+        assert_eq!(allocation_counts(&bridge), (0, 1));
+        assert!(bridge.read(&id).await.is_err());
+        assert!(bridge.status(&id).await.is_err());
+        assert!(
+            bridge
+                .input(&id, b"pre-proof".to_vec(), false)
+                .await
+                .is_err()
+        );
+        match proof {
+            ReplacementServer | WrongClientRole | Timeout => {}
+            RefreshUnavailable => {
+                respond(
+                    proof_peer.as_mut().unwrap(),
+                    Response::Error {
+                        message: "fixture unavailable".into(),
+                    },
+                )
+                .await;
+            }
+            Cancelled => attaching.abort(),
+            Verified | ClientChanged | ProcessReused | Detached => {
+                if proof == Detached {
+                    bridge.detach_all();
+                }
+                if proof == ClientChanged {
+                    fs::write(fixture.0.join("client-changed"), "").unwrap();
+                }
+                if proof == ProcessReused {
+                    refreshed.terminal.target.process_start += 1;
+                } else {
+                    refreshed.epoch = Some(ResizeEpoch {
+                        agent: opened.terminal.agent_epoch,
+                        owner: Uuid::new_v4(),
+                    });
+                }
+                respond(
+                    proof_peer.as_mut().unwrap(),
+                    Response::TerminalStatus {
+                        status: refreshed.clone(),
+                    },
+                )
+                .await;
+            }
+        }
+
+        let result = tokio::time::timeout(Duration::from_secs(4), attaching)
+            .await
+            .unwrap();
+        if proof == Verified {
+            let attachment = result.unwrap().unwrap();
+            assert_eq!(attachment.view_id, id);
+            assert_eq!(attachment.status, refreshed);
+            assert_eq!(bridge.attachment_pid(&id).unwrap().to_string(), pid);
+            let view = bridge.view(&id).unwrap();
+            view.output.lock().await.refresh_at = Instant::now() + Duration::from_secs(60);
+            assert_eq!(
+                read_until_bytes(&bridge, &id, b"buffered attachment output").await,
+                b"buffered attachment output"
+            );
+            fs::write(fixture.0.join("continue"), "").unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while view.output.lock().await.receiver.is_empty() {
+                    tokio::time::sleep(CLEANUP_POLL).await;
+                }
+            })
+            .await
+            .unwrap();
+            view.output.lock().await.refresh_at = Instant::now();
+            let reading = {
+                let bridge = bridge.clone();
+                let id = id.clone();
+                tokio::spawn(async move { bridge.read(&id).await })
+            };
+            let mut refresh = attachment_status_peer(&listener, &opened).await;
+            fs::write(fixture.0.join("finish"), "").unwrap();
+            tokio::time::timeout(Duration::from_secs(2), view.retired())
+                .await
+                .unwrap();
+            assert!(view.eof_draining());
+            respond(
+                &mut refresh,
+                Response::Error {
+                    message: "later observation failed".into(),
+                },
+            )
+            .await;
+            assert!(reading.await.unwrap().is_err());
+        } else if proof == Cancelled {
+            assert!(result.err().unwrap().is_cancelled());
+        } else {
+            let error = result.unwrap().err().unwrap();
+            let expected = match proof {
+                ReplacementServer | WrongClientRole | Timeout => {
+                    "Terminal attachment proof timed out"
+                }
+                RefreshUnavailable => "Розмір термінала недоступний",
+                ClientChanged => "Attachment client unavailable",
+                ProcessReused => "Terminal attachment identity changed",
+                Detached => "View context changed",
+                _ => unreachable!(),
+            };
+            assert_eq!(error.to_string(), expected, "{proof:?}");
+        }
+        assert!(bridge.read(&id).await.is_err());
+        assert!(bridge.status(&id).await.is_err());
+        assert!(
+            bridge
+                .input(&id, b"post-proof".to_vec(), false)
+                .await
+                .is_err()
+        );
+        until(|| allocation_counts(&bridge) == (0, 0)).await;
+        let observed = std::process::Command::new("/bin/ps")
+            .args(["-p", pid, "-o", "pid="])
+            .output()
+            .unwrap();
+        assert!(
+            !observed.status.success() && observed.stdout.is_empty(),
+            "child {pid} was not reaped for {proof:?}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), listener.accept())
+                .await
+                .is_err()
+        );
+    }
 }
 
 #[tokio::test]
@@ -1175,7 +1656,7 @@ esac
 
 fn allocation_counts(bridge: &DesktopBridge) -> (usize, usize) {
     let state = bridge.views.lock().unwrap();
-    (state.live.len(), state.allocated)
+    (state.live.len(), state.allocated.load(Ordering::Relaxed))
 }
 
 async fn reject_ninth(bridge: &DesktopBridge, runtime: &str) {
@@ -1216,17 +1697,10 @@ impl StartupGate {
 #[tokio::test]
 async fn w1_terminal_startup_full_is_retired_before_attach_replies() {
     let fixture = AgentFixture::new();
-    let tmux = fixture.0.join("tmux");
-    fs::write(
-        &tmux,
-        r#"#!/bin/sh
-exec /bin/dd if=/dev/zero bs=8192 count=32 2>/dev/null
-"#,
-    )
-    .unwrap();
-    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
-    let listener = UnixListener::bind(fixture.0.join("agent.sock")).unwrap();
     let target = target();
+    let tmux = attachment_tmux(&fixture, target.generation, "ignore-size");
+    fs::write(fixture.0.join("flood"), "").unwrap();
+    let listener = UnixListener::bind(fixture.0.join("agent.sock")).unwrap();
     let runtime = target.runtime_id.to_string();
     let bridge = Arc::new(DesktopBridge::new(Some(fixture.0.clone()), tmux));
     let (attached, starting) = tokio::sync::oneshot::channel();
@@ -1239,42 +1713,12 @@ exec /bin/dd if=/dev/zero bs=8192 count=32 2>/dev/null
         let bridge = bridge.clone();
         tokio::spawn(async move { bridge.attach_observer(&runtime).await })
     };
-    let (
-        mut peer,
-        Request::OpenTerminal {
-            runtime_id,
-            view_id,
-        },
-    ) = receive(&listener).await
-    else {
-        panic!("expected opening request");
-    };
-    assert_eq!(runtime_id, target.runtime_id);
-    respond(
-        &mut peer,
-        Response::TerminalOpened {
-            status: TerminalStatus {
-                terminal: TerminalView {
-                    target,
-                    view_id,
-                    agent_epoch: Uuid::new_v4(),
-                },
-                committed: CommittedGeometry {
-                    size: TerminalSize {
-                        cols: 100,
-                        rows: 30,
-                    },
-                    revision: 0,
-                    intent: None,
-                },
-                epoch: None,
-                provider: None,
-                observation: ObservationState::Unavailable,
-            },
-        },
-    )
-    .await;
+    let status = open_fixture(&listener, &target).await;
+    let mut peer = attachment_status_peer(&listener, &status).await;
+    let view_id = status.terminal.view_id;
+    respond(&mut peer, Response::TerminalStatus { status }).await;
     assert_eq!(starting.await.unwrap(), view_id);
+    fs::write(fixture.0.join("continue"), "").unwrap();
     until(|| allocation_counts(&bridge).0 == 0).await;
     assert!(!start.is_finished());
     assert_eq!(bridge.views.lock().unwrap().notices.len(), 1);
@@ -1311,9 +1755,6 @@ async fn w1_terminal_racing_eof_and_detach_have_one_owner_and_never_signal_reape
     until(|| allocation_counts(&bridge) == (0, 0)).await;
     assert_eq!(view.cleanup_confirmations.load(Ordering::Acquire), 3);
     assert_eq!(child.signals.load(Ordering::Relaxed), 0);
-    if let Ok(closed) = bridge.read(&id).await {
-        assert_eq!(closed.closure, Some(TerminalClosure::Eof));
-    }
     assert!(bridge.read(&id).await.is_err());
     bridge.detach(&id);
     assert_eq!(child.signals.load(Ordering::Relaxed), 0);
