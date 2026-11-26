@@ -251,7 +251,6 @@ function mountTerminal(
   }
 
   function compositionEnd(event: CompositionEvent) {
-    // While detached, let xterm close its old preedit with stdin disabled.
     if (!ownsComposition(activeComposition) && (current || !composing)) {
       event.stopImmediatePropagation();
       return;
@@ -294,7 +293,6 @@ function mountTerminal(
   textarea.addEventListener("compositionstart", compositionStart, true);
   textarea.addEventListener("compositionupdate", compositionUpdate, true);
   textarea.addEventListener("compositionend", compositionEnd, true);
-  // xterm captures input on the textarea itself. Capture on its ancestor first.
   host.addEventListener("input", compositionInput, true);
   textarea.addEventListener("blur", interrupt, true);
   document.addEventListener("visibilitychange", visibilityChanged);
