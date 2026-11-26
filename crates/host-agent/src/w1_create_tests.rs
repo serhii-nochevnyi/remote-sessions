@@ -7,15 +7,31 @@ use crate::{
     },
     product_launch::{LAUNCH_COMMAND, LaunchGuard, NONCE_ENV, read_setup_fault},
 };
-use std::io::{Error, ErrorKind};
+use std::{
+    fs::TryLockError,
+    io::{Error, ErrorKind},
+};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-const TMUX: &str = r#"#!/bin/sh
+const TMUX: &str = r##"#!/bin/sh
 set -eu
 cd "$(dirname "$3")"
 token=""
 if test -f generation; then token=$(cat generation); fi
+guard_equals() {
+  case "$guard" in *"#{==:#{$1},$2}"*) return 0 ;; *) return 1 ;; esac
+}
+option_value() {
+  if test -f "$1"; then cat "$1"; fi
+}
+valid_buffer() {
+  case "$1" in rs-paste-*) ;; *) return 1 ;; esac
+  id=${1#rs-paste-}
+  id=${id#probe-}
+  test "${#id}" = 32 || return 1
+  case "$id" in *[!0-9a-f]*) return 1 ;; esac
+}
 case "$4" in
   display-message)
     if test "${6-}" = -t; then
@@ -41,6 +57,69 @@ case "$4" in
   if-shell)
     if test "$6" = -t; then
       case "$9" in
+        'load-buffer '*|'delete-buffer '*)
+          test "$5" = -F && test "$#" = 9 || exit 1
+          socket="$PWD/tmux.sock"
+          test "$3" = "$socket" || exit 0
+          target=$7
+          guard=$8
+          branch=$9
+          set -f
+          set -- $branch
+          action=$1
+          test "$2" = -b && valid_buffer "$3" || exit 1
+          buffer=$3
+          shift 3
+          if test "$action" = load-buffer; then
+            test "$1" = - || exit 1
+            shift
+          fi
+          test "$#" = 7 && test "$1 $2 $3 $4 $5 $6" = "; display-message -p -l -t $target" || exit 1
+          witness=$7
+          case "$action:$witness" in
+            load-buffer:rs-paste-loaded-*|delete-buffer:rs-paste-cleanup-*) ;;
+            *) exit 1 ;;
+          esac
+          for name in $(cat names); do
+            IFS='|' read -r session window pane pid < "$name.pane"
+            if test "$pane" != "$target"; then continue; fi
+            dead=$(cat "$name.dead")
+            tty=$(cat tty)
+            nonce=$(cat "$name.nonce")
+            stamp=$(cat "$name.stamp")
+            epoch=$(option_value epoch)
+            launch=$(option_value paste-launch)
+            marker=$(option_value marker)
+            test "$dead" = 0 &&
+              guard_equals pid 42 && guard_equals start_time 100 &&
+              guard_equals @rs_create_generation "$token" &&
+              guard_equals session_name "$name" && guard_equals session_id "$session" &&
+              guard_equals window_id "$window" && guard_equals pane_id "$pane" &&
+              guard_equals pane_pid "$pid" && guard_equals pane_tty "$tty" &&
+              guard_equals @rs_create_nonce "$nonce:$stamp" &&
+              guard_equals @rs_resize_epoch "$epoch" &&
+              guard_equals @rs_paste_launch "$launch" &&
+              guard_equals @rs_paste_admission "$marker" &&
+              guard_equals version 3.8 && guard_equals socket_path "$socket" &&
+              guard_equals session_windows 1 && guard_equals window_panes 1 &&
+              guard_equals pane_dead 0 && guard_equals window-size manual || exit 0
+            for hook in after-load-buffer after-save-buffer after-paste-buffer after-delete-buffer after-send-keys after-set-option after-display-message after-resize-window command-error; do
+              guard_equals "$hook" "" || exit 0
+            done
+            if test "$action" = load-buffer; then
+              cat > "buffers/$buffer"
+              printf 'load\n' >> buffer-loads
+              printf '%s\n' "$guard" > last-buffer-guard
+              printf '%s\n' "$buffer" > last-buffer-load
+            else
+              guard_equals after-list-buffers "" || exit 0
+              rm "buffers/$buffer"
+              printf '%s\n' "$buffer" >> buffer-deletions
+            fi
+            printf '%s\n' "$witness"
+            exit 0
+          done
+          exit 0 ;;
         'set-option -p -o -t '*' @rs_paste_launch '*)
           printf '%s\n' "$9" | awk '{print $7}' > paste-launch
           printf '%s\n' "$9" | awk '{for(i=1;i<NF;i++) if ($i=="@rs_paste_admission") print $(i+1)}' > marker ;;
@@ -114,13 +193,17 @@ case "$4" in
     done ;;
   list-commands)
     printf 'paste-buffer [-dprS]\nload-buffer path\n' ;;
-  load-buffer)
-    printf 'load\n' >> buffer-loads
-    cat > buffer ;;
   save-buffer)
-    cat buffer ;;
-  delete-buffer)
-    rm buffer ;;
+    test "$#" = 7 && test "$5" = -b && valid_buffer "$6" && test "$7" = - || exit 1
+    test -f "buffers/$6"
+    if test -f corrupt-buffer-readback; then
+      printf 'altered'
+    else
+      cat "buffers/$6"
+    fi ;;
+  load-buffer|delete-buffer)
+    printf '%s\n' "$4" >> unexpected-terminal-mutations
+    exit 1 ;;
   capture-pane)
     test "$6" = -t
     name=$(cat names)
@@ -128,7 +211,7 @@ case "$4" in
     cat output ;;
   *) exit 1 ;;
 esac
-"#;
+"##;
 
 struct Fixture {
     _temp: tempfile::TempDir,
@@ -146,6 +229,7 @@ impl Fixture {
         let root = temp.path().canonicalize().unwrap();
         let workspace = root.join("Папка #{} $' ;");
         fs::create_dir(&workspace).unwrap();
+        fs::create_dir(root.join("buffers")).unwrap();
         let catalog = root.join("catalog");
         catalog::provision(&catalog).unwrap();
         tests::fixture_program(&root.join("tmux"), TMUX);
@@ -212,19 +296,37 @@ impl Fixture {
 
     async fn restart(&self, job: JoinHandle<Result<()>>) -> JoinHandle<Result<()>> {
         stop(job).await;
-        self.wait_catalog_released().await;
+        self.wait_restart_released().await;
         self.serve(self.lane()).await
     }
 
-    async fn wait_catalog_released(&self) {
-        let file = File::open(self.catalog.join("catalog.lock")).unwrap();
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while file.try_lock().is_err() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
+    async fn wait_restart_released(&self) {
+        let timeout = Duration::from_secs(3);
+        wait_lock_release(&self.catalog.join("catalog.lock"), timeout, || {})
+            .await
+            .expect("catalog ownership did not release");
+        wait_lock_release(&self.root.join("agent.lock"), timeout, || {})
+            .await
+            .expect("agent ownership did not release");
+    }
+
+    fn buffer_snapshot(&self) -> (std::collections::BTreeMap<String, Vec<u8>>, Vec<u8>) {
+        let buffers = fs::read_dir(self.root.join("buffers"))
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (
+                    entry.file_name().into_string().unwrap(),
+                    fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect();
+        let deletions = match fs::read(self.root.join("buffer-deletions")) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("could not read deletion ledger: {error}"),
+        };
+        (buffers, deletions)
     }
 
     async fn register(&self) -> Uuid {
@@ -296,6 +398,26 @@ impl Fixture {
     }
 }
 
+async fn wait_lock_release(
+    path: &Path,
+    timeout: Duration,
+    mut on_contention: impl FnMut(),
+) -> std::io::Result<()> {
+    let file = OpenOptions::new().read(true).write(true).open(path)?;
+    tokio::time::timeout(timeout, async {
+        loop {
+            match file.try_lock() {
+                Ok(()) => return file.unlock(),
+                Err(TryLockError::WouldBlock) => on_contention(),
+                Err(TryLockError::Error(error)) => return Err(error),
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .map_err(|_| Error::new(ErrorKind::TimedOut, "fixture lock remained owned"))?
+}
+
 async fn stop(job: JoinHandle<Result<()>>) {
     job.abort();
     assert!(job.await.unwrap_err().is_cancelled());
@@ -345,6 +467,180 @@ fn create(key: Uuid, workspace_id: Uuid, reservation: Option<Uuid>) -> ProductRe
         profile: ProviderProfile::Codex,
         reservation,
     }
+}
+
+#[tokio::test]
+async fn w1_create_restart_waits_for_agent_lock() {
+    let fixture = Fixture::new();
+    let path = fixture.root.join("agent.lock");
+    let owner = AgentLock::acquire(&fixture.root).unwrap();
+    let (observed, contention) = tokio::sync::oneshot::channel();
+    let mut observed = Some(observed);
+    let wait = wait_lock_release(&path, Duration::from_secs(3), || {
+        if let Some(signal) = observed.take() {
+            signal.send(()).unwrap();
+        }
+    });
+    let release = async {
+        tokio::time::timeout(Duration::from_secs(2), contention)
+            .await
+            .expect("waiter never observed contention")
+            .unwrap();
+        let error = AgentLock::acquire(&fixture.root).err().unwrap();
+        assert!(matches!(
+            error.downcast_ref::<TryLockError>(),
+            Some(TryLockError::WouldBlock)
+        ));
+        drop(owner);
+    };
+    let (result, ()) = tokio::join!(wait, release);
+    result.unwrap();
+
+    let owner = AgentLock::acquire(&fixture.root).unwrap();
+    let mut attempts = 0;
+    let error = wait_lock_release(&path, Duration::from_millis(30), || {
+        attempts += 1;
+        let error = AgentLock::acquire(&fixture.root).err().unwrap();
+        assert!(matches!(
+            error.downcast_ref::<TryLockError>(),
+            Some(TryLockError::WouldBlock)
+        ));
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::TimedOut);
+    assert!(attempts > 0);
+
+    let error = wait_lock_release(&fixture.root, Duration::from_secs(3), || {
+        panic!("unexpected lock I/O failure was treated as contention");
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::IsADirectory);
+    drop(owner);
+    assert!(AgentLock::acquire(&fixture.root).is_ok());
+}
+
+#[tokio::test]
+async fn w1_create_guarded_paste_probe() {
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+    };
+
+    let fixture = Fixture::new();
+    let (_master, _slave, tty) = observation_pty();
+    fixture.set("tty", tty);
+    fixture.set("pane-pid", std::process::id().to_string());
+    let unrelated = "rs-paste-11111111111111111111111111111111";
+    fixture.set(&format!("buffers/{unrelated}"), b"unrelated");
+    fixture.set("corrupt-buffer-readback", b"");
+    let lane = fixture.lane();
+    let job = fixture
+        .serve_engine(fixture.engine().with_fixture_sender(), lane)
+        .await;
+    let workspace = fixture.register().await;
+    let CreateState::Confirmed { outcome, .. } =
+        fixture.call(&create(Uuid::new_v4(), workspace, None)).await
+    else {
+        panic!("fixture did not create a live pane");
+    };
+    let runtime_id = outcome.runtime.runtime_id;
+    let Response::TerminalOpened { status } = request(
+        &fixture.root,
+        &Request::OpenTerminal {
+            runtime_id,
+            view_id: Uuid::new_v4(),
+        },
+    )
+    .await
+    .unwrap() else {
+        panic!("fixture pane unavailable");
+    };
+    let response = request(
+        &fixture.root,
+        &Request::AcquireTerminal {
+            terminal: status.terminal,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(response, Response::ControlRecovering { .. }),
+        "{response:?}"
+    );
+    assert!(!fixture.root.join("paste-launch").exists());
+    let (buffers, deletions) = fixture.buffer_snapshot();
+    let probe = fs::read_to_string(fixture.root.join("last-buffer-load")).unwrap();
+    assert!(probe.starts_with("rs-paste-probe-"));
+    assert_eq!(deletions, probe.as_bytes());
+    assert_eq!(
+        buffers,
+        [(unrelated.to_owned(), b"unrelated".to_vec())].into()
+    );
+    assert_eq!(
+        fs::read(fixture.root.join("buffer-loads")).unwrap(),
+        b"load\n"
+    );
+    fs::remove_file(fixture.root.join("corrupt-buffer-readback")).unwrap();
+
+    let guard = fs::read_to_string(fixture.root.join("last-buffer-guard")).unwrap();
+    let guard = guard.trim_end();
+    let rejected = guard.replace("#{==:#{pane_id},%1}", "#{==:#{pane_id},%2}");
+    assert_ne!(guard, rejected);
+    let name = probe.trim_end();
+    let bytes = "  first\n\tСніг ☃\n ".as_bytes();
+    let run = |args: &[&str], input: Option<&[u8]>| {
+        let mut command = Command::new(fixture.root.join("tmux"));
+        command
+            .args(["-N", "-S"])
+            .arg(fixture.root.join("tmux.sock"))
+            .args(args)
+            .stdout(Stdio::piped());
+        command.stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+        let mut child = command.spawn().unwrap();
+        if let Some(input) = input {
+            child.stdin.take().unwrap().write_all(input).unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{:?}", output.status);
+        output.stdout
+    };
+    let load =
+        format!("load-buffer -b {name} - ; display-message -p -l -t %1 rs-paste-loaded-control");
+    let delete =
+        format!("delete-buffer -b {name} ; display-message -p -l -t %1 rs-paste-cleanup-control");
+    let cleanup_guard = format!("#{{&&:{guard},#{{==:#{{after-list-buffers}},}}}}");
+    let rejected_cleanup = cleanup_guard.replace("#{==:#{pane_id},%1}", "#{==:#{pane_id},%2}");
+    let guarded = |guard, branch, input| run(&["if-shell", "-F", "-t", "%1", guard, branch], input);
+    let before = fixture.buffer_snapshot();
+    assert!(guarded(&rejected, &load, None).is_empty());
+    assert_eq!(fixture.buffer_snapshot(), before);
+    assert_eq!(
+        guarded(guard, &load, Some(bytes)),
+        b"rs-paste-loaded-control\n"
+    );
+    assert_eq!(run(&["save-buffer", "-b", name, "-"], None), bytes);
+    let loaded = fixture.buffer_snapshot();
+    assert_eq!(loaded.0[name], bytes);
+    assert!(guarded(&rejected_cleanup, &delete, None).is_empty());
+    assert_eq!(fixture.buffer_snapshot(), loaded);
+    assert_eq!(
+        guarded(&cleanup_guard, &delete, None),
+        b"rs-paste-cleanup-control\n"
+    );
+    let (buffers, deletions) = fixture.buffer_snapshot();
+    assert_eq!(buffers, before.0);
+    assert_eq!(deletions, format!("{name}\n{name}\n").as_bytes());
+    assert_eq!(
+        fs::read(fixture.root.join("buffer-loads")).unwrap(),
+        b"load\nload\n"
+    );
+    stop(job).await;
 }
 
 #[tokio::test]
@@ -436,6 +732,7 @@ async fn w1_create_catalog_fault_read_only() {
 
     let path = fixture.catalog.join("catalog.sqlite3");
     let retained = fixture.catalog.join("retained.sqlite3");
+    let buffers_before_fault = fixture.buffer_snapshot();
     fs::rename(&path, &retained).unwrap();
     let blocked_key = Uuid::new_v4();
     assert_eq!(
@@ -519,6 +816,7 @@ async fn w1_create_catalog_fault_read_only() {
     assert_eq!(read("marker"), marker);
     assert_eq!(read("epoch"), epoch);
     assert_eq!(read("buffer-loads"), "load\n");
+    assert_eq!(fixture.buffer_snapshot(), buffers_before_fault);
     for effect in ["resizes", "inputs", "unexpected-terminal-mutations"] {
         assert!(!fixture.root.join(effect).exists());
     }
@@ -527,7 +825,7 @@ async fn w1_create_catalog_fault_read_only() {
     fs::rename(&retained, &path).unwrap();
     drop(lane);
     stop(job).await;
-    fixture.wait_catalog_released().await;
+    fixture.wait_restart_released().await;
     let lane = fixture.lane();
     let job = fixture
         .serve_engine(fixture.engine().with_fixture_sender(), lane.clone())
