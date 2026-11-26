@@ -11,6 +11,8 @@ use anyhow::{Context, Result, ensure};
 use catalog::CatalogLane;
 use engine::Engine;
 use model::{ProductEnvelope, ProductIssue, ProductRequest, ProductResponse, Request, Response};
+#[cfg(debug_assertions)]
+use model::{ResizeEpoch, TerminalTarget};
 use nix::unistd::geteuid;
 use product_launch::ServiceProfiles;
 use serde::{Serialize, de::DeserializeOwned};
@@ -188,6 +190,110 @@ pub async fn serve(directory: PathBuf, tmux: PathBuf) -> Result<()> {
     serve_local(Engine::new(tmux, directory.join("tmux.sock")), guard, None).await
 }
 
+#[cfg(debug_assertions)]
+pub async fn serve_resize_fixture(
+    directory: PathBuf,
+    tmux: PathBuf,
+    tmux_socket: PathBuf,
+    target: TerminalTarget,
+) -> Result<()> {
+    let socket_directory = tmux_socket
+        .parent()
+        .context("Missing fixture tmux directory")?;
+    ensure!(
+        directory.canonicalize()? != socket_directory.canonicalize()?,
+        "Resize fixture requires an isolated agent directory"
+    );
+    let guard = Arc::new(AgentLock::acquire(&directory)?);
+    let engine = Engine::new(tmux, tmux_socket)
+        .for_resize_fixture(target)
+        .await?;
+    serve_local(engine, guard, None).await
+}
+
+#[cfg(debug_assertions)]
+#[derive(serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ResizeProbeRequest<T> {
+    resize_probe: T,
+    epoch: ResizeEpoch,
+    attempt: uuid::Uuid,
+}
+
+#[cfg(debug_assertions)]
+pub async fn request_resize_probe(
+    directory: &Path,
+    resize: &Request,
+    epoch: ResizeEpoch,
+    attempt: uuid::Uuid,
+) -> Result<Response> {
+    exchange(
+        directory,
+        &ResizeProbeRequest {
+            resize_probe: resize,
+            epoch,
+            attempt,
+        },
+    )
+    .await
+}
+
+#[cfg(debug_assertions)]
+async fn dispatch_resize_fixture(
+    bytes: &[u8],
+    diagnostic: bool,
+    engine: &Engine,
+    target: &TerminalTarget,
+) -> Result<Response> {
+    if diagnostic {
+        let ResizeProbeRequest {
+            resize_probe:
+                Request::ResizeTerminal {
+                    terminal,
+                    token,
+                    sequence,
+                    size,
+                },
+            epoch,
+            attempt,
+        } = serde_json::from_slice::<ResizeProbeRequest<Request>>(bytes)?
+        else {
+            anyhow::bail!("Expected a resize probe request");
+        };
+        ensure!(
+            terminal.target == *target && !attempt.is_nil(),
+            "Invalid resize probe scope"
+        );
+        return match engine
+            .resize_terminal(terminal, token, sequence, size, None, Some(epoch))
+            .await
+        {
+            Err(error) if error.is::<ownership::ResizeDeadlineReached>() => Ok(Response::Error {
+                message: format!("resize admission expired: {attempt}"),
+            }),
+            result => result,
+        };
+    }
+
+    let request = serde_json::from_slice::<Request>(bytes)?;
+    let allowed = match &request {
+        Request::Health {} => true,
+        Request::OpenTerminal { runtime_id, .. }
+        | Request::Release { runtime_id, .. }
+        | Request::Input {
+            runtime_id,
+            paste: false,
+            ..
+        } => *runtime_id == target.runtime_id,
+        Request::TerminalStatus { terminal }
+        | Request::AcquireTerminal { terminal }
+        | Request::ResizeTerminal { terminal, .. } => terminal.target == *target,
+        _ => false,
+    };
+    ensure!(allowed, "Request outside the resize fixture scope");
+    engine.handle(request, None).await
+}
+
 pub async fn serve_with_catalog(directory: PathBuf, tmux: PathBuf, catalog: PathBuf) -> Result<()> {
     let service_path = std::env::var_os("PATH");
     serve_with_catalog_directory(
@@ -273,10 +379,19 @@ async fn dispatch(
     creations: &Mutex<()>,
     catalog: Option<&CatalogLane>,
 ) -> Result<Vec<u8>> {
-    if serde_json::from_slice::<serde_json::Value>(bytes)?
-        .get("product")
-        .is_some()
-    {
+    let envelope = serde_json::from_slice::<serde_json::Value>(bytes)?;
+    #[cfg(debug_assertions)]
+    if let Some(target) = engine.resize_fixture_target() {
+        let response = dispatch_resize_fixture(
+            bytes,
+            envelope.get("resize_probe").is_some(),
+            engine,
+            target,
+        )
+        .await?;
+        return Ok(serde_json::to_vec(&response)?);
+    }
+    if envelope.get("product").is_some() {
         let product = match serde_json::from_slice::<ProductEnvelope<ProductRequest>>(bytes) {
             Ok(envelope) => match (catalog, envelope.product) {
                 (

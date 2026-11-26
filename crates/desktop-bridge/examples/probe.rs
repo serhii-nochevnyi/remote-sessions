@@ -6,25 +6,37 @@ use remote_sessions_desktop_bridge::{
 };
 use remote_sessions_host::{
     decode_local_fixture, encode_local_observation,
-    model::{Request, Response, Runtime, TerminalView},
-    request, serve, validate_directory,
+    model::{Request, ResizeIntent, Response, Runtime, TerminalTarget, TerminalView},
+    request, validate_directory,
 };
+#[cfg(debug_assertions)]
+use remote_sessions_host::{request_resize_probe, serve_resize_fixture};
 use serde::{Deserialize, Serialize};
+#[cfg(debug_assertions)]
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::{
     fs,
     io::Write,
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt, symlink},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let first = args
         .next()
         .context("state directory or resize/pressure subcommand")?;
+    #[cfg(debug_assertions)]
+    if first == "resize-fixture-capture" {
+        return capture_fixture_command(args.collect());
+    }
+    run(first, args)
+}
+
+#[tokio::main]
+async fn run(first: String, mut args: impl Iterator<Item = String>) -> Result<()> {
     if first == "resize" {
         return resize_probe(args.collect()).await;
     }
@@ -268,22 +280,252 @@ impl Lab {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FixtureScope {
+    socket: PathBuf,
+    target: TerminalTarget,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+enum CaptureKind {
+    Resize,
+    EpochSetter,
+}
+
+impl CaptureKind {
+    fn for_mode(mode: &str) -> Result<Self> {
+        match mode {
+            "before" | "after" => Ok(Self::Resize),
+            "before-setter" => Ok(Self::EpochSetter),
+            _ => bail!("Unknown guarded command kind"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureAttempt {
+    nonce: Uuid,
+    kind: CaptureKind,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GuardedCapture {
+    attempt: CaptureAttempt,
+    scope: FixtureScope,
+    argv: Vec<String>,
+}
+
+fn guard_tests(guard: &str, field: &str, value: &str) -> bool {
+    guard.contains(&format!("#{{==:#{{{field}}},{value}}}"))
+}
+
+fn epoch_marker(epoch: ResizeEpoch) -> String {
+    format!("{}:{}", epoch.agent, epoch.owner)
+}
+
+fn canonical_uuid(value: &str) -> bool {
+    Uuid::parse_str(value).is_ok_and(|id| !id.is_nil() && id.to_string() == value)
+}
+
+impl GuardedCapture {
+    fn validate(&self, attempt: CaptureAttempt, scope: &FixtureScope) -> Result<()> {
+        ensure!(
+            self.attempt == attempt && !attempt.nonce.is_nil() && self.scope == *scope,
+            "Guarded capture did not match the current attempt and target"
+        );
+        let [
+            no_start,
+            socket_flag,
+            socket,
+            command,
+            format_flag,
+            target_flag,
+            pane,
+            guard,
+            branch,
+        ] = self.argv.as_slice()
+        else {
+            bail!("Unexpected captured tmux argv length");
+        };
+        let target = &scope.target;
+        ensure!(
+            [no_start, socket_flag, command, format_flag, target_flag].map(String::as_str)
+                == ["-N", "-S", "if-shell", "-F", "-t"]
+                && Path::new(socket) == scope.socket.as_path()
+                && *pane == target.pane
+                && guard.starts_with("#{&&:")
+                && !guard.contains("#(")
+                && guard_tests(
+                    guard,
+                    "@rs_create_generation",
+                    &target.generation.to_string()
+                )
+                && guard_tests(guard, "session_id", &target.session)
+                && guard_tests(guard, "window_id", &target.window)
+                && guard_tests(guard, "pane_id", pane)
+                && guard_tests(guard, "pane_pid", &target.pid.to_string()),
+            "Captured guard did not match the fixture scope"
+        );
+
+        let nodes: Vec<_> = branch.split(" ; ").collect();
+        let [mutation, marker, receipt] = nodes.as_slice() else {
+            bail!("Unexpected captured tmux branch");
+        };
+        let mutation: Vec<_> = mutation.split(' ').collect();
+        let marker: Vec<_> = marker.split(' ').collect();
+        match attempt.kind {
+            CaptureKind::Resize => {
+                let ["resize-window", "-t", window, "-x", cols, "-y", rows] = mutation.as_slice()
+                else {
+                    bail!("Unexpected captured resize mutation");
+                };
+                let [
+                    "set-option",
+                    "-p",
+                    "-t",
+                    marker_pane,
+                    "@rs_resize_intent",
+                    intent,
+                ] = marker.as_slice()
+                else {
+                    bail!("Unexpected captured resize marker");
+                };
+                let fields: Vec<_> = intent.split(':').collect();
+                let [agent, owner, id, revision, intent_cols, intent_rows] = fields.as_slice()
+                else {
+                    bail!("Unexpected captured resize intent");
+                };
+                let size = TerminalSize {
+                    cols: cols.parse()?,
+                    rows: rows.parse()?,
+                };
+                ensure!(
+                    *window == target.window.as_str()
+                        && *marker_pane == pane.as_str()
+                        && size.supported()
+                        && *intent_cols == *cols
+                        && *intent_rows == *rows
+                        && [agent, owner, id]
+                            .into_iter()
+                            .all(|field| canonical_uuid(field))
+                        && revision.parse::<u64>().is_ok_and(|revision| revision > 0)
+                        && guard_tests(guard, "@rs_resize_epoch", &format!("{agent}:{owner}"))
+                        && *receipt == "display-message -p rs-committed",
+                    "Unexpected captured resize command"
+                );
+            }
+            CaptureKind::EpochSetter => {
+                let [
+                    "set-option",
+                    "-p",
+                    "-t",
+                    setter_pane,
+                    "@rs_resize_epoch",
+                    epoch,
+                ] = mutation.as_slice()
+                else {
+                    bail!("Unexpected captured epoch mutation");
+                };
+                let [
+                    "set-option",
+                    "-p",
+                    "-t",
+                    marker_pane,
+                    "@rs_paste_admission",
+                    ready,
+                ] = marker.as_slice()
+                else {
+                    bail!("Unexpected captured epoch marker");
+                };
+                ensure!(
+                    *setter_pane == pane.as_str()
+                        && *marker_pane == pane.as_str()
+                        && epoch
+                            .split_once(':')
+                            .is_some_and(
+                                |(agent, owner)| canonical_uuid(agent) && canonical_uuid(owner)
+                            )
+                        && ready.starts_with(&format!(
+                            "v1~{}~{}~",
+                            target.runtime_id, target.generation
+                        ))
+                        && ready
+                            .rsplit_once("~r~")
+                            .is_some_and(|(prefix, id)| prefix.ends_with(&format!("~{epoch}"))
+                                && canonical_uuid(id))
+                        && ready
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || b"~-:".contains(&byte))
+                        && *receipt == format!("display-message -p -l -t {pane} rs-fenced"),
+                    "Unexpected captured epoch setter"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
+    let incoming = path.with_extension(format!("{}.incoming", Uuid::new_v4().simple()));
+    fs::write(&incoming, contents)?;
+    fs::rename(incoming, path)?;
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn capture_fixture_command(args: Vec<String>) -> Result<()> {
+    let [directory, mode, nonce, argv @ ..] = args.as_slice() else {
+        bail!("Incomplete guarded capture");
+    };
+    let directory = Path::new(directory);
+    validate_directory(directory)?;
+    let scope: FixtureScope = decode_local_fixture(&fs::read(directory.join("scope"))?)?;
+    let attempt = CaptureAttempt {
+        nonce: Uuid::parse_str(nonce)?,
+        kind: CaptureKind::for_mode(mode)?,
+    };
+    let capture = GuardedCapture {
+        attempt,
+        scope,
+        argv: argv.to_vec(),
+    };
+    capture.validate(attempt, &capture.scope)?;
+    write_atomic(
+        &directory.join("captured"),
+        encode_local_observation(&capture)?,
+    )
+}
+
 struct FixtureAgent {
     directory: PathBuf,
+    scope: FixtureScope,
     job: tokio::task::JoinHandle<Result<()>>,
 }
 
 impl FixtureAgent {
-    async fn start(lab: &Lab) -> Result<Self> {
+    #[cfg(debug_assertions)]
+    async fn start(lab: &Lab, target: TerminalTarget) -> Result<Self> {
         let name = Uuid::new_v4().simple().to_string();
         let directory = lab.directory.join(format!("fixture-{}", &name[..8]));
         fs::DirBuilder::new().mode(0o700).create(&directory)?;
+        let scope = FixtureScope {
+            socket: lab.directory.join("tmux.sock"),
+            target,
+        };
         let configured = (|| {
-            symlink(lab.directory.join("tmux.sock"), directory.join("tmux.sock"))?;
             fs::write(
                 directory.join("bin"),
                 lab.tmux.as_os_str().as_encoded_bytes(),
             )?;
+            fs::write(
+                directory.join("probe"),
+                std::env::current_exe()?.as_os_str().as_encoded_bytes(),
+            )?;
+            fs::write(directory.join("scope"), encode_local_observation(&scope)?)?;
+            fs::write(directory.join("mode"), "\n")?;
             let wrapper = directory.join("tmux");
             fs::write(
                 &wrapper,
@@ -291,13 +533,15 @@ impl FixtureAgent {
 set -eu
 root=$(dirname "$0")
 tmux=$(cat "$root/bin")
-mode=$(cat "$root/mode" 2>/dev/null || true)
-case "$4:$mode:${9:-}" in
-    if-shell:before:resize-window*|if-shell:before-setter:set-option*|if-shell:after:resize-window*)
-        printf '%s\0' "$@" > "$root/argv.incoming"
-        mv "$root/argv.incoming" "$root/captured"
+mode=
+nonce=
+read -r mode nonce < "$root/mode" || true
+case "${4:-}:$mode:${9:-}" in
+    if-shell:before:resize-window*|if-shell:after:resize-window*|if-shell:before-setter:'set-option -p -t '*" @rs_resize_epoch "*)
+        probe=$(cat "$root/probe")
+        "$probe" resize-fixture-capture "$root" "$mode" "$nonce" "$@"
         if [ "$mode" = after ]; then
-            "$tmux" "$@" > "$root/receipt"
+            "$tmux" "$@" > "$root/receipt-$nonce"
         fi
         exec /bin/sleep 2
         ;;
@@ -318,14 +562,23 @@ exec "$tmux" "$@"
                 return Err(error);
             }
         };
-        let job = tokio::spawn(serve(directory.clone(), wrapper));
-        let fixture = Self { directory, job };
+        let job = tokio::spawn(serve_resize_fixture(
+            directory.clone(),
+            wrapper,
+            scope.socket.clone(),
+            scope.target.clone(),
+        ));
+        let mut fixture = Self {
+            directory,
+            scope,
+            job,
+        };
         tokio::time::timeout(Duration::from_secs(3), async {
             while !fixture.directory.join("agent.sock").exists() {
-                ensure!(
-                    !fixture.job.is_finished(),
-                    "Fixture agent exited during startup"
-                );
+                if fixture.job.is_finished() {
+                    (&mut fixture.job).await??;
+                    bail!("Fixture agent exited during startup");
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             Ok::<_, anyhow::Error>(())
@@ -334,23 +587,106 @@ exec "$tmux" "$@"
         Ok(fixture)
     }
 
-    fn mode(&self, mode: &str) -> Result<()> {
-        fs::write(self.directory.join("mode"), mode)?;
-        Ok(())
+    #[cfg(not(debug_assertions))]
+    async fn start(_lab: &Lab, _target: TerminalTarget) -> Result<Self> {
+        bail!("The resize fixture requires a debug probe")
     }
 
-    fn captured(&self) -> Result<Vec<String>> {
-        let bytes = fs::read(self.directory.join("captured"))?;
-        let args = bytes
-            .split(|byte| *byte == 0)
-            .filter(|part| !part.is_empty())
-            .map(|part| String::from_utf8(part.to_vec()))
-            .collect::<Result<Vec<_>, _>>()?;
+    fn mode(&self, mode: &str) -> Result<()> {
+        write_atomic(&self.directory.join("mode"), format!("{mode}\n"))
+    }
+
+    fn arm(&self, mode: &str) -> Result<CaptureAttempt> {
+        let attempt = CaptureAttempt {
+            nonce: Uuid::new_v4(),
+            kind: CaptureKind::for_mode(mode)?,
+        };
+        match fs::remove_file(self.directory.join("captured")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.mode(&format!("{mode} {}", attempt.nonce))?;
+        Ok(attempt)
+    }
+
+    fn captured(&self, attempt: CaptureAttempt) -> Result<Vec<String>> {
+        let capture: GuardedCapture =
+            decode_local_fixture(&fs::read(self.directory.join("captured"))?)?;
+        capture.validate(attempt, &self.scope)?;
+        Ok(capture.argv)
+    }
+
+    async fn capture_delayed_setter(&self, owner: &Owner) -> Result<Vec<String>> {
+        let attempt = self.arm("before-setter")?;
+        let acquired = Owner::acquire(&self.directory, owner.view.clone()).await;
+        self.mode("")?;
+        ensure!(acquired.is_err(), "Unconfirmed setter granted a token");
+        let argv = self.captured(attempt)?;
         ensure!(
-            args.len() == 9 && args[0] == "-N" && args[1] == "-S" && args[3] == "if-shell",
-            "Unexpected captured tmux command"
+            guard_tests(&argv[7], "@rs_resize_epoch", &epoch_marker(owner.epoch)),
+            "Captured setter did not guard the predecessor epoch"
         );
-        Ok(args)
+        Ok(argv)
+    }
+
+    fn captured_resize(
+        &self,
+        attempt: CaptureAttempt,
+        intent: ResizeIntent,
+        size: TerminalSize,
+    ) -> Result<Vec<String>> {
+        let argv = self.captured(attempt)?;
+        let marker = format!("{}:{}:", epoch_marker(intent.epoch), intent.id,);
+        let branch = &argv[8];
+        ensure!(
+            branch.starts_with(&format!(
+                "resize-window -t {} -x {} -y {} ; ",
+                self.scope.target.window, size.cols, size.rows
+            )) && branch.contains(&format!(" @rs_resize_intent {marker}")),
+            "Captured resize did not match the admitted intent"
+        );
+        Ok(argv)
+    }
+
+    #[cfg(debug_assertions)]
+    async fn expiry_attempt(
+        &self,
+        owner: &Owner,
+        attempt: Uuid,
+        size: TerminalSize,
+    ) -> Result<Response> {
+        request_resize_probe(
+            &self.directory,
+            &owner.resize_request(0, size),
+            owner.epoch,
+            attempt,
+        )
+        .await
+    }
+
+    #[cfg(not(debug_assertions))]
+    async fn expiry_attempt(
+        &self,
+        _owner: &Owner,
+        _attempt: Uuid,
+        _size: TerminalSize,
+    ) -> Result<Response> {
+        bail!("The resize fixture requires a debug probe")
+    }
+
+    fn confirm_first_grant(&self, owner: &Owner, observed: &TerminalStatus) -> Result<()> {
+        ensure!(
+            observed.terminal == owner.view
+                && observed.terminal.target == self.scope.target
+                && observed.epoch == Some(owner.epoch)
+                && owner.epoch.agent == owner.view.agent_epoch
+                && !owner.epoch.owner.is_nil()
+                && !owner.token.is_nil()
+                && observed.provider.is_some(),
+            "Exact first fixture grant and target observation are required"
+        );
+        Ok(())
     }
 
     async fn close(mut self) -> Result<()> {
@@ -423,19 +759,18 @@ impl Owner {
         sequence: u64,
         size: TerminalSize,
     ) -> Result<ResizeResult> {
-        match request(
-            directory,
-            &Request::ResizeTerminal {
-                terminal: self.view.clone(),
-                token: self.token,
-                sequence,
-                size,
-            },
-        )
-        .await?
-        {
+        match request(directory, &self.resize_request(sequence, size)).await? {
             Response::Resize { resize } => Ok(resize),
             _ => bail!("Native resize admission rejected"),
+        }
+    }
+
+    fn resize_request(&self, sequence: u64, size: TerminalSize) -> Request {
+        Request::ResizeTerminal {
+            terminal: self.view.clone(),
+            token: self.token,
+            sequence,
+            size,
         }
     }
 
@@ -640,8 +975,6 @@ async fn positive(lab: &Lab, report: &mut Report) -> Result<()> {
 }
 
 async fn saved_command(lab: &Lab, args: &[String], report: &mut Report) -> Result<String> {
-    let mut args = args.to_vec();
-    args[2] = lab.directory.join("tmux.sock").display().to_string();
     report
         .commands
         .push(format!("{} {}", lab.tmux.display(), args.join(" ")));
@@ -722,11 +1055,11 @@ async fn unknown_and_fences(
     first: Owner,
 ) -> Result<Owner> {
     let dir = &fixture.directory;
-    fixture.mode("before")?;
+    let attempt = fixture.arm("before")?;
     let ResizeResult::Uncertain { intent, .. } = first.resize(dir, 1, NARROW).await? else {
         bail!("Lost-before request failed to close admission");
     };
-    let delayed = fixture.captured()?;
+    let delayed = fixture.captured_resize(attempt, intent, NARROW)?;
     let unchanged = status(dir, &first.view).await?;
     ensure!(
         unchanged.committed.intent != Some(intent),
@@ -749,12 +1082,14 @@ async fn unknown_and_fences(
     report.statuses.push(unchanged);
     report.witnessed.push("unknown_before_and_stale_guard");
 
-    fixture.mode("after")?;
+    let attempt = fixture.arm("after")?;
     let ResizeResult::Uncertain { intent, .. } = second.resize(dir, 0, LATEST).await? else {
         bail!("Lost-after request failed to close admission");
     };
+    fixture.captured_resize(attempt, intent, LATEST)?;
     ensure!(
-        fs::read_to_string(dir.join("receipt"))?.trim() == "rs-committed",
+        fs::read_to_string(dir.join(format!("receipt-{}", attempt.nonce)))?.trim()
+            == "rs-committed",
         "Lost-after target was never committed"
     );
     let committed = status(dir, &second.view).await?;
@@ -767,13 +1102,7 @@ async fn unknown_and_fences(
         "Lost-after predecessor still admitted writes"
     );
 
-    fixture.mode("before-setter")?;
-    ensure!(
-        Owner::acquire(dir, second.view.clone()).await.is_err(),
-        "Unconfirmed setter granted a token"
-    );
-    let setter = fixture.captured()?;
-    fixture.mode("")?;
+    let setter = fixture.capture_delayed_setter(&second).await?;
     let third = Owner::acquire(dir, second.view).await?;
     let fresh = status(dir, &third.view).await?;
     ensure!(
@@ -805,11 +1134,11 @@ async fn yielding_negative(
 ) -> Result<Owner> {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let dir = &fixture.directory;
-    fixture.mode("before")?;
+    let attempt = fixture.arm("before")?;
     let ResizeResult::Uncertain { intent, .. } = predecessor.resize(dir, 0, NARROW).await? else {
         bail!("Expected a captured predecessor command");
     };
-    let mut delayed = fixture.captured()?;
+    let mut delayed = fixture.captured_resize(attempt, intent, NARROW)?;
     fixture.mode("")?;
     let name = format!("rs-test-{}", Uuid::new_v4().simple());
     let socket = lab.directory.join("tmux.sock");
@@ -817,7 +1146,6 @@ async fn yielding_negative(
     let prefix = ["-N", "-S", socket, "wait-for"];
     command(&lab.tmux, &[&prefix[..], &["-L", &name]].concat()).await?;
 
-    delayed[2] = socket.to_owned();
     delayed[8] = format!(
         "display-message -p rs-yielding ; wait-for -L {name} ; {} ; wait-for -U {name}",
         delayed[8]
@@ -1020,34 +1348,56 @@ async fn expiry(fixture: &FixtureAgent, terminal: TerminalView, report: &mut Rep
     let next = Owner::acquire(dir, terminal).await?;
     let granted = tokio::time::Instant::now();
     let before = status(dir, &next.view).await?;
+    let attempt = Uuid::new_v4();
     fixture.mode("delay-sample")?;
     tokio::time::sleep_until(granted + Duration::from_millis(14_850)).await;
-    ensure!(
-        next.resize(dir, 0, NORMAL).await.is_err(),
-        "Request waiting before admission committed after expiry"
-    );
+    let reply = fixture.expiry_attempt(&next, attempt, NORMAL).await;
     fixture.mode("")?;
     let after = status(dir, &next.view).await?;
-    ensure!(
-        before.committed == after.committed,
-        "Expired new request changed the target"
-    );
-    report.statuses.push(after);
+    confirm_expiry(attempt, reply, &next, NORMAL, &before, &after)?;
+    report.statuses.extend([before, after]);
     report.witnessed.push("expiry_and_late_propagation");
+    Ok(())
+}
+
+fn confirm_expiry(
+    attempt: Uuid,
+    reply: Result<Response>,
+    owner: &Owner,
+    proposed: TerminalSize,
+    before: &TerminalStatus,
+    after: &TerminalStatus,
+) -> Result<()> {
+    ensure!(
+        matches!(reply?, Response::Error { message } if message == format!("resize admission expired: {attempt}")),
+        "Exact resize expiry at host admission was unconfirmed"
+    );
+    ensure!(
+        before.terminal == owner.view
+            && after.terminal == owner.view
+            && before.epoch == Some(owner.epoch)
+            && after.epoch == Some(owner.epoch)
+            && proposed != before.committed.size
+            && before.committed == after.committed
+            && before
+                .provider
+                .zip(after.provider)
+                .is_some_and(|(before, after)| before.size == after.size),
+        "Expired resize lacked unchanged geometry on the same target"
+    );
     Ok(())
 }
 
 async fn run_matrix(lab: &Lab, report: &mut Report) -> Result<()> {
     report.agent_pids.push(lab.health().await?);
-    positive(lab, report).await?;
-    let fixture = FixtureAgent::start(lab).await?;
+    let target = Owner::open(&lab.directory, lab.runtime).await?.target;
+    let fixture = FixtureAgent::start(lab, target).await?;
     let dir = &fixture.directory;
     let terminal = Owner::open(dir, lab.runtime).await?;
     let first = Owner::acquire(dir, terminal.clone()).await?;
-    ensure!(
-        status(dir, &terminal).await?.epoch == Some(first.epoch),
-        "Installed authority is unconfirmed"
-    );
+    let observed = status(dir, &terminal).await?;
+    fixture.confirm_first_grant(&first, &observed)?;
+    report.statuses.push(observed);
     wrong_scope(dir, &first, report).await?;
     let owner = unknown_and_fences(lab, &fixture, report, first).await?;
     let owner = yielding_negative(lab, &fixture, owner, report).await?;
@@ -1058,17 +1408,12 @@ async fn run_matrix(lab: &Lab, report: &mut Report) -> Result<()> {
 
     let last = Owner::acquire(dir, terminal).await?;
     let persisted = status(dir, &last.view).await?;
-    fixture.mode("before")?;
-    let ResizeResult::Uncertain { .. } = last.resize(dir, 0, LATEST).await? else {
+    let attempt = fixture.arm("before")?;
+    let ResizeResult::Uncertain { intent, .. } = last.resize(dir, 0, LATEST).await? else {
         bail!("Restart fixture did not capture the old resize");
     };
-    let delayed = fixture.captured()?;
-    fixture.mode("before-setter")?;
-    ensure!(
-        Owner::acquire(dir, last.view.clone()).await.is_err(),
-        "Restart fixture unexpectedly acknowledged the delayed setter"
-    );
-    let setter = fixture.captured()?;
+    let delayed = fixture.captured_resize(attempt, intent, LATEST)?;
+    let setter = fixture.capture_delayed_setter(&last).await?;
     fixture.close().await?;
     report.fixture_cleaned_up = true;
 
@@ -1132,7 +1477,348 @@ async fn run_matrix(lab: &Lab, report: &mut Report) -> Result<()> {
     ]);
     fresh.release(&lab.directory).await?;
     report.witnessed.push("agent_only_restart");
-    Ok(())
+    positive(lab, report).await
+}
+
+#[cfg(all(test, debug_assertions))]
+mod resize_probe_tests {
+    use super::*;
+    use remote_sessions_host::model::{CommittedGeometry, ObservationState, ProviderSample};
+    use std::os::unix::fs::symlink;
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        net::UnixListener,
+    };
+
+    fn fixture() -> (FixtureAgent, Owner, TerminalStatus) {
+        let id = Uuid::new_v4().simple().to_string();
+        let directory = Path::new("/tmp").join(format!("rs-rz-{}", &id[..12]));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        let epoch = ResizeEpoch {
+            agent: Uuid::new_v4(),
+            owner: Uuid::new_v4(),
+        };
+        let view = TerminalView {
+            target: TerminalTarget {
+                runtime_id: Uuid::new_v4(),
+                generation: Uuid::new_v4(),
+                session: "$1".into(),
+                window: "@2".into(),
+                pane: "%3".into(),
+                pid: 4,
+                process_start: 5,
+            },
+            view_id: Uuid::new_v4(),
+            agent_epoch: epoch.agent,
+        };
+        let status = TerminalStatus {
+            terminal: view.clone(),
+            epoch: Some(epoch),
+            committed: CommittedGeometry {
+                size: NARROW,
+                revision: 0,
+                intent: None,
+            },
+            provider: Some(ProviderSample {
+                size: NARROW,
+                sampled_at_us: 1,
+            }),
+            observation: ObservationState::Observed,
+        };
+        let socket_dir = directory.join("server");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&socket_dir)
+            .unwrap();
+        let scope = FixtureScope {
+            socket: socket_dir.join("tmux.sock"),
+            target: view.target.clone(),
+        };
+        fs::write(
+            directory.join("scope"),
+            encode_local_observation(&scope).unwrap(),
+        )
+        .unwrap();
+        let agent = FixtureAgent {
+            directory,
+            scope,
+            job: tokio::spawn(std::future::pending()),
+        };
+        (
+            agent,
+            Owner {
+                view,
+                token: Uuid::new_v4(),
+                epoch,
+            },
+            status,
+        )
+    }
+
+    #[tokio::test]
+    async fn w1_resize_probe_private_socket() {
+        let (fixture, owner, observed) = fixture();
+        let _socket = UnixListener::bind(&fixture.scope.socket).unwrap();
+        let alias_dir = fixture.directory.join("alias");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&alias_dir)
+            .unwrap();
+        let alias = alias_dir.join("tmux.sock");
+        symlink(&fixture.scope.socket, &alias).unwrap();
+        let tmux = fixture.directory.join("fake-tmux");
+        fs::write(&tmux, "#!/bin/sh\n[ \"$3\" = \"$(dirname \"$0\")/server/tmux.sock\" ] && [ -S \"$3\" ] && echo real-socket >&2\nexit 1\n").unwrap();
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+        for (path, expected) in [
+            (alias, "private real tmux socket"),
+            (fixture.scope.socket.clone(), "real-socket"),
+        ] {
+            let error = serve_resize_fixture(
+                fixture.directory.clone(),
+                tmux.clone(),
+                path,
+                owner.view.target.clone(),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(!fixture.directory.join("agent.sock").exists());
+        }
+
+        fixture.confirm_first_grant(&owner, &observed).unwrap();
+        let mut wrong = observed.clone();
+        wrong.terminal.target.process_start += 1;
+        assert!(fixture.confirm_first_grant(&owner, &wrong).is_err());
+        let mut wrong = observed.clone();
+        wrong.provider = None;
+        assert!(fixture.confirm_first_grant(&owner, &wrong).is_err());
+        let mut wrong = observed.clone();
+        wrong.epoch = None;
+        assert!(fixture.confirm_first_grant(&owner, &wrong).is_err());
+    }
+
+    fn capture_args(fixture: &FixtureAgent, owner: &Owner, mode: &str, nonce: Uuid) -> Vec<String> {
+        let target = &owner.view.target;
+        let epoch = epoch_marker(owner.epoch);
+        let guard = [
+            format!("#{{==:#{{@rs_create_generation}},{}}}", target.generation),
+            format!("#{{==:#{{session_id}},{}}}", target.session),
+            format!("#{{==:#{{window_id}},{}}}", target.window),
+            format!("#{{==:#{{pane_id}},{}}}", target.pane),
+            format!("#{{==:#{{pane_pid}},{}}}", target.pid),
+            format!("#{{==:#{{@rs_resize_epoch}},{epoch}}}"),
+        ]
+        .into_iter()
+        .reduce(|left, right| format!("#{{&&:{left},{right}}}"))
+        .unwrap();
+        let pane = &target.pane;
+        let branch = if mode == "before-setter" {
+            let next = epoch_marker(ResizeEpoch {
+                owner: Uuid::new_v4(),
+                ..owner.epoch
+            });
+            format!(
+                "set-option -p -t {pane} @rs_resize_epoch {next} ; set-option -p -t {pane} @rs_paste_admission v1~{}~{}~{next}~r~{} ; display-message -p -l -t {pane} rs-fenced",
+                target.runtime_id,
+                target.generation,
+                Uuid::new_v4(),
+            )
+        } else {
+            format!(
+                "resize-window -t {} -x 119 -y 40 ; set-option -p -t {pane} @rs_resize_intent {epoch}:{}:1:119:40 ; display-message -p rs-committed",
+                target.window,
+                Uuid::new_v4(),
+            )
+        };
+        vec![
+            fixture.directory.to_str().unwrap().into(),
+            mode.into(),
+            nonce.to_string(),
+            "-N".into(),
+            "-S".into(),
+            fixture.scope.socket.to_str().unwrap().into(),
+            "if-shell".into(),
+            "-F".into(),
+            "-t".into(),
+            pane.clone(),
+            guard,
+            branch,
+        ]
+    }
+
+    #[tokio::test]
+    async fn w1_resize_probe_attempt_capture() {
+        for leg in ["handoff", "restart"] {
+            for outcome in [
+                "no dispatch",
+                "stale resize",
+                "wrong kind",
+                "wrong nonce",
+                "wrong argv",
+                "current setter",
+            ] {
+                let (fixture, owner, _) = fixture();
+                let predecessor = fixture.arm("before").unwrap();
+                capture_fixture_command(capture_args(
+                    &fixture,
+                    &owner,
+                    "before",
+                    predecessor.nonce,
+                ))
+                .unwrap();
+                let path = fixture.directory.join("captured");
+                let stale = fs::read(&path).unwrap();
+                assert!(fixture.captured(predecessor).is_ok());
+                let listener = UnixListener::bind(fixture.directory.join("agent.sock")).unwrap();
+                let fail_acquisition = async {
+                    let (mut connection, _) = listener.accept().await.unwrap();
+                    let mut frame = String::new();
+                    BufReader::new(&mut connection)
+                        .read_line(&mut frame)
+                        .await
+                        .unwrap();
+                    let request: Request = decode_local_fixture(frame.as_bytes()).unwrap();
+                    assert!(
+                        matches!(request, Request::AcquireTerminal { terminal } if terminal == owner.view)
+                    );
+                    assert!(!path.exists(), "{leg} retained predecessor capture");
+                    let control = fs::read_to_string(fixture.directory.join("mode")).unwrap();
+                    let (mode, nonce) = control.trim().split_once(' ').unwrap();
+                    assert_eq!(mode, "before-setter");
+                    let nonce = Uuid::parse_str(nonce).unwrap();
+                    match outcome {
+                        "no dispatch" => {}
+                        "stale resize" => write_atomic(&path, &stale).unwrap(),
+                        "wrong kind" => {
+                            capture_fixture_command(capture_args(&fixture, &owner, "before", nonce))
+                                .unwrap()
+                        }
+                        "wrong nonce" => capture_fixture_command(capture_args(
+                            &fixture,
+                            &owner,
+                            mode,
+                            predecessor.nonce,
+                        ))
+                        .unwrap(),
+                        "wrong argv" => {
+                            let mut args = capture_args(&fixture, &owner, mode, nonce);
+                            args[9] = "%9".into();
+                            assert!(capture_fixture_command(args).is_err());
+                        }
+                        "current setter" => {
+                            capture_fixture_command(capture_args(&fixture, &owner, mode, nonce))
+                                .unwrap()
+                        }
+                        _ => unreachable!(),
+                    }
+                    let error = Response::Error {
+                        message: "Acquisition unconfirmed".into(),
+                    };
+                    let line = encode_local_observation(&error).unwrap() + "\n";
+                    connection.write_all(line.as_bytes()).await.unwrap();
+                };
+                let (capture, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::join!(fixture.capture_delayed_setter(&owner), fail_acquisition)
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    capture.is_ok(),
+                    outcome == "current setter",
+                    "{leg}: {outcome}: {capture:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn w1_resize_probe_expiry_witness() {
+        let (_fixture, owner, before) = fixture();
+        let attempt = Uuid::new_v4();
+        let expired = |nonce| Response::Error {
+            message: format!("resize admission expired: {nonce}"),
+        };
+        for failure in [
+            Err(anyhow::anyhow!("transport lost")),
+            Ok(Response::Error {
+                message: "Resize authority changed".into(),
+            }),
+            Ok(Response::Error {
+                message: "Resize sequence rejected".into(),
+            }),
+            Ok(expired(Uuid::new_v4())),
+        ] {
+            assert!(confirm_expiry(attempt, failure, &owner, NORMAL, &before, &before).is_err());
+        }
+        let mut after = before.clone();
+        after.terminal.target.generation = Uuid::new_v4();
+        assert!(
+            confirm_expiry(
+                attempt,
+                Ok(expired(attempt)),
+                &owner,
+                NORMAL,
+                &before,
+                &after
+            )
+            .is_err()
+        );
+        let mut after = before.clone();
+        after.epoch = None;
+        assert!(
+            confirm_expiry(
+                attempt,
+                Ok(expired(attempt)),
+                &owner,
+                NORMAL,
+                &before,
+                &after
+            )
+            .is_err()
+        );
+        let mut after = before.clone();
+        after.committed.revision += 1;
+        assert!(
+            confirm_expiry(
+                attempt,
+                Ok(expired(attempt)),
+                &owner,
+                NORMAL,
+                &before,
+                &after
+            )
+            .is_err()
+        );
+        let mut after = before.clone();
+        after.provider = None;
+        assert!(
+            confirm_expiry(
+                attempt,
+                Ok(expired(attempt)),
+                &owner,
+                NORMAL,
+                &before,
+                &after
+            )
+            .is_err()
+        );
+        after.provider = Some(ProviderSample {
+            size: NARROW,
+            sampled_at_us: 2,
+        });
+        confirm_expiry(
+            attempt,
+            Ok(expired(attempt)),
+            &owner,
+            NORMAL,
+            &before,
+            &after,
+        )
+        .unwrap();
+    }
 }
 
 #[derive(Deserialize, Serialize)]
