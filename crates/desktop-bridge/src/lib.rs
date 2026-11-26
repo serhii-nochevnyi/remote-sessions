@@ -507,12 +507,18 @@ fn scan_output(vt: &mut VtState, bytes: &[u8]) -> usize {
     offset
 }
 
+enum GridBarrier {
+    Issued(GeometryEvent),
+    Successor(TerminalStatus),
+}
+
 struct Output {
     receiver: mpsc::Receiver<PtyEvent>,
     status: TerminalStatus,
     refresh_at: Instant,
     applied_revision: u64,
-    pending: Option<GeometryEvent>,
+    pending: Option<GridBarrier>,
+    renderer_id: Option<Uuid>,
     drain_started: Option<Instant>,
     writable: bool,
 }
@@ -1235,12 +1241,27 @@ async fn prepare_grid(view: &View, status: TerminalStatus) -> Result<GeometryEve
     })
 }
 
-async fn redraw_view(view: &View, boundary: &GeometryEvent) -> Result<GeometryEvent> {
-    let status = terminal_status(view).await?;
+fn newer_geometry(issued: &TerminalStatus, current: &TerminalStatus) -> Result<bool> {
+    if current.committed.revision > issued.committed.revision {
+        return Ok(true);
+    }
     ensure!(
-        status.epoch == boundary.status.epoch && status.committed == boundary.status.committed,
+        current.epoch == issued.epoch && current.committed == issued.committed,
         "Terminal geometry boundary was superseded"
     );
+    Ok(false)
+}
+
+async fn redraw_view(
+    view: &View,
+    boundary: &GeometryEvent,
+) -> Result<(GeometryEvent, Option<TerminalStatus>)> {
+    let current = terminal_status(view).await?;
+    let (status, successor) = if newer_geometry(&boundary.status, &current)? {
+        (boundary.status.clone(), Some(current))
+    } else {
+        (current, None)
+    };
     let (bridge_pty, _tty_guard) = {
         let master = view
             .master
@@ -1259,20 +1280,25 @@ async fn redraw_view(view: &View, boundary: &GeometryEvent) -> Result<GeometryEv
         !view.closed() && bridge_pty.size == size && client.size == size,
         "Attachment grid changed"
     );
-    view_command(
-        view,
-        &[
-            "refresh-client",
-            "-t",
-            view.tty.to_str().context("Invalid attachment TTY")?,
-        ],
-    )
-    .await?;
-    Ok(GeometryEvent {
-        status,
-        bridge_pty,
-        client,
-    })
+    if successor.is_none() {
+        view_command(
+            view,
+            &[
+                "refresh-client",
+                "-t",
+                view.tty.to_str().context("Invalid attachment TTY")?,
+            ],
+        )
+        .await?;
+    }
+    Ok((
+        GeometryEvent {
+            status,
+            bridge_pty,
+            client,
+        },
+        successor,
+    ))
 }
 
 fn expire_drain(registry: &Mutex<Views>, id: Uuid, revision: u64) {
@@ -1287,14 +1313,27 @@ fn expire_drain(registry: &Mutex<Views>, id: Uuid, revision: u64) {
     }
 }
 
-async fn read_chunk(view: &View, output: &mut Output, now: impl Fn() -> Instant) -> Result<Chunk> {
-    if view.eof_draining() {
-        return output.drain_eof();
-    }
-    ensure!(
-        output.pending.is_none(),
-        "Terminal grid acknowledgement required"
-    );
+async fn issue_grid(
+    view: &View,
+    output: &mut Output,
+    status: TerminalStatus,
+    remaining: Duration,
+    now: &impl Fn() -> Instant,
+) -> Result<GeometryEvent> {
+    let event = tokio::time::timeout(remaining, prepare_grid(view, status))
+        .await
+        .context(DRAIN_TIMEOUT_ERROR)??;
+    drain_budget(output.drain_started, now())?;
+    output.status = event.status.clone();
+    output.pending = Some(GridBarrier::Issued(event.clone()));
+    Ok(event)
+}
+
+async fn poll_output(
+    view: &View,
+    output: &mut Output,
+    now: &impl Fn() -> Instant,
+) -> Result<Chunk> {
     let mut chunk = Chunk::empty();
     let reading_at = now();
     let remaining = drain_budget(output.drain_started, reading_at)?;
@@ -1358,14 +1397,8 @@ async fn read_chunk(view: &View, output: &mut Output, now: impl Fn() -> Instant)
                 status.committed.revision >= output.status.committed.revision,
                 "Terminal geometry revision went backwards"
             );
-            let event = tokio::time::timeout(remaining, prepare_grid(view, status))
-                .await
-                .context(DRAIN_TIMEOUT_ERROR)??;
-            drain_budget(output.drain_started, now())?;
-            output.status = event.status.clone();
-            output.pending = Some(event.clone());
+            chunk.geometry = Some(issue_grid(view, output, status, remaining, now).await?);
             chunk.status = None;
-            chunk.geometry = Some(event);
         }
         Ok(None) if view.eof_draining() => return output.drain_eof(),
         Ok(None) => {
@@ -1374,6 +1407,32 @@ async fn read_chunk(view: &View, output: &mut Output, now: impl Fn() -> Instant)
         Err(_) if view.eof_draining() => return output.drain_eof(),
         Err(_) => {}
     }
+    Ok(chunk)
+}
+
+async fn read_chunk(view: &View, output: &mut Output, now: impl Fn() -> Instant) -> Result<Chunk> {
+    if view.eof_draining() {
+        return output.drain_eof();
+    }
+    let mut chunk = match &output.pending {
+        Some(GridBarrier::Successor(successor)) => {
+            let remaining = drain_budget(output.drain_started, now())?;
+            let current = terminal_status_during_drain(view, remaining).await?;
+            let remaining =
+                drain_budget(output.drain_started, now())?.context(DRAIN_TIMEOUT_ERROR)?;
+            let status = if newer_geometry(successor, &current)? {
+                successor.clone()
+            } else {
+                current
+            };
+            Chunk {
+                geometry: Some(issue_grid(view, output, status, remaining, &now).await?),
+                ..Chunk::empty()
+            }
+        }
+        Some(GridBarrier::Issued(_)) => bail!("Terminal grid acknowledgement required"),
+        None => poll_output(view, output, &now).await?,
+    };
     let control_sample = view.views.upgrade().and_then(|views| {
         let views = views.lock().unwrap();
         (!view.closed())
@@ -1410,7 +1469,9 @@ pub struct DesktopBridge {
     views: Arc<Mutex<Views>>,
     creates: tokio::sync::Mutex<()>,
     #[cfg(test)]
-    startup_gate: Mutex<Option<w1_terminal_tests::StartupGate>>,
+    startup_gate: Mutex<Option<w1_terminal_tests::ViewGate>>,
+    #[cfg(test)]
+    grid_completion_gate: Mutex<Option<w1_terminal_tests::ViewGate>>,
 }
 impl DesktopBridge {
     pub fn new(directory: Option<PathBuf>, tmux: PathBuf) -> Self {
@@ -1422,6 +1483,8 @@ impl DesktopBridge {
             creates: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             startup_gate: Mutex::new(None),
+            #[cfg(test)]
+            grid_completion_gate: Mutex::new(None),
         }
     }
     fn directory(&self) -> Result<&PathBuf> {
@@ -1573,6 +1636,7 @@ impl DesktopBridge {
                 status: status.clone(),
                 applied_revision: status.committed.revision,
                 pending: None,
+                renderer_id: None,
                 drain_started: None,
                 writable: false,
             }),
@@ -1854,18 +1918,30 @@ impl DesktopBridge {
         view_id: &str,
         acknowledgement: GridAcknowledgement,
     ) -> Result<GeometryEvent> {
+        self.acknowledge_grid_with_clock(view_id, acknowledgement, Instant::now)
+            .await
+    }
+
+    async fn acknowledge_grid_with_clock(
+        &self,
+        view_id: &str,
+        acknowledgement: GridAcknowledgement,
+        now: impl Fn() -> Instant,
+    ) -> Result<GeometryEvent> {
         let view = self.view(view_id)?;
         let mut output = view
             .output
             .try_lock()
             .context("Terminal boundary already in progress")?;
-        let event = output
-            .pending
-            .as_ref()
-            .context("No pending geometry boundary")?;
+        let Some(GridBarrier::Issued(event)) = &output.pending else {
+            bail!("No pending geometry boundary");
+        };
         ensure!(
             !view.closed()
                 && !acknowledgement.renderer_id.is_nil()
+                && output
+                    .renderer_id
+                    .is_none_or(|id| id == acknowledgement.renderer_id)
                 && event.status.epoch == acknowledgement.epoch
                 && event.status.committed.revision == acknowledgement.revision
                 && acknowledgement.size == event.status.committed.size,
@@ -1873,7 +1949,7 @@ impl DesktopBridge {
         );
         let redraw = async {
             let remaining =
-                drain_budget(output.drain_started, Instant::now())?.context(DRAIN_TIMEOUT_ERROR)?;
+                drain_budget(output.drain_started, now())?.context(DRAIN_TIMEOUT_ERROR)?;
             tokio::time::timeout(remaining, redraw_view(&view, event))
                 .await
                 .context(DRAIN_TIMEOUT_ERROR)?
@@ -1883,18 +1959,8 @@ impl DesktopBridge {
             _ = view.retired() => Err(anyhow::anyhow!("View detached")),
             result = redraw => result,
         };
-        match result {
-            Ok(event) => {
-                let _views = self.views.lock().unwrap();
-                view.reader_state
-                    .compare_exchange(PAUSE, RESUME, Ordering::AcqRel, Ordering::Acquire)
-                    .map_err(|_| anyhow::anyhow!("View detached"))?;
-                output.pending = None;
-                output.applied_revision = acknowledgement.revision;
-                output.drain_started = None;
-                view.drain_revision.store(0, Ordering::Relaxed);
-                Ok(event)
-            }
+        let (event, successor) = match result {
+            Ok(completed) => completed,
             Err(error) => {
                 let reason = if error.to_string() == DRAIN_TIMEOUT_ERROR {
                     Retirement::Typed(TerminalClosure::GeometryTimeout)
@@ -1902,9 +1968,39 @@ impl DesktopBridge {
                     Retirement::Failed
                 };
                 view.retire(reason);
-                Err(error)
+                return Err(error);
+            }
+        };
+        #[cfg(test)]
+        {
+            let gate = self.grid_completion_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.park(view.terminal.view_id).await;
             }
         }
+        let mut views = self.views.lock().unwrap();
+        ensure!(
+            view.reader_state.load(Ordering::Acquire) == PAUSE,
+            "View detached"
+        );
+        if let Err(error) = drain_budget(output.drain_started, now()) {
+            view.retire_locked(
+                &mut views,
+                Retirement::Typed(TerminalClosure::GeometryTimeout),
+            );
+            return Err(error);
+        }
+        if successor.is_none() {
+            view.reader_state
+                .compare_exchange(PAUSE, RESUME, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|_| anyhow::anyhow!("View detached"))?;
+            output.drain_started = None;
+            view.drain_revision.store(0, Ordering::Relaxed);
+        }
+        output.pending = successor.map(GridBarrier::Successor);
+        output.applied_revision = acknowledgement.revision;
+        output.renderer_id = Some(acknowledgement.renderer_id);
+        Ok(event)
     }
 
     pub async fn input(&self, view_id: &str, data: Vec<u8>, paste: bool) -> Result<()> {
@@ -2216,6 +2312,7 @@ mod tests {
                     refresh_at: Instant::now() + Duration::from_secs(60),
                     applied_revision: 0,
                     pending: None,
+                    renderer_id: None,
                     drain_started: None,
                     writable: false,
                 }),
@@ -3293,7 +3390,10 @@ esac
                 }
                 {
                     let output = live.output.lock().await;
-                    assert_eq!(output.pending.as_ref().unwrap().status, event.status);
+                    let Some(GridBarrier::Issued(pending)) = &output.pending else {
+                        panic!("Expected the issued geometry");
+                    };
+                    assert_eq!(pending.status, event.status);
                     assert!(output.receiver.is_empty());
                     assert_eq!(output.applied_revision, 0);
                     assert_eq!(live.reader_state.load(Ordering::Acquire), PAUSE);
