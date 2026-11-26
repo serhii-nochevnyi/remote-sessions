@@ -184,12 +184,10 @@ function assertSourceAssets(source: string, id: string) {
   function visit(node: ts.Node) {
     if (ts.isCallExpression(node)) {
       const callee = node.expression;
-      const [tag, props] = node.arguments;
-      if (tag && ts.isStringLiteralLike(tag)
-          && ((ts.isIdentifier(callee) && reactFactories.has(callee.text))
-            || (ts.isPropertyAccessExpression(callee) && callee.name.text === "createElement"
-              && ts.isIdentifier(callee.expression) && reactObjects.has(callee.expression.text)))) {
-        assertReactAssets(props);
+      if ((ts.isIdentifier(callee) && reactFactories.has(callee.text))
+          || (ts.isPropertyAccessExpression(callee) && callee.name.text === "createElement"
+            && ts.isIdentifier(callee.expression) && reactObjects.has(callee.expression.text))) {
+        assertReactAssets(node.arguments[1]);
       }
     }
     if (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) {

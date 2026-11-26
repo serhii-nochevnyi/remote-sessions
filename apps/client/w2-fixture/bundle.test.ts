@@ -75,22 +75,36 @@ test("guarded bundle rejects desktop modules and external assets", async () => {
     const rendered = (reactImport: string, element: string) => `
       ${reactImport}
       import { createRoot } from "react-dom/client";
+      const tag = "img";
       createRoot(document.body).render(${element});
     `;
     write("react-marker.svg", '<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"/>');
-    write("entry.tsx", rendered('import React from "react";',
-      `React.createElement("img", {
-        src: new URL("./react-marker.svg", import.meta.url).href,
-        alt: "rendered-local",
-        style: { backgroundImage: "url(./marker.svg)", opacity: 1 }
-      })`));
-    const localReact = await bundle();
-    assert("output" in localReact, "Vite emits a rendered local React asset control");
-    const reactAsset = localReact.output.find(file => file.type === "asset"
-      && file.fileName.endsWith(".svg") && file.originalFileNames.includes("react-marker.svg"));
-    assert(reactAsset, "Vite emits the SVG used by React");
-    assert(localReact.output.some(file => file.type === "chunk" && file.code.includes("rendered-local")
-      && file.code.includes(basename(reactAsset.fileName))), "The application chunk references the emitted React SVG");
+    for (const [tagExpression, marker] of [
+      ['"img"', "rendered-local"],
+      ["tag", "rendered-nonliteral-local"],
+    ] as const) {
+      write("entry.tsx", rendered('import React from "react";',
+        `React.createElement(${tagExpression}, {
+          src: new URL("./react-marker.svg", import.meta.url).href,
+          alt: "${marker}",
+          style: { backgroundImage: "url(./marker.svg)", opacity: 1 }
+        })`));
+      const localReact = await bundle();
+      assert("output" in localReact, `Vite emits the rendered asset control: ${marker}`);
+      const reactAsset = localReact.output.find(file => file.type === "asset"
+        && file.fileName.endsWith(".svg") && file.originalFileNames.includes("react-marker.svg"));
+      assert(reactAsset, `Vite emits the SVG used by ${marker}`);
+      assert(
+        localReact.output.some(file => file.type === "chunk" && file.code.includes(marker)
+          && file.code.includes(basename(reactAsset.fileName))),
+        `The application chunk for ${marker} references the emitted React SVG`,
+      );
+    }
+
+    for (const element of ["React.createElement(tag)", "React.createElement(tag, null)"]) {
+      write("entry.tsx", rendered('import React from "react";', element));
+      await bundle();
+    }
 
     for (const [reactImport, element, diagnostic] of [
       ['import React from "react";',
@@ -120,9 +134,18 @@ test("guarded bundle rejects desktop modules and external assets", async () => {
       ['import React from "react";',
         'React.createElement("img", { src: window.assetUrl })',
         /Dynamic React asset reference is forbidden in the offline fixture: src/],
+      ['import React from "react";',
+        'React.createElement(tag, { src: "https://example.invalid/remote.svg" })',
+        /External asset is forbidden in the fixture: .*remote\.svg/],
+      ['import * as React from "react";',
+        'React.createElement(tag, window.assetProps)',
+        /Opaque React props are forbidden in the offline fixture/],
+      ['import { createElement as element } from "react";',
+        'element(tag, { ...window.assetProps })',
+        /Opaque React props are forbidden in the offline fixture/],
     ] as const) {
       write("entry.tsx", rendered(reactImport, element));
-      await assert.rejects(bundle, diagnostic);
+      await assert.rejects(bundle, diagnostic, element);
     }
   } finally {
     rmSync(root, { recursive: true, force: true });
