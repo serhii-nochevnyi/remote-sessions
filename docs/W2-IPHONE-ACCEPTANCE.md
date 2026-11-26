@@ -6,6 +6,8 @@ Run the bundled Tauri and xterm fixture on a signed physical iPhone. The fixture
 
 The [scaffold workflow](../.github/workflows/ci.yml) runs Linux `core` with `make check` and macOS `native` with `make check-native` on push and pull request. Both jobs use Rust 1.97.1 and locked npm dependencies. Run them through the repository delivery gate even while device setup is on hold. For physical acceptance, record the passing job links and checked revision for the signed candidate in the cohort's `ci` record. The operator can start the scoped preflight while CI is running.
 
+See the [W2 local verification snapshot](W2-LOCAL-CHECKS.md) for the recorded fixture and repository checks.
+
 ## Pre-Xcode gate
 
 From the worktree root, check Node 24, npm 11 and Python 3.11 or newer, then use `npm ci` with the root lockfile. Keep the same Bash shell for the Rust setup, scoped Mac Cargo check, iOS target installation and signed packaging. Initialize the worktree's Rust homes and select Rustup.
