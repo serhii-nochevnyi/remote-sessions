@@ -349,6 +349,16 @@ fn controlled_view(
     agent: Uuid,
     revision: u64,
 ) -> (Arc<View>, ReadControl, Arc<ChildState>) {
+    controlled_view_with_master(bridge, target, agent, revision, None)
+}
+
+fn controlled_view_with_master(
+    bridge: &DesktopBridge,
+    target: &TerminalTarget,
+    agent: Uuid,
+    revision: u64,
+    master: Option<Box<dyn MasterPty + Send>>,
+) -> (Arc<View>, ReadControl, Arc<ChildState>) {
     use remote_sessions_host::model::{CommittedGeometry, ResizeIntent};
     let epoch = ResizeEpoch {
         agent,
@@ -387,18 +397,22 @@ fn controlled_view(
     let view = Arc::new(View {
         terminal,
         directory: bridge.directory.clone().unwrap_or_default(),
-        tmux: "/unused/tmux".into(),
+        tmux: bridge.tmux.clone(),
         client_pid: 42,
-        tty: PathBuf::new(),
+        tty: master
+            .as_ref()
+            .and_then(|master| master.tty_name())
+            .unwrap_or_default(),
         control: Arc::new(tokio::sync::Mutex::new(Control { lease: None })),
         resize: tokio::sync::Mutex::new(()),
-        master: Mutex::new(None),
+        master: Mutex::new(master),
         output: tokio::sync::Mutex::new(Output {
             receiver,
             status,
             refresh_at: Instant::now() + Duration::from_secs(60),
             applied_revision: 0,
             pending: None,
+            renderer_id: None,
             drain_started: None,
             writable: false,
         }),
@@ -642,7 +656,7 @@ async fn w1_terminal_boundary_received_at_deadline_cannot_reach_geometry() {
 
 use remote_sessions_host::{
     decode_local_fixture, encode_local_observation,
-    model::{CommittedGeometry, ResizeIntent, TerminalTarget},
+    model::{CommittedGeometry, ProviderSample, ResizeIntent, TerminalTarget},
 };
 use std::{
     fs,
@@ -1122,6 +1136,414 @@ async fn attachment_status_peer(listener: &UnixListener, status: &TerminalStatus
     };
     assert_eq!(terminal, status.terminal);
     peer
+}
+
+struct GeometryFixture {
+    bridge: DesktopBridge,
+    listener: UnixListener,
+    view: Arc<View>,
+    writer: ReadControl,
+    owner: Arc<View>,
+    _owner_reader: ReadControl,
+    status: TerminalStatus,
+    token: Uuid,
+    renderer: Uuid,
+    start: Instant,
+    _slave: Box<dyn portable_pty::SlavePty + Send>,
+    directory: AgentFixture,
+}
+
+const GRID_A: TerminalSize = TerminalSize {
+    cols: 118,
+    rows: 38,
+};
+const GRID_B: TerminalSize = TerminalSize {
+    cols: 124,
+    rows: 42,
+};
+
+impl GeometryFixture {
+    async fn new() -> Self {
+        let directory = AgentFixture::new();
+        let target = target();
+        let tmux = directory.0.join("tmux");
+        let program = r#"#!/bin/sh
+set -eu
+root=$(dirname "$0")
+test "$3" = "$root/tmux.sock"
+tty=$(cat "$root/tty")
+case "$4" in
+  list-clients)
+    test "$6" = '$0'
+    set -- $(stty size < "$tty")
+    printf '42|%s|$0|@0|%%0|GENERATION|ignore-size|%s|%s\n' "$tty" "$2" "$1"
+    ;;
+  refresh-client)
+    test "$6" = "$tty"
+    printf 'redraw\n' >> "$root/redraws"
+    ;;
+  *) exit 1 ;;
+esac
+"#;
+        fs::write(
+            &tmux,
+            program.replace("GENERATION", &target.generation.to_string()),
+        )
+        .unwrap();
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+        let listener = UnixListener::bind(directory.0.join("agent.sock")).unwrap();
+        let bridge = DesktopBridge::new(Some(directory.0.clone()), tmux);
+        let initial = TerminalSize {
+            cols: 110,
+            rows: 32,
+        };
+        let pair = native_pty_system().openpty(pty_size(initial)).unwrap();
+        let agent = Uuid::new_v4();
+        let (view, mut writer, _) =
+            controlled_view_with_master(&bridge, &target, agent, 0, Some(pair.master));
+        fs::write(directory.0.join("tty"), view.tty.to_str().unwrap()).unwrap();
+        writer.requested().await;
+        let (owner, owner_reader, _) = controlled_view(&bridge, &target, agent, 0);
+        let mut status = view.output.lock().await.status.clone();
+        let token = Uuid::new_v4();
+        let epoch = ResizeEpoch {
+            agent,
+            owner: Uuid::new_v4(),
+        };
+        status.epoch = Some(epoch);
+        let grant = async {
+            let (mut peer, request) = receive(&listener).await;
+            assert!(
+                matches!(request, Request::AcquireTerminal { terminal } if terminal == owner.terminal)
+            );
+            respond(&mut peer, Response::TerminalControl { token, epoch }).await;
+        };
+        tokio::join!(refresh_control(&owner), grant);
+        Self {
+            bridge,
+            listener,
+            view,
+            writer,
+            owner,
+            _owner_reader: owner_reader,
+            status,
+            token,
+            renderer: Uuid::new_v4(),
+            start: Instant::now() + Duration::from_secs(60),
+            _slave: pair.slave,
+            directory,
+        }
+    }
+
+    async fn commit(&mut self, size: TerminalSize) {
+        let owner = self.owner.terminal.view_id.to_string();
+        let epoch = self.status.epoch.unwrap();
+        let sequence = self.status.committed.revision;
+        let admission = ResizeIntent {
+            id: Uuid::new_v4(),
+            epoch,
+        };
+        let revision = sequence + 1;
+        self.status.committed = CommittedGeometry {
+            size,
+            revision,
+            intent: Some(admission),
+        };
+        self.status.provider = Some(ProviderSample {
+            size,
+            sampled_at_us: revision,
+        });
+        self.status.observation = ObservationState::Observed;
+        let mut owner_status = self.status.clone();
+        owner_status.terminal = self.owner.terminal.clone();
+        let agent = async {
+            let (mut peer, request) = receive(&self.listener).await;
+            assert!(
+                matches!(request, Request::ResizeTerminal { terminal, token, sequence: actual, size: proposed }
+                if terminal == self.owner.terminal && token == self.token && actual == sequence && proposed == size)
+            );
+            respond(
+                &mut peer,
+                Response::Resize {
+                    resize: ResizeResult::Committed {
+                        admission,
+                        status: owner_status.clone(),
+                    },
+                },
+            )
+            .await;
+        };
+        let (reply, ()) = tokio::join!(self.bridge.resize(&owner, size, epoch), agent);
+        assert_eq!(
+            reply.unwrap(),
+            ResizeResult::Committed {
+                admission,
+                status: owner_status
+            }
+        );
+    }
+
+    async fn reply_status(&self, status: TerminalStatus) {
+        let mut peer = attachment_status_peer(&self.listener, &self.status).await;
+        respond(&mut peer, Response::TerminalStatus { status }).await;
+    }
+
+    fn key(&self) -> String {
+        self.view.terminal.view_id.to_string()
+    }
+
+    async fn issue_first(&self) -> GeometryEvent {
+        let key = self.key();
+        self.view.output.lock().await.refresh_at = self.start;
+        let drive_producer = async {
+            self.reply_status(self.status.clone()).await;
+            until(|| self.view.reader_state.load(Ordering::Acquire) == DRAIN).await;
+            self.writer.would_block();
+            self.reply_status(self.status.clone()).await;
+        };
+        let pull_boundary = async {
+            loop {
+                let chunk = self
+                    .bridge
+                    .read_with_clock(&key, || self.start)
+                    .await
+                    .unwrap();
+                assert!(chunk.data.is_empty() && !chunk.writable && !chunk.closed);
+                if let Some(event) = chunk.geometry {
+                    assert!(chunk.status.is_none());
+                    return event;
+                }
+            }
+        };
+        let (event, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(pull_boundary, drive_producer)
+        })
+        .await
+        .unwrap();
+        assert_eq!(event.status, self.status);
+        event
+    }
+
+    async fn read_successor(&self) -> GeometryEvent {
+        let key = self.key();
+        let (chunk, ()) = tokio::join!(
+            self.bridge.read(&key),
+            self.reply_status(self.status.clone())
+        );
+        let chunk = chunk.unwrap();
+        assert!(
+            chunk.status.is_none() && chunk.data.is_empty() && !chunk.writable && !chunk.closed
+        );
+        let event = chunk.geometry.unwrap();
+        assert_eq!(event.status, self.status);
+        event
+    }
+
+    fn acknowledgement(&self, event: &GeometryEvent) -> GridAcknowledgement {
+        GridAcknowledgement {
+            renderer_id: self.renderer,
+            epoch: event.status.epoch,
+            revision: event.status.committed.revision,
+            size: event.status.committed.size,
+            focused: true,
+        }
+    }
+
+    fn redraws(&self) -> usize {
+        fs::read_to_string(self.directory.0.join("redraws")).map_or(0, |log| log.lines().count())
+    }
+
+    async fn assert_paused(&mut self, applied: u64) {
+        let output = self.view.output.lock().await;
+        assert_eq!(output.applied_revision, applied);
+        assert_eq!(output.drain_started, Some(self.start));
+        assert_eq!(self.view.drain_revision.load(Ordering::Relaxed), 1);
+        assert_eq!(self.view.reader_state.load(Ordering::Acquire), PAUSE);
+        assert!(output.receiver.is_empty());
+        assert!(self.writer.requests.try_recv().is_err());
+    }
+}
+
+#[tokio::test]
+async fn w1_resize_superseding_ack() {
+    let mut fixture = GeometryFixture::new().await;
+    let key = fixture.key();
+    fixture.commit(GRID_A).await;
+    let a = fixture.issue_first().await;
+    let ack_a = fixture.acknowledgement(&a);
+    assert_eq!(a.bridge_pty.size, ack_a.size);
+    assert_eq!(a.client.size, ack_a.size);
+    fixture.commit(GRID_B).await;
+    fixture.writer.data(b"after B");
+    fixture.assert_paused(0).await;
+
+    let (reply, ()) = tokio::join!(
+        fixture.bridge.acknowledge_grid(&key, ack_a),
+        fixture.reply_status(fixture.status.clone()),
+    );
+    let reply = reply.unwrap();
+    assert_eq!(reply.status.committed.revision, ack_a.revision);
+    assert_eq!(reply.status.epoch, ack_a.epoch);
+    assert_eq!(reply.status, a.status);
+    assert_eq!(reply.status.terminal, fixture.view.terminal);
+    assert_eq!(reply.bridge_pty.size, ack_a.size);
+    assert_eq!(reply.client.size, ack_a.size);
+    assert_eq!(fixture.redraws(), 0);
+    fixture.assert_paused(1).await;
+
+    let b = fixture.read_successor().await;
+    assert_eq!(b.status.terminal, a.status.terminal);
+    let ack_b = fixture.acknowledgement(&b);
+    assert_eq!(b.bridge_pty.size, ack_b.size);
+    assert_eq!(b.client.size, ack_b.size);
+    assert_eq!(b.status.provider.unwrap().size, ack_b.size);
+    fixture.assert_paused(1).await;
+    for wrong in [
+        ack_a,
+        GridAcknowledgement {
+            renderer_id: Uuid::new_v4(),
+            ..ack_b
+        },
+    ] {
+        assert!(fixture.bridge.acknowledge_grid(&key, wrong).await.is_err());
+        fixture.assert_paused(1).await;
+    }
+
+    let (reply, ()) = tokio::join!(
+        fixture.bridge.acknowledge_grid(&key, ack_b),
+        fixture.reply_status(fixture.status.clone()),
+    );
+    let reply = reply.unwrap();
+    assert_eq!(reply.status, b.status);
+    assert_eq!(reply.bridge_pty.size, ack_b.size);
+    assert_eq!(reply.client.size, ack_b.size);
+    assert_eq!(fixture.redraws(), 1);
+    assert_eq!(fixture.view.reader_state.load(Ordering::Acquire), RESUME);
+    assert_eq!(fixture.view.output.lock().await.applied_revision, 2);
+    assert_eq!(
+        read_until_bytes(&fixture.bridge, &key, b"after B").await,
+        b"after B",
+    );
+    drop(fixture);
+
+    let mut fixture = GeometryFixture::new().await;
+    let key = fixture.key();
+    fixture.commit(GRID_A).await;
+    let a = fixture.issue_first().await;
+    fixture.commit(GRID_B).await;
+    let mut replacement = fixture.status.clone();
+    replacement.terminal.target.process_start += 1;
+    fixture.writer.data(b"wrong attachment");
+    let (reply, ()) = tokio::join!(
+        fixture
+            .bridge
+            .acknowledge_grid(&key, fixture.acknowledgement(&a)),
+        fixture.reply_status(replacement),
+    );
+    assert_eq!(
+        reply.unwrap_err().to_string(),
+        "Terminal attachment identity changed"
+    );
+    assert_eq!(fixture.view.reader_state.load(Ordering::Acquire), CLOSE);
+    assert!(fixture.bridge.read(&key).await.is_err());
+    assert_eq!(fixture.redraws(), 0);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), fixture.writer.requests.recv())
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn w1_resize_original_drain_deadline() {
+    let tick = Duration::from_nanos(1);
+    for (elapsed, resumes, superseded) in [
+        (DRAIN_TIMEOUT - tick, true, false),
+        (DRAIN_TIMEOUT, false, false),
+        (DRAIN_TIMEOUT + tick, false, false),
+        (DRAIN_TIMEOUT, false, true),
+    ] {
+        let mut fixture = GeometryFixture::new().await;
+        let key = fixture.key();
+        fixture.commit(GRID_A).await;
+        let mut event = fixture.issue_first().await;
+        if superseded {
+            fixture.commit(GRID_B).await;
+            let (reply, ()) = tokio::join!(
+                fixture.bridge.acknowledge_grid_with_clock(
+                    &key,
+                    fixture.acknowledgement(&event),
+                    || fixture.start + tick,
+                ),
+                fixture.reply_status(fixture.status.clone()),
+            );
+            assert_eq!(reply.unwrap().status, event.status);
+            event = fixture.read_successor().await;
+        }
+        let applied = event.status.committed.revision - 1;
+        fixture.writer.data(b"after redraw");
+        fixture.assert_paused(applied).await;
+
+        let (attached, reached) = tokio::sync::oneshot::channel();
+        let (complete, resume) = tokio::sync::oneshot::channel();
+        *fixture.bridge.grid_completion_gate.lock().unwrap() = Some(ViewGate { attached, resume });
+        let now = Cell::new(fixture.start);
+        let check_clock = || {
+            if now.get() != fixture.start {
+                assert!(fixture.bridge.views.try_lock().is_err());
+            }
+            now.get()
+        };
+        let drive_redraw = async {
+            fixture.reply_status(fixture.status.clone()).await;
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), reached)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                fixture.view.terminal.view_id,
+            );
+            assert_eq!(fixture.redraws(), 1);
+            assert_eq!(fixture.view.reader_state.load(Ordering::Acquire), PAUSE);
+            expire_drain(&fixture.bridge.views, fixture.view.terminal.view_id, 2);
+            assert!(!fixture.view.closed());
+            now.set(fixture.start + elapsed);
+            complete.send(()).unwrap();
+        };
+        let (reply, ()) = tokio::join!(
+            fixture.bridge.acknowledge_grid_with_clock(
+                &key,
+                fixture.acknowledgement(&event),
+                check_clock
+            ),
+            drive_redraw,
+        );
+        expire_drain(&fixture.bridge.views, fixture.view.terminal.view_id, 1);
+        if resumes {
+            assert_eq!(reply.unwrap().status, event.status);
+            assert_eq!(fixture.view.reader_state.load(Ordering::Acquire), RESUME);
+            assert_eq!(
+                read_until_bytes(&fixture.bridge, &key, b"after redraw").await,
+                b"after redraw",
+            );
+        } else {
+            assert_eq!(reply.unwrap_err().to_string(), DRAIN_TIMEOUT_ERROR);
+            assert_eq!(fixture.view.reader_state.load(Ordering::Acquire), CLOSE);
+            assert_eq!(fixture.view.output.lock().await.applied_revision, applied);
+            let closed = fixture.bridge.read(&key).await.unwrap();
+            assert_eq!(closed.closure, Some(TerminalClosure::GeometryTimeout));
+            assert!(closed.closed && !closed.writable && closed.data.is_empty());
+            assert!(closed.geometry.is_none() && closed.status.is_none());
+            assert!(fixture.bridge.read(&key).await.is_err());
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), fixture.writer.requests.recv())
+                    .await
+                    .unwrap(),
+                None
+            );
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1682,12 +2104,12 @@ async fn read_until_bytes(bridge: &DesktopBridge, id: &str, expected: &[u8]) -> 
     .unwrap()
 }
 
-pub(super) struct StartupGate {
+pub(super) struct ViewGate {
     attached: tokio::sync::oneshot::Sender<Uuid>,
     resume: tokio::sync::oneshot::Receiver<()>,
 }
 
-impl StartupGate {
+impl ViewGate {
     pub(super) async fn park(self, id: Uuid) {
         let _ = self.attached.send(id);
         let _ = self.resume.await;
@@ -1705,7 +2127,7 @@ async fn w1_terminal_startup_full_is_retired_before_attach_replies() {
     let bridge = Arc::new(DesktopBridge::new(Some(fixture.0.clone()), tmux));
     let (attached, starting) = tokio::sync::oneshot::channel();
     let (resume, wait_reply) = tokio::sync::oneshot::channel();
-    *bridge.startup_gate.lock().unwrap() = Some(StartupGate {
+    *bridge.startup_gate.lock().unwrap() = Some(ViewGate {
         attached,
         resume: wait_reply,
     });
