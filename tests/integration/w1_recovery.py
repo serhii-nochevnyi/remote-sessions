@@ -38,6 +38,7 @@ from runtime_lab import CATALOG_DB, Lab, W1Record, catalog_message, internal_dev
 
 REQUEST_LIMIT = 65_536
 RESPONSE_LIMIT = 1_048_576
+CANCEL_OPERATIONS = ('register_workspace', 'workspace_readiness', 'create_managed')
 GENERATION_FORMAT = '#{pid}|#{start_time}|#{@rs_create_generation}'
 PANE_FORMAT = ('#{session_name}\t#{session_id}\t#{window_id}\t#{pane_id}\t#{pane_pid}\t#{pane_dead}\t'
                '#{@rs_create_nonce}\t#{pane_start_path}\t#{pane_current_path}')
@@ -127,6 +128,8 @@ class ResponseLoss:
         self.drops = []
         self.requests = Counter()
         self.replies = Counter()
+        self.failures = 0
+        self.active = 0
 
     def arm(self, profile):
         with self.lock:
@@ -191,6 +194,17 @@ class ResponseLoss:
         with self.lock:
             return self.replies[op, key]
 
+    def cancel_snapshot(self):
+        with self.lock:
+            return {
+                'requests': {op: sum(n for (name, _), n in self.requests.items() if name == op)
+                             for op in CANCEL_OPERATIONS},
+                'forwarded_lists': self.replies['list', None],
+                'failures': self.failures,
+                'active': self.active,
+                'pass_through': self.profile is None and not self.drops,
+            }
+
 
 @contextmanager
 def agent_proxy(lab, directory, loss):
@@ -199,12 +213,18 @@ def agent_proxy(lab, directory, loss):
     class Handler(socketserver.StreamRequestHandler):
         def handle(self):
             self.request.settimeout(7)
+            with loss.lock:
+                loss.active += 1
             try:
                 response = loss.relay(self.rfile, upstream)
                 if response is not None:
                     self.request.sendall(response)
             except (OSError, TypeError, ValueError):
-                return
+                with loss.lock:
+                    loss.failures += 1
+            finally:
+                with loss.lock:
+                    loss.active -= 1
 
     path = directory / 'agent.sock'
     server = socketserver.ThreadingUnixStreamServer(str(path), Handler)
@@ -808,23 +828,69 @@ def catalog_fault(report, lab, legacy_ids, app_args, action):
             require(case['healthy_catalog'] == case['restored_catalog'], 'Restored catalog identity changed')
 
 
+def picker_traffic(before, after):
+    deltas = {op: after['requests'][op] - before['requests'][op] for op in CANCEL_OPERATIONS}
+    connected = 0 < before['forwarded_lists'] < after['forwarded_lists']
+    intact = (before['pass_through'] and after['pass_through'] and not after['active']
+              and before['failures'] == after['failures'] == 0)
+    return {'connected': connected, 'intact': intact, 'deltas': deltas,
+            'before': before, 'after': after}
+
+
 def cancel_picker(report, lab):
     with scenario(report, 'R3-picker-cancel') as case:
-        before = pending_records(lab.state)
-        catalog_before = catalog_snapshot(lab)
-        panes_before = inventory(lab)
-        with native(case):
-            observe(case, 'cancelled', 'Open the native folder picker and cancel it. '
-                    'Did the dialog keep Create disabled without adding a tab?')
-        case['pending_before'] = sorted(before)
-        case['pending_after'] = sorted(pending_records(lab.state))
+        client = lab.state / ('cancel-' + uuid4().hex[:8])
+        client.mkdir(mode=0o700)
+        (client / 'tmux.sock').symlink_to(lab.state / 'tmux.sock')
+        loss = ResponseLoss()
+        with agent_proxy(lab, client, loss):
+            binary = app_binary()
+            app = subprocess.Popen([str(binary)], stdin=subprocess.DEVNULL,
+                                   env=dict(os.environ, RS_STATE_DIR=str(client), RS_TMUX_BIN=lab.tmux))
+            try:
+                try:
+                    wait_for(lambda: loss.forwarded('list'), timeout=8)
+                except TimeoutError:
+                    case['recorder'] = {'connected': False, 'before': loss.cancel_snapshot()}
+                    mark(case, no_requests=False)
+                    raise
+                input('Open the folder picker in the disposable app. Leave it open and press Enter. ')
+                pending_before = pending_records(client)
+                catalog_before = catalog_snapshot(lab)
+                panes_before = inventory(lab)
+                traffic_before = loss.cancel_snapshot()
+                observe(case, 'cancelled', 'Cancel the folder picker. '
+                        'Did Create stay disabled without adding a tab?')
+                traffic_decision = loss.cancel_snapshot()
+                require(app.poll() is None, 'Picker app exited during cancellation')
+                try:
+                    wait_for(lambda: loss.forwarded('list') > traffic_decision['forwarded_lists'], timeout=8)
+                    post_decision_connection = True
+                except TimeoutError:
+                    post_decision_connection = False
+            finally:
+                if app.poll() is None:
+                    app.terminate()
+                try:
+                    app.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    app.kill()
+                    app.wait(timeout=5)
+        traffic = case['recorder'] = picker_traffic(traffic_before, loss.cancel_snapshot())
+        traffic['at_decision'] = traffic_decision
+        traffic['connected'] = traffic['connected'] and post_decision_connection
+        pending_after = pending_records(client)
+        panes_after = inventory(lab)
+        catalog_after = catalog_snapshot(lab)
+        case['pending_before'] = sorted(pending_before)
+        case['pending_after'] = sorted(pending_after)
         case['runtime_ids_before'] = sorted(panes_before)
-        case['runtime_ids_after'] = sorted(inventory(lab))
-        after = catalog_snapshot(lab)
+        case['runtime_ids_after'] = sorted(panes_after)
         case['workspaces_before'] = catalog_before['workspace_ids']
-        case['workspaces_after'] = after['workspace_ids']
-        mark(case, no_requests=case['pending_before'] == case['pending_after']
-             and catalog_before == after, no_effect=case['runtime_ids_before'] == case['runtime_ids_after'])
+        case['workspaces_after'] = catalog_after['workspace_ids']
+        mark(case, no_requests=traffic['connected'] and traffic['intact'] and not any(traffic['deltas'].values()),
+             no_effect=pending_before == pending_after and catalog_before == catalog_after
+             and panes_before == panes_after)
 
 
 def real_profile(report, lab, name, folder, profile):

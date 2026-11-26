@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 """Run the installed terminal pressure fixture in its own logged-in Mac lab.
 
-Build host-agent and the debug probe from the current committed source first.
-For native acceptance, pass --owner-app and --victim-app with two separately
-signed debug copies of that build, using distinct bundle IDs. This runner opens
-the actual binaries and prints private coordination paths and the evidence
-format. The operator uses the native inspector in the victim only. Write each
-operator JSON record atomically with mode 0600. Times ending in _ns are from
+Write each operator JSON record atomically with mode 0600. Times ending in _ns are from
 time.monotonic_ns() on this Mac. Keep screenshots and terminal text outside
 these records. Use --describe-native to print the operator sequence and schema.
 """
 import argparse
-from contextlib import ExitStack, closing
+from contextlib import ExitStack, closing, nullcontext
+import ctypes
 import hashlib
 from itertools import count
 import json
@@ -24,6 +20,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 import termios
 import threading
 import time
@@ -35,12 +32,12 @@ CAPACITY = 16
 BRIDGE_INPUT = b'RS-BRIDGE-FRESH\r'
 NATIVE_INPUT = b'RS-NATIVE-FRESH\r'
 PREFIX = b'RS_W1_RESIZE_'
-PLAN_PATHS = (
-    'crates/desktop-bridge/src/lib.rs', 'crates/desktop-bridge/src/w1_terminal_tests.rs',
-    'apps/client/src/TerminalView.tsx', 'apps/client/src/local-client.ts',
-    'apps/client/src/local-client.test.ts', 'crates/desktop-bridge/examples/probe.rs',
-    'tests/integration/w1_terminal_pressure.py',
-)
+HOST_PATH = Path('target/debug/host-agent')
+PROBE_PATH = Path('target/debug/examples/probe')
+APP_PATH = Path('target/debug/bundle/macos/Remote Sessions.app')
+LOCKFILES = ('Cargo.lock', 'package-lock.json')
+BUILD_MODES = ('bridge', 'installed', 'paste')
+BUILD_TIMEOUT = 600
 BURSTS = {'startup': 12, 'bridge': 320, 'native': 750}
 MARKERS = {'startup': 'RSSTARTREADY', 'bridge': 'RSBRIDGEKEPT', 'native': 'RSNATIVEKEPT'}
 MAX_RECORD = 65_536
@@ -51,11 +48,18 @@ NATIVE_INSPECTOR_SETUP_SECONDS = 1800
 NATIVE_FINAL_RECORD_SECONDS = 7200
 NATIVE_FIXTURE_GRACE_SECONDS = 60
 CLEANUP_NS = 2_000_000_000
+STALE_INPUT = {'victim': b'RS-SPECTATOR-STALE\r', 'owner': b'RS-WRITER-STALE\r'}
+TRACE_STAGE = {'victim': 'acknowledge', 'owner': 'read'}
+SYNTHETIC_INCARNATION = '00000000-0000-4000-8000-000000000001'
 PS_START = re.compile(r'[A-Z][a-z]{2} [A-Z][a-z]{2}\s[ 0-9][0-9] \d\d:\d\d:\d\d \d{4}')
 
 
 class ProofError(Exception):
     """An evidence failure whose fixed message is safe to publish."""
+
+
+class ProvenanceHold(ProofError):
+    pass
 
 
 def need(condition, message):
@@ -137,7 +141,7 @@ def grid_sample(value):
     return value
 
 
-def capture_json(path):
+def capture_json(path, expected_sha256=None):
     invalid = 'record must be a bounded private file'
     deadline = time.monotonic() + PUBLICATION_WAIT_SECONDS
     while True:
@@ -158,6 +162,8 @@ def capture_json(path):
                 break
         need(time.monotonic() < deadline, invalid)
     need(len(data) == meta.st_size, 'record changed during read')
+    if expected_sha256 is not None and hashlib.sha256(data).hexdigest() != expected_sha256:
+        raise ProvenanceHold('build record differs from the independently retained producer digest')
 
     def unique(pairs):
         fields = dict(pairs)
@@ -169,9 +175,10 @@ def capture_json(path):
 
 def write_json(path, record, replace=False):
     pending = path.with_name(path.name + '.tmp')
+    data = json.dumps(record, separators=(',', ':')) + '\n'
+    need(len(data) <= MAX_RECORD, 'evidence record exceeds publication limit')
     with private_writer(pending) as output:
-        json.dump(record, output, separators=(',', ':'))
-        output.write('\n')
+        output.write(data)
     if replace:
         pending.replace(path)
     else:
@@ -179,6 +186,7 @@ def write_json(path, record, replace=False):
             os.link(pending, path)
         finally:
             pending.unlink()
+    return hashlib.sha256(data.encode('ascii')).hexdigest()
 
 
 def private_writer(path):
@@ -252,9 +260,11 @@ def read_if_present(path):
         return None
 
 
-def run_command(*args, timeout=10, check=True):
+def run_command(*args, timeout=10, check=True, cwd=None, env=None):
     result = subprocess.run([str(arg) for arg in args], stdin=subprocess.DEVNULL,
-                            capture_output=True, text=True, timeout=timeout, env=dict(os.environ, LC_ALL='C'))
+                            capture_output=True, text=True, timeout=timeout, cwd=cwd,
+                            env=dict(os.environ if env is None else env, LC_ALL='C'),
+                            encoding='utf-8', errors='surrogateescape')
     if check:
         need(result.returncode == 0, f'{Path(args[0]).name} command failed')
     return result
@@ -289,17 +299,14 @@ def same_process(first, second):
     return second is not None and (first['pid'], first['started']) == (second['pid'], second['started'])
 
 
-def versions(probe, host, tmux):
-    source = output('/usr/bin/git', '-C', ROOT, 'rev-parse', 'HEAD', 'HEAD^{tree}').splitlines()
-    need(len(source) == 2 and all(re.fullmatch(r'[0-9a-f]{40}', item) for item in source), 'invalid source identity')
-    need(run_command('/usr/bin/git', '-C', ROOT, 'diff', '--quiet', 'HEAD', '--', *PLAN_PATHS,
-                     check=False).returncode == 0, 'pressure source differs from committed tree')
+def versions(build, tmux):
     return {
-        'source': source[0], 'tree': source[1],
-        'probe_sha256': digest(probe), 'host_sha256': digest(host), 'tmux_sha256': digest(Path(tmux)),
+        'source': build['before']['commit'], 'tree': build['before']['tree'],
+        'probe_sha256': build['artifacts']['probe']['sha256'], 'host_sha256': build['artifacts']['host']['sha256'],
+        'tmux_sha256': digest(Path(tmux)),
         'tmux': output(tmux, '-V'), 'macos': output('/usr/bin/sw_vers', '-productVersion'),
         'macos_build': output('/usr/bin/sw_vers', '-buildVersion'),
-        'machine': output('/usr/bin/uname', '-m'), 'rustc': output('rustc', '--version'),
+        'machine': output('/usr/bin/uname', '-m'), 'rustc': build['tools']['rustc']['version'],
         'python': f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}',
     }
 
@@ -410,13 +417,16 @@ def ledger(state, expected):
 class Trace:
     """Read only the fixed debug record types from an owned app/probe log."""
 
-    def __init__(self, path):
+    def __init__(self, path, stream=None):
         self.path = path
+        self.stream = stream
         self.offset = 0
         self.pressure = {}
         self.grids = []
         self._providers = {}
         self.failures = []
+        self.retired_witness = None
+        self.detached_failure = None
 
     def provider_samples(self):
         for first, latest in self._providers.values():
@@ -440,9 +450,10 @@ class Trace:
                 self._providers[identity] = (first, item)
 
     def read(self):
-        with self.path.open('rb') as stream:
+        with (nullcontext(self.stream) if self.stream is not None else self.path.open('rb')) as stream:
             stream.seek(self.offset)
             for _ in range(8192):
+                start = stream.tell()
                 line = stream.readline(MAX_RECORD + 1)
                 if not line or not line.endswith(b'\n'):
                     need(len(line) < MAX_RECORD, 'oversized native diagnostic record')
@@ -477,6 +488,11 @@ class Trace:
                     if item['reason'] == 'stream_closed' and item['stage'] in ('read', 'renderer_detach'):
                         need(uuid_text(item['view_id']), 'invalid stream closure identity')
                         self.failures.append(item)
+                    if (item['reason'] == 'view_detached'
+                            and (item['view_id'], item['stage']) == self.retired_witness
+                            and self.detached_failure is None):
+                        self.detached_failure = {**item, 'offset': start, 'end_offset': self.offset,
+                                                 'observed_ns': ns()}
         need(len(self.pressure) <= 128 and len(self.grids) <= 256
              and len(self.failures) <= 256, 'too many debug observations')
         return self
@@ -736,9 +752,317 @@ def signed_app(bundle, state, role):
     need(code_hash is not None, 'native build signature identity unavailable')
     unsigned = state / f'unsigned-{role}'
     shutil.copyfile(binary, unsigned)
-    run_command('/usr/bin/codesign', '--remove-signature', unsigned)
+    if run_command('/usr/bin/codesign', '-d', unsigned, check=False).returncode == 0:
+        run_command('/usr/bin/codesign', '--remove-signature', unsigned)
     return binary, {'bundle_id': bundle_id, 'binary_sha256': digest(binary),
                     'code_hash': code_hash[1], 'unsigned_sha256': digest(unsigned)}
+
+
+def build_environment():
+    env = {key: os.environ[key] for key in ('PATH', 'HOME', 'TMPDIR') if key in os.environ}
+    return {**env, 'CI': 'true', 'GIT_OPTIONAL_LOCKS': '0', 'GIT_CONFIG_NOSYSTEM': '1',
+            'GIT_CONFIG_GLOBAL': os.devnull, 'CARGO_TARGET_DIR': str(ROOT / 'target'),
+            'NPM_CONFIG_USERCONFIG': os.devnull, 'NPM_CONFIG_GLOBALCONFIG': os.devnull}
+
+
+def source_snapshot(fresh=False, labs=()):
+    def git(*argv):
+        return run_command('/usr/bin/git', '-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false',
+                           *argv, cwd=ROOT, env=build_environment(), timeout=60).stdout
+
+    need(Path(git('rev-parse', '--show-toplevel').strip()).resolve() == ROOT, 'unexpected build checkout')
+    commit, tree = git('rev-parse', 'HEAD', 'HEAD^{tree}').splitlines()
+    need(all(re.fullmatch(r'[0-9a-f]{40}', item) for item in (commit, tree)), 'invalid source identity')
+    flags = git('ls-files', '-v', '-z').split('\0')[:-1]
+    need(all(entry.startswith('H ') for entry in flags), 'source index contains hidden or unmerged paths')
+    status_rows = git('status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching',
+                      '--ignore-submodules=none').split('\0')[:-1]
+    generated = ('target/', 'node_modules/', 'apps/client/node_modules/', 'apps/client/dist/',
+                 'apps/client/src-tauri/gen/', 'scripts/__pycache__/', 'tests/integration/__pycache__/')
+    cache = ROOT / '.cache'
+    if not fresh and os.path.lexists(cache):
+        receipts = {path for lab in labs for path in (lab.manifest, lab.recovery_path)}
+        need(not cache.is_symlink() and cache.is_dir() and set(cache.iterdir()) <= receipts,
+             'unexpected build checkout cache inputs')
+        generated += ('.cache/',)
+    need(all(not fresh and row.startswith('!! ') and row[3:].startswith(generated)
+             for row in status_rows), 'dirty or non-fresh build checkout')
+    return {'checkout': str(ROOT), 'commit': commit, 'tree': tree, 'staged': [], 'unstaged': [],
+            'untracked': [], 'locks': {name: digest(ROOT / name) for name in LOCKFILES}}
+
+
+def file_identity(path):
+    path = Path(path)
+    need(path.is_absolute() and path.resolve(strict=True) == path and path.is_file(),
+         'artifact path is not an exact regular file')
+    before = path.stat()
+    sha = digest(path)
+    after = path.stat()
+    fields = ('st_dev', 'st_ino', 'st_mode', 'st_size', 'st_mtime_ns', 'st_ctime_ns')
+    need(all(getattr(before, key) == getattr(after, key) for key in fields), 'artifact changed during hashing')
+    return {'path': str(path), 'sha256': sha, 'device': before.st_dev, 'inode': before.st_ino,
+            'mode': stat.S_IMODE(before.st_mode), 'size': before.st_size,
+            'modified_ns': before.st_mtime_ns, 'changed_ns': before.st_ctime_ns}
+
+
+def bundle_identity(bundle):
+    need(bundle.is_dir() and bundle.resolve(strict=True) == bundle, 'artifact bundle path changed')
+    metadata = plistlib.loads((bundle / 'Contents/Info.plist').read_bytes())
+    name = metadata['CFBundleExecutable']
+    need(isinstance(name, str) and re.fullmatch(r'[A-Za-z0-9_. -]{1,64}', name)
+         and name not in ('.', '..'), 'invalid bundle executable')
+    binary = file_identity(bundle / 'Contents' / 'MacOS' / name)
+    tree_hash = hashlib.sha256()
+    for path in sorted(bundle.rglob('*')):
+        mode = path.lstat().st_mode
+        if stat.S_ISLNK(mode):
+            value = str(path.readlink())
+        elif stat.S_ISREG(mode):
+            value = file_identity(path)['sha256']
+        else:
+            need(stat.S_ISDIR(mode), 'unexpected bundle file type')
+            value = ''
+        tree_hash.update(json.dumps([path.relative_to(bundle).as_posix(), mode, value]).encode())
+    return {'path': str(bundle), 'tree_sha256': tree_hash.hexdigest(), 'executable': binary}
+
+
+def build_commands(mode, tools):
+    commands = [[tools['make']['path'], 'build-runtime'],
+                [tools['cargo']['path'], 'build', '--locked', '-p', 'remote-sessions-desktop-bridge',
+                 '--example', 'probe']]
+    if mode != 'bridge':
+        npm = tools['npm']['path']
+        commands.extend([[npm, 'ci'], [npm, 'run', 'tauri', '--', 'build', '--debug', '--bundles',
+                                             'app', '--', '--locked']])
+    return commands
+
+
+def build_tools(mode, environment):
+    names = ['git', 'make', 'cargo', 'rustc']
+    if mode != 'bridge':
+        names.extend(('node', 'npm', 'codesign'))
+    tools = {}
+    for name in names:
+        command = (f'/usr/bin/{name}' if name in ('git', 'codesign')
+                   else shutil.which(name, path=environment.get('PATH')))
+        need(command is not None, 'required controlled build tool is unavailable')
+        path = Path(command).absolute()
+        args = ('-h',) if name == 'codesign' else ('--version',)
+        version = run_command(path, *args, cwd=ROOT, env=environment, check=name != 'codesign')
+        tools[name] = {'path': str(path), 'resolved': file_identity(path.resolve(strict=True)),
+                       'version': (version.stdout or version.stderr).splitlines()[0]}
+    sysroot = run_command(tools['rustc']['path'], '--print', 'sysroot', cwd=ROOT, env=environment).stdout.strip()
+    for name in ('cargo', 'rustc'):
+        tools[name]['toolchain'] = file_identity((Path(sysroot) / 'bin' / name).resolve(strict=True))
+    return tools
+
+
+def tauri_tool():
+    launcher = ROOT / 'node_modules/.bin/tauri'
+    package = ROOT / 'node_modules/@tauri-apps/cli'
+    executable = launcher.resolve(strict=True)
+    need(executable.is_relative_to(package), 'Tauri launcher is outside the locked package')
+    version = json.loads((package / 'package.json').read_bytes())['version']
+    locked = json.loads((ROOT / 'package-lock.json').read_bytes())['packages']['node_modules/@tauri-apps/cli']
+    need(version == locked['version'], 'Tauri launcher does not match the package lock')
+    return {'path': str(launcher), 'resolved': file_identity(executable), 'version': version}
+
+
+def bundle_roles(mode):
+    return {'bridge': (), 'installed': ('owner', 'victim'), 'paste': ('owner',)}[mode]
+
+
+def output_path(path):
+    need(path is not None and path.is_absolute(), 'controlled build outputs require absolute paths')
+    parent = path.parent.resolve(strict=True)
+    meta = parent.stat()
+    need(parent.is_dir() and meta.st_uid == os.getuid() and stat.S_IMODE(meta.st_mode) == 0o700
+         and not parent.is_relative_to(ROOT), 'controlled build outputs require a private directory outside the checkout')
+    checked = parent / path.name
+    need(not os.path.lexists(checked), 'controlled build output already exists')
+    return checked
+
+
+def controlled_build(options):
+    mode = options.controlled_build
+    record_path = output_path(options.build_record)
+    need(all(bool(getattr(options, role + '_app')) == (role in bundle_roles(mode))
+             for role in ('owner', 'victim')), 'controlled build bundle outputs do not match the mode')
+    bundles = {role: output_path(getattr(options, role + '_app')) for role in bundle_roles(mode)}
+    need(len(set(bundles.values()) | {record_path}) == len(bundles) + 1, 'controlled build outputs overlap')
+    before = source_snapshot(fresh=True)
+    need(not any(os.path.lexists(ROOT / path) for path in ('target', 'node_modules', 'apps/client/node_modules',
+                                                          'apps/client/dist', 'apps/client/src-tauri/gen')),
+         'controlled build requires fresh output paths')
+    env = build_environment()
+    tools = build_tools(mode, env)
+    argv = build_commands(mode, tools)
+    tauri = None
+    for command in argv:
+        run_command(*command, cwd=ROOT, env=env, timeout=BUILD_TIMEOUT)
+        if command[1:] == ['ci']:
+            tauri = tauri_tool()
+    artifacts = {role: file_identity(ROOT / path) for role, path in (('host', HOST_PATH), ('probe', PROBE_PATH))}
+    need(all(value['mode'] & stat.S_IXUSR for value in artifacts.values()), 'built executable is not executable')
+    if bundles:
+        artifacts['unsigned_app'] = bundle_identity(ROOT / APP_PATH)
+        with TemporaryDirectory() as scratch:
+            temporary = Path(scratch)
+            unsigned = temporary / 'source-app'
+            shutil.copyfile(artifacts['unsigned_app']['executable']['path'], unsigned)
+            if run_command('/usr/bin/codesign', '-d', unsigned, check=False).returncode == 0:
+                run_command('/usr/bin/codesign', '--remove-signature', unsigned)
+            artifacts['unsigned_app']['unsigned_sha256'] = digest(unsigned)
+            for role, bundle in bundles.items():
+                bundle.mkdir(mode=0o700)
+                shutil.copytree(ROOT / APP_PATH, bundle, dirs_exist_ok=True, symlinks=True)
+                info = bundle / 'Contents' / 'Info.plist'
+                metadata = plistlib.loads(info.read_bytes())
+                metadata['CFBundleIdentifier'] += f'.w1.{mode}.{role}'
+                info.write_bytes(plistlib.dumps(metadata))
+                signing = ['/usr/bin/codesign', '--force', '--deep', '--sign', '-', str(bundle)]
+                run_command(*signing, env=env, timeout=BUILD_TIMEOUT)
+                argv.append(signing)
+                _, signature = signed_app(bundle, temporary, role)
+                need(signature['unsigned_sha256'] == artifacts['unsigned_app']['unsigned_sha256'],
+                     'signed copy does not match the built debug app')
+                artifacts[role] = {**bundle_identity(bundle), 'signature': signature}
+    need(build_tools(mode, env) == tools, 'build tools changed during controlled build')
+    if tauri is not None:
+        need(tauri_tool() == tauri, 'Tauri launcher changed during controlled build')
+        tools['tauri'] = tauri
+    after = source_snapshot()
+    need(after == before, 'source changed during controlled build')
+    record = {'format': 'w1-controlled-build-1', 'mode': mode, 'before': before, 'after': after,
+              'tools': tools, 'argv': argv, 'artifacts': artifacts}
+    checksum = write_json(record_path, record)
+    print(f'BUILD_RECORD_SHA256={checksum}', flush=True)
+
+
+def verify_artifacts(build, options, mode, labs=()):
+    try:
+        need(source_snapshot(labs=labs) == build['before'] == build['after'],
+             'build source state differs from this checkout')
+        artifacts = build['artifacts']
+        keys = {'host', 'probe'}
+        if mode != 'bridge':
+            keys.update(('unsigned_app', *bundle_roles(mode)))
+        need(set(artifacts) == keys, 'build artifact roles do not match the mode')
+        for role, path in (('host', HOST_PATH), ('probe', PROBE_PATH)):
+            need(file_identity(ROOT / path) == artifacts[role], 'built host or probe does not match the receipt')
+        if mode != 'bridge':
+            unsigned = artifacts['unsigned_app']
+            need(bundle_identity(ROOT / APP_PATH) == {key: value for key, value in unsigned.items()
+                                                      if key != 'unsigned_sha256'},
+                 'unsigned app does not match the receipt')
+            with TemporaryDirectory() as scratch:
+                identities = []
+                for role in bundle_roles(mode):
+                    bundle = getattr(options, role + '_app').resolve(strict=True)
+                    binary, signature = signed_app(bundle, Path(scratch), role)
+                    expected = artifacts[role]
+                    need({**bundle_identity(bundle), 'signature': signature} == expected
+                         and str(binary) == expected['executable']['path']
+                         and signature['unsigned_sha256'] == unsigned['unsigned_sha256'],
+                         'signed app copy does not match the receipt')
+                    identities.append(signature['bundle_id'])
+                need(len(set(identities)) == len(identities), 'signed app roles share a bundle identity')
+    except (OSError, ValueError, TypeError, AttributeError, LookupError, ProofError, subprocess.SubprocessError) as error:
+        raise ProvenanceHold('source or built artifact could not be verified') from error
+
+
+def verified_build(options, mode):
+    try:
+        need(options.build_record is not None and isinstance(options.build_record_sha256, str)
+             and re.fullmatch(r'[0-9a-f]{64}', options.build_record_sha256),
+             'missing independently retained controlled build digest or record')
+        build = exact(capture_json(options.build_record, options.build_record_sha256),
+                      'format mode before after tools argv artifacts')
+        need(build['format'] == 'w1-controlled-build-1' and build['mode'] == mode,
+             'wrong controlled build mode')
+        expected = build_commands(mode, build['tools'])
+        expected.extend(['/usr/bin/codesign', '--force', '--deep', '--sign', '-', build['artifacts'][role]['path']]
+                        for role in bundle_roles(mode))
+        need(build['argv'] == expected,
+             'wrong controlled build mode or command')
+        verify_artifacts(build, options, mode)
+        return build
+    except ProvenanceHold:
+        raise
+    except (OSError, ValueError, TypeError, AttributeError, LookupError, ProofError) as error:
+        raise ProvenanceHold('controlled build record is missing, malformed or unanchored') from error
+
+
+def running_artifact(pid, artifact, original=None):
+    try:
+        first = live_process(pid)
+        executable = ctypes.create_string_buffer(4096)
+        proc_pidpath = ctypes.CDLL('/usr/lib/libproc.dylib').proc_pidpath
+        proc_pidpath.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32)
+        proc_pidpath.restype = ctypes.c_int
+        need(proc_pidpath(pid, executable, len(executable)) > 0, 'process executable could not be inspected')
+        observed = file_identity(Path(os.fsdecode(executable.value)))
+        second = live_process(pid)
+        need(observed == artifact and same_process(first, second)
+             and (original is None or same_process(original, second)),
+             'running executable or process identity differs from the receipt')
+        return second
+    except (OSError, ValueError, ProofError, subprocess.SubprocessError) as error:
+        raise ProvenanceHold('running executable or process identity differs from the receipt') from error
+
+
+def inspector_windows(pid):
+    quartz = ctypes.CDLL('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
+    foundation = ctypes.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
+    pointer = ctypes.c_void_p
+    quartz.CGWindowListCopyWindowInfo.argtypes = (ctypes.c_uint32, ctypes.c_uint32)
+    quartz.CGWindowListCopyWindowInfo.restype = pointer
+    foundation.CFPropertyListCreateData.argtypes = (pointer, pointer, ctypes.c_long, ctypes.c_ulong, pointer)
+    foundation.CFPropertyListCreateData.restype = pointer
+    foundation.CFDataGetBytePtr.argtypes = (pointer,)
+    foundation.CFDataGetBytePtr.restype = pointer
+    foundation.CFDataGetLength.argtypes = (pointer,)
+    foundation.CFDataGetLength.restype = ctypes.c_long
+    foundation.CFRelease.argtypes = (pointer,)
+    foundation.CFRelease.restype = None
+    array = quartz.CGWindowListCopyWindowInfo(1, 0)
+    need(array, 'native window identities are unavailable')
+    try:
+        data = foundation.CFPropertyListCreateData(None, array, 200, 0, None)
+        need(data, 'native window observations could not be decoded')
+        try:
+            windows = plistlib.loads(ctypes.string_at(foundation.CFDataGetBytePtr(data),
+                                                     foundation.CFDataGetLength(data)))
+        finally:
+            foundation.CFRelease(data)
+    finally:
+        foundation.CFRelease(array)
+    return {item['kCGWindowNumber'] for item in windows if item.get('kCGWindowOwnerPID') == pid}
+
+
+def lab_host_artifact(lab, build, prior=None):
+    try:
+        copied = file_identity(lab.service_host)
+        host = build['artifacts']['host']
+        need(str(lab.host) == host['path'] and lab.startup_argv['agent'][0] == copied['path']
+             and copied['sha256'] == host['sha256'] and (prior is None or copied == prior),
+             'launchd host copy differs from the built host')
+        return copied
+    except (OSError, ProofError) as error:
+        raise ProvenanceHold('launchd host copy differs from the built host') from error
+
+
+def launchd_agent_pid(lab):
+    sys.path.insert(0, str(ROOT / 'scripts'))
+    from runtime_lab import W1Record
+
+    try:
+        job = W1Record(lab.recovery_path, fixture=lab.fixture, recovery=True)
+        pid = job.loaded_pid('agent')
+        need(pid == lab.call('health')['agent_pid'], 'launchd process did not serve the selected lab')
+        return pid
+    except (OSError, ValueError, LookupError, ProofError, subprocess.SubprocessError) as error:
+        raise ProvenanceHold('launchd program or live host could not be verified') from error
 
 
 def stop_app(child):
@@ -751,15 +1075,20 @@ def stop_app(child):
             child.wait(timeout=5)
 
 
-def start_app(stack, lab, binary, role):
+def start_app(stack, lab, artifact, role):
     path = lab.state / f'pressure-{role}.log'
     environment = dict(os.environ, RS_STATE_DIR=str(lab.state), RS_TMUX_BIN=lab.tmux, RS_W1_RESIZE_TRACE='1')
     with private_writer(path) as log:
-        child = subprocess.Popen([str(binary)], stdin=subprocess.DEVNULL,
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        reader = stack.enter_context(os.fdopen(descriptor, 'rb'))
+        need(os.path.samestat(os.fstat(log.fileno()), os.fstat(reader.fileno())), 'native log stream changed')
+        child = subprocess.Popen([artifact['executable']['path']], stdin=subprocess.DEVNULL,
                                  stdout=subprocess.DEVNULL, stderr=log, env=environment)
     stack.callback(stop_app, child)
-    identity = live_process(child.pid)
-    return child, identity, Trace(path)
+    sample = running_artifact(child.pid, artifact['executable'])
+    identity = {'pid': sample['pid'], 'started': sample['started'], 'role': role,
+                'build': artifact['signature'], 'stderr': str(path)}
+    return child, identity, Trace(path, reader)
 
 
 def publish_operator(path, record):
@@ -881,9 +1210,8 @@ def observe_native_pressure(lab, expected, pause, pre_grid, bindings, owner, vic
             'heartbeat_before': before_full, 'heartbeat_after': after_full}
 
 
-def validate_raw_operator(data, lab, expected, pause, pressure, pre_victim, owner, victim,
-                          anchor, resume_gate, replacement_process):
-    exact(data, 'resumed_at_ns resumed_controls closure redraw progress input')
+def validate_replacement(data, expected, pause, pressure, victim, anchor, resume_gate, replacement_process):
+    exact(data, 'resumed_at_ns resumed_controls closure redraw progress')
     resumed = data['resumed_at_ns']
     full = pressure['retirement']['times_ns']['full']
     flood = pressure['workload']
@@ -891,7 +1219,7 @@ def validate_raw_operator(data, lab, expected, pause, pressure, pre_victim, owne
          and data['resumed_controls'] is True, 'actual Inspector resume not witnessed')
     closure = exact(data['closure'], 'view_id at_ns closed writable data_empty status_null geometry_null reason high_water')
     closed_at = closure['at_ns']
-    need(positive(closed_at) and resumed <= closed_at <= ns() and closure['view_id'] == pause['victim_view']
+    need(positive(closed_at) and resumed < closed_at <= ns() and closure['view_id'] == pause['victim_view']
          and closure['closed'] is True and closure['writable'] is False
          and all(closure[key] is True for key in ('data_empty', 'status_null', 'geometry_null'))
          and closure['reason'] == 'overflow' and closure['high_water'] == CAPACITY,
@@ -911,16 +1239,17 @@ def validate_raw_operator(data, lab, expected, pause, pressure, pre_victim, owne
     attached = victim.pressure.get(redraw['view_id'], {}).get('attached')
     need(attached is not None and replacement_process is not None
          and attached['pid'] == replacement_process['pid']
-         and min(closed_at, resumed) <= mono(attached['at_us'], anchor) <= redraw['at_ns'],
+         and closed_at < mono(attached['at_us'], anchor) < redraw['at_ns'] <= ns(),
          'replacement attachment does not follow actual victim closure')
     pressure_status = pressure['owner_convergence']['grid']['event']['status']
     committed = pressure_status['committed']
     need(redraw['revision'] == committed['revision'] and size(redraw['size']) == committed['size'],
          'replacement redraw used a different committed grid')
-    replacement_grids = raw_grid(victim, expected, redraw['view_id'], redraw['renderer_id'])
-    need(any(item['event']['status']['committed']['revision'] > redraw['revision']
-             and mono(item['event']['client']['sampled_at_us'], anchor) >= redraw['at_ns']
-             for item in replacement_grids), 'replacement renderer lacks a post-redraw production observation')
+    replacement_grids = [item for item in raw_grid(victim, expected, redraw['view_id'], redraw['renderer_id'])
+                         if item['event']['status']['committed']['revision'] > redraw['revision']
+                         and item['event']['status']['epoch'] == pressure_status['epoch']
+                         and redraw['at_ns'] < mono(item['event']['client']['sampled_at_us'], anchor)]
+    need(replacement_grids, 'replacement renderer lacks a post-redraw production observation')
 
     progress = exact(data['progress'], 'before_ns after_ns first_burst last_burst view_id renderer_id')
     need(all(positive(progress[key]) for key in ('before_ns', 'after_ns'))
@@ -930,32 +1259,92 @@ def validate_raw_operator(data, lab, expected, pause, pressure, pre_victim, owne
          and 0 <= progress['first_burst'] < progress['last_burst'] < flood['bursts'],
          'actual healthy owner output did not advance across Full')
 
-    inputs = exact(data['input'], 'owner_detached_ns authorized_ns stale_ack_ns stale_input_ns fresh_ns '
-                   'old_view_id old_renderer_id ack_epoch ack_revision ack_size ack_result input_result '
-                   'successor_epoch grid_unchanged')
-    times = [inputs[key] for key in ('owner_detached_ns', 'authorized_ns', 'stale_ack_ns', 'stale_input_ns', 'fresh_ns')]
-    need(all(positive(value) for value in times) and all(a < b for a, b in zip(times, times[1:]))
-         and redraw['at_ns'] < times[0] and times[-1] <= ns(), 'native input handoff timing is incomplete')
-    former = pre_victim['event']['status']
-    need(inputs['old_view_id'] == pause['victim_view'] and inputs['old_renderer_id'] == pause['victim_renderer']
-         and inputs['ack_epoch'] == former['epoch'] and inputs['ack_revision'] == former['committed']['revision']
-         and size(inputs['ack_size']) == former['committed']['size'] and inputs['ack_result'] == 'View detached'
-         and inputs['input_result'] == 'View detached' and inputs['grid_unchanged'] is True,
-         'stale native ACK or input rejection was not witnessed')
-    successor = epoch(inputs['successor_epoch'])
-    need(successor['agent'] == pressure_status['epoch']['agent'] and successor != pressure_status['epoch'],
-         'fresh input lacked a successor ownership epoch')
-    owner_retirement = owner.pressure.get(pause['owner_view'], {})
-    detach = owner_retirement.get('detached')
-    need(detach is not None and 'cleanup_complete' in owner_retirement
-         and times[0] <= mono(detach['at_us'], anchor) <= times[1],
-         'healthy owner did not detach before successor authority')
-    need(successor_provider_observed(victim, expected, redraw['view_id'], successor, anchor, times[0], times[-1]),
+    return replacement_grids[-1]
+
+
+def validate_capture(record, run_id, role, app, trace, expected, anchor, opened, received, scope=None):
+    exact(record, 'run_id capture_id inspector_target inspector_window window app captured_ns view_id renderer_id target epoch '
+                  'read_sample_us writable grant_sha256 acknowledgement')
+    need(record['run_id'] == run_id and record['app'] == app and app['role'] == role
+         and uuid_text(record['capture_id']) and uuid_text(record['inspector_target']) and record['window'] == 'main'
+         and positive(record['inspector_window'])
+         and positive(record['captured_ns']) and opened < record['captured_ns'] <= received
+         and uuid_text(record['view_id']) and uuid_text(record['renderer_id']) and record['target'] == expected,
+         'Inspector capture came from the wrong app, window, time or terminal view')
+    need(scope is None or (record['view_id'], record['renderer_id']) == scope,
+         'Inspector capture did not bind the original terminal view')
+    view = record['view_id']
+    events = trace.pressure.get(view, {})
+    attached = events.get('attached')
+    detached = events.get('detached')
+    at = record['captured_ns']
+    grids = raw_grid(trace, expected, view, record['renderer_id'])
+    prior = [grid for grid in grids if mono(grid['event']['client']['sampled_at_us'], anchor) <= at]
+    need(attached is not None and mono(attached['at_us'], anchor) < at and detached is None and prior,
+         'Inspector capture lacks a live role-owned attachment and renderer')
+    grid = prior[-1]
+    observed = grid['event']['status']
+    need(observed['epoch'] is not None and observed['epoch'] == epoch(record['epoch']),
+         'Inspector capture disagrees with the live authority interval')
+    read_at = mono(record['read_sample_us'], anchor)
+    need(mono(attached['at_us'], anchor) < read_at <= at
+         and any(committed_key(sample) == committed_key(observed) and sample['terminal'] == observed['terminal']
+                 and sample['provider'] is not None
+                 and sample['provider']['sampled_at_us'] == record['read_sample_us']
+                 for sample in trace.provider_samples()), 'capture lacks its role-owned live read status')
+    if role == 'victim':
+        need(record['writable'] is False and record['grant_sha256'] is None
+             and record['acknowledgement'] == grid['renderer'],
+             'spectator capture claims a grant or mismatched old grid')
+    else:
+        digest_value = record['grant_sha256']
+        need(record['writable'] is True and record['acknowledgement'] is None
+             and isinstance(digest_value, str) and re.fullmatch(r'[0-9a-f]{64}', digest_value)
+             and digest_value != hashlib.sha256(SYNTHETIC_INCARNATION.encode()).hexdigest(),
+             'writer capture lacks a live opaque input grant')
+    return grid
+
+
+def validate_invocation(record, capture, gate, trace, received):
+    fields = ('run_id capture_id inspector_target inspector_window window app view_id renderer_id target epoch '
+              'read_sample_us grant_sha256')
+    exact(record, fields + ' invoked_ns finished_ns input_result traced_result traced_stage')
+    need(all(record[key] == capture[key] for key in fields.split())
+         and gate['capture_id'] == capture['capture_id']
+         and gate['inspector_target'] == capture['inspector_target']
+         and gate['inspector_window'] == capture['inspector_window'],
+         'retired input did not use the original capture and Inspector page')
+    first, last = record['invoked_ns'], record['finished_ns']
+    need(positive(first) and positive(last) and gate['issued_ns'] < first <= last <= received
+         and last - first <= 10_000_000_000 and record['input_result'] == record['traced_result'] == 'View detached'
+         and record['traced_stage'] == TRACE_STAGE[capture['app']['role']], 'retired native input was not rejected')
+    failure = trace.detached_failure
+    need(failure is not None and failure['view_id'] == capture['view_id']
+         and failure['stage'] == record['traced_stage'] and failure['reason'] == 'view_detached'
+         and gate['log_cursor'] <= failure['offset'] < failure['end_offset'] <= trace.offset
+         and first <= failure['observed_ns'] <= received,
+         'retired input lacks its original native command trace')
+    return failure
+
+
+def validate_handoff(handoff, owner, victim, capture, capture_ack_ns, replacement, expected, anchor):
+    exact(handoff, 'owner_detached_ns authorized_ns successor_epoch')
+    detached, authorized = handoff['owner_detached_ns'], handoff['authorized_ns']
+    successor = epoch(handoff['successor_epoch'])
+    need(successor['agent'] == capture['epoch']['agent'] and successor != capture['epoch']
+         and positive(detached) and positive(authorized) and capture_ack_ns < detached < authorized <= ns(),
+         'fresh input lacked a successor ownership epoch after the captured writer')
+    events = owner.pressure.get(capture['view_id'], {})
+    attached = events.get('attached')
+    retired = events.get('detached')
+    cleaned = events.get('cleanup_complete')
+    need(attached is not None and retired is not None and cleaned is not None
+         and attached['pid'] == retired['pid'] == cleaned['pid']
+         and detached <= mono(retired['at_us'], anchor) <= mono(cleaned['at_us'], anchor) < authorized,
+         'healthy owner did not detach and clean up before successor authority')
+    need(successor_provider_observed(victim, expected, replacement, successor, anchor,
+                                     mono(cleaned['at_us'], anchor), authorized),
          'successor epoch was not observed in production status')
-    need(tmux_target(lab, expected) == replacement_grids[-1]['event']['status']['committed']['size'],
-         'stale commands changed the replacement grid')
-    return {'inspector': data, 'replacement_client': replacement_process,
-            'replacement_grid': replacement_grids[-1], 'input_delivery': ledger(lab.state, BRIDGE_INPUT + NATIVE_INPUT)}
 
 
 def managed_executable(lab, runtime_id, profile, tool):
@@ -1021,29 +1410,46 @@ def validate_providers(data, lab, anchor, owner, victim, after, agent_epoch):
     return results
 
 
-def native_leg(lab, options, report, expected, anchor, original_process):
+def sample_native_apps(apps, artifacts):
+    samples = {}
+    for role, (child, original, _) in apps.items():
+        need(child.poll() is None and child.pid == original['pid'], 'original native app exited')
+        samples[role] = running_artifact(child.pid, artifacts[role]['executable'], original)
+        need(child.poll() is None, 'original native app exited during its process sample')
+    return samples
+
+
+def replacement_status(trace, expected, view, authority, committed, anchor, after):
+    matching = [sample for sample in trace.read().provider_samples()
+                if sample['terminal']['view_id'] == view and sample['terminal']['target'] == expected
+                and sample['provider'] is not None
+                and mono(sample['provider']['sampled_at_us'], anchor) > after]
+    for sample in matching:
+        need(sample['epoch'] == authority and sample['committed'] == committed
+             and sample['provider']['size'] == committed['size'], 'stale commands changed the replacement authority or grid')
+    return bool(matching)
+
+
+def native_leg(lab, options, report, expected, anchor, original_process, build):
     state = lab.state
-    owner_bin, owner_build = signed_app(options.owner_app, state, 'owner')
-    victim_bin, victim_build = signed_app(options.victim_app, state, 'victim')
-    baseline_bin = ROOT / 'target/debug/remote-sessions-client'
-    unsigned = state / 'unsigned-source-build'
-    shutil.copyfile(baseline_bin, unsigned)
-    run_command('/usr/bin/codesign', '--remove-signature', unsigned)
-    need(owner_build['bundle_id'] != victim_build['bundle_id']
-         and owner_build['unsigned_sha256'] == victim_build['unsigned_sha256'] == digest(unsigned),
-         'dual apps must be signed copies of the same local debug binary with distinct bundle IDs')
-    builds = {'owner': owner_build, 'victim': victim_build}
+    artifacts = build['artifacts']
+    builds = {role: artifacts[role]['signature'] for role in ('owner', 'victim')}
     report['app_builds'] = builds
-    pause_path = state / 'pressure-operator-pause.json'
-    ready_path = state / 'pressure-operator-ready.json'
-    gate_path = state / 'pressure-operator-resume.json'
+    paths = {stage: state / f'pressure-operator-{stage}.json'
+             for stage in ('pause', 'ready', 'resume', 'recovery', 'handoff', 'fresh',
+                           'inspectors-open', 'inspectors')}
+    for role in ('owner', 'victim'):
+        for step in ('capture', 'captured', 'gate', 'invoked'):
+            stage = f'{role}-{step}'
+            paths[stage] = state / f'pressure-operator-{stage}.json'
     run_id = report['run_id']
     source = {key: report['build'][key] for key in ('source', 'tree')}
-    with ExitStack() as apps:
-        owner_child, owner_process, owner = start_app(apps, lab, owner_bin, 'owner')
+    with ExitStack() as stack:
+        apps = {'owner': start_app(stack, lab, artifacts['owner'], 'owner')}
+        owner_child, owner_app, owner = apps['owner']
         publish_operator(state / 'pressure-owner-ready.json', {
             'run_id': run_id, **source, 'builds': builds, 'lab_id': lab.id, 'state_dir': str(state),
-            'agent_pid': report['agent']['pid'], 'owner_app': owner_process,
+            'agent_pid': report['agent']['pid'], 'owner_app': owner_app,
             'target': expected, 'clock': anchor,
         })
         print('Open the raw runtime in the owner app and resize once to bind its renderer.', flush=True)
@@ -1053,163 +1459,388 @@ def native_leg(lab, options, report, expected, anchor, original_process):
             return raw_grid(owner.read(), expected)
 
         wait(owner_opened, NATIVE_OWNER_SETUP_SECONDS, 'real healthy owner view did not open')
-        victim_child, victim_process, victim = start_app(apps, lab, victim_bin, 'victim')
+        apps['victim'] = start_app(stack, lab, artifacts['victim'], 'victim')
+        _, victim_app, victim = apps['victim']
+        wait(lambda: inspector_windows(victim_app['pid']), 15, 'victim app window did not open')
+        initial_windows = {role: inspector_windows(app[1]['pid']) for role, app in apps.items()}
         opened = ns()
-        publish_operator(ready_path, {
+        publish_operator(paths['ready'], {
             'run_id': run_id, **source, 'builds': builds, 'target': expected, 'clock': anchor,
             'lab_id': lab.id, 'agent_pid': report['agent']['pid'], 'fixture': original_process,
-            'owner_app': owner_process, 'victim_app': victim_process,
-            'owner_log': str(owner.path), 'victim_log': str(victim.path),
-            'pause_record': str(pause_path), 'resume_record': str(gate_path),
+            'owner_app': owner_app, 'victim_app': victim_app,
+            'initial_windows': {role: sorted(windows) for role, windows in initial_windows.items()},
+            'stages': {stage: str(path) for stage, path in paths.items()},
             'final_record': str(options.native_evidence),
         })
-        print('Open the same raw runtime as spectator, resize from the owner, then pause only the victim JavaScript. '
-              'Submit the pause record to trigger the raw flood and resize the owner during the flood.', flush=True)
+        samples = {}
 
-        def pause_ready():
-            need(owner_child.poll() is None and victim_child.poll() is None, 'actual WebView app exited')
-            return pause_path.exists()
+        def stage(name, budget):
+            def read_stage():
+                need(all(child.poll() is None for child, _, _ in apps.values()), 'original native app exited')
+                return read_if_present(paths[name])
 
-        wait(pause_ready, NATIVE_INSPECTOR_SETUP_SECONDS, 'Inspector pause record was not supplied')
+            record = wait(read_stage, budget, f'operator stage {name} was not supplied')
+            samples[name] = sample_native_apps(apps, artifacts)
+            owner.read()
+            victim.read()
+            return record, ns()
+
+        def acknowledge_capture(role, budget, scope=None):
+            record, received = stage(f'{role}-capture', budget)
+            _, app, trace = apps[role]
+            grid = validate_capture(record, run_id, role, app, trace, expected, anchor, opened, received, scope)
+            need(record['inspector_window'] == inspector_ids[role]
+                 and record['inspector_window'] in inspector_windows(app['pid']),
+                 'capture did not bind the original undocked native Inspector window')
+            acknowledged = ns()
+            publish_operator(paths[f'{role}-captured'], {
+                'run_id': run_id, 'capture_id': record['capture_id'], 'acknowledged_ns': acknowledged,
+            })
+            return record, grid, acknowledged
+
+        setup_deadline = time.monotonic() + NATIVE_INSPECTOR_SETUP_SECONDS
+        print('Open the spectator and both undocked Inspectors. Send the inspectors-open record.', flush=True)
+        inspector_request, _ = stage('inspectors-open', NATIVE_INSPECTOR_SETUP_SECONDS)
+        need(inspector_request == {'run_id': run_id}, 'Inspector window request belongs to another run')
+        inspector_ids = {}
+        for role, (_, app, _) in apps.items():
+            opened_windows = inspector_windows(app['pid']) - initial_windows[role]
+            need(len(opened_windows) == 1, 'expected one new undocked Inspector window per native app')
+            inspector_ids[role] = opened_windows.pop()
+        publish_operator(paths['inspectors'], {'run_id': run_id, 'windows': inspector_ids})
+        spectator, spectator_grid, spectator_ack = acknowledge_capture('victim', setup_deadline - time.monotonic())
+        stage('pause', setup_deadline - time.monotonic())
         pause, pre_owner, pre_victim, clients = native_preflight(
-            lab, pause_path, anchor, run_id, expected, owner, victim, opened)
+            lab, paths['pause'], anchor, run_id, expected, owner, victim, opened)
+        need(spectator_ack < pause['paused_at_ns'] and spectator['view_id'] == pause['victim_view']
+             and spectator['renderer_id'] == pause['victim_renderer'] and pre_victim == spectator_grid,
+             'pause did not follow the acknowledged spectator capture on the same view')
         need(same_process(original_process, live_process(expected['pid'])), 'native fixture process changed')
         pressure = observe_native_pressure(lab, expected, pause, pre_owner, clients, owner, victim, anchor)
-        need(same_process(original_process, live_process(expected['pid']))
-             and same_process(owner_process, live_process(owner_child.pid))
-             and same_process(victim_process, live_process(victim_child.pid)),
-             'native runtime or app identities changed during pressure')
+        need(same_process(original_process, live_process(expected['pid'])), 'native fixture process changed')
+        samples['pressure'] = sample_native_apps(apps, artifacts)
         report['native'] = {
             'pause': pause, 'pre_owner': pre_owner, 'pre_victim': pre_victim, 'clients': clients,
-            'app_processes': {'owner': owner_process, 'victim': victim_process}, **pressure,
+            'app_processes': {'owner': owner_app, 'victim': victim_app}, **pressure,
         }
         resume_gate = ns()
-        publish_operator(gate_path, {
+        publish_operator(paths['resume'], {
             'run_id': run_id, 'resume_after_ns': resume_gate, 'retirement': pressure['retirement'],
             'healthy_owner_convergence': pressure['owner_convergence'],
             'held_marker': MARKERS['native'], 'target': expected,
         })
-        print('Resume the victim, inspect the production typed closure, and capture the redraw, '
-              'handoff and both provider flows. Submit the final private record when complete.', flush=True)
 
-        replacements = {}
+        final_deadline = time.monotonic() + NATIVE_FINAL_RECORD_SECONDS
 
-        def evidence_ready():
-            need(owner_child.poll() is None and victim_child.poll() is None, 'actual WebView app exited before evidence')
-            owner.read()
-            victim.read()
-            for view, events in victim.pressure.items():
-                attached = events.get('attached')
-                if attached and view not in replacements and mono(attached['at_us'], anchor) >= resume_gate:
-                    sample = process(attached['pid'])
-                    if sample is not None and sample['rss_kib'] > 0:
-                        replacements[view] = sample
-            return read_if_present(options.native_evidence)
+        def remaining():
+            return final_deadline - time.monotonic()
 
-        evidence = wait(evidence_ready, NATIVE_FINAL_RECORD_SECONDS, 'Root native evidence was not supplied')
+        recovery, _ = stage('recovery', remaining())
+        redraw_id = recovery['redraw']['view_id']
+        attached = victim.pressure.get(redraw_id, {}).get('attached')
+        replacement = live_process(attached['pid']) if attached else None
+        replacement_grid = validate_replacement(recovery, expected, pause, pressure, victim, anchor,
+                                                resume_gate, replacement)
+        tmux_client(lab, expected, replacement['pid'])
+        grid_status = replacement_grid['event']['status']
+        committed = grid_status['committed']
+
+        def invoke_retired(role, capture, authority):
+            _, _, trace = apps[role]
+            need(tmux_target(lab, expected) == committed['size'], 'replacement grid changed before stale input')
+            ledger(state, BRIDGE_INPUT)
+            before = ns()
+            wait(lambda: replacement_status(victim, expected, redraw_id, authority, committed, anchor, before),
+                 6, 'replacement authority and grid were not observed before stale input')
+            trace.read()
+            need(capture['inspector_window'] in inspector_windows(capture['app']['pid']),
+                 'original Inspector window closed before invocation')
+            gate = {'run_id': run_id, 'capture_id': capture['capture_id'],
+                    'inspector_target': capture['inspector_target'], 'inspector_window': capture['inspector_window'],
+                    'log_cursor': trace.offset, 'issued_ns': ns()}
+            trace.retired_witness = capture['view_id'], TRACE_STAGE[role]
+            publish_operator(paths[f'{role}-gate'], gate)
+            record, received = stage(f'{role}-invoked', remaining())
+            need(capture['inspector_window'] in inspector_windows(capture['app']['pid']),
+                 'original Inspector window closed during invocation')
+            failure = validate_invocation(record, capture, gate, trace, received)
+            wait(lambda: replacement_status(victim, expected, redraw_id, authority, committed, anchor,
+                                            record['finished_ns']),
+                 6, 'replacement authority and grid were not observed after stale input')
+            need(tmux_target(lab, expected) == committed['size'], 'stale input changed the runtime grid')
+            ledger(state, BRIDGE_INPUT)
+            return {'capture': capture, 'gate': gate, 'invocation': record, 'trace': failure}
+
+        detached_spectator = invoke_retired('victim', spectator, grid_status['epoch'])
+        writer, writer_grid, writer_ack = acknowledge_capture(
+            'owner', remaining(), (pause['owner_view'], pause['owner_renderer']))
+        need(writer['view_id'] == pause['owner_view'] and writer['renderer_id'] == pause['owner_renderer']
+             and writer['capture_id'] != spectator['capture_id']
+             and writer['inspector_target'] != spectator['inspector_target']
+             and committed_key(writer_grid['event']['status']) == committed_key(grid_status)
+             and detached_spectator['invocation']['finished_ns'] < writer['captured_ns'],
+             'writer capture did not bind the original owner and committed replacement grid')
+        handoff, _ = stage('handoff', remaining())
+        validate_handoff(handoff, owner, victim, writer, writer_ack, redraw_id, expected, anchor)
+        need(not same_process(clients['owner'], process(clients['owner']['pid'])),
+             'retired owner attachment PID still live')
+        retired_writer = invoke_retired('owner', writer, handoff['successor_epoch'])
+        fresh_gate = ns()
+        publish_operator(paths['fresh'], {'run_id': run_id, 'view_id': redraw_id,
+                                         'epoch': handoff['successor_epoch'], 'issued_ns': fresh_gate})
+
+        evidence = wait(lambda: read_if_present(options.native_evidence), remaining(),
+                        'final native evidence was not supplied')
+        samples['final'] = sample_native_apps(apps, artifacts)
+        need(all(record['inspector_window'] in inspector_windows(record['app']['pid'])
+                 for record in (spectator, writer)), 'original Inspector window closed before final evidence')
+        owner.read()
+        victim.read()
         exact(evidence, 'run_id source tree builds pause raw providers')
         need(evidence['run_id'] == run_id and all(evidence[key] == source[key] for key in source)
              and evidence['builds'] == builds and evidence['pause'] == pause,
              'native record belongs to a different run, source, or actual app build')
-        redraw_id = evidence['raw']['redraw']['view_id']
-        native = validate_raw_operator(evidence['raw'], lab, expected, pause, pressure, pre_victim,
-                                       owner, victim, anchor, resume_gate, replacements.get(redraw_id))
-        report['native']['raw_recovery'] = native
+        raw = exact(evidence['raw'], 'recovery handoff detached_spectator retired_writer fresh')
+        need(raw['recovery'] == recovery and raw['handoff'] == handoff
+             and raw['detached_spectator'] == detached_spectator['invocation']
+             and raw['retired_writer'] == retired_writer['invocation'], 'final record changed a staged observation')
+        fresh = exact(raw['fresh'], 'at_ns view_id renderer_id target epoch xterm')
+        need(positive(fresh['at_ns']) and fresh_gate < fresh['at_ns'] <= ns()
+             and fresh['view_id'] == redraw_id and fresh['renderer_id'] == recovery['redraw']['renderer_id']
+             and fresh['target'] == expected and fresh['epoch'] == handoff['successor_epoch']
+             and fresh['xterm'] is True and same_process(replacement, live_process(replacement['pid']))
+             and same_process(original_process, live_process(expected['pid'])),
+             'fresh successor xterm input did not use the authorized replacement')
+        report['native']['raw_recovery'] = {
+            'inspector': raw, 'replacement_client': replacement, 'replacement_grid': replacement_grid,
+            'detached_spectator': detached_spectator, 'retired_writer': retired_writer,
+            'app_samples': samples, 'input_delivery': ledger(state, BRIDGE_INPUT + NATIVE_INPUT),
+        }
         agent = pre_owner['event']['status']['terminal']['agent_epoch']
-        providers = validate_providers(evidence['providers'], lab, anchor, owner, victim,
-                                       evidence['raw']['input']['fresh_ns'], agent)
+        providers = validate_providers(evidence['providers'], lab, anchor, owner, victim, fresh['at_ns'], agent)
         need(all(data['operator']['target'] != expected for data in providers.values()),
              'provider evidence reused the raw fixture')
         report['native']['providers'] = providers
+        verify_artifacts(build, options, 'installed', labs=(lab,))
+        sample_native_apps(apps, artifacts)
         report['native']['outcome'] = 'passed'
 
 
 NATIVE_INSTRUCTIONS = """\
-Use two signed copies of the same local debug executable with distinct bundle
-identifiers. The runner launches the owner first. In both apps select the
-printed raw runtime. Resize the owner once before opening the victim and once
-after the victim attaches. Use the private scoped GRID and PRESSURE records to
-bind both view and renderer IDs. Open the victim Inspector from the HTML
-header to avoid sending mouse input through xterm. If using an operator fetch
-wrapper, capture the original fetch in a lexical const and guard installation
-so rerunning the snippet reuses the wrapper. Verify the ready result confirms
-the wrapper and the exact victim view. If Console output looks stale, switch
-to Sources and back to Console to refresh it before checking that result.
-Require both scoped GRID records to acknowledge the same committed revision
-and grid with no pending boundary before triggering pressure. In the victim
-Inspector choose Sources > Pause script execution. Confirm Immediate Pause
-Requested and enabled Continue and Step. Keep the owner running. Write
-pressure-operator-pause.json with these exact fields:
+Use a fresh disposable checkout of the final clean commit per mode. Use new
+absolute output paths in an existing mode-0700 directory outside the checkout.
+Run each consumer in its producer's checkout. Capture the producer stdout
+directly in a private log and supply its BUILD_RECORD_SHA256 value.
 
-  run_id paused_at_ns owner_view victim_view owner_renderer victim_renderer
-  inspector="immediate_pause_requested" continue_enabled=true
-  step_enabled=true no_pending_boundary=true
+  python3 tests/integration/w1_terminal_pressure.py --controlled-build bridge --build-record "$BRIDGE_RECORD"
+  python3 tests/integration/w1_terminal_pressure.py --build-record "$BRIDGE_RECORD" --build-record-sha256 "$BRIDGE_SHA256" --report "$BRIDGE_REPORT"
+  python3 tests/integration/w1_terminal_pressure.py --controlled-build installed --build-record "$INSTALLED_RECORD" --owner-app "$OWNER_APP" --victim-app "$VICTIM_APP"
+  python3 tests/integration/w1_terminal_pressure.py --build-record "$INSTALLED_RECORD" --build-record-sha256 "$INSTALLED_SHA256" --owner-app "$OWNER_APP" --victim-app "$VICTIM_APP" --native-evidence "$NATIVE_EVIDENCE" --report "$INSTALLED_REPORT"
+  python3 tests/integration/w1_terminal_pressure.py --controlled-build paste --build-record "$PASTE_RECORD" --owner-app "$PASTE_APP"
+  python3 tests/integration/w1_terminal_pressure.py --paste --build-record "$PASTE_RECORD" --build-record-sha256 "$PASTE_SHA256" --owner-app "$PASTE_APP" --paste-native "$PASTE_NATIVE_EVIDENCE" --report "$PASTE_REPORT"
 
-The harness starts the finite flood on receipt. Resize the actual owner during
-the flood, then stop resize proposals. Observe actual owner output ordinals
-RSPROGRESSnnnn across Full (use a non-pausing Inspector logpoint in the owner
-write callback to record these scalars from the xterm buffer after parsing).
-Convert logpoint wall-clock microseconds as mono_ns + (wall_us - clock.wall_us)
-* 1000 using the ready record's clock anchor. Wait for pressure-operator-resume.json. The final screen marker
-is now held and the paused victim's Rust reader/client are gone.
+The paste route stays on HOLD until the prepared workload binds the actual
+probe, each live host process and any launchd copy, and the native executable
+from the signed WebView bundle before provider observations and before cleanup.
+A probe serving as the fixture agent must be observed in both roles. Keep
+prior-build negative fixtures and their provenance separate.
 
-Continue the victim from Sources. Use a breakpoint at the typed-closure branch
-in TerminalView to inspect the retiring view and the parsed chunk. Continue
-through renderer disposal and automatic reconnect. Read RSNATIVEKEPT from the
-replacement xterm before any test input or further resize. Leave the tab open.
-Then make a later healthy owner geometry change to bind the replacement view
-and renderer to a production GRID observation. Close the healthy raw tab
-normally and wait until the replacement owns the runtime. In the victim,
-invoke the existing terminal_acknowledge_grid with the old view ID, renderer
-ID, epoch, revision and size, and terminal_input with the old view ID,
-RS-NATIVE-STALE followed by CR and paste=false. Record the actual errors.
-Confirm the grid is unchanged. Type RS-NATIVE-FRESH and press Enter once in
-the replacement xterm. Do not retype or paste the fresh marker.
+For installed pressure, keep both original apps, windows and Inspectors open
+through the final sample. Open the same raw runtime in the owner and victim.
+Resize from the owner before opening the victim and once after it attaches.
+Bind each role's live view, renderer, target and authority to its private
+PRESSURE attached and GRID lines. The PRESSURE PID is the tmux client.
+The ready record supplies the independently sampled native apps.
 
-For each installed provider, use normal managed create and normal trust/auth
-settings. Bind each real view/renderer with a grid change. Observe the actual
-startup and unsent editing in the owner during an Inspector pause of that
-provider's victim view. Resume the victim without sending any model prompt.
-Keep these processes running for the final live identity sample.
+Write each staged JSON atomically as mode 0600 at its path in ready.stages.
+Use mono_ns + (wall_us - clock.wall_us) * 1000 for wall clock observations.
+After ready, open one undocked Inspector per app from the HTML header,
+outside xterm. Keep the two windows visible. Send inspectors-open with only
+run_id and wait for inspectors, which gives each original window number.
+In each original Inspector use a breakpoint immediately after localClient.read
+returns the production chunk in TerminalView. Capture a live nonwritable chunk
+in the victim before pause. Capture the actual owner's live writable chunk
+after victim recovery and before closing the owner tab. Install this operation
+once on each original page. Supply clock and evidenceScope in a lexical block
+at the breakpoint. evidenceScope has run_id, app copied from ready, renderer_id,
+target, epoch, inspector_window from inspectors and acknowledgement. For the
+victim use the exact GRID renderer object as acknowledgement. For the owner
+use null. Wait for a matching chunk with a status and provider sample.
 
-Write the final --native-evidence JSON only after the observations. Nested
-records use these exact fields (bare names below are JSON keys):
+  (() => {
+    const page = globalThis;
+    if (page.w1Capture) throw Error("Capture already installed");
+    const tauri = page.__TAURI_INTERNALS__;
+    const invoke = tauri.invoke.bind(tauri);
+    const window = tauri.metadata.currentWindow.label;
+    const uuid = () => {
+      const bytes = crypto.getRandomValues(new Uint8Array(16));
+      bytes[6] = (bytes[6] & 15) | 64;
+      bytes[8] = (bytes[8] & 63) | 128;
+      const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+      return [hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16),
+              hex.slice(16, 20), hex.slice(20)].join("-");
+    };
+    const inspector_target = uuid();
+    const capture_id = uuid();
+    const now = () => clock.mono_ns + (Date.now() * 1000 - clock.wall_us) * 1000;
+    const captured_ns = now();
+    const writer = evidenceScope.app.role === "owner";
+    const read_sample_us = chunk.status?.provider?.sampled_at_us;
+    if (chunk.closed || chunk.status?.terminal?.view_id !== view || !read_sample_us ||
+        chunk.writable !== writer ||
+        Boolean(chunk.paste_incarnation) !== writer) throw Error("Wrong live read");
+    const incarnation = writer ? chunk.paste_incarnation : "SPECTATOR_SYNTHETIC_GRANT";
+    const viewId = view;
+    const { acknowledgement, ...identity } = structuredClone(evidenceScope);
+    const bound = { ...identity, view_id: viewId, capture_id, inspector_target, window, read_sample_us };
+    const digestGrant = () => {
+      if (!writer) return null;
+      if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(incarnation))
+        throw Error("Invalid grant shape");
+      const block = new Uint8Array(64);
+      block.set(new TextEncoder().encode(incarnation));
+      block[36] = 128;
+      const input = new DataView(block.buffer);
+      input.setUint32(60, 36 * 8);
+      const words = new Int32Array(64);
+      const rotate = (word, bits) => (word >>> bits) | (word << (32 - bits));
+      for (let i = 0; i < 16; i++) words[i] = input.getInt32(i * 4);
+      for (let i = 16; i < 64; i++) {
+        const left = words[i - 15], right = words[i - 2];
+        words[i] = words[i - 16] + words[i - 7] +
+          (rotate(left, 7) ^ rotate(left, 18) ^ (left >>> 3)) +
+          (rotate(right, 17) ^ rotate(right, 19) ^ (right >>> 10));
+      }
+      const initial = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                       0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+      const rounds = ("428a2f98 71374491 b5c0fbcf e9b5dba5 3956c25b 59f111f1 923f82a4 ab1c5ed5 " +
+        "d807aa98 12835b01 243185be 550c7dc3 72be5d74 80deb1fe 9bdc06a7 c19bf174 " +
+        "e49b69c1 efbe4786 0fc19dc6 240ca1cc 2de92c6f 4a7484aa 5cb0a9dc 76f988da " +
+        "983e5152 a831c66d b00327c8 bf597fc7 c6e00bf3 d5a79147 06ca6351 14292967 " +
+        "27b70a85 2e1b2138 4d2c6dfc 53380d13 650a7354 766a0abb 81c2c92e 92722c85 " +
+        "a2bfe8a1 a81a664b c24b8b70 c76c51a3 d192e819 d6990624 f40e3585 106aa070 " +
+        "19a4c116 1e376c08 2748774c 34b0bcb5 391c0cb3 4ed8aa4a 5b9cca4f 682e6ff3 " +
+        "748f82ee 78a5636f 84c87814 8cc70208 90befffa a4506ceb bef9a3f7 c67178f2")
+        .split(" ").map(word => parseInt(word, 16));
+      let [a, b, c, d, e, f, g, h] = initial;
+      for (let i = 0; i < 64; i++) {
+        const first = h + (rotate(e, 6) ^ rotate(e, 11) ^ rotate(e, 25)) +
+          ((e & f) ^ (~e & g)) + rounds[i] + words[i];
+        const second = (rotate(a, 2) ^ rotate(a, 13) ^ rotate(a, 22)) +
+          ((a & b) ^ (a & c) ^ (b & c));
+        [a, b, c, d, e, f, g, h] = [(first + second) | 0, a, b, c, (d + first) | 0, e, f, g];
+      }
+      return [a, b, c, d, e, f, g, h]
+        .map((word, i) => ((word + initial[i]) >>> 0).toString(16).padStart(8, "0")).join("");
+    };
+    const rejected = async (command, args) => {
+      try { await invoke(command, args); return "unexpected success"; }
+      catch (error) { return error === "View detached" ? error : "unexpected rejection"; }
+    };
+    let used = false;
+    page.w1Capture = Object.freeze({
+      capture: () => ({ ...structuredClone(bound), captured_ns, writable: writer,
+                       acknowledgement: structuredClone(acknowledgement),
+                       grant_sha256: digestGrant() }),
+      invoke: async gate => {
+        if (used || globalThis !== page || page.__TAURI_INTERNALS__ !== tauri ||
+            gate.run_id !== bound.run_id || gate.capture_id !== capture_id ||
+            gate.inspector_target !== inspector_target ||
+            gate.inspector_window !== bound.inspector_window) throw Error("Wrong capture gate");
+        used = true;
+        const invoked_ns = now();
+        const marker = writer ? "RS-WRITER-STALE" : "RS-SPECTATOR-STALE";
+        const data = [...new TextEncoder().encode(marker), 13];
+        const input_result = await rejected("terminal_input", { viewId, incarnation, data, paste: false });
+        const traced_result = writer
+          ? await rejected("terminal_read", { viewId })
+          : await rejected("terminal_acknowledge_grid", { viewId, acknowledgement });
+        return { ...structuredClone(bound), invoked_ns, finished_ns: now(), input_result,
+                 traced_result, traced_stage: writer ? "read" : "acknowledge",
+                 grant_sha256: digestGrant() };
+      }
+    });
+  })()
+
+While still at the breakpoint, save only the output of w1Capture.capture().
+Continue after the corresponding capture acknowledgement. Save only the
+output of await w1Capture.invoke(gate) from that original Inspector. Do not
+reload, reopen the Inspector or copy the closure to another page. The
+synthetic spectator incarnation and real writer grant remain in memory.
+Never print or save the raw chunk or either incarnation.
+
+Send victim-capture and wait for victim-captured before pausing only the
+victim with Sources > Pause script execution. Confirm Immediate Pause
+Requested and enabled Continue and Step. Send pause.
+
+  pause: run_id paused_at_ns owner_view victim_view owner_renderer victim_renderer
+         inspector="immediate_pause_requested" continue_enabled=true
+         step_enabled=true no_pending_boundary=true
+
+Resize the owner during the triggered finite flood and then stop resizing.
+Use a non-pausing logpoint after xterm parses output to observe the owner
+RSPROGRESSnnnn across Full. Wait for resume. Continue the victim to a breakpoint
+at the typed-closure branch. Record the retiring view and closure before
+allowing any replacement attach. Continue through disposal and automatic
+reconnect. Observe RSNATIVEKEPT in the replacement xterm before further resize
+or test input. Resize from the owner again to produce a scoped replacement
+GRID. Send recovery and hold the grid steady until fresh input.
+
+  recovery: resumed_at_ns resumed_controls closure redraw progress
+  closure: view_id at_ns closed writable data_empty status_null geometry_null
+           reason="overflow" high_water=16
+  redraw: view_id renderer_id at_ns marker="RSNATIVEKEPT" revision size
+          automatic old_renderer_disposed tab_preserved old_work_absent
+  progress: before_ns after_ns first_burst last_burst view_id renderer_id
+
+After victim-gate, invoke once in that original Inspector and send
+victim-invoked. Then capture the live owner grant and send owner-capture.
+Wait for owner-captured before closing the raw owner tab normally. Leave
+the original window and Inspector open. Wait for owner cleanup_complete
+and the replacement's writable successor chunk, then send handoff. After
+owner-gate invoke once from the retained closure and send owner-invoked.
+
+  capture: run_id capture_id inspector_target inspector_window window app
+           captured_ns view_id renderer_id target epoch read_sample_us writable
+           grant_sha256 acknowledgement
+  invocation: run_id capture_id inspector_target inspector_window window app
+              view_id renderer_id target epoch read_sample_us grant_sha256 invoked_ns
+              finished_ns input_result traced_result traced_stage
+  handoff: owner_detached_ns authorized_ns successor_epoch
+
+Wait for fresh. Type RS-NATIVE-FRESH and press Enter once in the successor
+xterm. For each installed provider use normal managed create and trust/auth.
+Bind each view and renderer with a grid change. Observe startup and unsent
+editing in the owner during that provider's victim Inspector pause. Resume the
+victim. Submit zero model prompts and keep the provider processes live.
+
+Send the final --native-evidence JSON with these exact fields:
 
   run_id source tree builds pause raw providers
-  builds: copy the exact owner/victim identities from the ready record
-  pause: copy the exact pause record
-  raw: resumed_at_ns resumed_controls closure redraw progress input
-  raw.closure: view_id at_ns closed writable data_empty status_null
-               geometry_null reason="overflow" high_water=16
-  raw.redraw: view_id renderer_id at_ns marker="RSNATIVEKEPT" revision
-              size automatic old_renderer_disposed tab_preserved old_work_absent
-  raw.progress: before_ns after_ns first_burst last_burst view_id renderer_id
-  raw.input: owner_detached_ns authorized_ns stale_ack_ns stale_input_ns fresh_ns
-             old_view_id old_renderer_id ack_epoch ack_revision ack_size
-             ack_result input_result successor_epoch grid_unchanged
+  raw: recovery handoff detached_spectator retired_writer fresh
+  detached_spectator: exact victim-invoked record
+  retired_writer: exact owner-invoked record
+  fresh: at_ns view_id renderer_id target epoch xterm=true
   providers: claude_code codex
   each provider: target paused_ns startup_ns edit_ns resumed_ns owner_view
                  victim_view owner_renderer victim_renderer prompts_submitted=0
                  inspector="immediate_pause_requested" continued
                  trust_auth_unchanged startup_visible unsent_edit_visible
   target: runtime_id generation session window pane pid process_start
-  size, ack_size: cols rows
-  ack_epoch, successor_epoch: agent owner
+  size: cols rows
+  epoch: agent owner
 
-Record monotonic times in nanoseconds. The ready record pairs the Mac monotonic
-clock with the wall-clock timestamps in the native debug records. Record
-observation booleans only after the actual UI/Inspector events. Do not put
-raw terminal content, source snippets, private input bytes, screenshots,
-environment values or broad logs in the submitted records.
-"""
+Keep raw terminal bytes, raw grants, screenshots, environment values and broad
+logs out of the records. Record booleans after observing the corresponding UI.
+""".replace('SPECTATOR_SYNTHETIC_GRANT', SYNTHETIC_INCARNATION)
 
 
-def prove(options, report):
+def prove(options, report, build):
     sys.path.insert(0, str(ROOT / 'scripts'))
     from runtime_lab import Lab
 
-    probe = ROOT / 'target/debug/examples/probe'
-    need(probe.is_file(), 'debug bridge probe is unavailable')
+    probe = Path(build['artifacts']['probe']['path'])
     anchor = sample_clock()
     lab = Lab(w1=True, pressure=True)
     state = lab.state
@@ -1217,8 +1848,14 @@ def prove(options, report):
     report['lab_id'] = lab.id
     report['clock'] = anchor
     try:
+        copied = lab_host_artifact(lab, build)
         with lab:
-            report['build'] = versions(probe, lab.service_host, lab.tmux)
+            report['build'] = versions(build, lab.tmux)
+            report['exercised_artifacts'] = {'launchd_host': copied, 'probe': build['artifacts']['probe']}
+            for role in bundle_roles(report['mode']):
+                report['exercised_artifacts'][role] = build['artifacts'][role]
+            report['agent'] = running_artifact(launchd_agent_pid(lab), copied)
+            observed_processes.append(report['agent'])
             created = lab.call('create', '--cwd', state, '--', sys.executable,
                                Path(__file__).resolve(), '--fixture', state)
             runtime = created['runtime']
@@ -1226,8 +1863,6 @@ def prove(options, report):
             need(positive(pid) and uuid_text(runtime['runtime_id']), 'raw runtime did not start')
             provider = live_process(pid)
             observed_processes.append(provider)
-            report['agent'] = live_process(lab.call('health')['agent_pid'])
-            observed_processes.append(report['agent'])
             wait(lambda: (state / 'pressure-startup.json').exists(), 6, 'startup flood did not finish')
             report['fixture'] = provider
             report['startup'] = workload(state, 'startup')
@@ -1238,7 +1873,7 @@ def prove(options, report):
             need(server['generation'] == expected['generation'], 'tmux generation changed')
             need(same_process(provider, live_process(pid)), 'raw provider process was replaced')
             if options.native_evidence:
-                native_leg(lab, options, report, expected, anchor, provider)
+                native_leg(lab, options, report, expected, anchor, provider, build)
                 observed_processes.extend(data['provider'] for data in report['native']['providers'].values())
             engine = tmux_server(lab)
             need(same_process(server['process'], engine['process']) and
@@ -1247,28 +1882,85 @@ def prove(options, report):
             finished_clock = sample_clock()
             need(abs(mono(finished_clock['wall_us'], anchor) - finished_clock['mono_ns']) <= 50_000_000,
                  'wall and monotonic clocks drifted during evidence collection')
-            need(versions(probe, lab.service_host, lab.tmux) == report['build'],
-                 'source or binaries changed during workload')
+            lab_host_artifact(lab, build, copied)
+            running_artifact(launchd_agent_pid(lab), copied, report['agent'])
+            verify_artifacts(build, options, report['mode'], labs=(lab,))
+            need(digest(Path(lab.tmux)) == report['build']['tmux_sha256'], 'tmux binary changed during workload')
     finally:
+        if not lab.loaded and not lab.cleanup_confirmed and not lab.recovery:
+            lab.close()
         if lab.cleanup_confirmed:
             wait(lambda: all(not same_process(item, process(item['pid'])) for item in observed_processes),
                  5, 'owned fixture or agent process survived lab cleanup')
             report['cleanup'] = 'confirmed'
 
 
-def main():
+def paste_workload(options, report, build, stack, observe):
+    raise ProvenanceHold('prepared paste workload and live artifact observations are unavailable')
+
+
+def prove_paste(options, report, build):
+    artifacts = build['artifacts']
+    original = None
+    selected = None
+
+    def observe(probe_pid, app_pid, hosts, previous=None):
+        need(hosts, 'paste workload requires live host process observations')
+        prior = previous or {}
+        found = {'probe': running_artifact(probe_pid, artifacts['probe'], prior.get('probe')),
+                 'app': running_artifact(app_pid, artifacts['owner']['executable'], prior.get('app'))}
+        copies = {}
+        for pid, (kind, lab) in hosts.items():
+            if kind == 'launchd':
+                artifact = copies[pid] = lab_host_artifact(lab, build, prior.get('copies', {}).get(pid))
+                need(pid == launchd_agent_pid(lab), 'paste launchd copy did not serve the observed agent')
+            elif kind == 'fixture' and pid == probe_pid and lab is None:
+                artifact = artifacts['probe']
+            else:
+                need(kind == 'host' and lab is None, 'unexpected paste host role')
+                artifact = artifacts['host']
+            found[pid] = running_artifact(pid, artifact, prior.get(pid))
+        found['copies'] = copies
+        return found
+
+    def bind(probe_pid, app_pid, hosts):
+        nonlocal original, selected
+        need(original is None, 'paste artifacts already bound')
+        selected = (probe_pid, app_pid, dict(hosts))
+        original = observe(*selected)
+
+    try:
+        with ExitStack() as stack:
+            paste_workload(options, report, build, stack, bind)
+            need(original is not None, 'paste workload did not bind its running artifacts')
+            final = observe(*selected, previous=original)
+            labs = tuple(lab for kind, lab in selected[2].values() if kind == 'launchd')
+            verify_artifacts(build, options, 'paste', labs=labs)
+            report['exercised_artifacts'] = {'initial': original, 'final': final}
+    except ProofError as error:
+        if isinstance(error, ProvenanceHold):
+            raise
+        raise ProvenanceHold(str(error)) from error
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--report', type=Path, help='New private JSON report destination')
     parser.add_argument('--native-evidence', type=Path, help='New same-run Root operator JSON record')
     parser.add_argument('--owner-app', type=Path, help='Signed debug owner application bundle')
     parser.add_argument('--victim-app', type=Path, help='Signed debug victim application bundle')
+    parser.add_argument('--controlled-build', choices=BUILD_MODES, help='Produce a private mode-specific build record')
+    parser.add_argument('--build-record', type=Path, help='Private controlled build record')
+    parser.add_argument('--build-record-sha256', help='Digest retained independently from the producer completion log')
+    parser.add_argument('--paste', action='store_true', help='Use the held paste acceptance route')
+    parser.add_argument('--paste-native', type=Path, help='Private paste operator evidence')
     parser.add_argument('--describe-native', action='store_true', help='Print the native operator sequence and record schema')
     parser.add_argument('--fixture', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--test-record-publication', action='store_true',
                         help='Run the evidence publication regression without starting the lab')
     parser.add_argument('--test-trace-retention', action='store_true',
                         help='Run the diagnostic retention regression without starting the lab')
-    options = parser.parse_args()
+    options = parser.parse_args(argv)
     if options.test_trace_retention:
         test_trace_retention()
         print('Trace retention regression passed.')
@@ -1283,10 +1975,20 @@ def main():
     if options.describe_native:
         print(NATIVE_INSTRUCTIONS)
         return 0
+    if options.controlled_build:
+        if any((options.report, options.native_evidence, options.paste_native, options.paste,
+                options.build_record_sha256)):
+            parser.error('controlled build and acceptance arguments cannot be mixed')
+        try:
+            controlled_build(options)
+        except (OSError, ValueError, TypeError, LookupError, ProofError, subprocess.SubprocessError) as error:
+            print(str(error) if isinstance(error, ProofError) else 'Controlled build evidence incomplete.',
+                  file=sys.stderr)
+            return 1
+        return 0
     if not options.report:
         parser.error('--report is required')
-    if bool(options.owner_app) != bool(options.native_evidence) or bool(options.victim_app) != bool(options.native_evidence):
-        parser.error('--native-evidence requires both --owner-app and --victim-app')
+    mode = 'paste' if options.paste else 'installed' if options.native_evidence else 'bridge'
     if options.native_evidence:
         options.native_evidence = options.native_evidence.absolute()
         if os.path.lexists(options.native_evidence) or not options.native_evidence.parent.is_dir():
@@ -1297,8 +1999,9 @@ def main():
         output_file = private_writer(options.report)
     except OSError:
         parser.error('--report must be a new private output file')
-    report = {'format': 'w1-terminal-pressure-1', 'run_id': str(uuid.uuid4()),
-              'started_ns': ns(), 'bridge': {'outcome': 'owed'}, 'native': {'outcome': 'owed'}}
+    report = {'format': 'w1-terminal-pressure-2', 'run_id': str(uuid.uuid4()),
+              'started_ns': ns(), 'mode': mode, 'bridge': {'outcome': 'owed'},
+              'native': {'outcome': 'owed'}, 'paste': {'outcome': 'owed'}}
     if options.native_evidence:
         report['native_operator_budget_seconds'] = {
             'owner_setup': NATIVE_OWNER_SETUP_SECONDS, 'inspector_setup': NATIVE_INSPECTOR_SETUP_SECONDS,
@@ -1306,8 +2009,22 @@ def main():
         }
     with output_file:
         try:
+            if (bool(options.paste_native) != options.paste or options.paste and options.native_evidence
+                    or any(bool(getattr(options, role + '_app')) != (role in bundle_roles(mode))
+                           for role in ('owner', 'victim'))):
+                raise ProvenanceHold('acceptance arguments do not match the mode')
+            build = verified_build(options, mode)
+            report['build_record_sha256'] = options.build_record_sha256
             need(sys.platform == 'darwin', 'pressure acceptance requires a logged-in Mac')
-            prove(options, report)
+            if mode == 'paste':
+                prove_paste(options, report, build)
+            else:
+                prove(options, report, build)
+            verify_artifacts(build, options, mode)
+            report['provenance'] = 'verified'
+        except ProvenanceHold as error:
+            report['failure'] = str(error)
+            report['provenance'] = 'hold'
         except ProofError as error:
             report['failure'] = str(error)
             if str(error) == 'overflow not reached in actual victim WebView':
@@ -1317,9 +2034,9 @@ def main():
         except (OSError, ValueError, TypeError, LookupError, RuntimeError, sqlite3.Error, subprocess.SubprocessError):
             report['failure'] = 'fixture, command, or evidence record was unavailable or malformed'
         report['finished_ns'] = ns()
+        legs = {'bridge': ('bridge',), 'installed': ('bridge', 'native'), 'paste': ('paste',)}[mode]
         report['passed'] = ('failure' not in report and report.get('cleanup') == 'confirmed'
-                            and report['bridge']['outcome'] == 'passed'
-                            and (options.native_evidence is None or report['native']['outcome'] == 'passed'))
+                            and all(report[leg]['outcome'] == 'passed' for leg in legs))
         json.dump(report, output_file, indent=2)
         output_file.write('\n')
     print('Pressure report complete.' if report['passed'] else 'Pressure evidence incomplete.', flush=True)
