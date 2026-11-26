@@ -14,7 +14,7 @@ const lock = JSON.parse(readFileSync(resolve(repoRoot, "package-lock.json"), "ut
 };
 const runtimeModules = ["@tauri-apps/api", "@xterm/xterm", "@xterm/addon-fit", "react", "react-dom", "scheduler"];
 const assetAttributes = new Set([
-  "src", "href", "xlink:href", "srcset", "imagesrcset", "poster", "data", "action",
+  "src", "href", "xlink:href", "xlinkhref", "srcset", "imagesrcset", "poster", "data", "action",
   "formaction", "background", "style",
 ]);
 const srcSetAttributes = new Set(["srcset", "imagesrcset"]);
@@ -96,13 +96,102 @@ function assertAssetAttribute(name: string, value: string) {
   }
 }
 
-function assertJsxAssets(source: string, id: string) {
+function inlineProperties(object: ts.ObjectLiteralExpression, context: string) {
+  return object.properties.map(property => {
+    if ((ts.isPropertyAssignment(property) || ts.isShorthandPropertyAssignment(property))
+        && (ts.isIdentifier(property.name) || ts.isStringLiteral(property.name)
+          || ts.isNumericLiteral(property.name))) {
+      return {
+        name: property.name.text.toLowerCase(),
+        value: ts.isPropertyAssignment(property) ? property.initializer : property.name,
+      };
+    }
+    throw new Error(`Opaque ${context} props are forbidden in the offline fixture`);
+  });
+}
+
+function bundledUrl(value: ts.Expression) {
+  if (!ts.isPropertyAccessExpression(value) || value.name.text !== "href") return;
+  const url = value.expression;
+  if (!ts.isNewExpression(url) || !ts.isIdentifier(url.expression) || url.expression.text !== "URL"
+      || url.arguments?.length !== 2) return;
+  const [path, base] = url.arguments;
+  if (path && ts.isStringLiteralLike(path) && base && ts.isPropertyAccessExpression(base)
+      && base.name.text === "url" && ts.isMetaProperty(base.expression)
+      && base.expression.keywordToken === ts.SyntaxKind.ImportKeyword
+      && base.expression.name.text === "meta") return path.text;
+}
+
+function assertReactAssets(props: ts.Expression | undefined) {
+  if (!props || props.kind === ts.SyntaxKind.NullKeyword) return;
+  if (!ts.isObjectLiteralExpression(props)) {
+    throw new Error("Opaque React props are forbidden in the offline fixture");
+  }
+  for (const { name, value } of inlineProperties(props, "React")) {
+    if (!assetAttributes.has(name)) continue;
+    if (name === "style") {
+      if (value.kind === ts.SyntaxKind.NullKeyword) continue;
+      if (!ts.isObjectLiteralExpression(value)) {
+        throw new Error("Opaque React style props are forbidden in the offline fixture");
+      }
+      for (const { value: declaration } of inlineProperties(value, "React style")) {
+        if (ts.isStringLiteralLike(declaration)) assertAssetAttribute(name, declaration.text);
+        else if (!ts.isNumericLiteral(declaration) && declaration.kind !== ts.SyntaxKind.NullKeyword) {
+          throw new Error("Dynamic React asset reference is forbidden in the offline fixture: style");
+        }
+      }
+      continue;
+    }
+    if (ts.isStringLiteralLike(value)) {
+      assertAssetAttribute(name, value.text);
+      continue;
+    }
+    const url = bundledUrl(value);
+    if (url !== undefined) {
+      assertLocal(url);
+      if (!srcSetAttributes.has(name) && /^\.\.?\//.test(url)) continue;
+    }
+    throw new Error(`Dynamic React asset reference is forbidden in the offline fixture: ${name}`);
+  }
+}
+
+function assertSourceAssets(source: string, id: string) {
   const scriptKind = /\.(?:m|c)?tsx$/i.test(id) ? ts.ScriptKind.TSX
     : /\.(?:m|c)?jsx$/i.test(id) ? ts.ScriptKind.JSX
       : /\.(?:m|c)?ts$/i.test(id) ? ts.ScriptKind.TS : ts.ScriptKind.JS;
   const file = ts.createSourceFile(id, source, ts.ScriptTarget.Latest, true, scriptKind);
+  const reactObjects = new Set<string>();
+  const reactFactories = new Set<string>();
+  for (const statement of file.statements) {
+    if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier)
+        || statement.moduleSpecifier.text !== "react") continue;
+    const clause = statement.importClause;
+    if (!clause || clause.isTypeOnly) continue;
+    if (clause.name) reactObjects.add(clause.name.text);
+    const bindings = clause.namedBindings;
+    if (!bindings) continue;
+    if (ts.isNamespaceImport(bindings)) reactObjects.add(bindings.name.text);
+    else {
+      for (const binding of bindings.elements) {
+        if (binding.isTypeOnly) continue;
+        const imported = (binding.propertyName ?? binding.name).text;
+        if (imported === "createElement") reactFactories.add(binding.name.text);
+        if (imported === "default") reactObjects.add(binding.name.text);
+      }
+    }
+  }
 
   function visit(node: ts.Node) {
+    if (ts.isCallExpression(node)) {
+      const callee = node.expression;
+      const [tag, props] = node.arguments;
+      if (tag && ts.isStringLiteralLike(tag)
+          && ((ts.isIdentifier(callee) && reactFactories.has(callee.text))
+            || (ts.isPropertyAccessExpression(callee) && callee.name.text === "createElement"
+              && ts.isIdentifier(callee.expression) && reactObjects.has(callee.expression.text)))) {
+        assertReactAssets(props);
+      }
+    }
     if (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) {
       for (const attribute of node.attributes.properties) {
         if (ts.isJsxSpreadAttribute(attribute)) {
@@ -211,7 +300,7 @@ function guardFixtureBundle(): Plugin {
         } else if (/\.[cm]?[jt]sx?(?:$|\?)/i.test(id) && isAbsolute(id)) {
           const file = id.split("?", 1)[0];
           if (file === undefined || !existsSync(file) || !inside(appRoot, realpathSync(file))) return;
-          assertJsxAssets(source, file);
+          assertSourceAssets(source, file);
           for (const match of source.matchAll(/\bnew\s+URL\s*\(\s*(["'`])([^"'`]*)\1/g)) {
             const url = match[2];
             if (url !== undefined) assertLocal(url);

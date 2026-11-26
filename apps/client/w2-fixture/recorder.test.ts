@@ -108,10 +108,11 @@ test("bounded recorder serializes input and rejects overflow", async t => {
   });
 
   for (const [name, queued, extra, message] of [
-    ["event capacity", Array.from({ length: 255 }, () => "a"), "b", /capacity/i],
-    ["byte capacity", [...Array.from({ length: 15 }, () => "ї".repeat(512)), "a".repeat(1022)], "b", /capacity/i],
-    ["oversized event", [], "ї".repeat(512) + "b", /event/i],
-    ["empty event", [], "", /event/i],
+    ["event capacity", Array.from({ length: 255 }, () => "a"), "b", "Pending input capacity exceeded"],
+    ["byte capacity", [...Array.from({ length: 15 }, () => "ї".repeat(512)), "a".repeat(1022)], "b",
+      "Pending input capacity exceeded"],
+    ["oversized event", [], "ї".repeat(512) + "b", "Invalid input event size"],
+    ["empty event", [], "", "Invalid input event size"],
   ] as const) {
     await t.test(name, async () => {
       const fixture = await mountRecorder();
@@ -123,8 +124,7 @@ test("bounded recorder serializes input and rejects overflow", async t => {
         assert.equal(fixture.appends.length, 1);
         assert.equal(fixture.alert(), "", "the exact retained capacity is valid");
         await fixture.input(extra);
-        assert.match(fixture.alert(), /invalid attempt/i);
-        assert.match(fixture.alert(), message);
+        assert.equal(fixture.alert(), `Held: ${message}`);
         await fixture.accept(0);
         assert.equal(fixture.appends.length, 1, "overflow discards unsent work");
         await fixture.click("Read");
@@ -137,7 +137,14 @@ test("bounded recorder serializes input and rejects overflow", async t => {
 });
 
 test("invoke failure retires pending input without replay", async t => {
-  for (const mode of ["rejection", "missing", "malformed", "sequence", "generation", "timeout"] as const) {
+  for (const [mode, message] of [
+    ["rejection", "native rejected append"],
+    ["missing", "Error: Invalid append acknowledgment"],
+    ["malformed", "Error: Invalid append acknowledgment"],
+    ["sequence", "Error: Invalid append acknowledgment"],
+    ["generation", "Error: Invalid append acknowledgment"],
+    ["timeout", "Error: Local invoke timed out"],
+  ] as const) {
     await t.test(mode, async subtest => {
       const fixture = await mountRecorder();
       try {
@@ -163,7 +170,7 @@ test("invoke failure retires pending input without replay", async t => {
               break;
           }
         });
-        assert.match(fixture.alert(), /invalid attempt/i);
+        assert.equal(fixture.alert(), `Held: ${message}`);
         assert.equal(fixture.appends.length, 2);
         const lateRead = deferred();
         if (mode === "missing") {
