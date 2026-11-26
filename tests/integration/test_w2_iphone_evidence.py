@@ -653,6 +653,20 @@ class EvidenceTest(unittest.TestCase):
         repeat["recovery"]["restart"]["ref"] = "different synthetic restart reference"
         self.reject(report, "native attempt or generation is reused")
 
+    def test_fresh_recovery_cannot_reuse_a_bound_before_identity(self):
+        case = self.cases["app-switch"]
+        first = self.sample(case["id"])
+        second = add_attempt(self.baseline, case, "fresh")
+        report = report_for(self.baseline, support=[first["id"], second["id"]])
+        recovery = second["recovery"]
+        for record in (recovery["before"], recovery["retained"], recovery["restart"]["previous"]):
+            record.update(attemptId=first["attemptId"], generation=first["generation"])
+        self.reject(report, f"{first['id']}: expected inconclusive .*is reused")
+        mark(first, "inconclusive")
+        self.reject(report, f"{second['id']}: expected inconclusive .*is reused")
+        mark(second, "inconclusive")
+        self.validate(report_for(self.baseline, "inconclusive", "inconclusive", []), "inconclusive")
+
     def test_fresh_recovery_requires_greater_generation_and_exact_input(self):
         row = self.sample("lock-foreground")
         report = report_for(self.baseline, "inconclusive", "inconclusive", [])
@@ -776,12 +790,63 @@ class EvidenceTest(unittest.TestCase):
 
         early.update(launch_ref="conflicting capture", attemptId=later[0]["attemptId"],
                      generation=later[0]["generation"], recovery=copy.deepcopy(later[0]["recovery"]))
+        early["recovery"]["before"].update(attemptId=later[1]["attemptId"], generation=later[1]["generation"])
         self.validate(report, "pass")
         early["status"] = "pass"
         self.reject(report, "does not match its retained launch and measurement")
         mark(early, "inconclusive")
         support[support.index(later[0]["id"])] = early["id"]
         self.reject(report, "disposition must reference the attempts that establish it")
+
+    def test_partially_bound_retained_counters_disqualify_later_passes(self):
+        case = self.cases["english-return"]
+        for native_id, generation, diagnostic in (
+            (4, 4, "is reused"),
+            (4, 2, "is reused"),
+            (2, 4, "is reused"),
+            (5, 2, "is out of order"),
+            (2, 5, "is out of order"),
+        ):
+            with self.subTest(attemptId=native_id, generation=generation):
+                cohort = bound_cohort()
+                make_recipes(cohort, self.cases)
+                early = add_attempt(cohort, case, "partial")
+                report = self.complete(cohort)
+                reused, fresh = [row for row in cohort["attempts"][1:] if row["case_id"] == case["id"]]
+                cohort["launches"][0]["measurements"][0].update(attemptId=native_id, generation=generation)
+                early.pop("launch_ref")
+                mark(early, "inconclusive")
+                report["decision"]["supporting_attempt_ids"].remove(early["id"])
+                self.reject(report, f"{reused['id']}: expected inconclusive .*{diagnostic}")
+
+                mark(reused, "inconclusive")
+                self.reject(report, "report status must be inconclusive")
+                held = report_for(cohort, "inconclusive", "inconclusive", [])
+                self.validate(held, "inconclusive")
+                self.reject(report_for(cohort, "inconclusive", "inconclusive", [reused["id"], fresh["id"]]),
+                            "disposition must reference the attempts that establish it")
+
+    def test_reused_partial_identity_cannot_support_failure_reproduction(self):
+        case = self.cases["english-return"]
+        early = self.sample(case["id"])
+        reused = add_attempt(self.baseline, case, "reused")
+        fresh = add_attempt(self.baseline, case, "fresh")
+        self.baseline["launches"][0]["measurements"][0].update(attemptId=reused["attemptId"],
+                                                              generation=reused["generation"])
+        early.pop("launch_ref")
+        mark(early, "inconclusive")
+        for row in (reused, fresh):
+            row["observations"]["cursor_visible"] = False
+            mark(row, "failing")
+        report = report_for(self.baseline, "failing", "mandatory-failure", [reused["id"], fresh["id"]])
+        self.reject(report, f"{reused['id']}: expected inconclusive .*is reused")
+        mark(reused, "inconclusive")
+        report["decision"]["supporting_attempt_ids"].remove(reused["id"])
+        self.validate(report, "failing")
+        report["correction"] = {"case_id": case["id"], "layer": "synthetic viewport layer",
+                                "change": "synthetic scoped correction", "scope": ["synthetic source path"],
+                                "baseline_attempt_ids": [reused["id"], fresh["id"]]}
+        self.reject(report, "correction requires the same unresolved measured failure twice")
 
     def test_later_and_unpositioned_partial_rows_still_hold_the_case(self):
         self.complete(self.baseline)
