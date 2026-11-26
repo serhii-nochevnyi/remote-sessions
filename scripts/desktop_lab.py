@@ -9,8 +9,7 @@ import stat
 import sys
 from pathlib import Path
 
-from runtime_lab import (Lab, ROOT, W1_ID, W1Record, private_path, run,
-                         write_w1_manifest)
+from runtime_lab import Lab, ROOT, W1_ID, W1Record, close_w1, private_path, run
 
 MANIFEST = ROOT / '.cache/desktop-lab.json'
 W1_MANIFEST = ROOT / '.cache/desktop-lab-w1.json'
@@ -48,12 +47,9 @@ def fixture_client_state(lab, name):
 
 
 def start_w1():
-    if os.path.lexists(W1_MANIFEST):
-        raise SystemExit('W1 desktop lab already recorded; run down --w1 first')
-    lab = Lab(w1=True).start()
+    lab = Lab(w1=True, manifest=W1_MANIFEST).start()
     try:
-        record = dict(lab.w1_record(), runtimes=[seed_legacy(lab)])
-        write_w1_manifest(W1_MANIFEST, record)
+        record = lab.publish_w1_manifest(runtimes=[seed_legacy(lab)])
     except (Exception, KeyboardInterrupt):
         lab.close()
         raise
@@ -88,7 +84,7 @@ def main():
         if args.action == 'up':
             start_w1()
         elif args.action == 'down':
-            W1Record(manifest, fixture=args.fixture, stopping=True).close()
+            close_w1(manifest, fixture=args.fixture)
             print('W1 desktop lab stopped.')
         else:
             lab = W1Record(manifest, fixture=args.fixture)

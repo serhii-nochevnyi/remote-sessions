@@ -34,8 +34,7 @@ from uuid import UUID, uuid4
 from runtime_lifecycle import ROOT, Viewer, run, wait_for
 from desktop_lab import (FIXTURE_MANIFEST, W1_MANIFEST, app_binary,
                          fixture_client_state, seed_legacy)
-from runtime_lab import (CATALOG_DB, Lab, W1Record, catalog_message,
-                         internal_device, private_path, write_w1_manifest)
+from runtime_lab import CATALOG_DB, Lab, W1Record, catalog_message, internal_device, private_path
 
 REQUEST_LIMIT = 65_536
 RESPONSE_LIMIT = 1_048_576
@@ -295,7 +294,7 @@ def install_fixture(lab):
 def fixture_jobs():
     require(not os.path.lexists(FIXTURE_MANIFEST),
             'Earlier fixture recorded. Close its app and run desktop_lab.py down --w1 --fixture')
-    lab = Lab(w1=True, fixture=True)
+    lab = Lab(w1=True, fixture=True, manifest=FIXTURE_MANIFEST)
     try:
         install_fixture(lab)
     except (Exception, KeyboardInterrupt):
@@ -303,15 +302,10 @@ def fixture_jobs():
         raise
     lab.start()
     try:
-        write_w1_manifest(FIXTURE_MANIFEST, lab.w1_record())
-    except Exception:
-        lab.close()
-        raise
-    fixture = W1Record(FIXTURE_MANIFEST, fixture=True)
-    try:
-        yield fixture
+        lab.publish_w1_manifest()
+        yield W1Record(FIXTURE_MANIFEST, fixture=True)
     finally:
-        fixture.close()
+        lab.close()
 
 
 def product(lab, op, **fields):
