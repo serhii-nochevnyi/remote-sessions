@@ -149,7 +149,7 @@ function assertReactAssets(props: ts.Expression | undefined) {
     const url = bundledUrl(value);
     if (url !== undefined) {
       assertLocal(url);
-      if (!srcSetAttributes.has(name) && /^\.\.?\//.test(url)) continue;
+      if (!srcSetAttributes.has(name) && (url.startsWith("./") || url.startsWith("../"))) continue;
     }
     throw new Error(`Dynamic React asset reference is forbidden in the offline fixture: ${name}`);
   }
