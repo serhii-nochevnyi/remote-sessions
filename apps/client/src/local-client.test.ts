@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { localClient, parseInventory, parseAttachment, parseChunk, parseCreateSubmission, TerminalViewScope } from "./local-client.ts";
+import { localClient, parseInventory, parseAttachment, parseChunk, parseCreateSubmission, TerminalDelivery, TerminalViewScope } from "./local-client.ts";
 import type { GeometryEvent, TerminalStatus } from "./local-client.ts";
 import { OrderedGeometry } from "./terminal-geometry.ts";
 import { closeView, openView } from "./session-state.ts";
@@ -102,15 +102,26 @@ const nativeRejection = {
 
 for (const successorFirst of [false, true]) {
   for (const [label, rejection, recover] of [
-    ["definite native rejection", nativeRejection, true],
-    ["transport uncertainty", Error("Input outcome unknown"), false],
+    ["definite native grant-gap rejection", nativeRejection, true],
+    ["post-dispatch transport uncertainty", Error("Input outcome unknown; input was not retried"), false],
     ["host error with the same message", "Керування змінилося", false],
     ["serialized string lookalike", JSON.stringify(nativeRejection), false],
+    ["Error object lookalike", Object.assign(Error("Керування змінилося"), nativeRejection), false],
+    ["Error object with unreadable description", Object.assign(Error(), nativeRejection, {
+      toString() { throw Error("unreadable"); },
+    }), false],
+    ["object with inherited metadata", Object.create(nativeRejection), false],
+    ["object with an accessor", { ...nativeRejection, get reason() { return "stale_input"; } }, false],
+    ["missing fields", { reason: "stale_input", view_id: id, rejection_id: nativeRejection.rejection_id }, false],
     ["wrong view", { ...nativeRejection, view_id: freshId }, false],
     ["invalid identity", { ...nativeRejection, rejection_id: "00000000-0000-0000-0000-000000000000" }, false],
+    ["wrong rejection UUID version", { ...nativeRejection, rejection_id: "33333333-3333-1333-8333-333333333333" }, false],
+    ["noncanonical rejection UUID", { ...nativeRejection, rejection_id: "3333333A-3333-4333-8333-333333333333" }, false],
     ["invalid event time", { ...nativeRejection, event_time_us: 0 }, false],
+    ["unsafe event time", { ...nativeRejection, event_time_us: Number.MAX_SAFE_INTEGER + 1 }, false],
     ["unrecognized reason", { ...nativeRejection, reason: "attachment_changed" }, false],
     ["extra fields", { ...nativeRejection, incarnation: id }, false],
+    ["hidden extra fields", Object.defineProperty({ ...nativeRejection }, "incarnation", { value: id }), false],
   ] as const) {
     test(`${label} with successor ${successorFirst ? "already observed" : "observed after rejection"}`, async t => {
       const first = deferred<void>();
@@ -132,6 +143,7 @@ for (const successorFirst of [false, true]) {
         if (original) Object.defineProperty(globalThis, "window", original);
         else Reflect.deleteProperty(globalThis, "window");
       });
+      const delivery = new TerminalDelivery();
       const scope = new TerminalViewScope({
         input: (viewId, data, incarnation) => localClient.input({ viewId, data, incarnation }),
         inputFailure: error => failures.push(error),
@@ -144,31 +156,51 @@ for (const successorFirst of [false, true]) {
         },
         retire: () => {},
         reconnect: () => {},
+      }, delivery);
+      const snapshot = (incarnation: string) => parseChunk({
+        ...liveChunk, status: null, geometry: null, paste_incarnation: incarnation,
       });
-      const successor = { ...liveChunk, paste_incarnation: freshId };
+      const predecessor = snapshot(id);
+      const successor = snapshot(freshId);
       assert.ok(scope.bind(id));
-      await scope.consume(id, liveChunk, async () => {});
+      await scope.consume(id, predecessor, async () => {});
       const sending = scope.send(new Uint8Array(4097).fill(1));
       const queuedKey = scope.send(Uint8Array.of(2));
       const queuedPaste = scope.paste(Uint8Array.of(3));
       await Promise.resolve();
       assert.equal(sent.length, 1);
-      if (successorFirst) await scope.consume(id, successor, async () => {});
+      let freshKey: Promise<void> | undefined;
+      if (successorFirst) {
+        await scope.consume(id, successor, async () => {});
+        freshKey = scope.send(Uint8Array.of(4));
+        assert.equal(sent.length, 1);
+      }
       first.reject(rejection);
       await Promise.all([sending, queuedKey, queuedPaste]);
       assert.equal(scope.canWrite, recover && successorFirst);
-      assert.equal(sent.length, 1);
       assert.deepEqual(revoked, recover ? [successorFirst] : []);
       assert.deepEqual(failures, recover ? [] : [rejection]);
-      if (!successorFirst) {
-        for (let repeat = 0; repeat < 2; repeat++) {
-          await scope.consume(id, liveChunk, async () => {});
-          assert.equal(scope.canWrite, false);
-        }
+      for (let repeat = 0; repeat < 2; repeat++) {
+        await scope.consume(id, predecessor, async () => {});
+        assert.equal(scope.canWrite, recover && successorFirst);
       }
       await scope.consume(id, successor, async () => {});
       assert.equal(scope.canWrite, recover);
-      await scope.send(Uint8Array.of(4));
+      await (freshKey ?? scope.send(Uint8Array.of(4)));
+      if (!recover) {
+        scope.retire();
+        const reconnected = new TerminalViewScope({
+          input: (viewId, data, incarnation) => localClient.input({ viewId, data, incarnation }),
+          inputFailure: error => assert.fail(String(error)),
+          retire: () => {},
+          reconnect: () => {},
+        }, delivery);
+        assert.ok(reconnected.bind(freshId));
+        await reconnected.consume(freshId, snapshot(nativeRejection.rejection_id), async () => {});
+        assert.equal(reconnected.canWrite, false);
+        assert.equal(delivery.mayRestore, false);
+        await reconnected.send(Uint8Array.of(5));
+      }
       assert.deepEqual(sent, [
         { viewId: id, data: new Array(4096).fill(1), incarnation: id },
         ...(recover ? [{ viewId: id, data: [4], incarnation: freshId }] : []),
@@ -226,7 +258,11 @@ test("a typed rejection from another scoped invoke cannot retire this grant", as
     else Reflect.deleteProperty(globalThis, "window");
   });
   let rejection: unknown;
-  await assert.rejects(localClient.input({ viewId: id, incarnation: id, data: [1] }), error => {
+  const input = { viewId: id, incarnation: id, data: [1] };
+  const pending = localClient.input(input);
+  input.viewId = freshId;
+  input.incarnation = freshId;
+  await assert.rejects(pending, error => {
     rejection = error;
     return error instanceof Error && error.message === "Керування змінилося";
   });
