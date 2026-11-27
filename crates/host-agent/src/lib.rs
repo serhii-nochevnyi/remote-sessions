@@ -329,7 +329,15 @@ pub async fn serve_catalog_fixture(
     catalog: PathBuf,
     service_path: &std::ffi::OsStr,
 ) -> Result<()> {
-    serve_catalog_fixture_with(directory, tmux, catalog, service_path, catalog::provision).await
+    serve_catalog_fixture_with(
+        directory,
+        tmux,
+        catalog,
+        service_path,
+        catalog::provision,
+        None,
+    )
+    .await
 }
 
 #[cfg(debug_assertions)]
@@ -339,14 +347,16 @@ async fn serve_catalog_fixture_with(
     catalog: PathBuf,
     service_path: &std::ffi::OsStr,
     provision: impl FnOnce(&Path) -> Result<(), ProductIssue>,
+    busy: Option<catalog::FixtureBusyObserver>,
 ) -> Result<()> {
     let guard = Arc::new(AgentLock::acquire(&directory)?);
     provision(&catalog).map_err(|issue| anyhow::anyhow!("fixture catalog: {issue:?}"))?;
-    let lane = start_catalog_worker(
-        &guard,
-        move || Ok(catalog),
+    let lane = CatalogLane::start_fixture(
+        catalog_directory_with_guard(Arc::clone(&guard), move || Ok(catalog)),
         ServiceProfiles::new(Some(service_path)),
-    );
+        busy,
+    )
+    .await?;
     serve_local(
         Engine::new(tmux, directory.join("tmux.sock")),
         guard,
@@ -360,17 +370,23 @@ fn start_catalog_worker(
     open_directory: impl FnOnce() -> Result<PathBuf> + Send + 'static,
     profiles: ServiceProfiles,
 ) -> CatalogLane {
-    let guard = Arc::clone(guard);
     CatalogLane::start(
-        move || {
-            thread_local! {
-                static AGENT_LOCK: Cell<Option<Arc<AgentLock>>> = const { Cell::new(None) };
-            }
-            AGENT_LOCK.set(Some(guard));
-            open_directory()
-        },
+        catalog_directory_with_guard(Arc::clone(guard), open_directory),
         profiles,
     )
+}
+
+fn catalog_directory_with_guard(
+    guard: Arc<AgentLock>,
+    open_directory: impl FnOnce() -> Result<PathBuf> + Send + 'static,
+) -> impl FnOnce() -> Result<PathBuf> + Send + 'static {
+    move || {
+        thread_local! {
+            static AGENT_LOCK: Cell<Option<Arc<AgentLock>>> = const { Cell::new(None) };
+        }
+        AGENT_LOCK.set(Some(guard));
+        open_directory()
+    }
 }
 
 async fn dispatch(
@@ -568,6 +584,13 @@ mod tests {
             ),
         );
         let search = std::env::join_paths([Path::new("."), root]).unwrap();
+        w1_create_tests::wait_lock_release(
+            &catalog_dir.join("catalog.lock"),
+            Duration::from_secs(3),
+            || {},
+        )
+        .await
+        .expect("catalog ownership did not release");
         let fixture_catalog = catalog_dir.clone();
         let mut server = tokio::spawn(serve_with_catalog_directory(
             root.to_owned(),

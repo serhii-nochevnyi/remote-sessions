@@ -5,13 +5,13 @@ use crate::{
         CreateState, ObservationState, PaneLiveness, PasteBinding, PasteResult, ProviderProfile,
         RuntimeOrigin, TerminalSize, TerminalStatus, tmux_name,
     },
-    product_launch::{LAUNCH_COMMAND, LaunchGuard, NONCE_ENV, read_setup_fault},
+    product_launch::{LAUNCH_COMMAND, LaunchGuard, NONCE_ENV, read_setup_fault, resolve_workspace},
 };
 use std::{
     fs::TryLockError,
     io::{Error, ErrorKind},
 };
-use tokio::task::JoinHandle;
+use tokio::{sync::mpsc, task::JoinHandle};
 use uuid::Uuid;
 
 const TMUX: &str = r##"#!/bin/sh
@@ -249,6 +249,15 @@ struct Fixture {
     root: PathBuf,
     catalog: PathBuf,
     workspace: PathBuf,
+    catalog_busy: Option<mpsc::Sender<()>>,
+}
+
+struct FixtureServer(JoinHandle<Result<()>>);
+
+impl Drop for FixtureServer {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl Fixture {
@@ -270,16 +279,23 @@ impl Fixture {
             root,
             catalog,
             workspace,
+            catalog_busy: None,
         }
     }
 
-    fn lane(&self) -> CatalogLane {
+    async fn lane(&self) -> CatalogLane {
         let catalog = self.catalog.clone();
         let path = std::env::join_paths([&self.root]).unwrap();
-        CatalogLane::start(move || Ok(catalog), ServiceProfiles::new(Some(&path)))
+        let busy = self
+            .catalog_busy
+            .clone()
+            .map(|observed| (catalog.clone(), observed));
+        CatalogLane::start_fixture(move || Ok(catalog), ServiceProfiles::new(Some(&path)), busy)
+            .await
+            .expect("fixture catalog worker did not report startup")
     }
 
-    async fn serve(&self, lane: CatalogLane) -> JoinHandle<Result<()>> {
+    async fn serve(&self, lane: CatalogLane) -> FixtureServer {
         self.serve_engine(self.engine(), lane).await
     }
 
@@ -287,20 +303,23 @@ impl Fixture {
         Engine::new(self.root.join("tmux"), self.root.join("tmux.sock"))
     }
 
-    async fn serve_engine(&self, engine: Engine, lane: CatalogLane) -> JoinHandle<Result<()>> {
-        let job = tokio::spawn(serve_local(
+    async fn serve_engine(&self, engine: Engine, lane: CatalogLane) -> FixtureServer {
+        let job = FixtureServer(tokio::spawn(serve_local(
             engine,
             Arc::new(AgentLock::acquire(&self.root).unwrap()),
             Some(lane),
-        ));
+        )));
         self.wait_listening(&job).await;
         job
     }
 
-    async fn wait_listening(&self, job: &JoinHandle<Result<()>>) {
+    async fn wait_listening(&self, job: &FixtureServer) {
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                assert!(!job.is_finished(), "fixture agent stopped before readiness");
+                assert!(
+                    !job.0.is_finished(),
+                    "fixture agent stopped before readiness"
+                );
                 match request(&self.root, &Request::Health {}).await {
                     Ok(Response::Health {
                         agent_pid,
@@ -325,20 +344,38 @@ impl Fixture {
         .expect("fixture agent did not answer health within three seconds");
     }
 
-    async fn restart(&self, job: JoinHandle<Result<()>>) -> JoinHandle<Result<()>> {
+    async fn restart(&self, job: FixtureServer) -> FixtureServer {
         stop(job).await;
         self.wait_restart_released().await;
-        self.serve(self.lane()).await
+        self.serve(self.lane().await).await
     }
 
     async fn wait_restart_released(&self) {
         let timeout = Duration::from_secs(3);
-        wait_lock_release(&self.catalog.join("catalog.lock"), timeout, || {})
-            .await
-            .expect("catalog ownership did not release");
         wait_lock_release(&self.root.join("agent.lock"), timeout, || {})
             .await
             .expect("agent ownership did not release");
+    }
+
+    async fn wait_catalog_released(&self) {
+        wait_lock_release(
+            &self.catalog.join("catalog.lock"),
+            Duration::from_secs(3),
+            || {},
+        )
+        .await
+        .expect("catalog ownership did not release");
+    }
+
+    async fn hold_catalog(&self) -> File {
+        self.wait_catalog_released().await;
+        let holder = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.catalog.join("catalog.lock"))
+            .unwrap();
+        holder.try_lock().expect("could not hold fixture catalog");
+        holder
     }
 
     fn buffer_snapshot(&self) -> (std::collections::BTreeMap<String, Vec<u8>>, Vec<u8>) {
@@ -429,7 +466,7 @@ impl Fixture {
     }
 }
 
-async fn wait_lock_release(
+pub(super) async fn wait_lock_release(
     path: &Path,
     timeout: Duration,
     mut on_contention: impl FnMut(),
@@ -449,9 +486,15 @@ async fn wait_lock_release(
     .map_err(|_| Error::new(ErrorKind::TimedOut, "fixture lock remained owned"))?
 }
 
-async fn stop(job: JoinHandle<Result<()>>) {
-    job.abort();
-    assert!(job.await.unwrap_err().is_cancelled());
+async fn stop(mut job: FixtureServer) {
+    job.0.abort();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), &mut job.0)
+            .await
+            .expect("fixture agent did not stop")
+            .unwrap_err()
+            .is_cancelled()
+    );
 }
 
 fn observation_pty() -> (File, File, String) {
@@ -566,7 +609,7 @@ async fn w1_create_guarded_paste_probe() {
     let unrelated = "rs-paste-11111111111111111111111111111111";
     fixture.set(&format!("buffers/{unrelated}"), b"unrelated");
     fixture.set("corrupt-buffer-readback", b"");
-    let lane = fixture.lane();
+    let lane = fixture.lane().await;
     let job = fixture
         .serve_engine(fixture.engine().with_fixture_sender(), lane)
         .await;
@@ -677,7 +720,7 @@ async fn w1_create_guarded_paste_probe() {
 #[tokio::test]
 async fn w1_create_inventory_corroborates_origin() {
     let fixture = Fixture::new();
-    let lane = fixture.lane();
+    let lane = fixture.lane().await;
     let job = fixture.serve(lane).await;
     let workspace = fixture.register().await;
     let legacy = tmux_name(Uuid::new_v4(), Uuid::new_v4());
@@ -799,7 +842,7 @@ async fn w1_create_terminal_status_classifies_first_and_second_sample_replacemen
     let (_master, _slave, tty) = observation_pty();
     fixture.set("tty", &tty);
     fixture.set("pane-pid", std::process::id().to_string());
-    let job = fixture.serve(fixture.lane()).await;
+    let job = fixture.serve(fixture.lane().await).await;
     let workspace = fixture.register().await;
     let launch = async || {
         let CreateState::Confirmed {
@@ -966,7 +1009,7 @@ async fn w1_create_catalog_fault_read_only() {
     fixture.set("pane-pid", std::process::id().to_string());
     let local = async |message| request(&fixture.root, &message).await.unwrap();
     let read = |path| fs::read_to_string(fixture.root.join(path)).unwrap();
-    let lane = fixture.lane();
+    let lane = fixture.lane().await;
     let job = fixture
         .serve_engine(fixture.engine().with_fixture_sender(), lane.clone())
         .await;
@@ -1141,7 +1184,7 @@ async fn w1_create_catalog_fault_read_only() {
     drop(lane);
     stop(job).await;
     fixture.wait_restart_released().await;
-    let lane = fixture.lane();
+    let lane = fixture.lane().await;
     let job = fixture
         .serve_engine(fixture.engine().with_fixture_sender(), lane.clone())
         .await;
@@ -1242,6 +1285,94 @@ async fn w1_create_catalog_fault_read_only() {
     stop(job).await;
 }
 
+async fn release_on_catalog_busy(holder: File, mut contention: mpsc::Receiver<()>) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(2), contention.recv())
+        .await
+        .context("fixture catalog did not report Busy before release")?
+        .context("fixture catalog worker stopped without reporting Busy")?;
+    holder.unlock()?;
+    drop(holder);
+    Ok(())
+}
+
+async fn assert_catalog_handoff(fixture: &mut Fixture, server: FixtureServer) {
+    let locator = fixture.workspace.to_str().unwrap().to_owned();
+    let identity = resolve_workspace(&fixture.workspace).unwrap();
+    let workspace_id = fixture.register().await;
+    stop(server).await;
+    fixture.catalog_busy = None;
+    fixture.wait_restart_released().await;
+
+    let lane = fixture.lane().await;
+    let server = fixture.serve(lane.clone()).await;
+    let readiness = ProductRequest::WorkspaceReadiness {
+        workspace_id,
+        profile: ProviderProfile::Codex,
+    };
+    assert_eq!(
+        product_request(&fixture.root, &readiness).await.unwrap(),
+        ProductResponse::Ready {}
+    );
+    let saved = lane
+        .run(move |db, profiles| {
+            let (locator, launch) = db.preflight(workspace_id, ProviderProfile::Codex, profiles)?;
+            Ok((locator, launch.workspace))
+        })
+        .await
+        .unwrap();
+    assert_eq!(saved, (locator, identity));
+    assert_eq!(fixture.register().await, workspace_id);
+
+    fs::rename(&fixture.workspace, fixture.root.join("original-workspace")).unwrap();
+    fs::create_dir(&fixture.workspace).unwrap();
+    assert_eq!(
+        product_request(&fixture.root, &readiness).await.unwrap(),
+        ProductResponse::Blocked {
+            issue: ProductIssue::WorkspaceChanged,
+        }
+    );
+    stop(server).await;
+}
+
+#[tokio::test]
+async fn w1_create_ordinary_catalog_fixture_registers_after_lock_handoff() {
+    let mut fixture = Fixture::new();
+    let holder = fixture.hold_catalog().await;
+    let (observed, contention) = mpsc::channel(1);
+    fixture.catalog_busy = Some(observed);
+    let startup = async { fixture.serve(fixture.lane().await).await };
+    let (server, release) = tokio::join!(startup, release_on_catalog_busy(holder, contention));
+    release.unwrap();
+    assert_catalog_handoff(&mut fixture, server).await;
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn w1_create_debug_catalog_fixture_registers_after_lock_handoff() {
+    let mut fixture = Fixture::new();
+    let holder = fixture.hold_catalog().await;
+    let (observed, contention) = mpsc::channel(1);
+    let root = fixture.root.clone();
+    let catalog = fixture.catalog.clone();
+    let server = FixtureServer(tokio::spawn(async move {
+        serve_catalog_fixture_with(
+            root.clone(),
+            root.join("tmux"),
+            catalog.clone(),
+            root.as_os_str(),
+            |_| Ok(()),
+            Some((catalog, observed)),
+        )
+        .await
+    }));
+    let ((), release) = tokio::join!(
+        fixture.wait_listening(&server),
+        release_on_catalog_busy(holder, contention)
+    );
+    release.unwrap();
+    assert_catalog_handoff(&mut fixture, server).await;
+}
+
 #[cfg(debug_assertions)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn w1_create_state_guard_precedes_catalog() {
@@ -1256,10 +1387,17 @@ async fn w1_create_state_guard_precedes_catalog() {
         let tmux = root.join("tmux");
         let path = root.clone();
         if fixture_start {
-            serve_catalog_fixture_with(root, tmux, catalog, path.as_os_str(), move |directory| {
-                on_catalog();
-                catalog::provision(directory)
-            })
+            serve_catalog_fixture_with(
+                root,
+                tmux,
+                catalog,
+                path.as_os_str(),
+                move |directory| {
+                    on_catalog();
+                    catalog::provision(directory)
+                },
+                None,
+            )
             .await
         } else {
             serve_with_catalog_directory(
@@ -1280,11 +1418,12 @@ async fn w1_create_state_guard_precedes_catalog() {
         let catalog = if fixture_wins {
             fixture.root.join("unprovisioned")
         } else {
+            fixture.wait_catalog_released().await;
             fixture.catalog.clone()
         };
         let (reached, pending) = oneshot::channel();
         let (release, resume) = std::sync::mpsc::sync_channel(1);
-        let winner = tokio::spawn(start(
+        let winner = FixtureServer(tokio::spawn(start(
             fixture_wins,
             fixture.root.clone(),
             catalog.clone(),
@@ -1292,7 +1431,7 @@ async fn w1_create_state_guard_precedes_catalog() {
                 reached.send(()).unwrap();
                 resume.recv_timeout(Duration::from_secs(5)).unwrap();
             },
-        ));
+        )));
         tokio::time::timeout(Duration::from_secs(3), pending)
             .await
             .unwrap()
@@ -1338,7 +1477,7 @@ async fn w1_create_state_guard_precedes_catalog() {
 #[tokio::test]
 async fn w1_create_concurrent_equal_keys_finalize_once_and_preserve_original_result() {
     let fixture = Fixture::new();
-    let job = fixture.serve(fixture.lane()).await;
+    let job = fixture.serve(fixture.lane().await).await;
     let workspace = fixture.register().await;
     let key = Uuid::new_v4();
     assert_eq!(fixture.status(key).await, CreateState::Absent {});
@@ -1407,7 +1546,7 @@ async fn w1_create_concurrent_equal_keys_finalize_once_and_preserve_original_res
 #[tokio::test]
 async fn w1_create_reserved_retry_uses_original_ids_and_absent_retry_cannot_allocate() {
     let fixture = Fixture::new();
-    let lane = fixture.lane();
+    let lane = fixture.lane().await;
     let job = fixture.serve(lane.clone()).await;
     let workspace = fixture.register().await;
     let missing = create(Uuid::new_v4(), workspace, Some(Uuid::new_v4()));
@@ -1464,7 +1603,7 @@ async fn w1_create_reserved_retry_uses_original_ids_and_absent_retry_cannot_allo
 #[tokio::test]
 async fn w1_create_catalog_corruption_before_marker_fails_closed_and_keeps_evidence() {
     let fixture = Fixture::new();
-    let lane = fixture.lane();
+    let lane = fixture.lane().await;
     let job = fixture.serve(lane.clone()).await;
     let workspace = fixture.register().await;
     let (key, id) = fixture.reserve(&lane, workspace).await;
@@ -1487,7 +1626,7 @@ async fn w1_create_catalog_corruption_before_marker_fails_closed_and_keeps_evide
 #[tokio::test]
 async fn w1_create_uncertain_marker_ack_and_after_marker_before_send_are_status_only() {
     let fixture = Fixture::new();
-    let lane = fixture.lane();
+    let lane = fixture.lane().await;
     let job = fixture.serve(lane.clone()).await;
     let workspace = fixture.register().await;
     let (key, id) = fixture.reserve(&lane, workspace).await;
@@ -1522,7 +1661,7 @@ async fn w1_create_uncertain_marker_ack_and_after_marker_before_send_are_status_
 #[tokio::test]
 async fn w1_create_effect_before_reply_requires_exact_generation_nonce_and_pane() {
     let fixture = Fixture::new();
-    let job = fixture.serve(fixture.lane()).await;
+    let job = fixture.serve(fixture.lane().await).await;
     let workspace = fixture.register().await;
     let key = Uuid::new_v4();
     fixture.set("mode", "effect-lost");
@@ -1595,7 +1734,7 @@ async fn w1_create_effect_before_reply_requires_exact_generation_nonce_and_pane(
 #[tokio::test]
 async fn w1_create_quick_exit_with_no_current_pid_finalizes_and_survives_restart() {
     let fixture = Fixture::new();
-    let job = fixture.serve(fixture.lane()).await;
+    let job = fixture.serve(fixture.lane().await).await;
     let workspace = fixture.register().await;
     let key = Uuid::new_v4();
     fixture.set("mode", "exited");
@@ -1633,7 +1772,7 @@ async fn w1_create_quick_exit_with_no_current_pid_finalizes_and_survives_restart
 #[tokio::test]
 async fn w1_create_delayed_dispatch_times_out_and_does_not_send_again() {
     let fixture = Fixture::new();
-    let job = fixture.serve(fixture.lane()).await;
+    let job = fixture.serve(fixture.lane().await).await;
     let workspace = fixture.register().await;
     let key = Uuid::new_v4();
     fixture.set("mode", "delay");
@@ -1660,7 +1799,7 @@ async fn w1_create_delayed_dispatch_times_out_and_does_not_send_again() {
 async fn w1_create_sqlite_full_blocks_failed_marker_or_finalization_and_preserves_legacy() {
     for full_at in ["marked", "finished"] {
         let fixture = Fixture::new();
-        let lane = fixture.lane();
+        let lane = fixture.lane().await;
         let job = fixture.serve(lane.clone()).await;
         let workspace = fixture.register().await;
         let (key, id) = fixture.reserve(&lane, workspace).await;
