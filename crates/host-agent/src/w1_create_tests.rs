@@ -35,6 +35,12 @@ valid_buffer() {
 case "$4" in
   display-message)
     if test "${6-}" = -t; then
+      if test "$#" = 8 && test -f geometry-1; then
+        printf '%s\n' "$7" >> geometry-samples
+        sample=$(awk 'END {print NR}' geometry-samples)
+        cat "geometry-$sample"
+        exit
+      fi
       for name in $(cat names); do
         IFS='|' read -r session window pane pid < "$name.pane"
         if test "$pane" != "$7"; then continue; fi
@@ -177,11 +183,13 @@ case "$4" in
         if test -f mode; then mode=$(cat mode); fi
         if test "$mode" = delay; then exec /bin/sleep 20; fi
         count=$(wc -l < dispatched | tr -d ' ')
+        slot=$(option_value pane-slot)
+        if test -z "$slot"; then slot=$count; fi
         printf '%s\n' "$name" >> names
         printf '%s\n' "$nonce" > "$name.nonce"
         pid=$((300 + count))
         if test -f pane-pid; then pid=$(cat pane-pid); fi
-        printf '$%s|@%s|%%%s|%s\n' "$count" "$count" "$count" "$pid" > "$name.pane"
+        printf '$%s|@%s|%%%s|%s\n' "$slot" "$slot" "$slot" "$pid" > "$name.pane"
         tr '|' ':' < "$name.pane" > "$name.stamp"
         printf '0\n' > "$name.dead"
         receipt=$(cat "$name.pane")
@@ -782,6 +790,171 @@ async fn w1_create_inventory_corroborates_origin() {
     assert!(managed.operation_id.is_some());
     assert_eq!(managed, outcome.runtime);
     assert_eq!(fixture.dispatches(), 1);
+    stop(job).await;
+}
+
+#[tokio::test]
+async fn w1_create_terminal_status_classifies_first_and_second_sample_replacement() {
+    let fixture = Fixture::new();
+    let (_master, _slave, tty) = observation_pty();
+    fixture.set("tty", &tty);
+    fixture.set("pane-pid", std::process::id().to_string());
+    let job = fixture.serve(fixture.lane()).await;
+    let workspace = fixture.register().await;
+    let launch = async || {
+        let CreateState::Confirmed {
+            outcome,
+            current: PaneLiveness::Live,
+            ..
+        } = fixture.call(&create(Uuid::new_v4(), workspace, None)).await
+        else {
+            panic!("expected a catalog-corroborated live launch");
+        };
+        outcome.runtime
+    };
+    let original = launch().await;
+    let open = request(
+        &fixture.root,
+        &Request::OpenTerminal {
+            runtime_id: original.runtime_id,
+            view_id: Uuid::new_v4(),
+        },
+    )
+    .await
+    .unwrap();
+    let Response::TerminalOpened { status: opened } = open else {
+        panic!("expected live terminal proof, got {open:?}");
+    };
+    assert_eq!(opened.observation, ObservationState::Observed);
+    assert_eq!(opened.provider.unwrap().size, opened.committed.size);
+
+    fixture.set("pane-slot", "1");
+    let replacement = launch().await;
+    assert_eq!(original.pane_id, replacement.pane_id);
+    assert_ne!(original.runtime_id, replacement.runtime_id);
+    let read = |path: &str| fs::read_to_string(fixture.root.join(path)).unwrap();
+    let geometry = |runtime: &crate::model::Runtime, device: &str| {
+        let name = &runtime.tmux_name;
+        let token = read("generation");
+        let pane = read(&format!("{name}.pane"));
+        let nonce = read(&format!("{name}.nonce"));
+        let stamp = read(&format!("{name}.stamp"));
+        format!(
+            "42|100|{}|{}|{name}|0|0|{}:{}|0|1|1|manual|{device}|100|30|100|30|||||0|1\n",
+            token.trim(),
+            pane.trim(),
+            nonce.trim(),
+            stamp.trim()
+        )
+    };
+    let live = geometry(&original, &tty);
+    let no_device = geometry(&original, "/dev/pts/999999999");
+    let replaced = geometry(&replacement, &tty).replace("|100|30|100|30", "|1|30|1|30");
+    let sample = async |terminal, rows: &[&str], count| {
+        fixture.set("geometry-samples", "");
+        for (index, row) in rows.iter().enumerate() {
+            fixture.set(&format!("geometry-{}", index + 1), row);
+        }
+        let reply = request(&fixture.root, &Request::TerminalStatus { terminal })
+            .await
+            .unwrap();
+        assert_eq!(
+            read("geometry-samples"),
+            format!("{}\n", original.pane_id).repeat(count)
+        );
+        reply
+    };
+    for (rows, count) in [
+        ([replaced.as_str(), &live], 1),
+        ([live.as_str(), &replaced], 2),
+        ([no_device.as_str(), &replaced], 2),
+    ] {
+        assert!(matches!(
+            sample(opened.terminal.clone(), &rows, count).await,
+            Response::TerminalChanged {}
+        ));
+    }
+    let mut older = opened.terminal.clone();
+    older.target.process_start += 1;
+    assert!(matches!(
+        sample(older, &[&live], 1).await,
+        Response::TerminalChanged {}
+    ));
+    let replacement_nonce_path = format!("{}.nonce", replacement.tmux_name);
+    let replacement_nonce = read(&replacement_nonce_path);
+    fixture.set(&replacement_nonce_path, Uuid::new_v4().to_string());
+    assert!(matches!(
+        sample(opened.terminal.clone(), &[&replaced], 1).await,
+        Response::Error { .. }
+    ));
+    let uncorroborated = sample(opened.terminal.clone(), &[&live, &replaced], 2).await;
+    assert!(
+        matches!(&uncorroborated, Response::TerminalStatus { status }
+            if status.terminal == opened.terminal
+                && status.committed == opened.committed
+                && status.observation == ObservationState::Unavailable
+                && status.provider.is_none()),
+        "{uncorroborated:?}"
+    );
+    fixture.set(&replacement_nonce_path, replacement_nonce);
+
+    let mut exited: Vec<_> = live.split('|').collect();
+    exited[6] = "";
+    exited[11] = "1";
+    let exited = exited.join("|");
+    assert!(matches!(
+        sample(opened.terminal.clone(), &[&exited], 1).await,
+        Response::Error { .. }
+    ));
+    let malformed = live.replacen("|manual|", "|unsupported|", 1);
+    assert!(matches!(
+        sample(opened.terminal.clone(), &[&malformed], 1).await,
+        Response::Error { .. }
+    ));
+    let nonce_path = format!("{}.nonce", original.tmux_name);
+    let nonce = read(&nonce_path);
+    fixture.set(&nonce_path, Uuid::new_v4().to_string());
+    assert!(matches!(
+        sample(opened.terminal.clone(), &[&live], 1).await,
+        Response::Error { .. }
+    ));
+    fixture.set(&nonce_path, nonce);
+
+    let mut resized: Vec<_> = live.split('|').collect();
+    let epoch = format!("{}:{}", opened.terminal.agent_epoch, Uuid::new_v4());
+    let intent = format!("{epoch}:{}:1:105:33", Uuid::new_v4());
+    resized[16..22].copy_from_slice(&["105", "33", "105", "33", &epoch, &intent]);
+    let resized = resized.join("|");
+    for rows in [
+        [&live, &exited],
+        [&no_device, &no_device],
+        [&live, &resized],
+    ] {
+        let reply = sample(opened.terminal.clone(), &rows.map(String::as_str), 2).await;
+        let Response::TerminalStatus { status } = reply else {
+            panic!("expected same-scope unavailable provider: {reply:?}");
+        };
+        assert_eq!(status.terminal, opened.terminal);
+        assert_eq!(status.committed, opened.committed);
+        assert_eq!(status.observation, ObservationState::Unavailable);
+        assert!(status.provider.is_none());
+    }
+    let reply = sample(opened.terminal.clone(), &[&resized, &resized], 2).await;
+    let Response::TerminalStatus { status } = reply else {
+        panic!("expected ordered geometry readback: {reply:?}");
+    };
+    assert_eq!(status.terminal, opened.terminal);
+    assert_eq!(status.committed.revision, 1);
+    assert_eq!(
+        status.committed.size,
+        TerminalSize {
+            cols: 105,
+            rows: 33
+        }
+    );
+    assert_eq!(status.observation, ObservationState::Pending);
+    assert_eq!(status.provider.unwrap().size, opened.committed.size);
+    assert_eq!(fixture.dispatches(), 2);
     stop(job).await;
 }
 

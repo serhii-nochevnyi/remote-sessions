@@ -2556,6 +2556,338 @@ async fn w1_terminal_eof_refresh_expired_registration_discards_fifo() {
     check_eof_refresh(EofRefresh::Expired).await;
 }
 
+#[cfg(debug_assertions)]
+const STATUS_HOST_TMUX: &str = r#"#!/bin/sh
+set -eu
+cd "$(dirname "$3")"
+token=$(cat generation)
+pid=$(cat pane-pid)
+case "$4" in
+  display-message)
+    if test "$#" = 8 && test "$6" = -t; then
+      test "$7" = '%0'
+      name=$(cat active)
+      device=$(cat tty)
+      if test -f samples; then
+        sample=$(awk 'END {print NR + 1}' samples)
+        name=$(cat "sample-$sample")
+        printf '%s\n' "$name" >> samples
+        if test -f fail-query; then exit 1; fi
+        if test -f missing-device && test "$sample" = 1; then device=/dev/pts/999999999; fi
+      fi
+      nonce=$(cat "$name.nonce")
+      printf '52|101|%s|$0|@0|%%0|%s|%s|0|0|%s:$0:@0:%%0:%s|0|1|1|manual|%s|100|30|100|30|||||0|0\n' \
+        "$token" "$pid" "$name" "$nonce" "$pid" "$device"
+    else
+      printf '52|101|%s\n' "$token"
+      if test "$#" -gt 6 && test -f names; then cat names; fi
+    fi ;;
+  if-shell)
+    case "${7-}" in
+      'new-session '*)
+        case "$6" in *"$token"*) ;; *) exit 1 ;; esac
+        name=$(printf '%s\n' "$7" | awk '{for(i=1;i<NF;i++) if ($i=="-s") {print $(i+1); exit}}')
+        nonce=$(printf '%s\n' "$7" | awk '{for(i=1;i<=NF;i++) if ($i~/^RS_CREATE_NONCE=/) {sub(/^RS_CREATE_NONCE=/,"",$i); print $i; exit}}')
+        test -n "$name" && test -n "$nonce"
+        printf '%s\n' "$nonce" > "$name.nonce"
+        printf '%s\n' "$name" >> names
+        printf '$0|@0|%%0|%s\n' "$pid" ;;
+      *) printf '%s\n' "$*" >> unexpected; exit 1 ;;
+    esac ;;
+  show-environment)
+    name=${6#=}
+    test "$#" = 14 && test "$7" = RS_CREATE_NONCE
+    nonce=$(cat "$name.nonce")
+    printf 'RS_CREATE_NONCE=%s\n52|101|%s|$0|@0|%%0|%s|%s|0|0|%s:$0:@0:%%0:%s|0|100|30\n' \
+      "$nonce" "$token" "$pid" "$name" "$nonce" "$pid" ;;
+  list-sessions)
+    if test -f names; then cat names; fi ;;
+  list-panes)
+    while IFS= read -r name; do
+      printf '%s\t%%0\t%s\t0\t100\t30\tcodex\n' "$name" "$pid"
+    done < names ;;
+  *) printf '%s\n' "$*" >> unexpected; exit 1 ;;
+esac
+"#;
+
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy)]
+enum RealEofStatus {
+    Unavailable,
+    FirstSample,
+    SecondSample,
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn w1_terminal_eof_standalone_status_failure_preserves_fifo() {
+    check_real_eof_status(RealEofStatus::Unavailable, true).await;
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn w1_terminal_eof_real_host_replacement_discards_fifo() {
+    for outcome in [RealEofStatus::FirstSample, RealEofStatus::SecondSample] {
+        for standalone in [true, false] {
+            check_real_eof_status(outcome, standalone).await;
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+async fn check_real_eof_status(outcome: RealEofStatus, standalone: bool) {
+    use remote_sessions_host::{
+        model::{CreateState, PaneLiveness},
+        serve_catalog_fixture,
+    };
+
+    let host = AgentFixture::new();
+    let attachment = AgentFixture::new();
+    let generation = Uuid::new_v4();
+    let initial = TerminalSize {
+        cols: 100,
+        rows: 30,
+    };
+    let provider = native_pty_system().openpty(pty_size(initial)).unwrap();
+    let tmux = host.0.join("tmux");
+    fs::write(&tmux, STATUS_HOST_TMUX).unwrap();
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let codex = host.0.join("codex");
+    fs::write(&codex, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(host.0.join("generation"), generation.to_string()).unwrap();
+    fs::write(host.0.join("pane-pid"), std::process::id().to_string()).unwrap();
+    fs::write(
+        host.0.join("tty"),
+        provider.master.tty_name().unwrap().to_str().unwrap(),
+    )
+    .unwrap();
+    let project = host.0.join("project");
+    fs::create_dir(&project).unwrap();
+    let server = tokio::spawn({
+        let directory = host.0.clone();
+        async move {
+            serve_catalog_fixture(
+                directory.clone(),
+                tmux,
+                directory.join("catalog"),
+                directory.as_os_str(),
+            )
+            .await
+        }
+    });
+    until(|| server.is_finished() || host.0.join("agent.sock").exists()).await;
+    assert!(!server.is_finished());
+    let workspace = product_request(
+        &host.0,
+        &ProductRequest::RegisterWorkspace {
+            locator: project.to_str().unwrap().into(),
+        },
+    )
+    .await
+    .unwrap();
+    let ProductResponse::WorkspaceRegistered { workspace } = workspace else {
+        panic!("expected a registered fixture workspace");
+    };
+    let launch = async || {
+        let reply = product_request(
+            &host.0,
+            &ProductRequest::CreateManaged {
+                key: Uuid::new_v4(),
+                workspace_id: workspace.workspace_id,
+                profile: ProviderProfile::Codex,
+                reservation: None,
+            },
+        )
+        .await
+        .unwrap();
+        let ProductResponse::Create {
+            state:
+                CreateState::Confirmed {
+                    outcome,
+                    current: PaneLiveness::Live,
+                    ..
+                },
+        } = reply
+        else {
+            panic!("expected a catalog-corroborated live pane: {reply:?}");
+        };
+        outcome.runtime
+    };
+    let original = launch().await;
+    fs::write(host.0.join("active"), &original.tmux_name).unwrap();
+    let runtime_id = original.runtime_id;
+    let runtime = runtime_id.to_string();
+    fs::write(attachment.0.join("hold"), "").unwrap();
+    let tmux = attachment_tmux(&attachment, generation, "ignore-size");
+    let listener = UnixListener::bind(attachment.0.join("agent.sock")).unwrap();
+    let bridge = DesktopBridge::new(Some(attachment.0.clone()), tmux);
+    let prove = async {
+        let (mut peer, opening) = receive(&listener).await;
+        assert!(
+            matches!(opening, Request::OpenTerminal { runtime_id: id, .. } if id == runtime_id)
+        );
+        let opened = request(&host.0, &opening).await.unwrap();
+        let Response::TerminalOpened { status } = &opened else {
+            panic!("host did not prove the original terminal: {opened:?}");
+        };
+        assert_eq!(status.observation, ObservationState::Observed);
+        let status = status.clone();
+        respond(&mut peer, opened).await;
+        let mut peer = attachment_status_peer(&listener, &status).await;
+        let reply = request(
+            &host.0,
+            &Request::TerminalStatus {
+                terminal: status.terminal.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&reply, Response::TerminalStatus { status: current }
+            if current.terminal == status.terminal && current.observation == ObservationState::Observed)
+        );
+        respond(&mut peer, reply).await;
+        status
+    };
+    let (attached, status) = tokio::join!(bridge.attach_observer(&runtime), prove);
+    let id = attached.unwrap().view_id;
+    let view = bridge.view(&id).unwrap();
+    assert_eq!(view.terminal, status.terminal);
+    view.output.lock().await.refresh_at = Instant::now() + Duration::from_secs(60);
+    assert_eq!(
+        read_until_bytes(&bridge, &id, b"buffered attachment output").await,
+        b"buffered attachment output"
+    );
+    let replacement = launch().await;
+    assert_eq!(replacement.pane_id, original.pane_id);
+    assert_ne!(replacement.runtime_id, original.runtime_id);
+
+    let samples = match outcome {
+        RealEofStatus::Unavailable => {
+            fs::write(host.0.join("fail-query"), "").unwrap();
+            vec![&original.tmux_name]
+        }
+        RealEofStatus::FirstSample => vec![&replacement.tmux_name],
+        RealEofStatus::SecondSample => {
+            fs::write(host.0.join("missing-device"), "").unwrap();
+            vec![&original.tmux_name, &replacement.tmux_name]
+        }
+    };
+    for (index, name) in samples.iter().enumerate() {
+        fs::write(host.0.join(format!("sample-{}", index + 1)), name).unwrap();
+    }
+    fs::write(host.0.join("samples"), "").unwrap();
+    view.output.lock().await.refresh_at = Instant::now();
+    let mut pending = std::pin::pin!(async {
+        if standalone {
+            bridge.status(&id).await.map(|_| None)
+        } else {
+            bridge.read(&id).await.map(Some)
+        }
+    });
+    let (mut peer, query) = tokio::select! {
+        incoming = receive(&listener) => incoming,
+        _ = &mut pending => panic!("terminal status settled before the fixture received it"),
+    };
+    assert!(matches!(&query, Request::TerminalStatus { terminal } if *terminal == view.terminal));
+    let reply = request(&host.0, &query).await.unwrap();
+    let expected_error = match outcome {
+        RealEofStatus::Unavailable => {
+            assert!(matches!(&reply, Response::Error { .. }));
+            "Розмір термінала недоступний"
+        }
+        RealEofStatus::FirstSample | RealEofStatus::SecondSample => {
+            assert!(matches!(&reply, Response::TerminalChanged {}));
+            "Terminal attachment identity changed"
+        }
+    };
+    let sampled = fs::read_to_string(host.0.join("samples")).unwrap();
+    assert!(sampled.lines().eq(samples.into_iter().map(String::as_str)));
+
+    fs::write(attachment.0.join("continue"), "").unwrap();
+    tokio::time::timeout(Duration::from_secs(2), view.retired())
+        .await
+        .unwrap();
+    let expires = {
+        let views = bridge.views.lock().unwrap();
+        let drain = &views.drains[&view.terminal.view_id];
+        assert!(view.eof_draining() && Arc::ptr_eq(&drain.view, &view));
+        drain.expires
+    };
+    until(|| view.cleanup_confirmations.load(Ordering::Acquire) == 3).await;
+    assert_eq!(allocation_counts(&bridge), (0, 1));
+    assert_eq!(
+        bridge
+            .input(
+                &id,
+                b"after EOF".to_vec(),
+                &Uuid::new_v4().to_string(),
+                false
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+        "View detached"
+    );
+    respond(&mut peer, reply).await;
+    let result = pending.await;
+    assert_eq!(result.err().unwrap().to_string(), expected_error);
+    if matches!(outcome, RealEofStatus::Unavailable) {
+        assert_eq!(
+            bridge.views.lock().unwrap().drains[&view.terminal.view_id].expires,
+            expires
+        );
+        assert_parked_eof_fifo(&bridge, &id, bridge.read(&id).await.unwrap()).await;
+    } else {
+        assert!(matches!(
+            *view.retirement.borrow(),
+            Some(Retirement::Failed)
+        ));
+    }
+    assert_eq!(
+        bridge.read(&id).await.err().unwrap().to_string(),
+        "View detached"
+    );
+    until(|| allocation_counts(&bridge) == (0, 0)).await;
+    assert!(view.output.lock().await.receiver.is_empty());
+    assert!(!host.0.join("unexpected").exists());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), listener.accept())
+            .await
+            .is_err()
+    );
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}
+
+async fn assert_parked_eof_fifo(bridge: &DesktopBridge, id: &str, mut chunk: Chunk) {
+    let mut data = Vec::new();
+    let mut frames = 0;
+    loop {
+        assert_read_only_drain(&chunk);
+        if chunk.closed {
+            assert_eq!(chunk.closure, Some(TerminalClosure::Eof));
+            assert!(chunk.data.is_empty());
+            break;
+        }
+        assert!(chunk.closure.is_none() && !chunk.data.is_empty());
+        assert!(chunk.data.len() <= OUTPUT_CHUNK_SIZE);
+        data.extend(chunk.data);
+        frames += 1;
+        assert!(frames <= OUTPUT_SLOTS);
+        chunk = bridge.read(id).await.unwrap();
+    }
+    let expected = [
+        b"first diagnostic".as_slice(),
+        &[0; OUTPUT_CHUNK_SIZE],
+        b"last diagnostic".as_slice(),
+    ]
+    .concat();
+    assert!(frames > 1);
+    assert_eq!(data, expected);
+}
+
 async fn check_eof_refresh(outcome: EofRefresh) {
     let fixture = AgentFixture::new();
     fs::write(fixture.0.join("hold"), "").unwrap();
@@ -2672,35 +3004,11 @@ async fn check_eof_refresh(outcome: EofRefresh) {
     let result = reading.await;
     match outcome {
         EofRefresh::Newer | EofRefresh::Unavailable => {
-            let mut chunk = result.unwrap();
             assert_eq!(
                 bridge.views.lock().unwrap().drains[&view.terminal.view_id].expires,
                 expires
             );
-            let mut data = Vec::new();
-            let mut frames = 0;
-            loop {
-                assert_read_only_drain(&chunk);
-                if chunk.closed {
-                    assert_eq!(chunk.closure, Some(TerminalClosure::Eof));
-                    assert!(chunk.data.is_empty());
-                    break;
-                }
-                assert!(chunk.closure.is_none() && !chunk.data.is_empty());
-                assert!(chunk.data.len() <= OUTPUT_CHUNK_SIZE);
-                data.extend(chunk.data);
-                frames += 1;
-                assert!(frames <= OUTPUT_SLOTS);
-                chunk = bridge.read(&id).await.unwrap();
-            }
-            let expected = [
-                b"first diagnostic".as_slice(),
-                &[0; OUTPUT_CHUNK_SIZE],
-                b"last diagnostic".as_slice(),
-            ]
-            .concat();
-            assert!(frames > 1);
-            assert_eq!(data, expected);
+            assert_parked_eof_fifo(&bridge, &id, result.unwrap()).await;
         }
         EofRefresh::Changed | EofRefresh::Replaced => {
             assert_eq!(
