@@ -149,6 +149,17 @@ struct CustodySlot {
 
 type CustodySnapshot = [Option<CustodySlot>; CUSTODY_SLOTS];
 
+#[derive(Debug)]
+struct CustodyClaimConflict;
+
+impl std::fmt::Display for CustodyClaimConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Paste custody claim lost its slot")
+    }
+}
+
+impl std::error::Error for CustodyClaimConflict {}
+
 fn custody_option(server: ServerGeneration, index: usize) -> String {
     format!(
         "@rs_paste_custody_{}_{}_{}_{index:02}",
@@ -377,6 +388,7 @@ fn valid_paste(data: &[u8], expected: usize) -> bool {
 #[derive(Default)]
 struct PasteTest {
     now: Mutex<Option<Instant>>,
+    custody_claim: Mutex<Option<Arc<PasteBarrier>>>,
     admission: Mutex<Option<Arc<PasteBarrier>>>,
     sender_fixture: bool,
     provider_sample: Option<ProviderSample>,
@@ -394,9 +406,9 @@ struct PasteBarrier {
 }
 
 #[cfg(test)]
-impl PasteTest {
-    async fn pause_before_admission(&self) {
-        let barrier = self.admission.lock().unwrap().take();
+impl PasteBarrier {
+    async fn pause_once(slot: &Mutex<Option<Arc<Self>>>) {
+        let barrier = slot.lock().unwrap().take();
         if let Some(barrier) = barrier {
             barrier.reached.notify_one();
             barrier.proceed.notified().await;
@@ -2685,6 +2697,16 @@ impl Engine {
         from: &GeometryReadback,
         next: &str,
     ) -> Result<Option<GeometryReadback>> {
+        self.transition_marker_guarded(from, next, self.paste_guard(from))
+            .await
+    }
+
+    async fn transition_marker_guarded(
+        &self,
+        from: &GeometryReadback,
+        next: &str,
+        guard: String,
+    ) -> Result<Option<GeometryReadback>> {
         let pane = &from.target.pane;
         let witness = Uuid::new_v4();
         let printed = pane_witness(pane, &witness.to_string());
@@ -2692,15 +2714,7 @@ impl Engine {
         let rejected = format!("rs-rejected-{witness}");
         let else_branch = rejection_witness(pane, &rejected);
         let reply = self
-            .geometry_command(&[
-                "if-shell",
-                "-F",
-                "-t",
-                pane,
-                &self.paste_guard(from),
-                &branch,
-                &else_branch,
-            ])
+            .geometry_command(&["if-shell", "-F", "-t", pane, &guard, &branch, &else_branch])
             .await;
         if reply
             .as_ref()
@@ -2855,17 +2869,55 @@ impl Engine {
             Some(buffer) => format!("delete-buffer -b {buffer} ; {set}"),
             None => set,
         };
-        let _ = self
-            .geometry_command(&["if-shell", "-F", "-t", pane, &guard, &branch])
-            .await;
+        let claim = next.active.as_ref().filter(|active| {
+            !active.completed
+                && previous.is_none_or(|slot| slot.active.is_none())
+                && delete.is_none()
+        });
+        let rejection = claim.map(|_| {
+            let prior = previous.map_or("", |slot| slot.value.as_str());
+            let changed = self.custody_guard(read, format!("#{{!=:#{{{option}}},{prior}}}"));
+            let witness = format!("rs-paste-custody-conflict-{}", next.mutation);
+            let otherwise = format!(
+                "if-shell -F -t {pane} {} {}",
+                tmux_word(&changed),
+                tmux_word(&pane_witness(pane, &witness))
+            );
+            (witness, otherwise)
+        });
+        let mut args = vec!["if-shell", "-F", "-t", pane, &guard, &branch];
+        if let Some((_, otherwise)) = &rejection {
+            args.push(otherwise);
+        }
+        let reply = self.geometry_command(&args).await;
         let observed = self.read_custody(read.server).await?;
-        ensure!(
-            observed[next.index]
-                .as_ref()
-                .is_some_and(|slot| slot.value == next.value),
-            "Paste custody transition is unconfirmed"
-        );
-        Ok(())
+        let current = observed[next.index].as_ref();
+        let rejected = rejection.is_some_and(|(witness, _)| {
+            reply
+                .as_deref()
+                .is_ok_and(|reply| reply.strip_suffix('\n') == Some(witness.as_str()))
+        });
+        if !rejected && current.is_some_and(|slot| slot.value == next.value) {
+            return Ok(());
+        }
+        if rejected
+            && let Some(claim) = claim
+            && current.is_some_and(|slot| {
+                slot.mutation != next.mutation
+                    && previous.is_none_or(|prior| slot.mutation != prior.mutation)
+            })
+            && !observed.iter().flatten().any(|slot| {
+                slot.active.as_ref().is_some_and(|active| {
+                    active.runtime == claim.runtime
+                        || active.pane == claim.pane
+                        || active.buffer.name == claim.buffer.name
+                        || active.buffer.nonce == claim.buffer.nonce
+                })
+            })
+        {
+            return Err(CustodyClaimConflict.into());
+        }
+        bail!("Paste custody transition is unconfirmed")
     }
 
     async fn retire_custody(
@@ -3346,11 +3398,27 @@ impl Engine {
         };
         let buffer = scope.buffer.as_ref().expect("reserved paste buffer");
         let custody = scope.custody.as_ref().expect("reserved paste custody");
-        if self
+        #[cfg(test)]
+        PasteBarrier::pause_once(&self.paste_test.custody_claim).await;
+        if let Err(error) = self
             .mutate_custody(&scope.original, snapshot[index].as_ref(), custody, None)
             .await
-            .is_err()
         {
+            if error.is::<CustodyClaimConflict>() && self.private_sender_socket() {
+                scope.custody = None;
+                let loading = &scope.original;
+                let ready = loading.ready_marker(loading.epoch);
+                let guard = format_all([
+                    self.paste_guard(loading),
+                    format_equal("after-if-shell", ""),
+                ]);
+                if matches!(
+                    self.transition_marker_guarded(loading, &ready, guard).await,
+                    Ok(Some(_))
+                ) {
+                    return PasteResult::Unavailable {};
+                }
+            }
             return self.quarantine(&mut lane, &binding, scope);
         }
         let loaded = self
@@ -3380,7 +3448,7 @@ impl Engine {
         };
         scope.original = held;
         #[cfg(test)]
-        self.paste_test.pause_before_admission().await;
+        PasteBarrier::pause_once(&self.paste_test.admission).await;
         let current = self.scoped_geometry(&binding.terminal).await.ok();
         let authorized = match &current {
             Some(read) => self.authorize_terminal_writer(read, catalog).await.is_ok(),
@@ -4688,7 +4756,15 @@ mod tests {
                 "{outcome}"
             );
             assert_held(&f.engine, &binding).await;
-            for effect in ["last-load", "submissions", "effects", "deletions"] {
+            for effect in [
+                "last-load",
+                "paste-load-attempts",
+                "paste-loads",
+                "submissions",
+                "effects",
+                "deletions",
+                "custody-conflicts",
+            ] {
                 assert!(file(&f, effect).is_empty(), "{outcome}: {effect}");
             }
             set(&f, control, "");
@@ -4701,6 +4777,30 @@ mod tests {
                 snapshot.iter().flatten().count(),
                 usize::from(outcome == "hide-write")
             );
+            assert!(
+                f.engine
+                    .handle(
+                        Request::Stop {
+                            runtime_id: binding.terminal.target.runtime_id,
+                            expected_pane_id: binding.terminal.target.pane.clone(),
+                        },
+                        None,
+                    )
+                    .await
+                    .is_err(),
+                "{outcome}"
+            );
+            assert_held(&f.engine, &binding).await;
+            for effect in [
+                "paste-load-attempts",
+                "paste-loads",
+                "submissions",
+                "effects",
+                "deletions",
+                "removed-0",
+            ] {
+                assert!(file(&f, effect).is_empty(), "{outcome}: {effect}");
+            }
         }
     }
 
