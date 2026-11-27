@@ -2835,6 +2835,9 @@ case "$4" in
         printf '%s\n' "$nonce" > "$name.nonce"
         printf '%s\n' "$name" >> names
         printf '$0|@0|%%0|%s\n' "$pid" ;;
+      'show-options -sq -F '*)
+        test "$sender" = 1
+        exec ./paste-tmux "$@" ;;
       *)
         if test "$sender" = 1; then exec ./paste-tmux "$@"; fi
         printf '%s\n' "$*" >> unexpected; exit 1 ;;
@@ -2863,6 +2866,7 @@ const PASTE_HOST_MUTATIONS: &str = r##"#!/usr/bin/env python3
 from pathlib import Path
 import json
 import re
+import shlex
 import sys
 import uuid
 
@@ -2887,6 +2891,27 @@ def allows(guard, actual):
 def write(name, value):
     Path(name).write_text(value)
 
+def custody_options():
+    token = uuid.UUID(read("generation")).hex
+    return [f"@rs_paste_custody_52_101_{token}_{i:02}" for i in range(16)]
+
+def custody_path(option):
+    assert option in custody_options()
+    return Path("custody") / option
+
+def custody_value(value):
+    assert len(value) <= 2048 and re.fullmatch(r"[a-zA-Z0-9:/_~-]+", value)
+    version, mutation, state, *fields = value.split("~")
+    assert version == "v1" and str(uuid.UUID(mutation)) == mutation
+    assert uuid.UUID(mutation).version == 4
+    if state == "free":
+        assert not fields
+    else:
+        assert state in ("possible", "completed") and len(fields) == 19
+        assert fields[2] == "v1" and fields[4:7] == [read("generation"), "52", "101"]
+        assert fields[-4] == "l" and re.fullmatch(r"rs-paste-[0-9a-f]{32}", fields[-1])
+    return mutation, state, fields
+
 command, *args = sys.argv[4:]
 if command == "list-commands":
     assert not args
@@ -2900,6 +2925,21 @@ elif command == "if-shell" and args[0] == "-F" and args[1] != "-t":
     flag, guard, branch = args
     token, pid = read("generation"), read("pane-pid")
     actual = {"pid": "52", "start_time": "101", "@rs_create_generation": token, "command-error": ""}
+    if branch.startswith("show-options "):
+        actual.update({"after-if-shell": "", "after-show-options": "", "after-display-message": ""})
+        if not allows(guard, actual):
+            sys.exit()
+        nodes = [shlex.split(node) for node in branch.split(" ; ")]
+        assert len(nodes) == 17 and nodes[-1] == ["display-message", "-p", "-l", "rs-custody-snapshot"]
+        row = "#{option_name} #{?#{m/r:^[a-zA-Z0-9:/_~-]+$,#{option_value}},#{option_value},invalid}"
+        for words, option in zip(nodes[:-1], custody_options()):
+            assert words == ["show-options", "-sq", "-F", row, option]
+            path = custody_path(option)
+            if path.exists():
+                value = path.read_text()
+                print(option, value if re.fullmatch(r"[a-zA-Z0-9:/_~-]+", value) else "invalid")
+        print("rs-custody-snapshot")
+        sys.exit()
     for hook in ("after-if-shell", "after-new-session", "session-created", "session-window-changed",
                  "window-linked", "window-layout-changed", "after-set-environment", "after-set-option"):
         actual[hook] = ""
@@ -2953,6 +2993,43 @@ else:
     for hook in ("load-buffer", "save-buffer", "paste-buffer", "delete-buffer",
                  "send-keys", "set-option", "display-message", "resize-window", "list-buffers"):
         actual["after-" + hook] = ""
+    options = re.findall(r"#\{==:#\{(@rs_paste_custody_[^}]+)\},", guard)
+    if options:
+        option, = options
+        path = custody_path(option)
+        prior = path.read_text() if path.exists() else None
+        actual[option] = "" if prior is None else prior
+        if not allows(guard, actual):
+            if otherwise:
+                print(re.search(r"rs-(?:paste-)?rejected-[0-9a-f-]+", otherwise[0]).group())
+            sys.exit()
+        nodes = branch.split(" ; ")
+        if nodes[-1].startswith("set-option -s"):
+            action, flag, key, value = nodes[-1].split()
+            assert action == "set-option" and key == option and flag in ("-s", "-so")
+            mutation, state, fields = custody_value(value)
+            if flag == "-so" and prior is not None:
+                sys.exit(1)
+            if prior is None:
+                assert flag == "-so" and state == "possible"
+            else:
+                old_mutation, old_state, old_fields = custody_value(prior)
+                assert mutation != old_mutation
+                assert (old_state, state) in (("free", "possible"), ("possible", "completed"),
+                                              ("possible", "free"), ("completed", "free"))
+                if state == "completed":
+                    assert fields == old_fields
+            if state == "possible":
+                assert fields[:2] == [name, read("tty")] and "~".join(fields[2:]) == read("marker")
+            if len(nodes) == 2:
+                assert state == "free" and nodes[0] == f"delete-buffer -b {old_fields[-1]}"
+                buffer_path(old_fields[-1]).unlink()
+            else:
+                assert len(nodes) == 1
+            path.parent.mkdir(exist_ok=True)
+            with path.open("x" if flag == "-so" else "w") as out:
+                out.write(value)
+            sys.exit()
     assert allows(guard, actual), (guard, branch, otherwise)
     for node in branch.split(" ; "):
         action, *words = node.split()
@@ -2978,6 +3055,13 @@ else:
             flag, buffer = words
             assert flag == "-b"
             buffer_path(buffer).unlink()
+        elif action == "list-buffers":
+            _, flag, present, filter_flag, condition = shlex.split(node)
+            assert (flag, present, filter_flag) == ("-F", "present", "-f") and options
+            name = re.fullmatch(r"#\{==:#\{buffer_name\},(rs-paste-[0-9a-f]{32})\}", condition).group(1)
+            assert custody_value(prior)[2][-1] == name
+            if buffer_path(name).exists():
+                print("present")
         elif action == "paste-buffer":
             assert words[:5] == ["-p", "-r", "-S", "-d", "-b"] and words[6:] == ["-t", pane]
             buffer = buffer_path(words[5])

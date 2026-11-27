@@ -26,7 +26,10 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::{io::AsyncWriteExt, process::Command};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::Command,
+};
 use uuid::Uuid;
 
 pub struct Engine {
@@ -59,9 +62,10 @@ struct PendingPaste {
 struct PasteScope {
     original: GeometryReadback,
     buffer: Option<PasteBuffer>,
+    custody: Option<CustodySlot>,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct PasteBuffer {
     nonce: Uuid,
     operation: u64,
@@ -117,6 +121,175 @@ impl PasteBuffer {
     }
 }
 
+struct CustodyBinding {
+    runtime: Uuid,
+    pane: String,
+    name: String,
+    tty: String,
+    marker: String,
+    buffer: PasteBuffer,
+    completed: bool,
+}
+
+impl CustodyBinding {
+    fn matches(&self, read: &GeometryReadback, buffer: &PasteBuffer) -> bool {
+        self.name == read.name
+            && Path::new(&self.tty) == read.tty
+            && self.buffer == *buffer
+            && self.marker == buffer.marker(read, 'l')
+    }
+}
+
+struct CustodySlot {
+    index: usize,
+    value: String,
+    mutation: Uuid,
+    active: Option<CustodyBinding>,
+}
+
+type CustodySnapshot = [Option<CustodySlot>; CUSTODY_SLOTS];
+
+fn custody_option(server: ServerGeneration, index: usize) -> String {
+    format!(
+        "@rs_paste_custody_{}_{}_{}_{index:02}",
+        server.pid,
+        server.start,
+        server.token.simple()
+    )
+}
+
+fn canonical_number(value: &str) -> Result<u64> {
+    let number: u64 = value.parse()?;
+    ensure!(number.to_string() == value, "Noncanonical custody number");
+    Ok(number)
+}
+
+impl CustodySlot {
+    fn bind(
+        read: &GeometryReadback,
+        index: usize,
+        buffer: &PasteBuffer,
+        state: &str,
+    ) -> Result<Self> {
+        Self::parse(
+            read.server,
+            index,
+            &format!(
+                "v1~{}~{state}~{}~{}~{}",
+                Uuid::new_v4(),
+                read.name,
+                read.tty.display(),
+                buffer.marker(read, 'l'),
+            ),
+        )
+    }
+
+    fn parse(server: ServerGeneration, index: usize, value: &str) -> Result<Self> {
+        ensure!(
+            index < CUSTODY_SLOTS
+                && value.len() <= CUSTODY_VALUE_LIMIT
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b":/_~-".contains(&byte)),
+            "Invalid paste custody value"
+        );
+        let mut fields = value.split('~');
+        ensure!(fields.next() == Some("v1"), "Unknown paste custody version");
+        let mutation = parse_uuid(fields.next().context("Missing custody mutation")?)?;
+        ensure!(mutation.get_version_num() == 4, "Invalid custody mutation");
+        let active = match fields.next() {
+            Some("free") if fields.next().is_none() => None,
+            Some(state @ ("possible" | "completed")) => {
+                let rest: Vec<_> = fields.collect();
+                let [
+                    name,
+                    tty,
+                    "v1",
+                    runtime,
+                    token,
+                    pid,
+                    start,
+                    sid,
+                    wid,
+                    pane,
+                    process,
+                    process_start,
+                    create,
+                    launch,
+                    epoch,
+                    "l",
+                    nonce,
+                    operation,
+                    buffer,
+                ] = rest.as_slice()
+                else {
+                    bail!("Malformed paste custody binding");
+                };
+                let runtime = parse_uuid(runtime)?;
+                let (session, named_runtime) =
+                    parse_name(name).context("Invalid custody runtime name")?;
+                let pane = format!("%{pane}");
+                let process = canonical_number(process)?;
+                ensure!(
+                    !session.is_nil()
+                        && named_runtime == runtime
+                        && tmux_name(session, runtime) == *name
+                        && valid_pane_tty(tty)
+                        && parse_uuid(token)? == server.token
+                        && canonical_number(pid)? == u64::from(server.pid)
+                        && canonical_number(start)? == server.start
+                        && canonical_tmux_id(&format!("${sid}"), '$')
+                        && canonical_tmux_id(&format!("@{wid}"), '@')
+                        && canonical_tmux_id(&pane, '%')
+                        && (1..=u64::from(u32::MAX)).contains(&process)
+                        && canonical_number(process_start)? > 0
+                        && (*create == "-" || parse_uuid(create).is_ok())
+                        && parse_uuid(launch).is_ok()
+                        && parse_epoch(epoch)?.is_some(),
+                    "Invalid paste custody identity"
+                );
+                let nonce = parse_uuid(nonce)?;
+                let operation = canonical_number(operation)?;
+                let id = buffer
+                    .strip_prefix("rs-paste-")
+                    .context("Invalid custody buffer name")?;
+                let uuid = Uuid::try_parse(id)?;
+                ensure!(
+                    nonce.get_version_num() == 4
+                        && operation > 0
+                        && uuid.get_version_num() == 4
+                        && uuid.simple().to_string() == id,
+                    "Invalid paste custody buffer"
+                );
+                Some(CustodyBinding {
+                    runtime,
+                    pane,
+                    name: (*name).into(),
+                    tty: (*tty).into(),
+                    marker: rest[2..].join("~"),
+                    buffer: PasteBuffer {
+                        nonce,
+                        operation,
+                        name: (*buffer).into(),
+                    },
+                    completed: state == "completed",
+                })
+            }
+            _ => bail!("Invalid paste custody state"),
+        };
+        Ok(Self {
+            index,
+            value: value.into(),
+            mutation,
+            active,
+        })
+    }
+
+    fn guard(&self, server: ServerGeneration) -> String {
+        format_equal(&custody_option(server, self.index), &self.value)
+    }
+}
+
 fn paste_process_stamp(marker: &str) -> Result<(&str, u64)> {
     let mut fields = marker.split('~').skip(8);
     let pid = fields.next().context("Missing original paste process ID")?;
@@ -136,6 +309,7 @@ impl PasteScope {
         Self {
             original: read.clone(),
             buffer: PasteBuffer::from_marker(read),
+            custody: None,
         }
     }
 
@@ -173,6 +347,7 @@ impl ResizeLane {
                 && previous.original.paste_marker == scope.original.paste_marker
             {
                 previous.buffer = scope.buffer;
+                previous.custody = scope.custody;
             }
         } else {
             self.paste_quarantines.push(scope);
@@ -289,6 +464,12 @@ const GEOMETRY_FORMAT: &str = concat!(
 const MAX_REVISION: u64 = (1 << 53) - 1;
 const GENERATION_OPTION: &str = "@rs_create_generation";
 const GENERATION_FORMAT: &str = "#{pid}|#{start_time}|#{@rs_create_generation}";
+const CUSTODY_SLOTS: usize = 16;
+const CUSTODY_VALUE_LIMIT: usize = 2048;
+const CUSTODY_SNAPSHOT_LIMIT: usize = 40960;
+const CUSTODY_ROW: &str =
+    "#{option_name} #{?#{m/r:^[a-zA-Z0-9:/_~-]+$,#{option_value}},#{option_value},invalid}";
+const CUSTODY_END: &str = "rs-custody-snapshot";
 const PANE_OPTION: &str = "@rs_create_nonce";
 const INITIALIZER_OPTION: &str = "@rs_create_initializer";
 const BIRTH_OPTION: &str = "@rs_create_birth";
@@ -2485,7 +2666,7 @@ impl Engine {
         );
         let name = format!("rs-paste-probe-{}", Uuid::new_v4().simple());
         let sample = format!("{}\n\t\u{2603}", Uuid::new_v4());
-        let loaded = self.load_paste(read, &name, sample.as_bytes()).await;
+        let loaded = self.load_paste(read, &name, sample.as_bytes(), None).await;
         let returned = match loaded {
             Ok(()) => {
                 self.geometry_command(&["save-buffer", "-b", &name, "-"])
@@ -2554,7 +2735,160 @@ impl Engine {
         Ok(after)
     }
 
-    async fn load_paste(&self, read: &GeometryReadback, name: &str, data: &[u8]) -> Result<()> {
+    async fn read_custody(&self, server: ServerGeneration) -> Result<CustodySnapshot> {
+        let options: [_; CUSTODY_SLOTS] = std::array::from_fn(|i| custody_option(server, i));
+        let guard = format_all([
+            generation_guard(server),
+            format_equal("after-if-shell", ""),
+            format_equal("after-show-options", ""),
+            format_equal("after-display-message", ""),
+            format_equal("command-error", ""),
+        ]);
+        let mut branch = String::new();
+        for option in &options {
+            branch.push_str(&format!("show-options -sq -F '{CUSTODY_ROW}' {option} ; "));
+        }
+        branch.push_str(&format!("display-message -p -l {CUSTODY_END}"));
+        let output = tokio::time::timeout(self.terminal_command_watchdog(), async {
+            let mut child = Command::new(&self.tmux)
+                .args(["-N", "-S"])
+                .arg(&self.socket)
+                .args(["if-shell", "-F", &guard, &branch])
+                .env_remove("TMUX")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()?;
+            let mut output = Vec::new();
+            child
+                .stdout
+                .take()
+                .context("Paste custody snapshot unavailable")?
+                .take((CUSTODY_SNAPSHOT_LIMIT + 1) as u64)
+                .read_to_end(&mut output)
+                .await?;
+            ensure!(
+                output.len() <= CUSTODY_SNAPSHOT_LIMIT,
+                "Paste custody snapshot too large"
+            );
+            ensure!(
+                child.wait().await?.success(),
+                "Paste custody snapshot failed"
+            );
+            Ok::<_, anyhow::Error>(output)
+        })
+        .await
+        .context("Paste custody snapshot timed out")??;
+        let output = std::str::from_utf8(&output).context("Invalid paste custody snapshot")?;
+        let mut rows = output
+            .strip_suffix('\n')
+            .context("Incomplete paste custody snapshot")?
+            .rsplit('\n');
+        ensure!(
+            rows.next() == Some(CUSTODY_END),
+            "Incomplete paste custody snapshot"
+        );
+        let mut slots: CustodySnapshot = std::array::from_fn(|_| None);
+        let mut mutations = HashSet::new();
+        let mut panes = HashSet::new();
+        let mut buffers = HashSet::new();
+        let mut nonces = HashSet::new();
+        for row in rows {
+            let (option, value) = row.split_once(' ').context("Invalid paste custody row")?;
+            let index = options
+                .iter()
+                .position(|key| key == option)
+                .context("Unknown paste custody slot")?;
+            let slot = CustodySlot::parse(server, index, value)?;
+            ensure!(
+                slots[index].is_none() && mutations.insert(slot.mutation),
+                "Duplicate paste custody slot or mutation"
+            );
+            if let Some(active) = &slot.active {
+                ensure!(
+                    panes.insert(active.pane.clone())
+                        && buffers.insert(active.buffer.name.clone())
+                        && nonces.insert(active.buffer.nonce),
+                    "Duplicate paste custody binding"
+                );
+            }
+            slots[index] = Some(slot);
+        }
+        Ok(slots)
+    }
+
+    fn custody_guard(&self, read: &GeometryReadback, compare: String) -> String {
+        format_all([
+            self.paste_guard(read),
+            format_equal("after-if-shell", ""),
+            compare,
+        ])
+    }
+
+    async fn mutate_custody(
+        &self,
+        read: &GeometryReadback,
+        previous: Option<&CustodySlot>,
+        next: &CustodySlot,
+        delete: Option<&str>,
+    ) -> Result<()> {
+        ensure!(
+            read.sender_supported && self.private_sender_socket(),
+            "Paste custody mutation unavailable"
+        );
+        let pane = &read.target.pane;
+        let option = custody_option(read.server, next.index);
+        let (flag, compare) = match previous {
+            Some(previous) => {
+                ensure!(
+                    previous.index == next.index && previous.mutation != next.mutation,
+                    "Invalid paste custody transition"
+                );
+                ("-s", previous.guard(read.server))
+            }
+            None => ("-so", format_equal(&option, "")),
+        };
+        let guard = self.custody_guard(read, compare);
+        let set = format!("set-option {flag} {option} {}", next.value);
+        let branch = match delete {
+            Some(buffer) => format!("delete-buffer -b {buffer} ; {set}"),
+            None => set,
+        };
+        let _ = self
+            .geometry_command(&["if-shell", "-F", "-t", pane, &guard, &branch])
+            .await;
+        let observed = self.read_custody(read.server).await?;
+        ensure!(
+            observed[next.index]
+                .as_ref()
+                .is_some_and(|slot| slot.value == next.value),
+            "Paste custody transition is unconfirmed"
+        );
+        Ok(())
+    }
+
+    async fn retire_custody(
+        &self,
+        read: &GeometryReadback,
+        slot: &CustodySlot,
+        delete: Option<&str>,
+    ) -> Result<()> {
+        let free = CustodySlot::parse(
+            read.server,
+            slot.index,
+            &format!("v1~{}~free", Uuid::new_v4()),
+        )?;
+        self.mutate_custody(read, Some(slot), &free, delete).await
+    }
+
+    async fn load_paste(
+        &self,
+        read: &GeometryReadback,
+        name: &str,
+        data: &[u8],
+        custody: Option<&CustodySlot>,
+    ) -> Result<()> {
         ensure!(
             self.private_sender_socket(),
             "Paste load target unavailable"
@@ -2563,18 +2897,15 @@ impl Engine {
         let witness = format!("rs-paste-loaded-{}", Uuid::new_v4());
         let printed = pane_witness(pane, &witness);
         let branch = format!("load-buffer -b {name} - ; {printed}");
+        let guard = match custody {
+            Some(slot) => self.custody_guard(read, slot.guard(read.server)),
+            None => self.paste_guard(read),
+        };
         tokio::time::timeout(self.terminal_command_watchdog(), async {
             let mut child = Command::new(&self.tmux)
                 .args(["-N", "-S"])
                 .arg(&self.socket)
-                .args([
-                    "if-shell",
-                    "-F",
-                    "-t",
-                    pane,
-                    &self.paste_guard(read),
-                    &branch,
-                ])
+                .args(["if-shell", "-F", "-t", pane, &guard, &branch])
                 .env_remove("TMUX")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -2616,18 +2947,8 @@ impl Engine {
             self.paste_guard(read),
             format_equal("after-list-buffers", ""),
         ]);
-        if allow_absent {
-            let filter = format_equal("buffer_name", buffer);
-            let branch = format!("list-buffers -F present -f '{filter}' ; {printed}");
-            let reply = self
-                .geometry_command(&["if-shell", "-F", "-t", pane, &guard, &branch])
-                .await?;
-            let mut lines = reply.lines();
-            match (lines.next(), lines.next(), lines.next()) {
-                (Some(first), None, None) if first == witness => return Ok(()),
-                (Some("present"), Some(last), None) if last == witness => {}
-                _ => bail!("Paste buffer absence is unconfirmed"),
-            }
+        if allow_absent && !self.paste_buffer_present(pane, &guard, buffer).await? {
+            return Ok(());
         }
         let branch = format!("delete-buffer -b {buffer} ; {printed}");
         let reply = self
@@ -2640,10 +2961,51 @@ impl Engine {
         Ok(())
     }
 
+    async fn paste_buffer_present(&self, pane: &str, guard: &str, buffer: &str) -> Result<bool> {
+        let witness = format!("rs-paste-cleanup-{}", Uuid::new_v4());
+        let printed = pane_witness(pane, &witness);
+        let filter = format_equal("buffer_name", buffer);
+        let branch = format!("list-buffers -F present -f '{filter}' ; {printed}");
+        let reply = self
+            .geometry_command(&["if-shell", "-F", "-t", pane, guard, &branch])
+            .await?;
+        let mut lines = reply.lines();
+        match (lines.next(), lines.next(), lines.next()) {
+            (Some(first), None, None) if first == witness => Ok(false),
+            (Some("present"), Some(last), None) if last == witness => Ok(true),
+            _ => bail!("Paste buffer absence is unconfirmed"),
+        }
+    }
+
+    async fn close_custody(&self, read: &GeometryReadback, slot: &CustodySlot) -> Result<()> {
+        let active = slot
+            .active
+            .as_ref()
+            .context("Missing active paste custody")?;
+        ensure!(
+            read.sender_supported && self.private_sender_socket(),
+            "Paste cleanup unavailable"
+        );
+        let buffer = active.buffer.name.as_str();
+        let guard = format_all([
+            self.custody_guard(read, slot.guard(read.server)),
+            format_equal("after-list-buffers", ""),
+        ]);
+        let delete = if active.completed {
+            self.paste_buffer_present(&read.target.pane, &guard, buffer)
+                .await?
+        } else {
+            true
+        };
+        self.retire_custody(read, slot, delete.then_some(buffer))
+            .await
+    }
+
     async fn delete_loading_paste(
         &self,
         fenced: &GeometryReadback,
         buffer: &PasteBuffer,
+        custody: Option<&CustodySlot>,
     ) -> Result<GeometryReadback> {
         ensure!(
             fenced.sender_supported && self.private_sender_socket(),
@@ -2655,27 +3017,24 @@ impl Engine {
             "delete-buffer -b {} ; set-option -p -t {pane} {PASTE_OPTION} {retired}",
             buffer.name,
         );
+        let guard = match custody {
+            Some(slot) => self.custody_guard(fenced, slot.guard(fenced.server)),
+            None => self.paste_guard(fenced),
+        };
         let _ = self
-            .geometry_command(&[
-                "if-shell",
-                "-F",
-                "-t",
-                pane,
-                &self.paste_guard(fenced),
-                &branch,
-            ])
+            .geometry_command(&["if-shell", "-F", "-t", pane, &guard, &branch])
             .await;
         self.read_paste_marker(fenced, &retired).await
     }
 
-    async fn reclaim_superseded_paste(
+    async fn prove_paste_replacement(
         &self,
-        scope: &PasteScope,
+        server: ServerGeneration,
+        original_pane: &str,
         current: &GeometryReadback,
     ) -> Result<()> {
-        let original = &scope.original;
         ensure!(
-            original.server == current.server && !scope.may_be_same_pane(current),
+            server == current.server && original_pane != current.target.pane,
             "Original paste server or pane is unconfirmed"
         );
         let output = self
@@ -2692,18 +3051,51 @@ impl Engine {
             .await?;
         let mut lines = output.lines();
         ensure!(
-            lines.next().and_then(generation) == Some(original.server),
+            lines.next().and_then(generation) == Some(server),
             "Original paste server changed"
         );
-        let mut current_seen = false;
+        let mut panes = HashSet::new();
         for pane in lines {
             ensure!(
-                canonical_tmux_id(pane, '%') && pane != original.target.pane,
+                canonical_tmux_id(pane, '%') && pane != original_pane && panes.insert(pane),
                 "Original paste pane absence is unconfirmed"
             );
-            current_seen |= pane == current.target.pane;
         }
-        ensure!(current_seen, "Current paste cleanup target is unconfirmed");
+        ensure!(
+            panes.contains(current.target.pane.as_str()),
+            "Current paste cleanup target is unconfirmed"
+        );
+        if current.nonce.is_empty() {
+            let scope = format!(
+                "{}|{}|{}|{}|{}",
+                server.pid,
+                server.start,
+                server.token,
+                current.target.session,
+                current.target.window
+            );
+            let (pid, exited) = match current.state {
+                PaneState::Live => (Some(current.target.pid), false),
+                PaneState::Exited(pid) => (pid, true),
+            };
+            self.corroborate_legacy(&current.target.pane, &current.name, pid, exited, &scope)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn reclaim_superseded_paste(
+        &self,
+        scope: &PasteScope,
+        current: &GeometryReadback,
+    ) -> Result<()> {
+        let original = &scope.original;
+        ensure!(
+            !scope.may_be_same_pane(current),
+            "Original paste pane still present"
+        );
+        self.prove_paste_replacement(original.server, &original.target.pane, current)
+            .await?;
         if let Some(buffer) = &scope.buffer {
             let allow_absent = !buffer.requires_deletion(original);
             self.delete_paste(current, &buffer.name, allow_absent)
@@ -2717,7 +3109,12 @@ impl Engine {
         Ok(())
     }
 
-    async fn reconcile_paste(&self, lane: &mut ResizeLane, current: &GeometryReadback) {
+    async fn reconcile_paste(
+        &self,
+        lane: &mut ResizeLane,
+        current: &GeometryReadback,
+        snapshot: &CustodySnapshot,
+    ) -> bool {
         if lane
             .pending_paste
             .as_ref()
@@ -2728,18 +3125,47 @@ impl Engine {
                 .release(current.target.runtime_id, pending.binding.token);
             lane.retain_paste(pending.scope);
         }
-        let mut index = 0;
-        while index < lane.paste_quarantines.len() {
+        let mut predecessors_closed = true;
+        for slot in snapshot.iter().flatten() {
+            let Some(active) = slot.active.as_ref().filter(|active| {
+                active.runtime == current.target.runtime_id && active.pane != current.target.pane
+            }) else {
+                continue;
+            };
             if self
-                .reclaim_superseded_paste(&lane.paste_quarantines[index], current)
+                .prove_paste_replacement(current.server, &active.pane, current)
                 .await
                 .is_ok()
+                && self.close_custody(current, slot).await.is_ok()
             {
+                lane.paste_quarantines.retain(|scope| {
+                    scope.original.server != current.server
+                        || !scope
+                            .buffer
+                            .as_ref()
+                            .is_some_and(|buffer| active.matches(&scope.original, buffer))
+                });
+            } else {
+                predecessors_closed = false;
+            }
+        }
+        let mut index = 0;
+        while index < lane.paste_quarantines.len() {
+            let scope = &lane.paste_quarantines[index];
+            let has_server_record = scope.custody.is_some()
+                || snapshot.iter().flatten().any(|slot| {
+                    slot.active.as_ref().is_some_and(|active| {
+                        scope.original.server == current.server
+                            && active.pane == scope.original.target.pane
+                    })
+                });
+            if !has_server_record && self.reclaim_superseded_paste(scope, current).await.is_ok() {
                 lane.paste_quarantines.swap_remove(index);
             } else {
                 index += 1;
             }
         }
+        predecessors_closed
     }
 
     async fn paste_stage(
@@ -2796,18 +3222,25 @@ impl Engine {
         &self,
         lane: &mut ResizeLane,
         binding: &PasteBinding,
-        scope: PasteScope,
+        mut scope: PasteScope,
         result: PasteResult,
     ) -> PasteResult {
-        let held = &scope.original;
-        let buffer = scope.buffer.as_ref().expect("reserved paste buffer");
         let cleaned = async {
+            let held = &scope.original;
+            let buffer = scope.buffer.as_ref().expect("reserved paste buffer");
             let fenced = self
                 .transition_marker(held, &buffer.marker(held, 'q'))
                 .await?
                 .context("Paste reservation was not fenced")?;
-            self.delete_paste(&fenced, &buffer.name, true).await?;
-            self.transition_marker(&fenced, &fenced.ready_marker(fenced.epoch))
+            scope.original = fenced;
+            let fenced = &scope.original;
+            self.close_custody(
+                fenced,
+                scope.custody.as_ref().context("Missing paste custody")?,
+            )
+            .await?;
+            scope.custody = None;
+            self.transition_marker(fenced, &fenced.ready_marker(fenced.epoch))
                 .await?
                 .context("Paste reservation was not retired")
         };
@@ -2863,10 +3296,30 @@ impl Engine {
         if !read.input_enabled {
             return PasteResult::Unavailable {};
         }
+        let Ok(snapshot) = self.read_custody(read.server).await else {
+            return PasteResult::Unavailable {};
+        };
+        if snapshot.iter().flatten().any(|slot| {
+            slot.active
+                .as_ref()
+                .is_some_and(|active| active.pane == read.target.pane)
+        }) {
+            return self.quarantine(&mut lane, &binding, PasteScope::sampled(&read));
+        }
+        let Some(index) = snapshot
+            .iter()
+            .position(|slot| slot.as_ref().is_some_and(|slot| slot.active.is_none()))
+            .or_else(|| snapshot.iter().position(Option::is_none))
+        else {
+            return PasteResult::Unavailable {};
+        };
         let buffer = PasteBuffer {
             nonce: Uuid::new_v4(),
             operation: binding.operation,
             name: format!("rs-paste-{}", Uuid::new_v4().simple()),
+        };
+        let Ok(custody) = CustodySlot::bind(&read, index, &buffer, "possible") else {
+            return PasteResult::Unavailable {};
         };
         let loading_marker = buffer.marker(&read, 'l');
         let loading = match self.transition_marker(&read, &loading_marker).await {
@@ -2881,6 +3334,7 @@ impl Engine {
                     PasteScope {
                         original,
                         buffer: None,
+                        custody: None,
                     },
                 );
             }
@@ -2888,15 +3342,39 @@ impl Engine {
         let mut scope = PasteScope {
             original: loading,
             buffer: Some(buffer),
+            custody: Some(custody),
         };
         let buffer = scope.buffer.as_ref().expect("reserved paste buffer");
-        let loaded = self.load_paste(&scope.original, &buffer.name, &data).await;
+        let custody = scope.custody.as_ref().expect("reserved paste custody");
+        if self
+            .mutate_custody(&scope.original, snapshot[index].as_ref(), custody, None)
+            .await
+            .is_err()
+        {
+            return self.quarantine(&mut lane, &binding, scope);
+        }
+        let loaded = self
+            .load_paste(&scope.original, &buffer.name, &data, Some(custody))
+            .await;
         drop(data);
         if loaded.is_err() {
             return self.quarantine(&mut lane, &binding, scope);
         }
+        let Ok(completed) = CustodySlot::bind(&scope.original, index, buffer, "completed") else {
+            return self.quarantine(&mut lane, &binding, scope);
+        };
+        if self
+            .mutate_custody(&scope.original, Some(custody), &completed, None)
+            .await
+            .is_err()
+        {
+            return self.quarantine(&mut lane, &binding, scope);
+        }
         let armed = buffer.marker(&scope.original, 'a');
         let spent = buffer.marker(&scope.original, 's');
+        let buffer_name = buffer.name.clone();
+        let nonce = buffer.nonce;
+        scope.custody = Some(completed);
         let Ok(Some(held)) = self.transition_marker(&scope.original, &armed).await else {
             return self.quarantine(&mut lane, &binding, scope);
         };
@@ -2915,7 +3393,13 @@ impl Engine {
                 && read.paste_marker == armed
                 && read.sender_supported
         });
-        let send = self.guarded_paste(&scope.original, &spent, &buffer.name, buffer.nonce);
+        let send = self.guarded_paste(
+            &scope.original,
+            &spent,
+            &buffer_name,
+            nonce,
+            scope.custody.as_ref().expect("completed paste custody"),
+        );
         // @invariant: The serialized monotonic check is the last admission step before submission.
         let rejection = match exact {
             Some(read) if self.owners().paste_live(&binding, self.now()) => {
@@ -2957,9 +3441,13 @@ impl Engine {
         spent: &str,
         buffer: &str,
         nonce: Uuid,
+        custody: &CustodySlot,
     ) -> GuardedPaste {
         let pane = held.target.pane.clone();
-        let guard = format_all([self.paste_guard(held), format_equal("pane_input_off", 0)]);
+        let guard = format_all([
+            self.custody_guard(held, custody.guard(held.server)),
+            format_equal("pane_input_off", 0),
+        ]);
         let enqueued = format!("rs-paste-enqueued-{nonce}");
         let rejected = format!("rs-paste-rejected-{nonce}");
         let printed = pane_witness(&pane, &enqueued);
@@ -3021,7 +3509,7 @@ impl Engine {
         if pending.binding != binding || pending.receipt != receipt {
             return PasteResult::Stale {};
         }
-        let pending = lane.pending_paste.take().expect("matched pending paste");
+        let mut pending = lane.pending_paste.take().expect("matched pending paste");
         let Ok(read) = self.scoped_geometry(&binding.terminal).await else {
             return self.quarantine(&mut lane, &binding, pending.scope);
         };
@@ -3036,6 +3524,15 @@ impl Engine {
         {
             return self.quarantine(&mut lane, &binding, pending.scope);
         }
+        let slot = pending
+            .scope
+            .custody
+            .as_ref()
+            .expect("committed paste custody");
+        if self.retire_custody(&read, slot, None).await.is_err() {
+            return self.quarantine(&mut lane, &binding, pending.scope);
+        }
+        pending.scope.custody = None;
         let ready = read.ready_marker(read.epoch);
         if !matches!(self.transition_marker(&read, &ready).await, Ok(Some(_))) {
             return self.quarantine(&mut lane, &binding, pending.scope);
@@ -3126,7 +3623,32 @@ impl Engine {
         if lane.holds_pane(&read) {
             return Ok(control_hold());
         }
-        if lane.has_paste_hold() {
+        if !read.sender_supported {
+            let hold = read
+                .paste_admission_hold()
+                .unwrap_or(PasteAdmission::Unavailable);
+            if hold == PasteAdmission::PriorSendUnknown {
+                lane.retain_paste(PasteScope::sampled(&read));
+            }
+            return Ok(control_recovering(hold));
+        }
+        let Ok(snapshot) = self.read_custody(read.server).await else {
+            return Ok(control_hold());
+        };
+        if snapshot.iter().flatten().any(|slot| {
+            slot.active
+                .as_ref()
+                .is_some_and(|active| active.pane == read.target.pane)
+        }) {
+            return Ok(control_hold());
+        }
+        if lane.has_paste_hold()
+            || snapshot.iter().flatten().any(|slot| {
+                slot.active
+                    .as_ref()
+                    .is_some_and(|active| active.runtime == runtime_id)
+            })
+        {
             if terminal.is_some() {
                 let current = self
                     .geometry_for_runtime(&self.find(runtime_id).await?)
@@ -3138,7 +3660,7 @@ impl Engine {
                 self.authorize_terminal_writer(&current, catalog).await?;
                 read = current;
             }
-            self.reconcile_paste(&mut lane, &read).await;
+            self.reconcile_paste(&mut lane, &read, &snapshot).await;
         }
         if let Some(hold) = read.paste_admission_hold() {
             if hold == PasteAdmission::PriorSendUnknown {
@@ -3325,11 +3847,18 @@ impl Engine {
         &self,
         lane: &mut ResizeLane,
         mut read: GeometryReadback,
+        snapshot: &CustodySnapshot,
     ) -> Result<GeometryReadback> {
-        if read.state == PaneState::Live {
-            self.reconcile_paste(lane, &read).await;
-        }
+        ensure!(
+            self.reconcile_paste(lane, &read, snapshot).await,
+            "Original paste custody is unconfirmed"
+        );
         let sampled = PasteScope::sampled(&read);
+        let slot = snapshot.iter().flatten().find(|slot| {
+            slot.active
+                .as_ref()
+                .is_some_and(|active| active.pane == read.target.pane)
+        });
         ensure!(
             sampled.buffer.is_some()
                 || read.paste_ready()
@@ -3340,17 +3869,26 @@ impl Engine {
             .paste_quarantines
             .iter()
             .chain(lane.pending_paste.iter().map(|pending| &pending.scope));
-        for saved in
-            scopes.filter(|scope| read.state != PaneState::Live || scope.may_be_same_pane(&read))
-        {
+        for saved in scopes {
             let recovered = PasteBuffer::from_marker(&saved.original);
             let buffer = saved.buffer.as_ref().or(recovered.as_ref());
             ensure!(
                 saved.original.same_pane(&read)
                     && saved.original.epoch == read.epoch
                     && buffer.is_some()
-                    && buffer == sampled.buffer.as_ref(),
+                    && buffer == sampled.buffer.as_ref()
+                    && (saved.custody.is_none() || slot.is_some()),
                 "Original paste buffer identity is unconfirmed"
+            );
+        }
+        let active = slot.and_then(|slot| slot.active.as_ref());
+        if let Some(active) = active {
+            ensure!(
+                sampled
+                    .buffer
+                    .as_ref()
+                    .is_some_and(|buffer| active.matches(&read, buffer)),
+                "Original paste custody does not match its pane marker"
             );
         }
         let Some(buffer) = sampled.buffer else {
@@ -3361,7 +3899,10 @@ impl Engine {
             read.sender_supported && self.private_sender_socket(),
             "Paste cleanup unavailable"
         );
-        let requires_deletion = buffer.requires_deletion(&read);
+        let requires_deletion = match active {
+            Some(active) => !active.completed && read.paste_marker != buffer.marker(&read, 'q'),
+            None => buffer.requires_deletion(&read),
+        };
         let fenced = buffer.marker(&read, if requires_deletion { 'f' } else { 'q' });
         if read.paste_marker != fenced {
             read = self
@@ -3370,11 +3911,23 @@ impl Engine {
                 .context("Original paste sender was not fenced")?;
         }
         if requires_deletion {
-            self.delete_loading_paste(&read, &buffer).await
-        } else {
-            self.delete_paste(&read, &buffer.name, true).await?;
-            Ok(read)
+            read = self.delete_loading_paste(&read, &buffer, slot).await?;
         }
+        match (slot, active) {
+            (Some(slot), Some(active)) if active.completed => {
+                self.close_custody(&read, slot).await?
+            }
+            (Some(slot), _) => self.retire_custody(&read, slot, None).await?,
+            (None, _) if !requires_deletion => self.delete_paste(&read, &buffer.name, true).await?,
+            (None, _) => {}
+        }
+        if let Some(pending) = lane.pending_paste.as_mut() {
+            pending.scope.custody = None;
+        }
+        for scope in &mut lane.paste_quarantines {
+            scope.custody = None;
+        }
+        Ok(read)
     }
 
     async fn stop_runtime(
@@ -3393,16 +3946,22 @@ impl Engine {
         let runtime = self.find(runtime_id).await?;
         let pane = &runtime.pane_id;
         ensure!(pane == expected_pane_id, "runtime precondition failed");
+        let snapshot = self.read_custody(server).await?;
         let checked = if runtime.exited {
             let read = self.retained_geometry(&runtime, server, catalog).await?;
-            Some(self.prepare_paste_stop(&mut lane, read).await?)
+            Some(self.prepare_paste_stop(&mut lane, read, &snapshot).await?)
         } else if let Ok(read) = self.geometry_for_runtime(&runtime).await {
             ensure!(read.server == server, "Stop target server changed");
             self.observe_terminal(&read.identity(), catalog).await?;
-            Some(self.prepare_paste_stop(&mut lane, read).await?)
+            Some(self.prepare_paste_stop(&mut lane, read, &snapshot).await?)
         } else {
             ensure!(
-                !lane.has_paste_hold(),
+                !lane.has_paste_hold()
+                    && !snapshot.iter().flatten().any(|slot| {
+                        slot.active.as_ref().is_some_and(|active| {
+                            active.runtime == runtime_id || active.pane == *pane
+                        })
+                    }),
                 "Original paste custody is unconfirmed"
             );
             None
@@ -3594,8 +4153,9 @@ impl Engine {
                         && current.target.pane == identity.pane
                         && current.target.pid == identity.pid
                         && current.nonce.is_empty()
+                        && let Ok(snapshot) = self.read_custody(server).await
                     {
-                        self.reconcile_paste(&mut lane, &current).await;
+                        self.reconcile_paste(&mut lane, &current, &snapshot).await;
                     }
                 }
                 Ok(Response::Created { runtime })
@@ -3901,6 +4461,309 @@ mod tests {
         match result {
             PasteResult::Committed { receipt } => receipt,
             other => panic!("Expected enqueue witness, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_paste_custody_tombstone_reuse_fences_stale_claim_and_clear() {
+        let f = Fixture::paste();
+        let mut first = writer(&f).await;
+        let (other, _process) = f.second_pane(false);
+        let (token, epoch) = f.acquire(other.clone()).await;
+        let other = PasteBinding {
+            terminal: other,
+            token,
+            epoch,
+            ..first.clone()
+        };
+        let server = f.engine.generation().await.unwrap();
+        set(&f, "custody-write", "lost");
+        stage(&f, &first, DRAFT).await;
+        let first_receipt = receipt(paste_reply(&f.engine, commit(&first, DRAFT.len())).await);
+        set(&f, "custody-write", "");
+        stage(&f, &other, DRAFT).await;
+        let other_receipt = receipt(paste_reply(&f.engine, commit(&other, DRAFT.len())).await);
+        let occupied = f.engine.read_custody(server).await.unwrap();
+        let old = occupied[0].as_ref().unwrap();
+        let neighbor = occupied[1].as_ref().unwrap();
+        let old_binding = old.active.as_ref().unwrap();
+        assert!(old_binding.completed && neighbor.active.as_ref().unwrap().completed);
+        assert_eq!(
+            paste_reply(&f.engine, ack(&first, first_receipt)).await,
+            PasteResult::Acknowledged { writable: true }
+        );
+        let retired = f.engine.read_custody(server).await.unwrap();
+        let free = retired[0].as_ref().unwrap();
+        assert!(free.active.is_none());
+        assert_ne!(old.mutation, free.mutation);
+        assert_eq!(retired[1].as_ref().unwrap().value, neighbor.value);
+
+        first.operation += 1;
+        first.sequence += 1;
+        stage(&f, &first, DRAFT).await;
+        let next_receipt = receipt(paste_reply(&f.engine, commit(&first, DRAFT.len())).await);
+        let reused = f.engine.read_custody(server).await.unwrap();
+        let next = reused[0].as_ref().unwrap();
+        assert!(next.active.as_ref().unwrap().completed);
+        assert_ne!(next.mutation, free.mutation);
+        assert_ne!(
+            next.active.as_ref().unwrap().buffer.name,
+            old_binding.buffer.name
+        );
+        let read = f.engine.scoped_geometry(&first.terminal).await.unwrap();
+        let stale_claim = CustodySlot::bind(&read, 0, &old_binding.buffer, "possible").unwrap();
+        let writes = file(&f, "custody-writes");
+        assert!(
+            f.engine
+                .mutate_custody(&read, None, &stale_claim, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            f.engine
+                .mutate_custody(&read, Some(free), &stale_claim, None)
+                .await
+                .is_err()
+        );
+        assert!(f.engine.retire_custody(&read, old, None).await.is_err());
+        let mut wrong_target = read.clone();
+        wrong_target.target.window = "@99".into();
+        assert!(
+            f.engine
+                .retire_custody(&wrong_target, next, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(file(&f, "custody-writes"), writes);
+        let unchanged = f.engine.read_custody(server).await.unwrap();
+        assert_eq!(unchanged[0].as_ref().unwrap().value, next.value);
+        assert_eq!(unchanged[1].as_ref().unwrap().value, neighbor.value);
+
+        assert_eq!(
+            paste_reply(&f.engine, ack(&first, next_receipt)).await,
+            PasteResult::Acknowledged { writable: true }
+        );
+        assert_eq!(
+            paste_reply(&f.engine, ack(&other, other_receipt)).await,
+            PasteResult::Acknowledged { writable: true }
+        );
+        let settled = f.engine.read_custody(server).await.unwrap();
+        assert!(settled.iter().flatten().all(|slot| slot.active.is_none()));
+        assert_eq!(settled.iter().flatten().count(), 2);
+        assert_eq!(file(&f, "pane0-bytes"), DRAFT.repeat(2));
+        assert_eq!(file(&f, "pane1-bytes"), DRAFT);
+        assert_eq!(file(&f, "submissions"), b"111");
+        assert_eq!(file(&f, "effects"), b"111");
+        assert!(file(&f, "deletions").is_empty());
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_paste_custody_refuses_unproved_or_full_snapshot() {
+        for mode in [
+            "missing",
+            "malformed",
+            "duplicate-row",
+            "duplicate-binding",
+            "oversized",
+            "over-budget",
+            "foreign",
+            "full",
+        ] {
+            let f = Fixture::paste();
+            let binding = writer(&f).await;
+            let mut read = f.engine.scoped_geometry(&binding.terminal).await.unwrap();
+            let server = read.server;
+            fs::create_dir(f.temp.path().join("custody")).unwrap();
+            let put = |index, value: &str| {
+                set(
+                    &f,
+                    &format!("custody/{}", custody_option(server, index)),
+                    value,
+                )
+            };
+            let bound = || PasteBuffer {
+                nonce: Uuid::new_v4(),
+                operation: 1,
+                name: format!("rs-paste-{}", Uuid::new_v4().simple()),
+            };
+            match mode {
+                "missing" | "over-budget" => set(&f, "custody-snapshot", mode),
+                "malformed" => put(0, "v2~bad~free"),
+                "duplicate-row" => {
+                    set(&f, "custody-snapshot", mode);
+                    put(0, &format!("v1~{}~free", Uuid::new_v4()));
+                }
+                "duplicate-binding" => {
+                    let buffer = bound();
+                    for i in 0..2 {
+                        put(
+                            i,
+                            &CustodySlot::bind(&read, i, &buffer, "possible")
+                                .unwrap()
+                                .value,
+                        );
+                    }
+                }
+                "oversized" => put(0, &"a".repeat(CUSTODY_VALUE_LIMIT + 1)),
+                "foreign" => {
+                    let value = CustodySlot::bind(&read, 0, &bound(), "possible")
+                        .unwrap()
+                        .value;
+                    put(
+                        0,
+                        &value.replace(&server.token.to_string(), &Uuid::new_v4().to_string()),
+                    );
+                }
+                "full" => {
+                    for i in 0..CUSTODY_SLOTS {
+                        read.target.pane = format!("%{}", i + 1);
+                        put(
+                            i,
+                            &CustodySlot::bind(&read, i, &bound(), "possible")
+                                .unwrap()
+                                .value,
+                        );
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let marker = file(&f, "marker");
+            assert_eq!(
+                f.engine.read_custody(server).await.is_ok(),
+                mode == "full",
+                "{mode}"
+            );
+            stage(&f, &binding, DRAFT).await;
+            assert_eq!(
+                paste_reply(&f.engine, commit(&binding, DRAFT.len())).await,
+                PasteResult::Unavailable {},
+                "{mode}"
+            );
+            assert_eq!(file(&f, "marker"), marker, "{mode}");
+            for effect in [
+                "last-load",
+                "submissions",
+                "effects",
+                "deletions",
+                "custody-writes",
+            ] {
+                assert!(file(&f, effect).is_empty(), "{mode}: {effect}");
+            }
+            if mode != "full" {
+                f.engine.handle(release(&binding), None).await.unwrap();
+                assert!(
+                    matches!(
+                        f.engine
+                            .handle(
+                                Request::AcquireTerminal {
+                                    terminal: binding.terminal
+                                },
+                                None
+                            )
+                            .await
+                            .unwrap(),
+                        Response::ControlRecovering {
+                            paste_admission: PasteAdmission::PriorSendUnknown
+                        }
+                    ),
+                    "{mode}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_paste_custody_unconfirmed_reservation_never_loads() {
+        for (control, outcome) in [
+            ("custody-write", "before"),
+            ("custody-snapshot", "hide-write"),
+        ] {
+            let f = Fixture::paste();
+            let binding = writer(&f).await;
+            set(&f, control, outcome);
+            stage(&f, &binding, DRAFT).await;
+            assert_eq!(
+                paste_reply(&f.engine, commit(&binding, DRAFT.len())).await,
+                PasteResult::Unknown {},
+                "{outcome}"
+            );
+            assert_held(&f.engine, &binding).await;
+            for effect in ["last-load", "submissions", "effects", "deletions"] {
+                assert!(file(&f, effect).is_empty(), "{outcome}: {effect}");
+            }
+            set(&f, control, "");
+            let snapshot = f
+                .engine
+                .read_custody(f.engine.generation().await.unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                snapshot.iter().flatten().count(),
+                usize::from(outcome == "hide-write")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn w1_resize_custody_requires_positive_deletion_only_for_possible_late_load() {
+        for completed in [false, true] {
+            let f = Fixture::paste();
+            let binding = writer(&f).await;
+            let runtime_id = binding.terminal.target.runtime_id;
+            if completed {
+                set(&f, "paste-mode", "lost-before");
+            } else {
+                set(&f, "load-mode", "before");
+            }
+            stage(&f, &binding, DRAFT).await;
+            assert_eq!(
+                paste_reply(&f.engine, commit(&binding, DRAFT.len())).await,
+                PasteResult::Unknown {}
+            );
+            let server = f.engine.generation().await.unwrap();
+            let reserved = f.engine.read_custody(server).await.unwrap();
+            let slot = reserved[0].as_ref().unwrap();
+            let active = slot.active.as_ref().unwrap();
+            assert_eq!(active.completed, completed);
+            let buffer = &active.buffer.name;
+            if completed {
+                assert_eq!(file(&f, buffer), DRAFT);
+                fs::remove_file(f.temp.path().join(buffer)).unwrap();
+            }
+            assert!(!f.temp.path().join(buffer).exists());
+
+            let (replacement, _process) = f.second_pane(true);
+            set(&f, "removed-0", "1");
+            let (engine, _) = f.restart();
+            let stop = || Request::Stop {
+                runtime_id,
+                expected_pane_id: replacement.target.pane.clone(),
+            };
+            if !completed {
+                assert!(engine.handle(stop(), None).await.is_err());
+                assert!(file(&f, "removed-1").is_empty());
+                assert!(file(&f, "deletions").is_empty());
+                let observed = engine.read_custody(server).await.unwrap();
+                assert_eq!(observed[0].as_ref().unwrap().value, slot.value);
+                fs::write(f.temp.path().join(buffer), DRAFT).unwrap();
+            }
+            assert!(matches!(engine.handle(stop(), None).await.unwrap(),
+                Response::Stopped { runtime_id: stopped } if stopped == runtime_id));
+            let settled = engine.read_custody(server).await.unwrap();
+            let free = settled[0].as_ref().unwrap();
+            assert!(free.active.is_none());
+            assert_ne!(free.mutation, slot.mutation);
+            assert!(!f.temp.path().join(buffer).exists());
+            if completed {
+                assert!(file(&f, "deletions").is_empty());
+                assert_eq!(file(&f, "submissions"), b"1");
+            } else {
+                assert_eq!(text(&f, "deletions"), format!("{buffer}\n"));
+                assert!(file(&f, "submissions").is_empty());
+            }
+            for effect in ["effects", "pane0-bytes", "pane1-bytes"] {
+                assert!(file(&f, effect).is_empty(), "{effect}");
+            }
         }
     }
 

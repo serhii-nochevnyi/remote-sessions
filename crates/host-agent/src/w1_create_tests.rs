@@ -32,6 +32,36 @@ valid_buffer() {
   test "${#id}" = 32 || return 1
   case "$id" in *[!0-9a-f]*) return 1 ;; esac
 }
+custody_option() {
+  compact=$(printf '%s' "$token" | tr -d '-')
+  printf '@rs_paste_custody_42_100_%s_%02d' "$compact" "$1"
+}
+custody_snapshot() {
+  guard_equals pid 42 && guard_equals start_time 100 &&
+    guard_equals @rs_create_generation "$token" || return 0
+  for hook in after-if-shell after-show-options after-display-message command-error; do
+    guard_equals "$hook" "" || return 0
+  done
+  set -f
+  set -- $1
+  index=0
+  while test "$index" -lt 16; do
+    option=$(custody_option "$index")
+    test "$1 $2 $3" = 'show-options -sq -F'
+    test "$4 $5" = "'#{option_name} #{?#{m/r:^[a-zA-Z0-9:/_~-]+\$,#{option_value}},#{option_value},invalid}'"
+    test "$6 $7" = "$option ;"
+    if test -f "custody/$option"; then
+      value=$(cat "custody/$option"; printf .)
+      value=${value%.}
+      case "$value" in ''|*[!a-zA-Z0-9:/_~-]*) value=invalid ;; esac
+      printf '%s %s\n' "$option" "$value"
+    fi
+    shift 7
+    index=$((index + 1))
+  done
+  test "$*" = 'display-message -p -l rs-custody-snapshot'
+  printf 'rs-custody-snapshot\n'
+}
 case "$4" in
   display-message)
     if test "${6-}" = -t; then
@@ -89,6 +119,92 @@ case "$4" in
   if-shell)
     if test "$6" = -t; then
       case "$9" in
+        'set-option -s'*' @rs_paste_custody_'*|'delete-buffer '*' ; set-option -s @rs_paste_custody_'*)
+          test "$5" = -F && test "$#" = 9 && test "$3" = "$PWD/tmux.sock"
+          guard=$8
+          target=$7
+          set -f
+          set -- $9
+          cleanup=""
+          if test "$1" = delete-buffer; then
+            test "$#" = 8 && test "$2" = -b && valid_buffer "$3" && test "$4" = ';'
+            cleanup=$3
+            shift 4
+          fi
+          test "$#" = 4 && test "$1" = set-option
+          flag=$2
+          option=$3
+          value=$4
+          index=0
+          while test "$index" -lt 16 && test "$option" != "$(custody_option "$index")"; do
+            index=$((index + 1))
+          done
+          test "$index" -lt 16
+          prior=$(option_value "custody/$option"; printf .)
+          prior=${prior%.}
+          guard_equals "$option" "$prior" || exit 0
+          case "$flag" in
+            -so) test ! -e "custody/$option" || exit 1 ;;
+            -s) test -n "$prior" || exit 1 ;;
+            *) exit 1 ;;
+          esac
+          test "${#value}" -le 2048
+          case "$value" in *[!a-zA-Z0-9:/_~-]*) exit 1 ;; esac
+          version=${value%%~*}
+          rest=${value#*~}
+          mutation=${rest%%~*}
+          state=${rest#*~}
+          test "$version" = v1 && test "${#mutation}" -eq 36
+          case "$mutation" in *[!0-9a-f-]*) exit 1 ;; esac
+          case "$prior" in "v1~$mutation~"*) exit 1 ;; esac
+          for name in $(cat names); do
+            IFS='|' read -r session window pane pid < "$name.pane"
+            if test "$pane" != "$target"; then continue; fi
+            guard_equals pid 42 && guard_equals start_time 100 &&
+              guard_equals @rs_create_generation "$token" && guard_equals session_name "$name" &&
+              guard_equals session_id "$session" && guard_equals window_id "$window" &&
+              guard_equals pane_id "$pane" && guard_equals pane_pid "$pid" &&
+              guard_equals pane_tty "$(cat tty)" && guard_equals pane_dead "$(cat "$name.dead")" &&
+              guard_equals @rs_create_nonce "$(cat "$name.nonce"):$(cat "$name.stamp")" &&
+              guard_equals @rs_resize_epoch "$(option_value epoch)" &&
+              guard_equals @rs_paste_launch "$(option_value paste-launch)" &&
+              guard_equals @rs_paste_admission "$(option_value marker)" &&
+              guard_equals session_windows 1 && guard_equals window_panes 1 &&
+              guard_equals window_index 0 && guard_equals pane_index 0 &&
+              guard_equals window-size manual && guard_equals version 3.8 &&
+              guard_equals socket_path "$PWD/tmux.sock" || exit 0
+            case "$(option_value paste-launch)" in
+              ??????????????8*) guard_equals @rs_create_birth "$(cat "$name.birth")" || exit 0 ;;
+            esac
+            for hook in after-if-shell after-load-buffer after-save-buffer after-paste-buffer after-delete-buffer after-send-keys after-set-option after-display-message after-resize-window command-error; do
+              guard_equals "$hook" "" || exit 0
+            done
+            case "$state" in
+              "possible~$name~$(cat tty)~$(cat marker)")
+                case "$prior" in ''|v1~*~free) ;; *) exit 1 ;; esac
+                case "$(cat marker)" in v1~*~"$token"~42~100~*~l~*) ;; *) exit 1 ;; esac
+                valid_buffer "${state##*~}" ;;
+              completed~*)
+                old=${prior#*~}; old=${old#*~}
+                test "$old" = "possible~${state#*~}" || exit 1 ;;
+              free)
+                case "$prior" in v1~*~possible~*|v1~*~completed~*) ;; *) exit 1 ;; esac ;;
+              *) exit 1 ;;
+            esac
+            if test -n "$cleanup"; then
+              test "$state" = free && test "$cleanup" = "${prior##*~}"
+              rm "buffers/$cleanup"
+              printf '%s\n' "$cleanup" >> buffer-deletions
+            fi
+            mkdir -p custody
+            if test "$flag" = -so; then
+              (set -C; printf '%s' "$value" > "custody/$option")
+            else
+              printf '%s' "$value" > "custody/$option"
+            fi
+            exit 0
+          done
+          exit 1 ;;
         'load-buffer '*|'delete-buffer '*)
           test "$5" = -F && test "$#" = 9 || exit 1
           socket="$PWD/tmux.sock"
@@ -139,6 +255,23 @@ case "$4" in
               guard_equals "$hook" "" || exit 0
             done
             if test "$action" = load-buffer; then
+              case "$guard" in
+                *'#{==:#{@rs_paste_custody_'*)
+                  index=0
+                  while test "$index" -lt 16; do
+                    option=$(custody_option "$index")
+                    case "$guard" in *"#{==:#{$option},"*) break ;; esac
+                    index=$((index + 1))
+                  done
+                  test "$index" -lt 16 || exit 0
+                  prior=$(option_value "custody/$option")
+                  guard_equals "$option" "$prior" && guard_equals after-if-shell "" || exit 0
+                  case "$prior" in
+                    v1~*~possible~"$name"~"$tty"~"$marker")
+                      test "${prior##*~}" = "$buffer" || exit 0 ;;
+                    *) exit 0 ;;
+                  esac ;;
+              esac
               cat > "buffers/$buffer"
               printf 'load\n' >> buffer-loads
               printf '%s\n' "$guard" > last-buffer-guard
@@ -211,6 +344,10 @@ case "$4" in
       exit 0
     fi
     case "$7" in
+      'show-options -sq -F '*)
+        test "$5" = -F && test "$#" = 7
+        guard=$6
+        custody_snapshot "$7" ;;
       'set-option -s @rs_create_generation '*)
         test -z "$token"
         printf '%s\n' "$7" | awk '{print $4}' > generation ;;
