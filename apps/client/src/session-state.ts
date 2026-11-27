@@ -1,7 +1,7 @@
 import type { Chunk, CreateStatus, Inventory, LocalCreate, RuntimeInfo, TerminalScope, TerminalViewScope, localClient } from "./local-client.ts";
 import type { CreateExposure } from "./presentation-preferences.ts";
 import type { OrderedGeometry } from "./terminal-geometry.ts";
-import { sameTerminal } from "./terminal-geometry.ts";
+import { sameSize, sameTerminal } from "./terminal-geometry.ts";
 
 export interface DemoSession {
   readonly id: string;
@@ -112,7 +112,7 @@ export function inventoryOpen(
 }
 
 type MountMode = "live" | "observe" | "rollover" | "draining" | "view-closed" | "completed" | "pending" | "offline" | "missing" | "exited" | "inactive";
-export type TerminalBindingState = "bound" | "retired" | "changed" | "draining" | "view-closed" | "completed" | "ended";
+export type TerminalBindingState = "bound" | "proved" | "retired" | "changed" | "draining" | "view-closed" | "completed" | "ended";
 export type AttachmentMode = "ordinary" | "observer";
 export interface TerminalAttachmentIntent {
   readonly mode: "live" | "observe" | "rollover";
@@ -127,7 +127,15 @@ export interface MountedTerminal {
   readonly intent?: TerminalAttachmentIntent;
   readonly reconnectIntent?: TerminalAttachmentIntent;
   readonly outputOnly?: BoundTerminal;
+  readonly reconnectFrom?: BoundTerminal;
 }
+
+export type TerminalRecord = {
+  readonly binding: BoundTerminal;
+  readonly state: TerminalBindingState;
+  readonly attempt: number;
+  readonly reconnectFrom?: BoundTerminal;
+} | { readonly binding: null; readonly state: "closed"; readonly attempt: number };
 
 function inventoryMatches(runtime: RuntimeInfo, expected: SessionIdentity) {
   return runtime.session_id === expected.sessionId && (expected.operationId === null
@@ -223,16 +231,86 @@ export function terminalPanel(
   id: string,
   inventory: Inventory | null,
   expected: SessionIdentity | undefined,
-  bound: BoundTerminal | null,
+  record: TerminalRecord | undefined,
   closed: boolean,
-  state?: TerminalBindingState,
-  reconnect = false,
+  selection: number,
 ): MountedTerminal {
-  if (closed || !views.open.includes(id)) return { mode: "missing" };
-  const mounted = mountedTerminal(id, inventory, expected, bound, false, state, reconnect);
+  if (closed || record?.state === "closed" || !views.open.includes(id)) return { mode: "missing" };
+  const reconnectFrom = record?.reconnectFrom;
+  const reconnect = reconnectFrom !== undefined && record?.attempt === selection && views.active === id;
+  const current = reconnect ? record : cancelTerminalReconnect(record);
+  let mounted = mountedTerminal(id, inventory, expected, current?.binding ?? null, false,
+    current?.state === "closed" ? undefined : current?.state, reconnect);
+  if (reconnectFrom && reconnect && (record?.state === "bound" || record?.state === "proved") &&
+      (mounted.intent?.mode === "rollover" || mounted.intent?.mode === "observe" || !mounted.key)) {
+    mounted = { mode: "view-closed", key: reconnectFrom.mountKey };
+  }
+  if (reconnectFrom && reconnect && mounted.key) {
+    const retained = mounted.mode === "draining" ? mounted.outputOnly : reconnectFrom;
+    mounted = {
+      ...mounted,
+      reconnectFrom,
+      ...(retained ? { outputOnly: retained } : {}),
+      ...(mounted.intent ? { intent: { ...mounted.intent, reconnect: true } } : {}),
+    };
+  }
   if (views.active === id) return mounted;
   return mounted.outputOnly
     ? { mode: mounted.mode, key: mounted.outputOnly.mountKey, outputOnly: mounted.outputOnly } : { mode: "inactive" };
+}
+
+export function beginTerminalReconnect(mounted: MountedTerminal, binding: BoundTerminal, attempt: number): TerminalRecord | undefined {
+  if (explicitClosedReconnect(mounted) === binding) return { binding, state: "view-closed", attempt, reconnectFrom: binding };
+}
+
+export function cancelTerminalReconnect(record: TerminalRecord | undefined): TerminalRecord | undefined {
+  if (record?.state !== "closed" && record?.reconnectFrom) {
+    return { binding: record.reconnectFrom, state: "view-closed", attempt: record.attempt };
+  }
+  return record;
+}
+
+export function refreshTerminalRecord(record: TerminalRecord, inventory: Inventory | null): TerminalRecord {
+  if (!record.binding) return record;
+  const { binding, reconnectFrom } = record;
+  const row = inventory?.runtimes.find(runtime => runtime.runtime_id === binding.terminal.target.runtime_id);
+  if (reconnectFrom && row && inventoryConflicts(row, binding.identity, binding)) {
+    return { binding: reconnectFrom, state: "changed", attempt: record.attempt };
+  }
+  if (reconnectFrom && (!row || !inventoryMatches(row, binding.identity) ||
+      (record.state === "proved" && (row.exited || inventory?.agent_pid !== binding.identity.agentPid)))) {
+    return { binding: reconnectFrom, state: "view-closed", attempt: record.attempt };
+  }
+  if (!inventory) return record;
+  const state = inventoryBindingState(binding, record.state, inventory);
+  if (state === record.state) return record;
+  return state === "draining" ? { ...record, state } : { binding, state, attempt: record.attempt };
+}
+
+export function updateTerminalRecord(
+  record: TerminalRecord | undefined,
+  mounted: MountedTerminal,
+  binding: BoundTerminal,
+  state: TerminalBindingState | "rendered",
+  previous: BoundTerminal | null,
+  attempt: number,
+  selection: number,
+): TerminalRecord | undefined {
+  if ((record?.binding ?? null) !== previous || (record?.attempt ?? 0) !== attempt ||
+      record?.state === "closed" || record?.state === "changed" || record?.state === "ended" || record?.state === "completed") return;
+  const reconnectFrom = record?.reconnectFrom;
+  if (reconnectFrom && attempt !== selection) return;
+  if (state === "bound" || state === "proved") {
+    const intent = mounted.intent;
+    if (!intent || !sameInventoryIdentity(intent.identity, binding.identity) || !matchesPane(intent.runtime, binding.terminal)) return;
+    return { binding, state, attempt, ...(reconnectFrom ? { reconnectFrom } : {}) };
+  }
+  if (state === "rendered") {
+    if (record?.binding !== binding || !reconnectFrom || mounted.reconnectFrom !== reconnectFrom) return;
+    return { binding, state: record.state, attempt };
+  }
+  if (reconnectFrom && (state === "retired" || state === "view-closed" || state === "ended")) return cancelTerminalReconnect(record);
+  return { binding, state, attempt };
 }
 
 export function inventoryBindingState(
@@ -281,6 +359,32 @@ export function desiredTerminalMode(
 ): AttachmentMode | undefined {
   if (!intent) return;
   return intent.mode === "live" && (mayRestore || (active === "ordinary" && !intent.reconnect)) ? "ordinary" : "observer";
+}
+
+export function mountedTerminalEntry(
+  mounted: MountedTerminal,
+  retained: BoundTerminal | undefined,
+  mayRestore: boolean,
+): AttachmentMode | undefined {
+  if (retained && (mounted.reconnectFrom !== retained || !mounted.intent?.reconnect)) return;
+  return desiredTerminalMode(mounted.intent, undefined, mayRestore);
+}
+
+export function terminalProofOnly(mounted: MountedTerminal, mode: AttachmentMode, mayRestore: boolean): boolean {
+  return mode === "observer" && mounted.intent?.mode === "rollover" && mayRestore;
+}
+
+export function acceptMountedRenderer(
+  mounted: MountedTerminal,
+  binding: BoundTerminal,
+  mode: AttachmentMode,
+  mayRestore: boolean,
+  retained: BoundTerminal | undefined,
+  currentRetained: BoundTerminal | undefined,
+  commit: () => boolean,
+) {
+  if (terminalStreamAccess(mounted, binding, mode, mayRestore) === "stale" || retained !== currentRetained) return false;
+  return !retained || (mounted.reconnectFrom === retained && commit());
 }
 
 export class TerminalAttachmentIdentityError extends Error {
@@ -340,12 +444,18 @@ export async function attachCurrentTerminal(
   const proofMatches = matchesPane(intent.runtime, terminal) && sameTarget && matchesAttempt;
   const needsFreshInventory = rollover || intent.reconnect;
   const fresh = needsFreshInventory && proofMatches && stillCurrent() ? await client.inventory().catch(() => null) : null;
+  const freshRow = fresh?.runtimes.find(runtime => runtime.runtime_id === runtimeId);
   const corroborated = !needsFreshInventory || (fresh !== null && fresh.agent_pid === identity.agentPid &&
-    fresh.runtimes.some(runtime => sameRuntime(runtime, intent.runtime)));
+    freshRow !== undefined && sameRuntime(freshRow, intent.runtime));
   const latest = stillCurrent();
   if (!latest || !proofMatches || !corroborated) {
     if (attachment.view_id !== previous?.terminal.view_id) await client.detach(attachment.view_id).catch(() => undefined);
-    if (latest && !proofMatches && stillCurrent()) throw new TerminalAttachmentIdentityError(!sameTarget);
+    if (latest && stillCurrent()) {
+      if (!proofMatches) throw new TerminalAttachmentIdentityError(!sameTarget);
+      if (fresh?.agent_pid === identity.agentPid && freshRow && inventoryConflicts(freshRow, identity, previous)) {
+        throw new TerminalAttachmentIdentityError(true);
+      }
+    }
     return;
   }
   return { attachment, runtime: intent.runtime, binding: { identity, terminal, mountKey: previous?.mountKey ?? `${runtimeId}:${identity.agentPid}` }, isCurrent: () => {
@@ -363,14 +473,14 @@ export async function adoptCurrentTerminal(
   scope: TerminalViewScope,
   accept: (binding: BoundTerminal) => boolean,
   detached: Promise<void>,
-  client: Pick<typeof localClient, "attach" | "detach" | "inventory" | "confirmWriter">,
+  client: Pick<typeof localClient, "attach" | "detach" | "inventory">,
 ) {
   scope.setInputEligible(false);
   const candidate = await attachCurrentTerminal(runtimeId, previous, mode, () => current(previous).intent,
     mayRestore, () => scope.active, detached, client);
   if (!candidate) return;
-  const { binding, runtime } = candidate;
-  const { terminal, identity } = binding;
+  const { binding } = candidate;
+  const { terminal } = binding;
   if (!candidate.isCurrent() || !scope.bind(terminal.view_id)) {
     await client.detach(terminal.view_id).catch(() => undefined);
     return;
@@ -379,33 +489,95 @@ export async function adoptCurrentTerminal(
     scope.retire();
     return;
   }
-  if (mode === "observer") return candidate;
+  return candidate;
+}
+
+const terminalDrainTimeout = 10_000;
+const terminalDrainFrames = 17;
+
+interface ConfirmationRecovery {
+  readonly error: unknown;
+  readonly deadline: number;
+  readonly original: Promise<RuntimeInfo | undefined>;
+}
+
+interface MountedConfirmation {
+  readonly pending: boolean;
+  readonly confirmed: boolean;
+  readonly recovery: ConfirmationRecovery | undefined;
+  readonly settled: Promise<void>;
+  stop(): void;
+}
+
+function corroborateTerminalDrain(binding: BoundTerminal, inventory: Inventory | null) {
+  if (!inventory) return;
+  const { identity, terminal: { target } } = binding;
+  const row = inventory.runtimes.find(runtime => runtime.runtime_id === target.runtime_id);
+  if (inventory.agent_pid !== identity.agentPid || (row && inventoryConflicts(row, identity, binding))) return "changed";
+  if (row && inventoryMatches(row, identity) && row.workspace_id === identity.workspaceId &&
+      row.operation_id === identity.operationId && row.pane_id === target.pane &&
+      (row.pane_pid === target.pid || (row.exited && row.pane_pid === null))) return row;
+}
+
+export function confirmMountedWriter(
+  candidate: { readonly binding: BoundTerminal; readonly runtime: RuntimeInfo },
+  mode: AttachmentMode,
+  current: () => MountedTerminal,
+  mayRestore: () => boolean,
+  stream: Pick<MountedStream, "scope" | "access" | "revokeMutations" | "identityChanged">,
+  recovering: () => void,
+  client: Pick<typeof localClient, "confirmWriter" | "inventory">,
+): MountedConfirmation {
+  const { scope } = stream;
+  const { binding: { terminal, identity }, runtime } = candidate;
   const canConfirm = () => {
-    const intent = current(binding).intent;
-    return scope.owns(terminal.view_id) && mayRestore() && intent?.mode === "live" &&
+    const intent = current().intent;
+    return mode === "ordinary" && scope.owns(terminal.view_id) && stream.access() === "attached" &&
+      mayRestore() && intent?.mode === "live" &&
       sameInventoryIdentity(intent.identity, identity) && sameRuntime(intent.runtime, runtime) &&
       matchesPane(intent.runtime, terminal);
   };
-  if (!canConfirm()) {
-    scope.retire();
-    return;
+  let pending = canConfirm();
+  let confirmed = false;
+  let recovery: ConfirmationRecovery | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  async function confirm() {
+    try {
+      await client.confirmWriter(terminal, {
+        agent_pid: identity.agentPid, session_id: identity.sessionId,
+        operation_id: identity.operationId, workspace_id: identity.workspaceId,
+      });
+    } catch (error) {
+      if (!scope.owns(terminal.view_id) || updateMountedStream(stream) === "stale") return;
+      const deadline = performance.now() + terminalDrainTimeout;
+      scope.setInputEligible(false);
+      stream.revokeMutations();
+      const original = client.inventory().catch(() => null).then(inventory => {
+        if (!scope.owns(terminal.view_id) || updateMountedStream(stream) === "stale") return;
+        const row = corroborateTerminalDrain(candidate.binding, inventory);
+        if (row === "changed") stream.identityChanged();
+        if (row && row !== "changed") return row;
+        scope.retire({ error });
+      });
+      recovery = { error, deadline, original };
+      timer = setTimeout(() => { scope.retire({ error }); }, terminalDrainTimeout);
+      recovering();
+      return;
+    } finally {
+      pending = false;
+    }
+    if (!scope.owns(terminal.view_id) || updateMountedStream(stream) === "stale" || !canConfirm()) return;
+    confirmed = true;
+    scope.setInputEligible(true);
   }
-  try {
-    await client.confirmWriter(terminal, {
-      agent_pid: identity.agentPid, session_id: identity.sessionId,
-      operation_id: identity.operationId, workspace_id: identity.workspaceId,
-    });
-  } catch (error) {
-    if (canConfirm()) throw error;
-  }
-  if (!canConfirm()) {
-    const mounted = current(binding);
-    if (scope.owns(terminal.view_id) && mounted.mode === "draining" && mounted.outputOnly === binding) return candidate;
-    scope.retire();
-    return;
-  }
-  scope.setInputEligible(true);
-  return candidate;
+  const settled = pending ? confirm() : Promise.resolve();
+  return {
+    get pending() { return pending; },
+    get confirmed() { return confirmed; },
+    get recovery() { return recovery; },
+    settled,
+    stop() { clearTimeout(timer); },
+  };
 }
 
 export function terminalStreamAccess(
@@ -415,7 +587,8 @@ export function terminalStreamAccess(
   mayRestore: boolean,
 ): "attached" | "draining" | "stale" {
   if (mounted.mode === "draining" && mounted.outputOnly === binding) return "draining";
-  if (!mounted.outputOnly && mounted.intent && sameInventoryIdentity(mounted.intent.identity, binding.identity) &&
+  if (mounted.intent && (!mounted.outputOnly || mounted.reconnectFrom === mounted.outputOnly) &&
+      sameInventoryIdentity(mounted.intent.identity, binding.identity) &&
       matchesPane(mounted.intent.runtime, binding.terminal) &&
       desiredTerminalMode(mounted.intent, attached, mayRestore) === attached) return "attached";
   return "stale";
@@ -426,7 +599,10 @@ interface MountedStream {
   readonly scope: TerminalViewScope;
   readonly routing: OrderedGeometry;
   readonly sink: Parameters<OrderedGeometry["consume"]>[1];
+  readonly confirmation: MountedConfirmation;
+  inventory(): Promise<Inventory>;
   access(): ReturnType<typeof terminalStreamAccess>;
+  acceptRenderer(): boolean;
   revokeMutations(): void;
   read(view: string): Promise<Chunk>;
   consume(view: string, chunk: Chunk, render: () => Promise<void>): Promise<boolean>;
@@ -447,42 +623,138 @@ export function updateMountedStream(stream: Pick<MountedStream, "scope" | "acces
 }
 
 export async function runMountedTerminalStream(stream: MountedStream) {
-  const { scope, routing, sink, binding } = stream;
+  const { scope, routing, sink, binding, confirmation } = stream;
   const terminal = binding.terminal;
   const view = terminal.view_id;
-  while (scope.owns(view) && updateMountedStream(stream) !== "stale") {
-    const checkEligibility = scope.captureReadEligibility();
-    const chunk = await stream.read(view);
-    if (!scope.owns(view)) return;
-    const access = updateMountedStream(stream);
-    if (access === "stale") return;
-    if (chunk.closure) {
-      if (chunk.closure.reason === "eof") {
-        scope.setInputEligible(false);
-        stream.revokeMutations();
-        stream.eof(access === "draining" ? "completed" : "view-closed");
-        scope.retire();
-      } else {
-        stream.closed();
-        scope.acceptClosure(view, chunk.closure);
-      }
+  const active = () => scope.owns(view) && updateMountedStream(stream) !== "stale";
+  const permitted = (release?: ConfirmationRecovery) => active() && confirmation.recovery === release;
+  const readOnly = (chunk: Chunk): Chunk => {
+    const { paste_incarnation, paste_completion, ...observation } = chunk;
+    return { ...observation, writable: false };
+  };
+  function finish(exited: boolean) {
+    if (!stream.acceptRenderer()) {
+      scope.retire();
       return;
     }
+    scope.setInputEligible(false);
+    stream.revokeMutations();
+    stream.eof(exited ? "completed" : "view-closed");
+    scope.retire();
+  }
+  function validateScope(chunk: Chunk) {
     if ((chunk.status && !sameTerminal(terminal, chunk.status.terminal)) ||
         (chunk.geometry && !sameTerminal(terminal, chunk.geometry.status.terminal))) {
       stream.identityChanged();
       throw Error("Стан термінала змінився");
     }
-    const { paste_incarnation, paste_completion, ...readOnly } = chunk;
-    const sample = access === "draining" ? { ...readOnly, writable: false } : checkEligibility(chunk);
+  }
+  async function render(sample: Chunk, release?: ConfirmationRecovery) {
+    let submitted = false;
     const rendered = await stream.consume(view, sample, async () => {
-      const current = updateMountedStream(stream);
-      if (current === "stale") return;
-      if (current === "draining" && chunk.geometry) throw Error("Потік перервано");
-      await routing.consume(sample, sink);
+      if (!permitted(release)) return;
+      if (stream.access() === "draining" && sample.geometry) throw Error("Потік перервано");
+      const accept = () => {
+        if (!permitted(release)) return false;
+        if (stream.acceptRenderer()) return true;
+        scope.retire();
+        return false;
+      };
+      const guardGrid = () => {
+        if (!permitted(release) || stream.access() !== "attached") throw Error("Потік перервано");
+      };
+      await routing.consume(sample, {
+        async write(data) {
+          if (!accept()) return;
+          submitted = true;
+          await sink.write(data);
+        },
+        resize(size) {
+          guardGrid();
+          if (!accept()) throw Error("Потік перервано");
+          submitted = true;
+          return sink.resize(size);
+        },
+        acknowledge(event, size) {
+          guardGrid();
+          return sink.acknowledge(event, size);
+        },
+      });
+      if (sample.writable && sample.paste_incarnation) accept();
     });
-    if (!rendered || updateMountedStream(stream) === "stale") return;
-    stream.rendered(sample);
+    if (rendered && permitted(release)) stream.rendered(sample);
+    return { rendered, submitted };
+  }
+
+  async function recover(recovery: ConfirmationRecovery, head?: Chunk) {
+    const held: Chunk[] = [];
+    const withinBudget = () => {
+      if (!permitted(recovery)) return false;
+      if (performance.now() >= recovery.deadline) throw recovery.error;
+      return true;
+    };
+    const original = await recovery.original;
+    if (!withinBudget() || !original) return;
+    let chunk = head;
+    while (withinBudget()) {
+      chunk ??= await stream.read(view);
+      if (!withinBudget()) return;
+      validateScope(chunk);
+      if (chunk.closure?.reason === "eof") break;
+      if (chunk.closure) stream.closed();
+      if (chunk.closed || chunk.writable || chunk.geometry) throw Error("Потік перервано");
+      const committed = chunk.status?.committed;
+      const grid = routing.status.committed;
+      if (committed && (committed.revision !== routing.applied || !sameSize(committed.size, grid.size) ||
+          committed.intent?.id !== grid.intent?.id || committed.intent?.epoch.agent !== grid.intent?.epoch.agent ||
+          committed.intent?.epoch.owner !== grid.intent?.epoch.owner)) throw Error("Стан термінала змінився");
+      if (chunk.data.length) {
+        if (held.length >= terminalDrainFrames) throw Error("Потік перервано");
+        held.push({ data: chunk.data, closed: false, writable: false });
+      }
+      chunk = undefined;
+    }
+    if (!withinBudget()) return;
+    const latest = await stream.inventory();
+    if (!withinBudget()) return;
+    const final = corroborateTerminalDrain(binding, latest);
+    if (final === "changed") stream.identityChanged();
+    if (!final || final === "changed" || (original.exited && !final.exited)) throw recovery.error;
+    confirmation.stop();
+    for (const frame of held) {
+      if (!permitted(recovery) || !(await render(frame, recovery)).rendered) return;
+    }
+    if (permitted(recovery)) finish(final.exited);
+  }
+
+  try {
+    while (active()) {
+      if (confirmation.recovery) return await recover(confirmation.recovery);
+      const checkEligibility = scope.captureReadEligibility();
+      const wasConfirmed = confirmation.confirmed;
+      const chunk = await stream.read(view);
+      if (!active()) return;
+      if (confirmation.pending && chunk.closure?.reason === "eof") await confirmation.settled;
+      if (!active()) return;
+      if (confirmation.recovery) return await recover(confirmation.recovery, chunk);
+      const access = stream.access();
+      if (chunk.closure) {
+        if (chunk.closure.reason === "eof") finish(access === "draining");
+        else {
+          stream.closed();
+          scope.acceptClosure(view, chunk.closure);
+        }
+        return;
+      }
+      validateScope(chunk);
+      const sample = access === "draining" || !wasConfirmed ? readOnly(chunk) : checkEligibility(chunk);
+      const { rendered, submitted } = await render(sample);
+      if (!active()) return;
+      if (confirmation.recovery) return await recover(confirmation.recovery, submitted ? undefined : chunk);
+      if (!rendered) return;
+    }
+  } finally {
+    confirmation.stop();
   }
 }
 
