@@ -49,6 +49,7 @@ VIEWPORTS = {
     "rotation": {"initial": "portrait", "rotated": "landscape", "restored": "portrait"},
 }
 PASTE = {"paste-short", "paste-multiline"}
+PASTE_ACTIONS = {"sample": 1, "native": 2}
 RECOVERY = {"app-switch", "lock-foreground"}
 RECORDER_OPERATIONS = ("begin", "append", "read")
 LAYOUT_CASES = PASTE | RECOVERY | VIEWPORTS.keys() | {"touch-selection-copy", "touch-scroll"}
@@ -336,28 +337,48 @@ def capture_segment(record, label):
     return start, end
 
 
-def rehearsal_segment(rehearsal):
-    return capture_segment(rehearsal, "rehearsal capture segment")
-
-
 def disjoint_segments(first, second):
     return first is not None and second is not None and (first[1] <= second[0] or second[1] <= first[0])
 
 
-def check_independent_captures(captures):
-    recordings = {}
-    for ref, segment in captures:
-        recordings.setdefault(ref, []).append(segment)
-    for segments in recordings.values():
-        if len(segments) < 2:
-            continue
-        need(all(segment is not None for segment in segments), "shared rehearsal recording requires capture segments")
-        segments.sort()
-        need(all(disjoint_segments(first, second) for first, second in zip(segments, segments[1:])),
-             "shared rehearsal recording has overlapping capture segments")
+@dataclass(frozen=True)
+class Capture:
+    kind: str
+    ref: str
+    pair: tuple
+    window: tuple | None
+    owner: tuple
+    detail: str = ""
+
+    @classmethod
+    def from_record(cls, kind, record, pair, owner=()):
+        label = kind if kind == "rehearsal" else f"retained {kind}"
+        try:
+            window = capture_segment(record, f"{label} capture segment")
+        except EvidenceError as error:
+            return cls(kind, record["ref"], pair, None, owner, str(error))
+        return cls(kind, record["ref"], pair, window, owner)
+
+    def conflict(self, other):
+        kinds = {self.kind, other.kind}
+        if ("launch" in kinds and self.pair == other.pair) or disjoint_segments(self.window, other.window):
+            return ""
+        if kinds == {"launch"}:
+            recording = "launch recording across signed builds"
+        elif "launch" in kinds:
+            observation = (kinds - {"launch"}).pop()
+            recording = f"launch and {observation} recording across signed builds"
+        elif kinds == {"measurement"}:
+            recording = "measured observation"
+        elif kinds == {"rehearsal"}:
+            recording = "rehearsal recording"
+        else:
+            recording = "rehearsal and measured observation"
+        return f"shared {recording} requires disjoint capture segments"
 
 
-def qualify(recipe, case, data, cohort_fingerprint):
+def qualify(recipe, case, cohort, role, pair):
+    data = cohort["tuple"]
     preedit, end_action = COMPOSITION[case["id"]]
     language = recipe.get("keyboard_language")
     need(language == data["keyboard"]["scenario_languages"][case["id"]] and recipe.get("keyboard") == data["keyboard"],
@@ -375,18 +396,25 @@ def qualify(recipe, case, data, cohort_fingerprint):
     rehearsals = items(recipe.get("rehearsals"), "recipe rehearsals")
     seen = set()
     captures = []
+    detail = ""
     for rehearsal in rehearsals:
-        rehearsal = obj(rehearsal, "rehearsal")
-        need(rehearsal.get("cohort_fingerprint") == cohort_fingerprint,
-             "recipe rehearsal belongs to a different signed cohort")
-        need(named(rehearsal, "id", "ref") and rehearsal["id"] not in seen
-             and rehearsal.get("recipe_id") == verified_fingerprint
-             and rehearsal.get("preedit") == preedit and rehearsal.get("end_state") == recipe["end_state"],
-             "rehearsal has missing, duplicate or different visible outcomes")
+        try:
+            rehearsal = obj(rehearsal, "rehearsal")
+            need(rehearsal.get("cohort_fingerprint") == cohort["fingerprint"],
+                 "recipe rehearsal belongs to a different signed cohort")
+            need(named(rehearsal, "id", "ref") and rehearsal["id"] not in seen
+                 and rehearsal.get("recipe_id") == verified_fingerprint
+                 and rehearsal.get("preedit") == preedit and rehearsal.get("end_state") == recipe["end_state"],
+                 "rehearsal has missing, duplicate or different visible outcomes")
+        except EvidenceError as error:
+            detail = detail or str(error)
+            continue
         seen.add(rehearsal["id"])
-        captures.append((rehearsal["ref"], rehearsal_segment(rehearsal)))
-    need(len(seen) >= 2, "two distinct observable rehearsals are required")
-    return Qualification(seen, fingerprint=verified_fingerprint, captures=tuple(captures))
+        owner = (role, case["id"], rehearsal["id"])
+        captures.append(Capture.from_record("rehearsal", rehearsal, pair, owner))
+    if len(seen) < 2:
+        detail = detail or "two distinct observable rehearsals are required"
+    return Qualification(seen, detail, verified_fingerprint, tuple(captures))
 
 
 def attempt_identity(record):
@@ -664,9 +692,11 @@ def check_composition_gesture(attempt, cohort, qualification, observed, identity
     return final
 
 
-def check_capture(attempt, case, cohort, qualification, observed, identity, recovery_prefix):
+def check_capture(attempt, case, cohort, qualification, observed, identity, recovery_prefix, paste_route):
     case_id = case["id"]
     expected = case["expected"]["afterHex"]
+    if case_id in PASTE:
+        need(paste_route is not None, "missing or conflicting retained paste action")
     if case_id in RECOVERY:
         check_recovery(attempt, identity, case["expected"]["beforeHex"], observed, recovery_prefix)
     final = None
@@ -681,10 +711,8 @@ def check_capture(attempt, case, cohort, qualification, observed, identity, reco
 def check_attempt_procedure(attempt, case):
     case_id = case["id"]
     if case_id in PASTE:
-        need(attempt.get("route") in ("sample", "native"), "record sample or native paste route")
-        order = [1] if attempt["route"] == "sample" else [2]
-    else:
-        order = list(range(1, len(case["actions"]) + 1))
+        return obj(attempt.get("observations"), "visible observations"), False
+    order = list(range(1, len(case["actions"]) + 1))
     actions = attempt.get("action_order")
     recovery_prefix = case_id in RECOVERY and actions == order[:-1]
     need((actions == order or recovery_prefix) and all(type(i) is int for i in actions),
@@ -702,14 +730,14 @@ def check_attempt_context(attempt, case, cohort):
     return check_attempt_procedure(attempt, case)
 
 
-def evaluate_attempt(attempt, case, cohort, qualification, retained_launch):
+def evaluate_attempt(attempt, case, cohort, qualification, retained_launch, paste_route):
     case_id = case["id"]
     try:
         observed, recovery_prefix = check_attempt_context(attempt, case, cohort)
         identity = (case_id, attempt["attemptId"], attempt["generation"])
         final, capture_issue = None, None
         try:
-            final = check_capture(attempt, case, cohort, qualification, observed, identity, recovery_prefix)
+            final = check_capture(attempt, case, cohort, qualification, observed, identity, recovery_prefix, paste_route)
         except MeasuredFailure:
             raise
         except EvidenceError as error:
@@ -742,7 +770,7 @@ def evaluate_attempt(attempt, case, cohort, qualification, retained_launch):
     return Result("pass")
 
 
-def verified_conditions(attempt, case, cohort, qualification, result):
+def verified_conditions(attempt, case, cohort, qualification, result, paste_route):
     case_id, signed = case["id"], cohort["tuple"]
     conditions = {
         "keyboard_language": signed["keyboard"]["scenario_languages"][case_id],
@@ -752,16 +780,15 @@ def verified_conditions(attempt, case, cohort, qualification, result):
         if attempt.get(key) != expected:
             conditions[key] = None
     if case_id in PASTE:
-        conditions["route"] = None
-    if case_id in COMPOSITION:
-        conditions["recipe_id"] = None
-    try:
-        observed, _ = check_attempt_procedure(attempt, case)
-    except EvidenceError:
+        conditions["route"] = paste_route
+    if case_id not in COMPOSITION:
         return conditions
-    if case_id in PASTE:
-        conditions["route"] = attempt["route"]
-    if case_id in COMPOSITION and conditions["keyboard_language"] is not None:
+    conditions["recipe_id"] = None
+    if not qualification.detail and conditions["keyboard_language"] is not None:
+        try:
+            observed, _ = check_attempt_procedure(attempt, case)
+        except EvidenceError:
+            return conditions
         if result.status != "pass":
             identity = (case_id, attempt["attemptId"], attempt["generation"])
             try:
@@ -774,22 +801,21 @@ def verified_conditions(attempt, case, cohort, qualification, result):
     return conditions
 
 
-def qualifications(cohort, cases):
+def qualifications(cohort, role, pair, cases):
     recipes = obj(cohort.get("recipes", {}), "composition recipes")
     result = {}
     all_rehearsals = set()
-    all_captures = []
     for case_id in COMPOSITION:
         try:
             recipe = obj(recipes.get(case_id), f"{case_id} recipe")
-            qualified = qualify(recipe, cases[case_id], cohort["tuple"], cohort["fingerprint"])
-            need(not (qualified.rehearsals & all_rehearsals), "rehearsal ID is reused across recipes")
-            check_independent_captures([*all_captures, *qualified.captures])
-            all_rehearsals.update(qualified.rehearsals)
-            all_captures.extend(qualified.captures)
-            result[case_id] = qualified
+            qualified = qualify(recipe, cases[case_id], cohort, role, pair)
         except EvidenceError as error:
-            result[case_id] = Qualification(set(), detail=str(error))
+            qualified = Qualification(set(), detail=str(error))
+        if not qualified.detail and qualified.rehearsals & all_rehearsals:
+            qualified.detail = "rehearsal ID is reused across recipes"
+        if not qualified.detail:
+            all_rehearsals.update(qualified.rehearsals)
+        result[case_id] = qualified
     return result
 
 
@@ -804,7 +830,7 @@ class CaseRecord:
         if result.status != "pass":
             self.clean.clear()
             return
-        route = attempt.get("route") if self.required == ("sample", "native") else None
+        route = conditions.get("route")
         self.clean.setdefault(route, []).append(attempt["id"])
         if self.passed:
             self.open_attempts.clear()
@@ -857,6 +883,13 @@ class RetainedMeasurement:
     record: dict
 
 
+@dataclass(frozen=True)
+class BoundMeasurement:
+    retained: RetainedMeasurement
+    launch: Capture
+    observation: Capture
+
+
 def retained_measurements(cohort):
     """Index rows by the launch and position recorded during measurement."""
     measurements = {}
@@ -898,39 +931,65 @@ def measurement_positions(attempts, records):
     return positions
 
 
+def bind_measurement(retained, attempt, cohort, role, pair):
+    launch, record = retained.launch, retained.record
+    need(attempt.get("cohort_fingerprint") == cohort["fingerprint"],
+         "attempt belongs to a different cohort tuple")
+    binding = obj(launch.get("binding"), "retained launch signed binding")
+    need((binding.get("source_revision"), binding.get("bundle_sha256")) == pair,
+         "retained launch signed binding differs from the signed source or bundle")
+    need(named(record, "ref") and record["ref"] == attempt.get("ref"),
+         "retained measurement observation reference does not match the attempt")
+    return BoundMeasurement(retained, Capture.from_record("launch", launch, pair, (role, launch["id"])),
+                            Capture.from_record("measurement", record, pair, (attempt["id"],)))
+
+
+def verified_paste_route(attempt, record):
+    if attempt["case_id"] not in PASTE:
+        return None
+    proof = record.get("paste_action")
+    if not isinstance(proof, dict) or proof.get("case_id") != attempt["case_id"]:
+        return None
+    route, action, order = proof.get("route"), proof.get("action"), attempt.get("action_order")
+    if (string(route) and route in PASTE_ACTIONS and route == attempt.get("route")
+            and type(action) is int and action == PASTE_ACTIONS[route]
+            and order == [action] and type(order[0]) is int):
+        return route
+    return None
+
+
 @dataclass
 class MeasuredCaptures:
-    launches: dict = field(default_factory=dict)
-    observations: dict = field(default_factory=dict)
+    recordings: dict = field(default_factory=dict)
+    conflicts: dict = field(default_factory=dict)
 
-    def admit(self, retained, attempt, signed):
-        launch, record = retained.launch, retained.record
-        pair = (signed["source_revision"], signed["bundle_sha256"])
-        binding = obj(launch.get("binding"), "retained launch signed binding")
-        need((binding.get("source_revision"), binding.get("bundle_sha256")) == pair,
-             "retained launch signed binding differs from the signed source or bundle")
-        need(named(record, "ref") and record["ref"] == attempt.get("ref"),
-             "retained measurement observation reference does not match the attempt")
-        launch_window = capture_segment(launch, "retained launch capture segment")
-        observation_window = capture_segment(record, "retained measurement capture segment")
-        launch_ref, observation_ref = launch["ref"], record["ref"]
-        launch_captures = self.launches.get(launch_ref, ())
-        observations = self.observations.get(observation_ref, ())
-        need(all(previous_pair == pair or disjoint_segments(previous_window, launch_window)
-                 for previous_pair, previous_window in launch_captures),
-             "shared launch recording across signed builds requires disjoint capture segments")
-        need(all(disjoint_segments(previous_window, observation_window)
-                 for _, previous_window in observations),
-             "shared measured observation requires disjoint capture segments")
-        for window, previous_captures in (
-            (launch_window, self.observations.get(launch_ref, ())),
-            (observation_window, self.launches.get(observation_ref, ())),
-        ):
-            need(all(previous_pair == pair or disjoint_segments(previous_window, window)
-                     for previous_pair, previous_window in previous_captures),
-                 "shared launch and measurement recording across signed builds requires disjoint capture segments")
-        self.launches.setdefault(launch_ref, set()).add((pair, launch_window))
-        self.observations.setdefault(observation_ref, []).append((pair, observation_window))
+    def register_context(self, capture):
+        peers = self.recordings.setdefault(capture.ref, {})
+        if capture in peers:
+            return
+        for peer in peers:
+            if capture.kind == peer.kind == "launch":
+                continue
+            if conflict := capture.conflict(peer):
+                self.conflicts.setdefault(peer, conflict)
+                self.conflicts.setdefault(capture, conflict)
+        peers[capture] = capture.kind != "launch"
+
+    def issue(self, capture):
+        return capture.detail or self.conflicts.get(capture, "")
+
+    def admit(self, measurement):
+        launch, observation = measurement.launch, measurement.observation
+        for capture in (launch, observation):
+            issue = self.issue(capture)
+            need(not issue, issue)
+        for capture in (launch, observation):
+            for peer, active in self.recordings.get(capture.ref, {}).items():
+                if active:
+                    conflict = capture.conflict(peer)
+                    need(not conflict, conflict)
+        self.recordings[launch.ref][launch] = True
+        self.recordings.setdefault(observation.ref, {})[observation] = True
 
 
 def moved_attempts(attempts, positions):
@@ -992,11 +1051,21 @@ class CohortAssessment:
     recipes: dict
 
 
-def assess_cohort(cohort, role, cases, ids, captures):
+@dataclass
+class CohortEvidence:
+    readiness: Result
+    recipes: dict
+    attempts: list
+    measurements: dict
+    holds: dict
+    moved: set
+
+
+def prepare_cohort(cohort, role, cases, ids):
     readiness = cohort_readiness(cohort, role)
-    recipes = qualifications(cohort, cases) if readiness.status == "pass" else {}
-    rows = {case_id: CaseRecord(("sample", "native") if case_id in PASTE else (None,))
-            for case_id in cases}
+    ready = readiness.status == "pass"
+    pair = (cohort["tuple"]["source_revision"], cohort["tuple"]["bundle_sha256"]) if ready else None
+    recipes = qualifications(cohort, role, pair, cases) if ready else {}
     attempts = [obj(value, "attempt") for value in items(cohort.get("attempts", []), "cohort attempts")]
     rehearsal_ids = {key for recipe in recipes.values() for key in recipe.rehearsals}
     for attempt in attempts:
@@ -1004,7 +1073,7 @@ def assess_cohort(cohort, role, cases, ids, captures):
              "duplicate measured attempt ID or reused rehearsal")
         ids.add(attempt["id"])
         case_id = attempt.get("case_id")
-        need(string(case_id) and case_id in rows, "unknown or missing mandatory case ID")
+        need(string(case_id) and case_id in cases, "unknown or missing mandatory case ID")
 
     records = retained_measurements(cohort)
     need(records.keys() <= {attempt["id"] for attempt in attempts}, "retained measurement has no submitted attempt")
@@ -1014,46 +1083,77 @@ def assess_cohort(cohort, role, cases, ids, captures):
                      key=lambda attempt: records[attempt["id"]].position)
     unpositioned = [attempt for attempt in attempts if attempt["id"] not in records]
     bound = [attempt for attempt in ordered if attempt["id"] in bound_positions]
+    holds, measurements = {}, {}
+    if ready:
+        for attempt in bound:
+            attempt_id = attempt["id"]
+            try:
+                measurements[attempt_id] = bind_measurement(records[attempt_id], attempt, cohort, role, pair)
+            except EvidenceError as error:
+                holds[attempt_id] = Result("inconclusive", str(error))
     restarts = Counter(ref for attempt in bound if (ref := restart_reference(attempt)) is not None)
     identities = {}
     for attempt in ordered:
         attempt_id = attempt["id"]
-        check_old = (readiness.status == "pass" and attempt_id in bound_positions
+        check_old = (ready and attempt_id in bound_positions
                      and restarts[restart_reference(attempt)] == 1)
         identities[attempt_id] = native_keys(attempt, records[attempt_id], cases[attempt["case_id"]], cohort, check_old)
     keys = [key for row_keys in identities.values() for key in row_keys]
     attempt_ids = Counter((launch, attempt_id) for launch, attempt_id, _ in keys)
     generations = Counter((launch, generation) for launch, _, generation in keys)
     out_of_order = out_of_order_attempts(identities)
-    for attempt in [*ordered, *unpositioned]:
+    chronology = [*ordered, *unpositioned]
+    for attempt in chronology:
         attempt_id = attempt["id"]
-        case_id = attempt["case_id"]
-        conditions = {}
-        if readiness.status != "pass":
-            result = readiness
+        if not ready:
+            holds[attempt_id] = readiness
         elif attempt_id not in bound_positions:
-            result = Result("inconclusive", "attempt does not match its retained launch and measurement")
+            holds[attempt_id] = Result("inconclusive", "attempt does not match its retained launch and measurement")
         elif any(attempt_ids[launch, native_id] > 1 or generations[launch, generation] > 1
                  for launch, native_id, generation in identities[attempt_id]):
-            result = Result("inconclusive", "native attempt or generation is reused within an app launch")
+            holds[attempt_id] = Result("inconclusive", "native attempt or generation is reused within an app launch")
         elif attempt_id in out_of_order:
-            result = Result("inconclusive", "native attempt or generation is out of order within an app launch")
+            holds[attempt_id] = Result("inconclusive", "native attempt or generation is out of order within an app launch")
         elif restarts[restart_reference(attempt)] > 1:
-            result = Result("inconclusive", "foreground restart observation is reused")
-        else:
-            retained = records[attempt_id]
+            holds[attempt_id] = Result("inconclusive", "foreground restart observation is reused")
+    return CohortEvidence(readiness, recipes, chronology, measurements, holds, moved)
+
+
+def prepare_captures(prepared):
+    captures = MeasuredCaptures()
+    for evidence in prepared.values():
+        for qualification in evidence.recipes.values():
+            for rehearsal in qualification.captures:
+                captures.register_context(rehearsal)
+        for measurement in evidence.measurements.values():
+            captures.register_context(measurement.launch)
+    for evidence in prepared.values():
+        for qualification in evidence.recipes.values():
+            for rehearsal in qualification.captures:
+                qualification.detail = qualification.detail or captures.issue(rehearsal)
+    return captures
+
+
+def assess_cohort(cohort, prepared, cases, captures):
+    rows = {case_id: CaseRecord(tuple(PASTE_ACTIONS) if case_id in PASTE else (None,)) for case_id in cases}
+    for attempt in prepared.attempts:
+        attempt_id, case_id = attempt["id"], attempt["case_id"]
+        conditions = {}
+        result = prepared.holds.get(attempt_id)
+        if result is None:
+            measurement = prepared.measurements[attempt_id]
             try:
-                need(attempt.get("cohort_fingerprint") == cohort["fingerprint"],
-                     "attempt belongs to a different cohort tuple")
-                captures.admit(retained, attempt, cohort["tuple"])
+                captures.admit(measurement)
             except EvidenceError as error:
                 result = Result("inconclusive", str(error))
             else:
-                case, qualification = cases[case_id], recipes.get(case_id)
-                result = evaluate_attempt(attempt, case, cohort, qualification, retained.launch["id"])
-                conditions = verified_conditions(attempt, case, cohort, qualification, result)
+                case, qualification = cases[case_id], prepared.recipes.get(case_id)
+                retained = measurement.retained
+                paste_route = verified_paste_route(attempt, retained.record)
+                result = evaluate_attempt(attempt, case, cohort, qualification, retained.launch["id"], paste_route)
+                conditions = verified_conditions(attempt, case, cohort, qualification, result, paste_route)
             # Keep verified failures at their retained positions and disqualify moved passes.
-            if result.status == "pass" and attempt_id in moved:
+            if result.status == "pass" and attempt_id in prepared.moved:
                 result = Result("inconclusive",
                                 "native attempt or generation is out of order in the submitted measurements")
         need(attempt.get("status") == result.status,
@@ -1061,7 +1161,7 @@ def assess_cohort(cohort, role, cases, ids, captures):
         if result.status != "pass":
             need(named(attempt, "reason"), f"{attempt['id']}: record the reason for the non-pass")
         rows[case_id].add(attempt, result, conditions)
-    return CohortAssessment(readiness, rows, recipes)
+    return CohortAssessment(prepared.readiness, rows, prepared.recipes)
 
 
 def matching_conditions(original, updated, allow_shell_change=False):
@@ -1089,17 +1189,13 @@ def matching_conditions(original, updated, allow_shell_change=False):
 def comparison_recipes_match(assessed):
     if any(assessed[role].readiness.status != "pass" for role in COHORTS):
         return False
-    captures = []
     for case_id in COMPOSITION:
         recipes = [assessed[role].recipes[case_id] for role in COHORTS]
+        if any(recipe.detail for recipe in recipes):
+            return False
         original, corrected, comparison = (recipe.fingerprint for recipe in recipes)
         if not original or original != corrected or original != comparison:
             return False
-        captures.extend(capture for recipe in recipes for capture in recipe.captures)
-    try:
-        check_independent_captures(captures)
-    except EvidenceError:
-        return False
     return True
 
 
@@ -1124,9 +1220,9 @@ def correction_result(correction, cohorts, assessed):
          and cohorts["baseline"]["tuple"]["source_revision"] != cohorts["corrected"]["tuple"]["source_revision"],
          "correction requires a different signed revision and bundle under the same physical conditions")
     for case_id in COMPOSITION:
-        before = baseline.recipes[case_id].fingerprint
-        after = corrected.recipes[case_id].fingerprint
-        need(not before or not after or before == after, "another build changed a frozen composition recipe")
+        before, after = baseline.recipes[case_id], corrected.recipes[case_id]
+        need(before.detail or after.detail or before.fingerprint == after.fingerprint,
+             "another build changed a frozen composition recipe")
     corrected_case = corrected.rows[case]
     for attempt_id in reversed(corrected_case.open_attempts):
         if corrected_case.reproduction([attempt_id]) == reproduced:
@@ -1160,8 +1256,9 @@ def validate(report, cases):
     need(set(entries) <= set(COHORTS), "only a baseline, one correction and one comparison cohort are allowed")
     cohorts = {role: obj(entries.get(role, {}), role) for role in COHORTS}
     ids = set()
-    captures = MeasuredCaptures()
-    assessed = {role: assess_cohort(cohort, role, cases, ids, captures) for role, cohort in cohorts.items()}
+    prepared = {role: prepare_cohort(cohort, role, cases, ids) for role, cohort in cohorts.items()}
+    captures = prepare_captures(prepared)
+    assessed = {role: assess_cohort(cohort, prepared[role], cases, captures) for role, cohort in cohorts.items()}
     correction = obj(report.get("correction", {}), "correction")
     need(bool(correction) or "corrected" not in entries, "corrected evidence requires an attributed correction")
     eligible, supporting = correction_result(correction, cohorts, assessed)
