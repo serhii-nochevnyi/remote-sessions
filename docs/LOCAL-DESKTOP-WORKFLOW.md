@@ -7,7 +7,7 @@ The native Mac app can create and use managed local Claude Code and Codex sessio
 
 ## Set up the Mac development app
 
-Use a logged-in macOS desktop, the repository's pinned Node, npm and Rust toolchains, the macOS native build prerequisites, and a locally installed tmux. Install the provider CLIs you intend to use and keep their normal account, trust, approval and sandbox settings. Start the disposable jobs from a shell whose PATH can resolve tmux and the provider executables or interpreters. The app asks the services to check readiness for the selected folder and preset. [Development setup](DEVELOPMENT.md) · [Runtime lab](RUNTIME-LAB.md) · [Current stack](STACK.md)
+Use a logged-in macOS desktop, the repository's pinned Node, npm and Rust toolchains, the macOS native build prerequisites, and exactly tmux 3.8 for writable W1 setup. Install the provider CLIs you intend to use and keep their normal account, trust, approval and sandbox settings. Start the disposable jobs from a shell whose PATH can resolve tmux 3.8 and the provider executables or interpreters. The app asks the services to check readiness for the selected folder and preset. [Development setup](DEVELOPMENT.md) · [Runtime lab](RUNTIME-LAB.md) · [Current stack](STACK.md)
 
 From the checkout root, prepare the debug app and use the ordinary W1 desktop lab.
 
@@ -20,6 +20,8 @@ python3 scripts/desktop_lab.py run --w1
 ```
 
 The lab starts separate tmux and host-agent launchd jobs and seeds one legacy fixture. `run --w1` starts the bundled debug app with that lab's private IPC state and tmux path. To reconnect, close the app and use the same `run --w1` command while the jobs remain up. After closing the app, `python3 scripts/desktop_lab.py down --w1` explicitly stops the disposable jobs and their lab runtimes. The same teardown reconciles interrupted lab startup where job identity and absence can be established. `--with-clis` belongs to the earlier P0 lab. [Desktop lab source](../scripts/desktop_lab.py) · [Launchd lab source](../scripts/runtime_lab.py)
+
+`up --w1` checks that the resolved binary reports `tmux 3.8` before creating lab state or starting jobs. After attempting both jobs, it separately checks that the server on the lab's private socket reports exactly `3.8` before checking agent and catalog readiness. A version check failure reports the required version, the observed value or why the check was unavailable, and the selected binary path or private socket. Put tmux 3.8 first on PATH. If jobs were attempted, run `python3 scripts/desktop_lab.py down --w1` from the same checkout to reconcile the retained startup record before retrying. Setup neither upgrades tmux nor stops a foreign server. The host still applies its sender guard when granting write access. Read-only observation and the catalog-free P0 lab retain their existing paths.
 
 ## Create and use a session
 
