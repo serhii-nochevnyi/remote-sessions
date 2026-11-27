@@ -1520,6 +1520,21 @@ async fn poll_output(
     if reading_at >= output.refresh_at {
         let status = terminal_status_during_drain(view, remaining).await;
         drain_budget(output.drain_started, now())?;
+        if status.is_err()
+            && let Some(registry) = view.views.upgrade()
+        {
+            let views = registry.lock().unwrap();
+            if view.eof_draining()
+                && views
+                    .drains
+                    .get(&view.terminal.view_id)
+                    .is_some_and(|drain| {
+                        std::ptr::eq(drain.view.as_ref(), view) && drain.expires > Instant::now()
+                    })
+            {
+                return output.drain_eof();
+            }
+        }
         let status = status?;
         ensure!(
             status.committed.revision >= output.status.committed.revision,

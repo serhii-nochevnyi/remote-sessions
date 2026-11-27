@@ -1115,8 +1115,9 @@ case "$4" in
     printf 'buffered attachment output'
     if [ -f "$root/hold" ]; then
       while [ ! -f "$root/continue" ]; do /bin/sleep 0.01; done
-      printf 'output before failed refresh'
-      while [ ! -f "$root/finish" ]; do /bin/sleep 0.01; done
+      printf 'first diagnostic'
+      /bin/dd if=/dev/zero bs={OUTPUT_CHUNK_SIZE} count=1 2>/dev/null
+      printf 'last diagnostic'
       exit 0
     fi
     exec /bin/sleep 30
@@ -1503,7 +1504,7 @@ async fn w1_resize_superseding_ack() {
 }
 
 #[tokio::test]
-async fn w1_resize_original_drain_deadline() {
+async fn w1_resize_w1_terminal_original_drain_deadline() {
     let tick = Duration::from_nanos(1);
     for (elapsed, resumes, superseded) in [
         (DRAIN_TIMEOUT - tick, true, false),
@@ -1634,9 +1635,6 @@ async fn w1_terminal_exact_attachment() {
             "ignore-size"
         };
         let tmux = attachment_tmux(&fixture, generation, flags);
-        if proof == Verified {
-            fs::write(fixture.0.join("hold"), "").unwrap();
-        }
         let listener = UnixListener::bind(fixture.0.join("agent.sock")).unwrap();
         let bridge = Arc::new(DesktopBridge::new(Some(fixture.0.clone()), tmux));
         let runtime = target.runtime_id.to_string();
@@ -1724,34 +1722,7 @@ async fn w1_terminal_exact_attachment() {
                 read_until_bytes(&bridge, &id, b"buffered attachment output").await,
                 b"buffered attachment output"
             );
-            fs::write(fixture.0.join("continue"), "").unwrap();
-            tokio::time::timeout(Duration::from_secs(2), async {
-                while view.output.lock().await.receiver.is_empty() {
-                    tokio::time::sleep(CLEANUP_POLL).await;
-                }
-            })
-            .await
-            .unwrap();
-            view.output.lock().await.refresh_at = Instant::now();
-            let reading = {
-                let bridge = bridge.clone();
-                let id = id.clone();
-                tokio::spawn(async move { bridge.read(&id).await })
-            };
-            let mut refresh = attachment_status_peer(&listener, &opened).await;
-            fs::write(fixture.0.join("finish"), "").unwrap();
-            tokio::time::timeout(Duration::from_secs(2), view.retired())
-                .await
-                .unwrap();
-            assert!(view.eof_draining());
-            respond(
-                &mut refresh,
-                Response::Error {
-                    message: "later observation failed".into(),
-                },
-            )
-            .await;
-            assert!(reading.await.unwrap().is_err());
+            bridge.detach(&id);
         } else if proof == Cancelled {
             assert!(result.err().unwrap().is_cancelled());
         } else {
@@ -1791,6 +1762,193 @@ async fn w1_terminal_exact_attachment() {
                 .is_err()
         );
     }
+}
+
+enum EofRefresh {
+    Unavailable,
+    Changed,
+    Replaced,
+    Detached,
+    Expired,
+}
+
+#[tokio::test]
+async fn w1_terminal_eof_refresh_error_preserves_verified_fifo() {
+    check_eof_refresh(EofRefresh::Unavailable).await;
+}
+
+#[tokio::test]
+async fn w1_terminal_eof_refresh_identity_change_discards_fifo() {
+    check_eof_refresh(EofRefresh::Changed).await;
+    check_eof_refresh(EofRefresh::Replaced).await;
+}
+
+#[tokio::test]
+async fn w1_terminal_eof_refresh_detach_discards_fifo() {
+    check_eof_refresh(EofRefresh::Detached).await;
+}
+
+#[tokio::test]
+async fn w1_terminal_eof_refresh_expired_registration_discards_fifo() {
+    check_eof_refresh(EofRefresh::Expired).await;
+}
+
+async fn check_eof_refresh(outcome: EofRefresh) {
+    let fixture = AgentFixture::new();
+    fs::write(fixture.0.join("hold"), "").unwrap();
+    let target = target();
+    let tmux = attachment_tmux(&fixture, target.generation, "ignore-size");
+    let listener = UnixListener::bind(fixture.0.join("agent.sock")).unwrap();
+    let bridge = DesktopBridge::new(Some(fixture.0.clone()), tmux);
+    let runtime = target.runtime_id.to_string();
+    let prove = async {
+        let mut status = open_fixture(&listener, &target).await;
+        status.epoch = Some(ResizeEpoch {
+            agent: status.terminal.agent_epoch,
+            owner: Uuid::new_v4(),
+        });
+        let mut peer = attachment_status_peer(&listener, &status).await;
+        respond(
+            &mut peer,
+            Response::TerminalStatus {
+                status: status.clone(),
+            },
+        )
+        .await;
+        status
+    };
+    let (attached, mut status) = tokio::join!(bridge.attach_observer(&runtime), prove);
+    let attached = attached.unwrap();
+    assert_eq!(attached.status, status);
+    let id = attached.view_id;
+    let view = bridge.view(&id).unwrap();
+    let token = Uuid::new_v4();
+    let acquiring = refresh_fixture_control(&view);
+    let mut peer = acquire_fixture_writer(&listener, &view).await;
+    respond(
+        &mut peer,
+        Response::TerminalControl {
+            token,
+            epoch: status.epoch.unwrap(),
+        },
+    )
+    .await;
+    acquiring.await.unwrap();
+    view.output.lock().await.refresh_at = Instant::now() + Duration::from_secs(60);
+    assert_eq!(
+        read_until_bytes(&bridge, &id, b"buffered attachment output").await,
+        b"buffered attachment output"
+    );
+    let writable = bridge.read(&id).await.unwrap();
+    assert!(writable.writable);
+    let incarnation = writable.paste_incarnation.unwrap().to_string();
+
+    view.output.lock().await.refresh_at = Instant::now();
+    let mut reading = std::pin::pin!(bridge.read(&id));
+    let mut refresh = tokio::select! {
+        peer = attachment_status_peer(&listener, &status) => peer,
+        _ = &mut reading => panic!("read completed before the scoped refresh reply"),
+    };
+    fs::write(fixture.0.join("continue"), "").unwrap();
+    tokio::time::timeout(Duration::from_secs(2), view.retired())
+        .await
+        .unwrap();
+    assert!(view.eof_draining());
+    assert_eq!(allocation_counts(&bridge), (0, 1));
+    assert_eq!(
+        bridge.read(&id).await.err().unwrap().to_string(),
+        "Terminal read already in progress"
+    );
+    assert_eq!(
+        bridge
+            .input(&id, b"after EOF".to_vec(), &incarnation, false)
+            .await
+            .unwrap_err()
+            .to_string(),
+        "View detached"
+    );
+    release_fixture_writer(&listener, &view, token).await;
+    until(|| view.allocation.strong_count() == 1).await;
+    assert_eq!(view.cleanup_confirmations.load(Ordering::Acquire), 3);
+    assert!(view.master.lock().unwrap().is_none());
+
+    let reply = match outcome {
+        EofRefresh::Unavailable | EofRefresh::Detached | EofRefresh::Expired => Response::Error {
+            message: "later observation failed".into(),
+        },
+        EofRefresh::Changed => Response::TerminalChanged {},
+        EofRefresh::Replaced => {
+            status.terminal.target.process_start += 1;
+            Response::TerminalStatus { status }
+        }
+    };
+    match outcome {
+        EofRefresh::Detached => bridge.detach(&id),
+        EofRefresh::Expired => {
+            let mut views = bridge.views.lock().unwrap();
+            views
+                .drains
+                .get_mut(&view.terminal.view_id)
+                .unwrap()
+                .expires = Instant::now();
+        }
+        _ => {}
+    }
+    respond(&mut refresh, reply).await;
+    let result = reading.await;
+    match outcome {
+        EofRefresh::Unavailable => {
+            let mut chunk = result.unwrap();
+            let mut data = Vec::new();
+            let mut frames = 0;
+            loop {
+                assert_read_only_drain(&chunk);
+                if chunk.closed {
+                    assert_eq!(chunk.closure, Some(TerminalClosure::Eof));
+                    assert!(chunk.data.is_empty());
+                    break;
+                }
+                assert!(chunk.closure.is_none() && !chunk.data.is_empty());
+                assert!(chunk.data.len() <= OUTPUT_CHUNK_SIZE);
+                data.extend(chunk.data);
+                frames += 1;
+                assert!(frames <= OUTPUT_SLOTS);
+                chunk = bridge.read(&id).await.unwrap();
+            }
+            let expected = [
+                b"first diagnostic".as_slice(),
+                &[0; OUTPUT_CHUNK_SIZE],
+                b"last diagnostic".as_slice(),
+            ]
+            .concat();
+            assert!(frames > 1);
+            assert_eq!(data, expected);
+        }
+        EofRefresh::Changed | EofRefresh::Replaced => {
+            assert_eq!(
+                result.err().unwrap().to_string(),
+                "Terminal attachment identity changed"
+            );
+        }
+        EofRefresh::Detached => {
+            let chunk = result.unwrap();
+            assert_eq!(chunk.closure, Some(TerminalClosure::Detached));
+            assert!(chunk.closed && chunk.data.is_empty());
+            assert_read_only_drain(&chunk);
+        }
+        EofRefresh::Expired => assert!(result.is_err()),
+    }
+    assert_eq!(
+        bridge.read(&id).await.err().unwrap().to_string(),
+        "View detached"
+    );
+    until(|| allocation_counts(&bridge) == (0, 0)).await;
+    assert!(view.output.lock().await.receiver.is_empty());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), listener.accept())
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
