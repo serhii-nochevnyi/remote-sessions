@@ -98,7 +98,7 @@ DOC_LINKS = {
 }
 LINK = re.compile(r"(?<!!)\[[^]\n]+\]\(([^)\s]+)\)")
 NON_RENDERED_LINK_CONTEXT = re.compile(r"<!--.*?-->|^```[^\n]*\n.*?^```[ \t]*$|`[^`\n]+`", re.MULTILINE | re.DOTALL)
-FALSE_MARKDOWN_CLAIM = re.compile(
+FALSE_OUTCOME_CLAIM = re.compile(
     r"\b(?:native|installed)(?:\s+(?:acceptance|outcome|verification|checks?))?"
     r"[:* =]+\s*(?:(?:has|is)\s+)?pass(?:ed)?\b"
     r"|\b(?:W1|P0|pilot)(?:\s+completion)?\s*[:* ]*\s*(?:is\s+)?complete[d]?\b"
@@ -190,6 +190,12 @@ def require_rejection_witness(case_id, witness):
         require(phrase in witness.lower(), f"{case_id}: owed witness must include {phrase!r}")
 
 
+def require_held_case_text(report, case_id, reason, owed_witness):
+    for field, value in (("reason", reason), ("owed_witness", owed_witness)):
+        claim = FALSE_OUTCOME_CLAIM.search(value)
+        require(not claim, f"{report}: {case_id}: contradictory {field} claim: {claim and claim[0]}")
+
+
 def validate_evidence(root, data, markdown):
     require(isinstance(data, dict) and data.keys() == {
         "schema", "installed_acceptance", "completion", "follow_up", "source_handoff",
@@ -259,7 +265,7 @@ def validate_evidence(root, data, markdown):
         else:
             prose.append(line)
     markdown_cases = index_cases(markdown_rows, REPORT)
-    false_claim = FALSE_MARKDOWN_CLAIM.search("\n".join(prose))
+    false_claim = FALSE_OUTCOME_CLAIM.search("\n".join(prose))
     require(not false_claim, f"{REPORT}: contradictory acceptance claim: {false_claim and false_claim[0]}")
 
     for case_id, status in CASE_STATUS.items():
@@ -270,14 +276,16 @@ def validate_evidence(root, data, markdown):
                 isinstance(row[field], str) and row[field].strip() and "\n" not in row[field],
                 f"{case_id}: missing or multiline {field}",
             )
-        require(not FALSE_MARKDOWN_CLAIM.search(row["reason"]), f"{case_id}: contradictory reason")
+        require_held_case_text(EVIDENCE, case_id, row["reason"], row["owed_witness"])
         is_rejection = case_id in SPECTATOR_REJECTIONS or case_id == STALE_REJECTION
         expected_observations = REJECTION_OBSERVATIONS if is_rejection else CASE_OBSERVATIONS
         require(row["observations"] == expected_observations, f"{case_id}: observations must remain unknown")
         if is_rejection:
             require_rejection_witness(case_id, row["owed_witness"])
+        markdown_case = markdown_cases[case_id]
+        require_held_case_text(REPORT, case_id, markdown_case[1], markdown_case[3])
         require(
-            markdown_cases[case_id] == [status, row["reason"], "Unknown", row["owed_witness"]],
+            markdown_case == [status, row["reason"], "Unknown", row["owed_witness"]],
             f"{REPORT}: {case_id} status, reason, prompt observation or owed witness differs from {EVIDENCE}",
         )
 
@@ -459,6 +467,36 @@ class W1EvidenceTest(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(AssertionError, "R7-CLAUDE-CLI.*differs"):
                     validate_evidence(ROOT, self.data, markdown)
+
+    def case_text_claim_fixture(self, field, claim):
+        case_id = "R7-CLAUDE-CLI"
+        data = copy.deepcopy(self.data)
+        row = next(row for row in data["cases"] if row["id"] == case_id)
+        original = f"| `{case_id}` | {row['status']} | {row['reason']} | Unknown | {row['owed_witness']} |"
+        self.assertEqual(self.markdown.splitlines().count(original), 1)
+        row[field] += f" {claim}"
+        changed = f"| `{case_id}` | {row['status']} | {row['reason']} | Unknown | {row['owed_witness']} |"
+        return case_id, data, self.markdown.replace(original, changed, 1)
+
+    def test_rejects_paired_owed_witness_prompt_claim(self):
+        case_id, data, markdown = self.case_text_claim_fixture(
+            "owed_witness", "Observed 2 submitted model prompts."
+        )
+        with self.assertRaisesRegex(AssertionError, rf"{case_id}: contradictory owed_witness claim"):
+            validate_evidence(ROOT, data, markdown)
+        print("W1EvidenceTest.test_rejects_paired_owed_witness_prompt_claim", flush=True)
+
+    def test_rejects_paired_installed_outcome_claim(self):
+        for field in ("reason", "owed_witness"):
+            with self.subTest(field=field):
+                case_id, data, markdown = self.case_text_claim_fixture(field, "Installed outcome passed.")
+                with self.assertRaisesRegex(AssertionError, rf"{case_id}: contradictory {field} claim"):
+                    validate_evidence(ROOT, data, markdown)
+                with self.assertRaisesRegex(
+                    AssertionError, rf"{re.escape(REPORT)}: {case_id}: contradictory {field} claim"
+                ):
+                    validate_evidence(ROOT, self.data, markdown)
+        print("W1EvidenceTest.test_rejects_paired_installed_outcome_claim", flush=True)
 
     def test_rejects_missing_json_link(self):
         markdown = self.markdown.replace("(W1-EVIDENCE.json)", "(unrelated.json)")
