@@ -119,6 +119,234 @@ def valid_id(value):
         return False
 
 
+def wire_object(value, required, optional=None):
+    optional = optional or {}
+    if (not isinstance(value, dict) or not required.keys() <= value.keys()
+            or not value.keys() <= required.keys() | optional.keys()
+            or any(not check(value[key]) for key, check in required.items())
+            or any(key in value and not check(value[key]) for key, check in optional.items())):
+        raise ValueError('Invalid IPC fields')
+    return value
+
+
+def object_shape(**fields):
+    def matches(value):
+        wire_object(value, fields)
+        return True
+    return matches
+
+
+def variant(value, tag, variants, optional=None):
+    name = value.get(tag) if isinstance(value, dict) else None
+    if not isinstance(name, str) or name not in variants:
+        raise ValueError('Unexpected IPC variant')
+    wire_object(value, {tag: string, **variants[name]}, (optional or {}).get(name))
+    return name
+
+
+def choices(*allowed):
+    return lambda value: isinstance(value, str) and value in allowed
+
+
+def integer(bits):
+    return lambda value: type(value) is int and 0 <= value < 2**bits
+
+
+def nullable(check):
+    return lambda value: value is None or check(value)
+
+
+def array(check):
+    return lambda value: isinstance(value, list) and all(check(item) for item in value)
+
+
+def string(value):
+    return isinstance(value, str) and not re.search(r'[\ud800-\udfff]', value)
+
+
+def boolean(value):
+    return type(value) is bool
+
+
+def wire_uuid(value):
+    if not isinstance(value, str):
+        return False
+    simple = r'[0-9a-fA-F]{32}'
+    hyphenated = r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}'
+    return re.fullmatch(rf'(?:{simple}|{hyphenated}|urn:uuid:{hyphenated}|\{{{hyphenated}\}})', value) is not None
+
+
+def runtime_shape(value):
+    wire_object(value, {'session_id': wire_uuid, 'runtime_id': wire_uuid, 'tmux_name': string,
+                        'pane_id': string, 'command': string, 'exited': boolean,
+                        'width': U16, 'height': U16},
+                {'pane_pid': nullable(U32), 'origin': choices('managed', 'legacy'),
+                 'workspace_id': nullable(wire_uuid), 'operation_id': nullable(wire_uuid)})
+    if (not valid_id(value['session_id']) or not valid_id(value['runtime_id'])
+            or not value['tmux_name'].startswith('rs_')
+            or value['tmux_name'][3:].lower() != f"{UUID(value['session_id']).hex}_{UUID(value['runtime_id']).hex}"
+            or not re.fullmatch(r'%(?:0|[1-9][0-9]{0,9})', value['pane_id'])
+            or not U32(int(value['pane_id'][1:]))):
+        raise ValueError('Invalid IPC runtime identity')
+    return True
+
+
+def resize_shape(value):
+    variant(value, 'result', {
+        'committed': {'admission': INTENT, 'status': TERMINAL_STATUS},
+        'rejected': {'terminal': TERMINAL, 'intent': INTENT},
+        'uncertain': {'terminal': TERMINAL, 'intent': INTENT},
+    })
+    return True
+
+
+def launch_outcome_shape(value):
+    wire_object(value, {'runtime': runtime_shape}, {'setup_issue': nullable(ISSUE)})
+    return True
+
+
+def create_state_shape(value):
+    nullable_issue = nullable(ISSUE)
+    variant(value, 'state', {
+        'absent': {},
+        'pending': {'reservation': wire_uuid},
+        'failed': {'issue': ISSUE},
+        'unknown': {},
+        'confirmed': {'outcome': launch_outcome_shape, 'current': choices('live', 'exited', 'unavailable')},
+    }, {'unknown': {'issue': nullable_issue}, 'confirmed': {'setup_issue': nullable_issue}})
+    return True
+
+
+U16, U32, U64 = (integer(bits) for bits in (16, 32, 64))
+DATA = array(integer(8))
+SIZE = object_shape(cols=U16, rows=U16)
+TARGET = object_shape(runtime_id=wire_uuid, generation=wire_uuid, session=string, window=string,
+                      pane=string, pid=U32, process_start=U64)
+TERMINAL = object_shape(target=TARGET, view_id=wire_uuid, agent_epoch=wire_uuid)
+EPOCH = object_shape(agent=wire_uuid, owner=wire_uuid)
+INTENT = object_shape(epoch=EPOCH, id=wire_uuid)
+GEOMETRY = object_shape(size=SIZE, revision=U64, intent=nullable(INTENT))
+PROVIDER = object_shape(size=SIZE, sampled_at_us=U64)
+TERMINAL_STATUS = object_shape(terminal=TERMINAL, epoch=nullable(EPOCH), committed=GEOMETRY,
+                               provider=nullable(PROVIDER), observation=choices('pending', 'observed', 'unavailable'))
+BINDING = object_shape(terminal=TERMINAL, token=wire_uuid, epoch=EPOCH, incarnation=wire_uuid,
+                       operation=U64, sequence=U64)
+PROFILE = choices('claude_code', 'codex')
+ISSUE = choices(*('invalid_request invalid_folder unsupported_path folder_unavailable folder_access_denied '
+                  'workspace_unknown workspace_changed workspace_check_timed_out provider_missing '
+                  'provider_not_executable interpreter_unavailable catalog_unconfigured catalog_missing '
+                  'catalog_unsafe catalog_busy catalog_unsupported catalog_unavailable create_conflict '
+                  'runtime_limit tmux_unavailable launch_setup_failed pending_unavailable').split())
+RUNTIME_ID = {'runtime_id': wire_uuid}
+LEASE = {**RUNTIME_ID, 'token': wire_uuid}
+REQUESTS = {
+    'health': {}, 'list': {},
+    'create': {**RUNTIME_ID, 'session_id': wire_uuid, 'cwd': string, 'argv': array(string)},
+    'snapshot': RUNTIME_ID, 'attach': RUNTIME_ID, 'acquire': RUNTIME_ID,
+    'open_terminal': {**RUNTIME_ID, 'view_id': wire_uuid},
+    'acquire_terminal': {'terminal': TERMINAL}, 'terminal_status': {'terminal': TERMINAL},
+    'resize_terminal': {'terminal': TERMINAL, 'token': wire_uuid, 'sequence': U64, 'size': SIZE},
+    'renew': LEASE, 'release': LEASE,
+    'input': {**LEASE, 'sequence': U64, 'data': DATA},
+    'paste_stage': {'binding': BINDING, 'offset': U64, 'data': DATA},
+    'paste_commit': {'binding': BINDING, 'bytes': U64},
+    'paste_ack': {'binding': BINDING, 'receipt': wire_uuid},
+    'stop': {**RUNTIME_ID, 'expected_pane_id': string},
+}
+PRODUCT_REQUESTS = {
+    'register_workspace': {'locator': string},
+    'workspace_readiness': {'workspace_id': wire_uuid, 'profile': PROFILE},
+    'create_managed': {'key': wire_uuid, 'workspace_id': wire_uuid, 'profile': PROFILE},
+    'create_status': {'key': wire_uuid},
+}
+REPLIES = {
+    'health': {'agent_pid': U32, 'remote_execution_enabled': boolean},
+    'runtimes': {'runtimes': array(runtime_shape)},
+    'created': {'runtime': runtime_shape},
+    'snapshot': {'text': string},
+    'attachment': {'tmux_name': string},
+    'control': {'token': wire_uuid},
+    'terminal_opened': {'status': TERMINAL_STATUS},
+    'terminal_control': {'token': wire_uuid, 'epoch': EPOCH},
+    'terminal_status': {'status': TERMINAL_STATUS},
+    'terminal_changed': {},
+    'control_recovering': {'paste_admission': choices('prior_send_unknown', 'unavailable')},
+    'paste_unavailable': {},
+    'paste': {'paste': lambda value: isinstance(value, dict)},
+    'resize': {'resize': resize_shape},
+    'accepted': {},
+    'stopped': RUNTIME_ID,
+    'error': {'message': string},
+}
+FAMILIES = {
+    'health': ('health',), 'list': ('runtimes',), 'create': ('created',),
+    'snapshot': ('snapshot',), 'attach': ('attachment',), 'acquire': ('control', 'control_recovering'),
+    'open_terminal': ('terminal_opened',), 'acquire_terminal': ('terminal_control', 'control_recovering'),
+    'terminal_status': ('terminal_status', 'terminal_changed'), 'resize_terminal': ('resize',),
+    'renew': ('accepted', 'control_recovering'), 'release': ('accepted',),
+    'input': ('accepted', 'control_recovering'), 'stop': ('stopped',),
+    'paste_stage': ('paste',), 'paste_commit': ('paste',), 'paste_ack': ('paste',),
+}
+PASTE_REPLIES = {
+    'paste_stage': {'staged': {}, 'stale': {}, 'invalid': {}, 'unavailable': {}, 'unknown': {}},
+    'paste_commit': {'committed': {'receipt': wire_uuid}, 'stale': {}, 'invalid': {},
+                     'unavailable': {}, 'unknown': {}},
+    'paste_ack': {'acknowledged': {'writable': boolean}, 'stale': {}, 'unknown': {}},
+}
+PRODUCT_REPLIES = {
+    'workspace_registered': {'workspace': object_shape(workspace_id=wire_uuid, label=string)},
+    'ready': {}, 'blocked': {'issue': ISSUE}, 'create': {'state': create_state_shape},
+}
+PRODUCT_FAMILIES = {
+    'register_workspace': 'workspace_registered', 'workspace_readiness': 'ready',
+    'create_managed': 'create', 'create_status': 'create',
+}
+
+
+def decode_ipc(frame):
+    def pairs(items):
+        value = dict(items)
+        if len(value) != len(items):
+            raise ValueError('Duplicate IPC field')
+        return value
+
+    def invalid_constant(_):
+        raise ValueError('Invalid IPC number')
+
+    return json.loads(frame.decode('utf-8'), object_pairs_hook=pairs, parse_constant=invalid_constant)
+
+
+def validate_request(message):
+    if isinstance(message, dict) and 'product' in message:
+        wire_object(message, {'product': lambda value: isinstance(value, dict)})
+        variant(message['product'], 'op', PRODUCT_REQUESTS,
+                {'create_managed': {'reservation': nullable(wire_uuid)}})
+    else:
+        variant(message, 'op', REQUESTS, {'input': {'paste': boolean}})
+
+
+def validate_reply(message, reply):
+    if 'product' in message and isinstance(reply, dict) and 'product' in reply:
+        wire_object(reply, {'product': lambda value: isinstance(value, dict)})
+        op = message['product']['op']
+        result = variant(reply['product'], 'result',
+                         {name: PRODUCT_REPLIES[name] for name in (PRODUCT_FAMILIES[op], 'blocked')})
+        if result == 'blocked' and op in ('create_managed', 'create_status'):
+            if reply['product']['issue'] != 'catalog_unconfigured':
+                raise ValueError('Unexpected IPC create error')
+        return result
+    if 'product' in message:
+        return variant(reply, 'result', {'error': REPLIES['error']})
+    op = message['op']
+    names = FAMILIES[op]
+    if op == 'input' and message.get('paste') is True:
+        names = ('paste_unavailable',)
+    result = variant(reply, 'result', {name: REPLIES[name] for name in (*names, 'error')})
+    if result == 'paste':
+        variant(reply['paste'], 'result', PASTE_REPLIES[op])
+    return result
+
+
 class ResponseLoss:
     """Drop one authoritative live create result after it has arrived from the lab."""
 
@@ -158,7 +386,8 @@ class ResponseLoss:
             raise ValueError('Incomplete or oversized upstream response')
         request = message.get('product', message)
         op, key = request.get('op'), request.get('key')
-        reply = json.loads(frame)
+        reply = decode_ipc(frame)
+        result = validate_reply(message, reply)
         state = response_state(reply)
         runtime = state.get('outcome', {}).get('runtime', {})
         with self.lock:
@@ -175,17 +404,14 @@ class ResponseLoss:
                     and runtime.get('exited') is False):
                 self.drops.append({'key': key, 'runtime': runtime})
                 self.profile = None
-                return None
-            if (op == 'list' and reply.get('result') == 'runtimes'
-                    or op == 'create_status' and state):
-                self.replies[op, key] += 1
-        return frame
+                return None, None
+        credit = (op, key) if (op, result) in (('list', 'runtimes'), ('create_status', 'create')) else None
+        return frame, credit
 
     def relay(self, reader, upstream):
         request = read_frame(reader, REQUEST_LIMIT)
-        message = json.loads(request)
-        if not isinstance(message, dict) or not isinstance(message.get('product', message), dict):
-            raise ValueError('IPC request must be an object')
+        message = decode_ipc(request)
+        validate_request(message)
         self.request(message)
         frame = exchange(upstream, request)
         return self.response(message, frame)
@@ -212,19 +438,25 @@ def agent_proxy(lab, directory, loss):
 
     class Handler(socketserver.StreamRequestHandler):
         def handle(self):
-            self.request.settimeout(7)
             with loss.lock:
                 loss.active += 1
+            credit = None
+            failed = True
             try:
-                response = loss.relay(self.rfile, upstream)
+                self.request.settimeout(7)
+                response, eligible = loss.relay(self.rfile, upstream)
                 if response is not None:
                     self.request.sendall(response)
-            except (OSError, TypeError, ValueError):
-                with loss.lock:
-                    loss.failures += 1
+                    credit = eligible
+                failed = False
+            except (OSError, TypeError, ValueError, RecursionError):
+                pass
             finally:
                 with loss.lock:
                     loss.active -= 1
+                    loss.failures += failed
+                    if credit is not None:
+                        loss.replies[credit] += 1
 
     path = directory / 'agent.sock'
     server = socketserver.ThreadingUnixStreamServer(str(path), Handler)
