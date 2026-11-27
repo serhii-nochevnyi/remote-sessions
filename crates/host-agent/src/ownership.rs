@@ -25,7 +25,7 @@ struct Lease {
     next_resize: u64,
     terminal: Option<TerminalView>,
     epoch: Option<ResizeEpoch>,
-    paste_incarnation: Option<Uuid>,
+    paste_wire_incarnation: Option<Uuid>,
     paste_high_water: u64,
     stage: Option<Stage>,
 }
@@ -40,7 +40,8 @@ impl Lease {
         if binding.operation <= self.paste_high_water {
             return false;
         }
-        self.paste_incarnation = Some(binding.incarnation);
+        self.paste_wire_incarnation
+            .get_or_insert(binding.incarnation);
         self.paste_high_water = binding.operation;
         self.stage = None;
         true
@@ -89,7 +90,7 @@ impl Ownership {
                 next_resize: 0,
                 terminal,
                 epoch,
-                paste_incarnation: None,
+                paste_wire_incarnation: None,
                 paste_high_water: 0,
                 stage: None,
             },
@@ -180,14 +181,14 @@ impl Ownership {
             && binding.sequence < u64::MAX
             && !binding.incarnation.is_nil()
             && lease
-                .paste_incarnation
+                .paste_wire_incarnation
                 .is_none_or(|id| id == binding.incarnation))
         .then_some(lease)
     }
 
     pub fn paste_live(&mut self, binding: &PasteBinding, now: Instant) -> bool {
         self.paste_lease(binding, now).is_some_and(|lease| {
-            lease.paste_incarnation == Some(binding.incarnation)
+            lease.paste_wire_incarnation == Some(binding.incarnation)
                 && lease.paste_high_water == binding.operation
         })
     }

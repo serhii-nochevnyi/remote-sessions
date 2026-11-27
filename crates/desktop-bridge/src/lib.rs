@@ -542,7 +542,7 @@ struct LeaseSample {
     epoch: ResizeEpoch,
     deadline: Instant,
     incarnation: Uuid,
-    pending_paste: Option<(Uuid, u64)>,
+    pending_paste: Option<PasteCompletion>,
 }
 
 struct Allocation(Arc<AtomicUsize>);
@@ -641,15 +641,19 @@ struct NativeLease {
     resize_sequence: u64,
     deadline: Instant,
     incarnation: Uuid,
+    paste_wire_incarnation: Uuid,
+    paste_high_water: u64,
+    staged_paste: Option<PasteCompletion>,
     pending_paste: Option<NativePaste>,
 }
 
 struct NativePaste {
+    gesture: PasteCompletion,
     binding: PasteBinding,
     receipt: Option<Uuid>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct PasteCompletion {
     incarnation: Uuid,
     operation: u64,
@@ -669,6 +673,7 @@ impl NativeLease {
     fn extend(&mut self, applied_at: Instant, deadline: Instant) {
         if self.deadline <= applied_at {
             self.incarnation = Uuid::new_v4();
+            self.staged_paste = None;
         }
         self.deadline = deadline;
     }
@@ -690,10 +695,7 @@ impl LeaseSample {
             epoch: lease.epoch,
             deadline: lease.deadline,
             incarnation: lease.incarnation,
-            pending_paste: lease
-                .pending_paste
-                .as_ref()
-                .map(|pending| (pending.binding.incarnation, pending.binding.operation)),
+            pending_paste: lease.pending_paste.as_ref().map(|pending| pending.gesture),
         }
     }
 }
@@ -1284,6 +1286,10 @@ fn read_pty(
 }
 
 async fn refresh_control(view: &View) {
+    refresh_control_with_clock(view, Instant::now).await;
+}
+
+async fn refresh_control_with_clock(view: &View, now: impl Fn() -> Instant) {
     let mut control = view.control.lock().await;
     if view.closed() {
         return;
@@ -1298,12 +1304,12 @@ async fn refresh_control(view: &View) {
             terminal: view.terminal.clone(),
         },
     };
-    let deadline = Instant::now() + INPUT_LEASE_TTL;
+    let deadline = now() + INPUT_LEASE_TTL;
     let result = view.agent_request(&message).await;
     {
         let views = view.views.upgrade();
         let mut registry = views.as_ref().map(|views| views.lock().unwrap());
-        let applied_at = Instant::now();
+        let applied_at = now();
         if !view.closed() && applied_at < deadline {
             match &result {
                 Ok(Response::TerminalControl { token, epoch })
@@ -1323,6 +1329,9 @@ async fn refresh_control(view: &View) {
                             input_sequence: 0,
                             resize_sequence: 0,
                             incarnation: Uuid::new_v4(),
+                            paste_wire_incarnation: Uuid::new_v4(),
+                            paste_high_water: 0,
+                            staged_paste: None,
                             pending_paste: None,
                         });
                     }
@@ -1874,11 +1883,8 @@ async fn read_chunk(view: &View, output: &mut Output, now: impl Fn() -> Instant)
         if chunk.paste_admission.is_none()
             && let Some(lease) = sample.lease
         {
-            if let Some((incarnation, operation)) = lease.pending_paste {
-                chunk.paste_completion = Some(PasteCompletion {
-                    incarnation,
-                    operation,
-                });
+            if let Some(gesture) = lease.pending_paste {
+                chunk.paste_completion = Some(gesture);
             } else if output.status.terminal == view.terminal
                 && Some(lease.epoch) == output.status.epoch
                 && lease.deadline > now()
@@ -2536,6 +2542,7 @@ impl DesktopBridge {
         lease.input_sequence = sequence
             .checked_add(1)
             .context("Input sequence exhausted")?;
+        lease.staged_paste = None;
         let runtime_id = view.terminal.target.runtime_id;
         let result = view
             .agent_request(&Request::Input {
@@ -2587,16 +2594,20 @@ impl DesktopBridge {
         else {
             return PasteResult::Stale {};
         };
+        let gesture = PasteCompletion {
+            incarnation,
+            operation,
+        };
         if let PasteAction::Ack { receipt } = action {
             let Ok(receipt) = Uuid::parse_str(&receipt) else {
                 return PasteResult::Invalid {};
             };
             let Some(pending) = lease.pending_paste.as_mut().filter(|pending| {
-                pending.binding.terminal == view.terminal
+                pending.gesture == gesture
+                    && pending.binding.terminal == view.terminal
                     && pending.binding.token == lease.token
                     && pending.binding.epoch == lease.epoch
-                    && pending.binding.incarnation == incarnation
-                    && pending.binding.operation == operation
+                    && pending.binding.incarnation == lease.paste_wire_incarnation
                     && pending.receipt == Some(receipt)
             }) else {
                 return PasteResult::Stale {};
@@ -2638,24 +2649,41 @@ impl DesktopBridge {
             terminal: view.terminal.clone(),
             token: lease.token,
             epoch: lease.epoch,
-            incarnation,
+            incarnation: lease.paste_wire_incarnation,
             operation,
             sequence: lease.input_sequence,
         };
         let request_message = match action {
-            PasteAction::Stage { offset, data } => Request::PasteStage {
-                binding,
-                offset,
-                data,
-            },
+            PasteAction::Stage { offset, data } => {
+                if operation > lease.paste_high_water {
+                    lease.paste_high_water = operation;
+                    lease.staged_paste = None;
+                    if offset != 0 {
+                        return PasteResult::Invalid {};
+                    }
+                } else if lease.staged_paste != Some(gesture) {
+                    return PasteResult::Stale {};
+                }
+                Request::PasteStage {
+                    binding,
+                    offset,
+                    data,
+                }
+            }
             PasteAction::Commit { bytes } => {
+                if lease.staged_paste != Some(gesture) {
+                    return PasteResult::Stale {};
+                }
+                lease.staged_paste = None;
                 if lease.input_sequence == u64::MAX {
                     return Self::hold_unknown_paste(&view, &mut control);
                 }
                 lease.pending_paste = Some(NativePaste {
+                    gesture,
                     binding: binding.clone(),
                     receipt: None,
                 });
+                view.publish_lease(lease);
                 Request::PasteCommit { binding, bytes }
             }
             PasteAction::Ack { .. } => unreachable!("handled receipt above"),
@@ -2672,13 +2700,17 @@ impl DesktopBridge {
             }
             Ok(Response::Paste {
                 paste: PasteResult::Staged {},
-            }) if !committing => PasteResult::Staged {},
+            }) if !committing => {
+                lease.staged_paste = Some(gesture);
+                PasteResult::Staged {}
+            }
             Ok(Response::Paste {
                 paste:
                     paste @ (PasteResult::Stale {}
                     | PasteResult::Invalid {}
                     | PasteResult::Unavailable {}),
             }) => {
+                lease.staged_paste = None;
                 lease.pending_paste = None;
                 view.publish_lease(lease);
                 paste
@@ -2961,10 +2993,9 @@ mod tests {
                 panic!("expected scoped stage request");
             };
             assert_eq!(binding.terminal, view.terminal);
-            assert_eq!(
-                (binding.incarnation, binding.operation),
-                (incarnation, operation)
-            );
+            assert_ne!(binding.incarnation, incarnation);
+            assert!(!binding.incarnation.is_nil());
+            assert_eq!(binding.operation, operation);
             assert_eq!(data, b"x");
             Self::reply(
                 peer,
@@ -3568,9 +3599,15 @@ mod tests {
             .await
             .unwrap();
         let pending = ipc.bridge.read(&id).await.unwrap();
-        assert!(pending.writable);
-        assert_eq!(pending.paste_incarnation, Some(incarnation));
-        assert!(pending.paste_completion.is_none());
+        assert!(!pending.writable);
+        assert!(pending.paste_incarnation.is_none());
+        assert_eq!(
+            pending.paste_completion,
+            Some(PasteCompletion {
+                incarnation,
+                operation: 1
+            })
+        );
         let receipt = Uuid::new_v4();
         PasteIpc::reply(
             commit_reply,

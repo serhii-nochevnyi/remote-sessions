@@ -546,6 +546,196 @@ else:
     }
 }
 
+#[tokio::test]
+async fn w1_terminal_paste_capability_gap_retains_exact_buffer_custody() {
+    let fixture = Fixture::paste();
+    let root = fixture.temp.path();
+    let (token, epoch) = fixture.acquire(fixture.terminal.clone()).await;
+    let old_binding = PasteBinding {
+        terminal: fixture.terminal.clone(),
+        token,
+        epoch,
+        incarnation: Uuid::new_v4(),
+        operation: 1,
+        sequence: 0,
+    };
+    let runtime = old_binding.terminal.target.runtime_id;
+    let pane = &old_binding.terminal.target.pane;
+    let ready = fixture.engine.geometry(runtime, pane).await.unwrap();
+    let bound = PasteBuffer {
+        nonce: Uuid::new_v4(),
+        operation: old_binding.operation,
+        name: format!("rs-paste-{}", Uuid::new_v4().simple()),
+    };
+    let draft = b"original staged draft";
+    let loading = fixture
+        .engine
+        .transition_marker(&ready, &bound.marker(&ready, 'l'))
+        .await
+        .unwrap()
+        .unwrap();
+    fixture
+        .engine
+        .load_paste(&loading, &bound.name, draft)
+        .await
+        .unwrap();
+    let canary = format!("rs-paste-{}", Uuid::new_v4().simple());
+    fs::write(root.join(&canary), b"unrelated buffer").unwrap();
+
+    let (engine, original) = fixture.restart();
+    assert_ne!(original.agent_epoch, old_binding.terminal.agent_epoch);
+    assert!(engine.existing_lane(runtime).is_none());
+    fs::write(root.join("unsupported"), "1").unwrap();
+    assert!(matches!(
+        engine
+            .handle(Request::AcquireTerminal { terminal: original }, None)
+            .await
+            .unwrap(),
+        Response::ControlRecovering {
+            paste_admission: PasteAdmission::PriorSendUnknown
+        }
+    ));
+    let lane = engine.existing_lane(runtime).unwrap();
+    let assert_custody = || async {
+        let lane = lane.lock().await;
+        let [held] = &lane.paste_quarantines[..] else {
+            panic!("expected one quarantine for the original pane");
+        };
+        assert!(!held.original.sender_supported);
+        assert!(held.original.same_pane(&loading));
+        assert_eq!(held.original.epoch, Some(epoch));
+        assert_eq!(held.original.paste_marker, loading.paste_marker);
+        assert!(held.buffer.as_ref() == Some(&bound));
+        assert_eq!(fs::read(root.join(&bound.name)).unwrap(), draft);
+        assert_eq!(fs::read(root.join(&canary)).unwrap(), b"unrelated buffer");
+        assert!(!root.join("deletions").exists());
+    };
+    assert_custody().await;
+
+    let (mut replacement, _process) = fixture.second_pane(true);
+    replacement.agent_epoch = engine.agent_epoch;
+    assert_ne!(replacement.target.pane, *pane);
+    fs::write(root.join("removed-0"), "1").unwrap();
+    let acquire = || Request::AcquireTerminal {
+        terminal: replacement.clone(),
+    };
+    assert!(matches!(
+        engine.handle(acquire(), None).await.unwrap(),
+        Response::ControlRecovering {
+            paste_admission: PasteAdmission::Unavailable
+        }
+    ));
+    assert_custody().await;
+
+    fs::write(root.join("cleanup-blocked"), "1").unwrap();
+    fs::remove_file(root.join("unsupported")).unwrap();
+    let Response::TerminalControl {
+        token: successor, ..
+    } = engine.handle(acquire(), None).await.unwrap()
+    else {
+        panic!("expected the corroborated replacement to acquire control");
+    };
+    assert_ne!(successor, token);
+    assert_custody().await;
+    assert!(matches!(
+        engine
+            .handle(
+                Request::Release {
+                    runtime_id: runtime,
+                    token: successor
+                },
+                None
+            )
+            .await
+            .unwrap(),
+        Response::Accepted {}
+    ));
+    fs::remove_file(root.join("cleanup-blocked")).unwrap();
+    assert!(matches!(
+        engine.handle(acquire(), None).await.unwrap(),
+        Response::TerminalControl { .. }
+    ));
+    assert!(!lane.lock().await.has_paste_hold());
+    assert!(!root.join(&bound.name).exists());
+    assert_eq!(
+        fs::read_to_string(root.join("deletions")).unwrap(),
+        format!("{}\n", bound.name)
+    );
+    assert_eq!(fs::read(root.join(&canary)).unwrap(), b"unrelated buffer");
+    assert!(matches!(
+        engine
+            .handle(
+                Request::PasteCommit {
+                    binding: old_binding,
+                    bytes: draft.len()
+                },
+                None
+            )
+            .await
+            .unwrap(),
+        Response::Paste {
+            paste: PasteResult::Stale {}
+        }
+    ));
+    for file in ["submissions", "effects", "pane0-bytes", "pane1-bytes"] {
+        assert!(!root.join(file).exists());
+    }
+}
+
+#[tokio::test]
+async fn w1_terminal_paste_replacement_preserves_unproved_custody() {
+    let fixture = Fixture::paste();
+    let root = fixture.temp.path();
+    let runtime = fixture.terminal.target.runtime_id;
+    let (_, epoch) = fixture.acquire(fixture.terminal.clone()).await;
+    let original = fixture.engine.geometry(runtime, "%0").await.unwrap();
+    let canary = format!("rs-paste-{}", Uuid::new_v4().simple());
+    let marker = PasteBuffer {
+        nonce: Uuid::new_v4(),
+        operation: 1,
+        name: canary.clone(),
+    }
+    .marker(&original, 'l')
+    .replace(&epoch.owner.to_string(), &Uuid::new_v4().to_string());
+    fs::write(root.join(&canary), b"unrelated buffer").unwrap();
+    fs::write(root.join("marker"), &marker).unwrap();
+
+    let (engine, terminal) = fixture.restart();
+    assert!(matches!(
+        engine
+            .handle(Request::AcquireTerminal { terminal }, None)
+            .await
+            .unwrap(),
+        Response::ControlRecovering {
+            paste_admission: PasteAdmission::PriorSendUnknown
+        }
+    ));
+    let (mut replacement, _process) = fixture.second_pane(true);
+    replacement.agent_epoch = engine.agent_epoch;
+    fs::write(root.join("removed-0"), "1").unwrap();
+    assert!(matches!(
+        engine
+            .handle(
+                Request::AcquireTerminal {
+                    terminal: replacement
+                },
+                None
+            )
+            .await
+            .unwrap(),
+        Response::TerminalControl { .. }
+    ));
+    let lane = engine.existing_lane(runtime).unwrap();
+    let lane = lane.lock().await;
+    let [held] = &lane.paste_quarantines[..] else {
+        panic!("expected unresolved original custody");
+    };
+    assert!(held.buffer.is_none());
+    assert_eq!(held.original.paste_marker, marker);
+    assert_eq!(fs::read(root.join(&canary)).unwrap(), b"unrelated buffer");
+    assert!(!root.join("deletions").exists());
+}
+
 #[cfg(debug_assertions)]
 #[tokio::test]
 async fn w1_resize_private_fixture_socket() {
@@ -1070,6 +1260,7 @@ async fn w1_resize_reconciliation_waits_for_a_fresh_identity_bracketed_sample() 
 mod exited_stop {
     use super::*;
 
+    const COMMAND_TIMEOUT: Duration = Duration::from_secs(4);
     const DRAFT: &[u8] = "fixture draft\n\t日本語".as_bytes();
     const CANARY: &str = "unrelated fixture buffer";
     const SCOPE: &str = "#{pid}|#{start_time}|#{@rs_create_generation}|#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}|#{pane_dead}";
@@ -1164,10 +1355,12 @@ os.execvp(cli[0], [*cli, *args])
         }
 
         fn engine(&self) -> Engine {
-            let engine = Engine::new(
+            let mut engine = Engine::new(
                 self.temp.path().join("tmux-fixture"),
                 self.stock.socket.clone(),
             );
+            engine.paste_test.geometry_watchdog = Some(COMMAND_TIMEOUT);
+            engine.paste_test.send_watchdog = Some(COMMAND_TIMEOUT);
             *engine.paste_test.now.lock().unwrap() = Some(Instant::now());
             engine
         }
@@ -1326,7 +1519,7 @@ os.execvp(cli[0], [*cli, *args])
             view_id: Uuid::new_v4(),
             agent_epoch: engine.agent_epoch,
         };
-        let Response::TerminalControl { token, epoch } = engine
+        let acquired = engine
             .handle(
                 Request::AcquireTerminal {
                     terminal: terminal.clone(),
@@ -1334,9 +1527,9 @@ os.execvp(cli[0], [*cli, *args])
                 None,
             )
             .await
-            .unwrap()
-        else {
-            panic!("Expected a real pane writer");
+            .unwrap();
+        let Response::TerminalControl { token, epoch } = acquired else {
+            panic!("Expected a real pane writer, got {acquired:?}");
         };
         let binding = PasteBinding {
             terminal,
