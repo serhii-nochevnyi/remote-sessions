@@ -9,14 +9,16 @@ use crate::{
         ResizeResult, Response, Runtime, RuntimeOrigin, TerminalSize, TerminalStatus,
         TerminalTarget, TerminalView, parse_name, tmux_name,
     },
-    product_launch::{LAUNCH_COMMAND, LaunchGuard, NONCE_ENV, read_setup_fault, workspace_locator},
+    product_launch::{
+        LAUNCH_COMMAND, LaunchGuard, NONCE_ENV, TICKET_ENV, read_setup_fault, workspace_locator,
+    },
 };
 use anyhow::{Context, Result, bail, ensure};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
     os::{
-        fd::AsRawFd,
+        fd::{AsFd, AsRawFd},
         unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
     },
     path::{Path, PathBuf},
@@ -78,7 +80,7 @@ impl PasteBuffer {
     }
 
     fn from_marker(read: &GeometryReadback) -> Option<Self> {
-        if read.epoch.is_none() || parse_uuid(&read.paste_launch).is_err() {
+        if read.epoch.is_none() || parse_uuid(read.launch()).is_err() {
             return None;
         }
         let marker = read
@@ -205,6 +207,8 @@ struct PasteTest {
     provider_sample: Option<ProviderSample>,
     geometry_watchdog: Option<Duration>,
     send_watchdog: Option<Duration>,
+    launch_program: Option<PathBuf>,
+    replacement_start: Option<u64>,
 }
 
 #[cfg(test)]
@@ -277,7 +281,8 @@ const GEOMETRY_FORMAT: &str = concat!(
     "#{session_windows}|#{window_panes}|#{window-size}|#{pane_tty}|",
     "#{pane_width}|#{pane_height}|#{window_width}|#{window_height}|",
     "#{@rs_resize_epoch}|#{@rs_resize_intent}|",
-    "#{?#{m/r:^[0-9a-f-]*$,#{@rs_paste_launch}},#{@rs_paste_launch},invalid}|",
+    "#{?#{m/r:^[0-9a-f-]*$,#{@rs_paste_launch}},#{@rs_paste_launch},invalid}",
+    "#{?#{m/r:^..............8,#{@rs_paste_launch}},~#{@rs_create_birth},}|",
     "#{?#{m/r:^[a-z0-9:~-]*$,#{@rs_paste_admission}},#{@rs_paste_admission},invalid}|",
     "#{pane_input_off}"
 );
@@ -285,6 +290,11 @@ const MAX_REVISION: u64 = (1 << 53) - 1;
 const GENERATION_OPTION: &str = "@rs_create_generation";
 const GENERATION_FORMAT: &str = "#{pid}|#{start_time}|#{@rs_create_generation}";
 const PANE_OPTION: &str = "@rs_create_nonce";
+const INITIALIZER_OPTION: &str = "@rs_create_initializer";
+const BIRTH_OPTION: &str = "@rs_create_birth";
+const BIRTH_FORMAT: &str = "#{@rs_create_initializer}|#{@rs_create_birth}";
+const BIRTH_RETRY: Duration = Duration::from_millis(25);
+const BIRTH_READ_BUDGET: Duration = Duration::from_millis(300);
 const RECEIPT_FORMAT: &str = "#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}";
 const EVIDENCE_FORMAT: &str = concat!(
     "#{pid}|#{start_time}|#{@rs_create_generation}|",
@@ -307,6 +317,130 @@ const INVENTORY_SCOPE_FORMAT: &str = concat!(
     "#{session_id}|#{window_id}"
 );
 const RUNTIME_LIMIT: usize = 16;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct LaunchBirth {
+    pub tmux: PathBuf,
+    pub server: ServerGeneration,
+    pub operation: Uuid,
+    pub session: Uuid,
+    pub runtime: Uuid,
+    pub ticket: Uuid,
+}
+
+fn birth_prefix(server: ServerGeneration, operation: Uuid, runtime: Uuid, nonce: Uuid) -> String {
+    format!(
+        "v1~{}~{}~{}~{operation}~{runtime}~{nonce}~",
+        server.pid, server.start, server.token
+    )
+}
+
+fn initializer(prefix: &str, ticket: Uuid, pane: &PaneIdentity) -> String {
+    format!(
+        "{prefix}{ticket}~{}~{}~{}~{}",
+        pane.session, pane.window, pane.pane, pane.pid
+    )
+}
+
+fn birth_text(init: &str, start: u64, tty: &Path, (dev, ino, rdev): TtyIdentity) -> String {
+    format!("{init}~{start}~{}~{dev}~{ino}~{rdev}", tty.display())
+}
+
+fn birth_launch_id(ticket: Uuid) -> Uuid {
+    let mut bytes = *ticket.as_bytes();
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+fn generation_guard(server: ServerGeneration) -> String {
+    format_all([
+        format_equal("pid", server.pid),
+        format_equal("start_time", server.start),
+        format_equal(GENERATION_OPTION, server.token),
+    ])
+}
+
+fn creation_guard(server: ServerGeneration) -> String {
+    format_all([
+        generation_guard(server),
+        format_equal("after-if-shell", ""),
+        format_equal("after-new-session", ""),
+        format_equal("session-created", ""),
+        format_equal("session-window-changed", ""),
+        format_equal("window-linked", ""),
+        format_equal("window-layout-changed", ""),
+        format_equal("after-set-environment", ""),
+        format_equal("after-set-option", ""),
+        format_equal("command-error", ""),
+    ])
+}
+
+impl LaunchBirth {
+    pub(crate) async fn publish(&self, directory: &Path, nonce: Uuid) -> Result<()> {
+        let engine = Engine::new(self.tmux.clone(), directory.join("tmux.sock"));
+        ensure!(
+            engine.private_sender_socket(),
+            "Launch socket is unavailable"
+        );
+        let pane = std::env::var("TMUX_PANE")?;
+        ensure!(canonical_tmux_id(&pane, '%'), "Invalid launch pane");
+        let pid = std::process::id();
+        let start = process_start(pid)?;
+        let mut tty = [0; 128];
+        let result = unsafe {
+            nix::libc::ttyname_r(std::io::stdin().as_raw_fd(), tty.as_mut_ptr(), tty.len())
+        };
+        ensure!(result == 0, "Launch terminal is unavailable");
+        let tty = unsafe { std::ffi::CStr::from_ptr(tty.as_ptr()) }.to_str()?;
+        ensure!(valid_pane_tty(tty), "Unsupported launch terminal");
+        let terminal = fs::File::from(std::io::stdin().as_fd().try_clone_to_owned()?);
+        let device = tty_identity(&terminal.metadata()?)?;
+        ensure!(
+            tty_identity(&fs::symlink_metadata(tty)?)? == device,
+            "Launch terminal changed"
+        );
+        let row = engine
+            .geometry_command(&["display-message", "-p", "-t", &pane, RECEIPT_FORMAT])
+            .await?;
+        let fields: Vec<_> = row.trim_end().split('|').collect();
+        let identity = pane_identity(&fields).context("Invalid launch pane identity")?;
+        ensure!(
+            identity.pane == pane && identity.pid == pid,
+            "Launch process changed"
+        );
+        let name = tmux_name(self.session, self.runtime);
+        let stamp = format!(
+            "{nonce}:{}:{}:{pane}:{pid}",
+            identity.session, identity.window
+        );
+        let init = initializer(
+            &birth_prefix(self.server, self.operation, self.runtime, nonce),
+            self.ticket,
+            &identity,
+        );
+        let birth = birth_text(&init, start, Path::new(tty), device);
+        let guard = format_all([
+            generation_guard(self.server),
+            engine.sender_guard(),
+            format_equal("session_name", name),
+            format_equal("session_id", &identity.session),
+            format_equal("window_id", &identity.window),
+            format_equal("pane_id", &pane),
+            format_equal("pane_pid", pid),
+            format_equal("pane_tty", tty),
+            format_equal("pane_dead", 0),
+            format_equal(PANE_OPTION, stamp),
+            format_equal(INITIALIZER_OPTION, &init),
+            format_equal(BIRTH_OPTION, ""),
+            format_equal("after-if-shell", ""),
+        ]);
+        let branch = format!("set-option -po -t {pane} {BIRTH_OPTION} '{birth}'");
+        engine
+            .geometry_command(&["if-shell", "-F", "-t", &pane, &guard, &branch])
+            .await?;
+        Ok(())
+    }
+}
 
 struct Observation {
     identity: PaneIdentity,
@@ -530,7 +664,7 @@ impl GeometryReadback {
             t.pid,
             t.process_start,
             launch,
-            self.paste_launch,
+            self.launch(),
             epoch_text(epoch),
         )
     }
@@ -540,11 +674,78 @@ impl GeometryReadback {
     }
 
     fn paste_ready(&self) -> bool {
-        parse_uuid(&self.paste_launch).is_ok()
+        parse_uuid(self.launch()).is_ok()
+            && self.birth_ready()
             && self
                 .paste_marker
                 .strip_prefix(&format!("{}r~", self.paste_prefix(self.epoch)))
                 .is_some_and(|nonce| parse_uuid(nonce).is_ok())
+    }
+
+    fn launch(&self) -> &str {
+        self.paste_launch
+            .split_once('~')
+            .map_or(&self.paste_launch, |(launch, _)| launch)
+    }
+
+    fn birth(&self) -> Option<&str> {
+        self.paste_launch.split_once('~').map(|(_, birth)| birth)
+    }
+
+    fn birth_bound(&self) -> bool {
+        parse_uuid(self.launch()).is_ok_and(|id| id.get_version_num() == 8)
+    }
+
+    fn birth_ready(&self) -> bool {
+        if !self.birth_bound() {
+            return true;
+        }
+        let t = &self.target;
+        let Some((nonce, _)) = self.nonce.split_once(':') else {
+            return false;
+        };
+        let Some(birth) = self.birth() else {
+            return false;
+        };
+        let mut fields = birth.split('~');
+        let (Some("used"), Some(operation), Some(ticket)) =
+            (fields.next(), fields.nth(4), fields.nth(2))
+        else {
+            return false;
+        };
+        let (Ok(operation), Ok(ticket), Ok(nonce)) =
+            (parse_uuid(operation), parse_uuid(ticket), parse_uuid(nonce))
+        else {
+            return false;
+        };
+        let mut device = birth.rsplit('~').take(3).map(str::parse::<u64>);
+        let (Some(Ok(rdev)), Some(Ok(ino)), Some(Ok(dev))) =
+            (device.next(), device.next(), device.next())
+        else {
+            return false;
+        };
+        let device = (dev, ino, rdev);
+        if self.state == PaneState::Live
+            && !fs::symlink_metadata(&self.tty)
+                .is_ok_and(|meta| tty_identity(&meta).is_ok_and(|actual| actual == device))
+        {
+            return false;
+        }
+        let pane = PaneIdentity {
+            session: t.session.clone(),
+            window: t.window.clone(),
+            pane: t.pane.clone(),
+            pid: t.pid,
+        };
+        let prefix = birth_prefix(self.server, operation, t.runtime_id, nonce);
+        let init = initializer(&prefix, ticket, &pane);
+        ticket.get_version_num() == 4
+            && birth_launch_id(ticket).to_string() == self.launch()
+            && birth
+                == format!(
+                    "used~{}",
+                    birth_text(&init, t.process_start, &self.tty, device)
+                )
     }
 
     fn paste_admission_hold(&self) -> Option<PasteAdmission> {
@@ -562,7 +763,7 @@ impl GeometryReadback {
             PaneState::Live => (0, Some(self.target.pid)),
             PaneState::Exited(pid) => (1, pid),
         };
-        format_all([
+        let mut predicates = vec![
             format_equal("pid", self.server.pid),
             format_equal("start_time", self.server.start),
             format_equal(GENERATION_OPTION, self.target.generation),
@@ -587,7 +788,11 @@ impl GeometryReadback {
             format_equal("after-display-message", ""),
             format_equal("command-error", ""),
             format_equal(EPOCH_OPTION, epoch_text(predecessor)),
-        ])
+        ];
+        if self.birth_bound() {
+            predicates.push(format_equal(BIRTH_OPTION, self.birth().unwrap_or("")));
+        }
+        format_all(predicates)
     }
 
     fn status(&self, terminal: TerminalView, provider: Option<ProviderSample>) -> TerminalStatus {
@@ -655,6 +860,20 @@ fn tty_identity(metadata: &fs::Metadata) -> Result<TtyIdentity> {
         "Unexpected provider terminal device"
     );
     Ok((metadata.dev(), metadata.ino(), metadata.rdev()))
+}
+
+fn valid_pane_tty(tty: &str) -> bool {
+    tty.strip_prefix("/dev/ttys")
+        .or_else(|| tty.strip_prefix("/dev/pts/"))
+        .is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.bytes().all(|c| c.is_ascii_alphanumeric())
+        })
+}
+
+#[cfg(any(debug_assertions, test))]
+#[doc(hidden)]
+pub fn launch_fixture_process_start(pid: u32) -> Result<u64> {
+    process_start(pid)
 }
 
 fn sample_tty(path: &Path) -> Result<(ProviderSample, TtyIdentity)> {
@@ -737,6 +956,17 @@ impl Engine {
         self
     }
 
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn with_creation_fixture(
+        mut self,
+        launch_program: Option<PathBuf>,
+        replacement_start: Option<u64>,
+    ) -> Self {
+        self.paste_test.launch_program = launch_program;
+        self.paste_test.replacement_start = replacement_start;
+        self
+    }
+
     fn now(&self) -> Instant {
         #[cfg(test)]
         if let Some(now) = *self.paste_test.now.lock().unwrap() {
@@ -788,7 +1018,7 @@ impl Engine {
         format_all([
             read.guard(read.epoch),
             self.sender_guard(),
-            format_equal(PASTE_LAUNCH_OPTION, &read.paste_launch),
+            format_equal(PASTE_LAUNCH_OPTION, read.launch()),
             format_equal(PASTE_OPTION, &read.paste_marker),
         ])
     }
@@ -1005,6 +1235,27 @@ impl Engine {
             .collect())
     }
 
+    async fn creation_targets(
+        &self,
+        catalog: &CatalogLane,
+        server: ServerGeneration,
+    ) -> Result<HashSet<(Uuid, Uuid)>, ProductIssue> {
+        let names = self.names(server).await.map_err(|_| unavailable())?;
+        let marked = catalog.run(move |db, _| db.marked_targets(server)).await?;
+        let mut targets = HashSet::new();
+        let mut sessions = HashSet::new();
+        let mut runtimes = HashSet::new();
+        for name in names.into_iter().chain(marked) {
+            let ids = parse_name(&name)
+                .filter(|(session, runtime)| tmux_name(*session, *runtime) == name)
+                .ok_or_else(unavailable)?;
+            if targets.insert(ids) && (!sessions.insert(ids.0) || !runtimes.insert(ids.1)) {
+                return Err(unavailable());
+            }
+        }
+        Ok(targets)
+    }
+
     async fn observe(&self, operation: &Operation) -> Result<Observation> {
         let pane = self
             .observe_pane(
@@ -1105,32 +1356,49 @@ impl Engine {
             .context("missing service state")?
             .to_owned();
         let launcher = std::env::current_exe()?;
+        #[cfg(test)]
+        let launcher = self.paste_test.launch_program.clone().unwrap_or(launcher);
         let launcher = workspace_locator(&launcher)
             .map_err(|_| anyhow::anyhow!("unsupported host binary path"))?;
         let cwd = workspace_locator(Path::new(&operation.policy.workspace.canonical))
             .map_err(|_| anyhow::anyhow!("unsupported launch directory"))?;
+        let ticket = Uuid::new_v4();
         let capsule = LaunchGuard {
             locator: operation.locator.clone(),
             profile: operation.profile,
             policy: operation.policy.clone(),
             service_state,
             nonce: operation.nonce,
+            birth: Some(LaunchBirth {
+                tmux: fs::canonicalize(&self.tmux)?,
+                server: operation.generation,
+                operation: operation.id,
+                session: operation.session_id,
+                runtime: operation.runtime_id,
+                ticket,
+            }),
         }
         .argument()?;
-        let ServerGeneration { pid, start, token } = operation.generation;
-        let guard = format!("#{{&&:#{{==:#{{pid}},{pid}}},#{{==:#{{start_time}},{start}}}}}");
-        let guard = format!("#{{&&:{guard},#{{==:#{{{GENERATION_OPTION}}},{token}}}}}");
+        let guard = creation_guard(operation.generation);
         let name = &operation.target;
         let pane_target = format!("={name}:0.0");
         let nonce = operation.nonce;
+        let prefix = birth_prefix(
+            operation.generation,
+            operation.id,
+            operation.runtime_id,
+            nonce,
+        );
         // @security: Double literal hashes to prevent tmux format expansion in the working directory.
         let cwd = tmux_word(&cwd.replace('#', "##"));
         let launcher = tmux_word(launcher);
         let profile = operation.profile.executable_name();
         let branch = format!(
             "new-session -d -E -s {name} -n {profile} -c {cwd} -x 100 -y 30 \
-             -e {NONCE_ENV}={nonce} -P -F '{RECEIPT_FORMAT}' -- {launcher} {LAUNCH_COMMAND} {capsule} ; \
-             set-option -Fp -t {pane_target} {PANE_OPTION} '{nonce}:#{{session_id}}:#{{window_id}}:#{{pane_id}}:#{{pane_pid}}' ; \
+             -e {NONCE_ENV}={nonce} -e {TICKET_ENV}={ticket} -P -F '{RECEIPT_FORMAT}' -- {launcher} {LAUNCH_COMMAND} {capsule} ; \
+             set-environment -r -t ={name} {TICKET_ENV} ; \
+             set-option -Fpo -t {pane_target} {INITIALIZER_OPTION} '{prefix}{ticket}~#{{session_id}}~#{{window_id}}~#{{pane_id}}~#{{pane_pid}}' ; \
+             set-option -Fpo -t {pane_target} {PANE_OPTION} '{nonce}:#{{session_id}}:#{{window_id}}:#{{pane_id}}:#{{pane_pid}}' ; \
              set-option -p -t {pane_target} @rs_command {profile}"
         );
         Ok((guard, branch))
@@ -1223,26 +1491,17 @@ impl Engine {
         let key = operation.key;
         let runtime_id = operation.runtime_id;
         let generation = operation.generation;
-        let Ok(names) = self.names(generation).await else {
-            return unknown(unavailable());
-        };
-        if names.contains(&operation.target) {
-            return unknown(None);
-        }
-        let targets = match catalog
-            .run(move |db, _| db.marked_targets(generation))
-            .await
-        {
+        let targets = match self.creation_targets(catalog, generation).await {
             Ok(targets) => targets,
             Err(issue) => return unknown(issue),
         };
-        if names.len()
-            + targets
-                .iter()
-                .filter(|target| !names.contains(target))
-                .count()
-            >= RUNTIME_LIMIT
+        if targets
+            .iter()
+            .any(|(session, runtime)| *session == operation.session_id || *runtime == runtime_id)
         {
+            return unknown(None);
+        }
+        if targets.len() >= RUNTIME_LIMIT {
             return Self::fail_reserved(catalog, key, runtime_id, ProductIssue::RuntimeLimit).await;
         }
         let Ok((guard, branch)) = self.spawn_command(&operation) else {
@@ -1281,14 +1540,6 @@ impl Engine {
         };
         match self.observe(&operation).await {
             Ok(observed) if observed.identity == receipt => {
-                let _ = self
-                    .stamp_paste(
-                        &observed.runtime,
-                        generation,
-                        &receipt,
-                        Some(operation.nonce),
-                    )
-                    .await;
                 self.finalize_launch(catalog, &operation, observed).await
             }
             _ => unknown(None),
@@ -1366,6 +1617,9 @@ impl Engine {
         let Some(state) = self.socket.parent() else {
             return unknown(None);
         };
+        if !observed.runtime.exited {
+            let _ = self.initialize_managed_writer(operation, &observed).await;
+        }
         let setup_issue = if observed.runtime.exited {
             read_setup_fault(state, operation.nonce)
         } else {
@@ -1550,7 +1804,7 @@ impl Engine {
             None
         };
         let (target, state, server) =
-            Self::geometry_identity(&fields, runtime_id, exited, original_process)?;
+            self.geometry_identity(&fields, runtime_id, exited, original_process)?;
         self.decode_geometry(&fields, target, state, server)
     }
 
@@ -1583,6 +1837,7 @@ impl Engine {
     }
 
     fn geometry_identity(
+        &self,
         fields: &[&str; 26],
         runtime_id: Uuid,
         exited: bool,
@@ -1617,7 +1872,7 @@ impl Engine {
         let process_start = if exited {
             original_process.map_or(0, |(_, started)| started)
         } else {
-            process_start(identity.pid)?
+            self.observed_process_start(identity.pid)?
         };
         let target = TerminalTarget {
             runtime_id,
@@ -1636,6 +1891,13 @@ impl Engine {
         Ok((target, state, server))
     }
 
+    fn observed_process_start(&self, pid: u32) -> Result<u64> {
+        let start = process_start(pid)?;
+        #[cfg(test)]
+        let start = self.paste_test.replacement_start.unwrap_or(start);
+        Ok(start)
+    }
+
     fn decode_geometry(
         &self,
         fields: &[&str; 26],
@@ -1644,14 +1906,7 @@ impl Engine {
         server: ServerGeneration,
     ) -> Result<GeometryReadback> {
         let tty = fields[15];
-        ensure!(
-            (tty.strip_prefix("/dev/ttys")
-                .or_else(|| tty.strip_prefix("/dev/pts/")))
-            .is_some_and(
-                |suffix| !suffix.is_empty() && suffix.bytes().all(|c| c.is_ascii_alphanumeric())
-            ),
-            "Unsupported terminal device"
-        );
+        ensure!(valid_pane_tty(tty), "Unsupported terminal device");
         let size = TerminalSize {
             cols: fields[16].parse()?,
             rows: fields[17].parse()?,
@@ -1675,6 +1930,16 @@ impl Engine {
             committed.intent.is_none() || epoch.is_some(),
             "Resize intent has no engine epoch"
         );
+        let paste_launch = match fields[22].split_once('~') {
+            Some((launch, birth))
+                if !birth
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"/$@%~-".contains(&byte)) =>
+            {
+                format!("{launch}~invalid")
+            }
+            _ => fields[22].to_owned(),
+        };
         Ok(GeometryReadback {
             target,
             state,
@@ -1684,7 +1949,7 @@ impl Engine {
             tty: tty.into(),
             epoch,
             committed,
-            paste_launch: fields[22].into(),
+            paste_launch,
             paste_marker: fields[23].into(),
             input_enabled: fields[24] == "0",
             sender_supported: matches!(fields[24], "0" | "1")
@@ -1774,7 +2039,7 @@ impl Engine {
             PaneState::Live => {
                 !evidence.exited
                     && evidence.pane_pid == Some(target.pid)
-                    && process_start(target.pid)? == target.process_start
+                    && self.observed_process_start(target.pid)? == target.process_start
             }
             PaneState::Exited(pid) => evidence.exited && evidence.pane_pid == pid,
         };
@@ -1877,10 +2142,23 @@ impl Engine {
         read: &GeometryReadback,
         catalog: Option<&CatalogLane>,
     ) -> Result<()> {
-        let read = &read.identity();
-        match Self::terminal_operation(read, catalog).await {
-            Ok(operation) => self.verify_terminal_operation(read, operation).await,
-            Err(_) if read.nonce.is_empty() => Ok(()),
+        let identity = &read.identity();
+        match Self::terminal_operation(identity, catalog).await {
+            Ok(operation) => {
+                if read.birth_bound()
+                    && let Some(birth_operation) = read
+                        .birth()
+                        .and_then(|birth| birth.split('~').nth(5))
+                        .and_then(|value| parse_uuid(value).ok())
+                {
+                    ensure!(
+                        Some(birth_operation) == operation.as_ref().map(|operation| operation.id),
+                        "Managed terminal birth operation changed"
+                    );
+                }
+                self.verify_terminal_operation(identity, operation).await
+            }
+            Err(_) if identity.nonce.is_empty() => Ok(()),
             Err(issue) => bail!("Managed terminal catalog unavailable: {issue:?}"),
         }
     }
@@ -1917,7 +2195,7 @@ impl Engine {
             "1" => true,
             _ => return Err(anyhow::anyhow!("Invalid terminal liveness").into()),
         };
-        let (target, state, server) = Self::geometry_identity(&fields, runtime_id, exited, None)?;
+        let (target, state, server) = self.geometry_identity(&fields, runtime_id, exited, None)?;
         let same_target = target.runtime_id == expected.runtime_id
             && target.generation == expected.generation
             && previous_server.is_none_or(|previous| previous == server)
@@ -2036,6 +2314,105 @@ impl Engine {
         Ok(before.status(terminal, provider))
     }
 
+    async fn initialize_managed_writer(
+        &self,
+        operation: &Operation,
+        observed: &Observation,
+    ) -> Result<()> {
+        let identity = &observed.identity;
+        let pane = &identity.pane;
+        let read = self.geometry(operation.runtime_id, pane).await?;
+        let prefix = birth_prefix(
+            operation.generation,
+            operation.id,
+            operation.runtime_id,
+            operation.nonce,
+        );
+        let stamp = format!(
+            "{}:{}:{}:{pane}:{}",
+            operation.nonce, identity.session, identity.window, identity.pid
+        );
+        ensure!(
+            read.sender_supported
+                && read.input_enabled
+                && read.server == operation.generation
+                && read.name == operation.target
+                && read.target.session == identity.session
+                && read.target.window == identity.window
+                && read.target.pane == *pane
+                && read.target.pid == identity.pid
+                && read.nonce == stamp
+                && read.epoch.is_none()
+                && read.paste_launch.is_empty()
+                && read.paste_marker.is_empty(),
+            "Managed writer initialization is unavailable"
+        );
+        let (_, device) = sample_tty(&read.tty)?;
+        let (init, birth, ticket) = tokio::time::timeout(BIRTH_READ_BUDGET, async {
+            loop {
+                let row = self
+                    .geometry_command(&["display-message", "-p", "-t", pane, BIRTH_FORMAT])
+                    .await?;
+                let (init, birth) = row
+                    .strip_suffix('\n')
+                    .and_then(|row| row.split_once('|'))
+                    .context("Invalid launch birth evidence")?;
+                let tail = init
+                    .strip_prefix(&prefix)
+                    .context("Missing launch initializer")?;
+                let (ticket, _) = tail.split_once('~').context("Invalid launch initializer")?;
+                let ticket = parse_uuid(ticket)?;
+                ensure!(
+                    ticket.get_version_num() == 4 && init == initializer(&prefix, ticket, identity),
+                    "Launch initializer changed"
+                );
+                if !birth.is_empty() {
+                    ensure!(
+                        birth == birth_text(init, read.target.process_start, &read.tty, device),
+                        "Managed process birth changed or was consumed"
+                    );
+                    break Ok::<_, anyhow::Error>((init.to_owned(), birth.to_owned(), ticket));
+                }
+                tokio::time::sleep(BIRTH_RETRY).await;
+            }
+        })
+        .await
+        .context("Launch birth evidence unavailable")??;
+        self.prove_paste_buffer_io(&read).await?;
+        let fresh = self.geometry(operation.runtime_id, pane).await?;
+        ensure!(
+            fresh == read && tty_identity(&fs::symlink_metadata(&fresh.tty)?)? == device,
+            "Managed process changed before writer initialization"
+        );
+
+        let guard = format_all([
+            self.paste_guard(&fresh),
+            format_equal("pane_input_off", 0),
+            format_equal(INITIALIZER_OPTION, &init),
+            format_equal(BIRTH_OPTION, &birth),
+            format_equal("after-if-shell", ""),
+        ]);
+        let used = format!("used~{birth}");
+        let launch = birth_launch_id(ticket);
+        let mut stamped = fresh;
+        stamped.paste_launch = format!("{launch}~{used}");
+        let ready = stamped.ready_marker(None);
+        let branch = format!(
+            "set-option -p -t {pane} {BIRTH_OPTION} '{used}' ; \
+             set-option -po -t {pane} {PASTE_LAUNCH_OPTION} {launch} ; \
+             set-option -po -t {pane} {PASTE_OPTION} {ready}"
+        );
+        self.geometry_command(&["if-shell", "-F", "-t", pane, &guard, &branch])
+            .await?;
+        let after = self.geometry(operation.runtime_id, pane).await?;
+        stamped.paste_marker = ready;
+        ensure!(
+            after == stamped && after.paste_ready(),
+            "Managed writer initialization is unconfirmed"
+        );
+        Ok(())
+    }
+
     async fn stamp_paste(
         &self,
         runtime: &Runtime,
@@ -2043,6 +2420,11 @@ impl Engine {
         identity: &PaneIdentity,
         managed_nonce: Option<Uuid>,
     ) -> Result<()> {
+        #[cfg(not(test))]
+        ensure!(
+            managed_nonce.is_none(),
+            "Managed launch requires birth evidence"
+        );
         let read = self.geometry(runtime.runtime_id, &identity.pane).await?;
         let nonce = managed_nonce.map_or_else(String::new, |nonce| {
             format!(
@@ -3046,7 +3428,7 @@ impl Engine {
             Some(read) => format_all([
                 identity_guard,
                 read.guard(read.epoch),
-                format_equal(PASTE_LAUNCH_OPTION, &read.paste_launch),
+                format_equal(PASTE_LAUNCH_OPTION, read.launch()),
                 format_equal(PASTE_OPTION, &read.paste_marker),
             ]),
             None => format_all([
@@ -3104,21 +3486,49 @@ impl Engine {
                 validate_launch(&cwd, &argv)?;
                 let lock = self.lane(runtime_id);
                 let mut lane = lock.lock().await;
-                let runtimes = self.list().await?;
+                let (targets, admitted) = match catalog {
+                    Some(catalog) => {
+                        let server = self.generation().await?;
+                        let targets =
+                            self.creation_targets(catalog, server)
+                                .await
+                                .map_err(|issue| {
+                                    anyhow::anyhow!("Creation capacity unavailable: {issue:?}")
+                                })?;
+                        (targets, Some(server))
+                    }
+                    None => (
+                        self.list()
+                            .await?
+                            .into_iter()
+                            .map(|runtime| (runtime.session_id, runtime.runtime_id))
+                            .collect(),
+                        None,
+                    ),
+                };
                 ensure!(
-                    runtimes.len() < RUNTIME_LIMIT,
+                    targets.len() < RUNTIME_LIMIT,
                     "local spike limit is 16 runtimes"
                 );
                 ensure!(
-                    !runtimes
+                    !targets
                         .iter()
-                        .any(|r| r.runtime_id == runtime_id || r.session_id == session_id),
+                        .any(|(session, runtime)| *runtime == runtime_id || *session == session_id),
                     "session/runtime already exists; reconcile instead of retrying creation"
                 );
                 self.owners().revoke(runtime_id);
                 let cwd = cwd.canonicalize()?;
                 let name = tmux_name(session_id, runtime_id);
-                let server = self.generation().await?;
+                let server = match admitted {
+                    Some(server) => server,
+                    None => self.generation().await?,
+                };
+                let cwd = cwd.to_str().context("cwd must be UTF8")?;
+                let label = Path::new(&argv[0])
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("CLI");
+                let target = format!("={name}:0.0");
                 // More than one command argument makes tmux use direct exec, not sh -c.
                 let mut args = vec![
                     "new-session",
@@ -3129,7 +3539,7 @@ impl Engine {
                     "-s",
                     &name,
                     "-c",
-                    cwd.to_str().context("cwd must be UTF8")?,
+                    cwd,
                     "-x",
                     "100",
                     "-y",
@@ -3138,17 +3548,43 @@ impl Engine {
                     "/usr/bin/env",
                 ];
                 args.extend(argv.iter().map(String::as_str));
-                let receipt = self.command(&args).await?;
-                let label = Path::new(&argv[0])
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("CLI");
-                let target = format!("={name}:0.0");
-                self.command(&["set-option", "-t", &target, "@rs_command", label])
-                    .await?;
+                let receipt = if admitted.is_some() {
+                    let command = argv.iter().map(|arg| tmux_word(arg)).collect::<Vec<_>>();
+                    let branch = format!(
+                        "new-session -d -P -F '{RECEIPT_FORMAT}' -s {name} -c {} -x 100 -y 30 \
+                         -- /usr/bin/env {} ; set-option -t {target} @rs_command {}",
+                        tmux_word(&cwd.replace('#', "##")),
+                        command.join(" "),
+                        tmux_word(label),
+                    );
+                    let receipt = self
+                        .command(&["if-shell", "-F", &creation_guard(server), &branch])
+                        .await?;
+                    ensure!(
+                        pane_identity(&receipt.trim_end().split('|').collect::<Vec<_>>()).is_some()
+                            && self.names(server).await?.contains(&name),
+                        "Diagnostic creation could not be confirmed in the admitted generation"
+                    );
+                    receipt
+                } else {
+                    let receipt = self.command(&args).await?;
+                    self.command(&["set-option", "-t", &target, "@rs_command", label])
+                        .await?;
+                    receipt
+                };
                 let runtime = self.find(runtime_id).await?;
                 let fields: Vec<_> = receipt.trim_end().split('|').collect();
                 if let Some(identity) = pane_identity(&fields) {
+                    if admitted.is_some() {
+                        ensure!(
+                            runtime.tmux_name == name
+                                && runtime.pane_id == identity.pane
+                                && (runtime.pane_pid == Some(identity.pid)
+                                    || (runtime.exited && runtime.pane_pid.is_none()))
+                                && self.names(server).await?.contains(&name),
+                            "Diagnostic creation target changed"
+                        );
+                    }
                     let _ = self.stamp_paste(&runtime, server, &identity, None).await;
                     if lane.has_paste_hold()
                         && let Ok(current) = self.geometry_for_runtime(&runtime).await

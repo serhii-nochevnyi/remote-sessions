@@ -2782,7 +2782,7 @@ async fn w1_terminal_eof_refresh_expired_registration_discards_fifo() {
 }
 
 #[cfg(debug_assertions)]
-const STATUS_HOST_TMUX: &str = r#"#!/bin/sh
+const STATUS_HOST_TMUX: &str = r##"#!/bin/sh
 set -eu
 cd "$(dirname "$3")"
 token=$(cat generation)
@@ -2809,9 +2809,15 @@ case "$4" in
         if test -f missing-device && test "$sample" = 1; then device=/dev/pts/999999999; fi
       fi
       nonce=$(cat "$name.nonce")
+      if test "$8" = '#{@rs_create_initializer}|#{@rs_create_birth}'; then
+        printf '%s|%s\n' "$(read_option "$name.initializer")" "$(read_option "$name.birth")"
+        exit 0
+      fi
+      launch=$(read_option launch)
+      case "$launch" in ??????????????8*) launch="$launch~$(read_option "$name.birth")" ;; esac
       printf '52|101|%s|$0|@0|%%0|%s|%s|0|0|%s:$0:@0:%%0:%s|0|1|1|manual|%s|100|30|100|30|%s||%s|%s|0|%s\n' \
         "$token" "$pid" "$name" "$nonce" "$pid" "$device" \
-        "$(read_option epoch)" "$(read_option launch)" "$(read_option marker)" "$sender"
+        "$(read_option epoch)" "$launch" "$(read_option marker)" "$sender"
     else
       printf '52|101|%s\n' "$token"
       if test "$#" -gt 6 && test -f names; then cat names; fi
@@ -2819,13 +2825,15 @@ case "$4" in
   if-shell)
     case "${7-}" in
       'new-session '*)
-        case "$6" in *"$token"*) ;; *) exit 1 ;; esac
+        if test "$sender" = 1; then exec ./paste-tmux "$@"; fi
+        for predicate in "#{==:#{pid},52}" "#{==:#{start_time},101}" "#{==:#{@rs_create_generation},$token}"; do
+          case "$6" in *"$predicate"*) ;; *) exit 1 ;; esac
+        done
         name=$(printf '%s\n' "$7" | awk '{for(i=1;i<NF;i++) if ($i=="-s") {print $(i+1); exit}}')
         nonce=$(printf '%s\n' "$7" | awk '{for(i=1;i<=NF;i++) if ($i~/^RS_CREATE_NONCE=/) {sub(/^RS_CREATE_NONCE=/,"",$i); print $i; exit}}')
         test -n "$name" && test -n "$nonce"
         printf '%s\n' "$nonce" > "$name.nonce"
         printf '%s\n' "$name" >> names
-        if test "$sender" = 1; then printf '%s\n' "$name" > active; fi
         printf '$0|@0|%%0|%s\n' "$pid" ;;
       *)
         if test "$sender" = 1; then exec ./paste-tmux "$@"; fi
@@ -2848,13 +2856,15 @@ case "$4" in
     done < names ;;
   *) printf '%s\n' "$*" >> unexpected; exit 1 ;;
 esac
-"#;
+"##;
 
 #[cfg(debug_assertions)]
 const PASTE_HOST_MUTATIONS: &str = r##"#!/usr/bin/env python3
 from pathlib import Path
+import json
 import re
 import sys
+import uuid
 
 def read(name):
     path = Path(name)
@@ -2863,6 +2873,19 @@ def read(name):
 def buffer_path(name):
     assert re.fullmatch(r"rs-paste-(?:probe-)?[0-9a-f]{32}", name), name
     return Path(name)
+
+def allows(guard, actual):
+    guard = re.sub(r"#\{==:#\{([^}]+)\},([^}]*)\}",
+                   lambda match: str(int(actual[match[1]] == match[2])), guard)
+    while "#{" in guard:
+        reduced = re.sub(r"#\{&&:([01]),([01])\}",
+                         lambda match: str(int(match[1] == match[2] == "1")), guard)
+        assert reduced != guard, guard
+        guard = reduced
+    return guard == "1"
+
+def write(name, value):
+    Path(name).write_text(value)
 
 command, *args = sys.argv[4:]
 if command == "list-commands":
@@ -2873,6 +2896,43 @@ elif command == "save-buffer":
     flag, buffer, output = args
     assert (flag, output) == ("-b", "-") and buffer.startswith("rs-paste-probe-")
     sys.stdout.buffer.write(buffer_path(buffer).read_bytes())
+elif command == "if-shell" and args[0] == "-F" and args[1] != "-t":
+    flag, guard, branch = args
+    token, pid = read("generation"), read("pane-pid")
+    actual = {"pid": "52", "start_time": "101", "@rs_create_generation": token, "command-error": ""}
+    for hook in ("after-if-shell", "after-new-session", "session-created", "session-window-changed",
+                 "window-linked", "window-layout-changed", "after-set-environment", "after-set-option"):
+        actual[hook] = ""
+    assert allows(guard, actual)
+    spawn, mask, initialize, stamp, label = branch.split(" ; ")
+    name = re.search(r" -s (rs_[0-9a-f]{32}_[0-9a-f]{32}) ", spawn)[1]
+    nonce, ticket = re.search(r" -e RS_CREATE_NONCE=(\S+) -e RS_CREATE_TICKET=(\S+) ", spawn).groups()
+    assert str(uuid.UUID(ticket)) == ticket and uuid.UUID(ticket).version == 4
+    capsule = json.loads(bytes.fromhex(spawn.rsplit(" __managed-launch ", 1)[1]))
+    birth = capsule["birth"]
+    assert capsule["nonce"] == nonce and birth["ticket"] == ticket
+    assert Path(capsule["service_state"]) == Path.cwd() and Path(birth["tmux"]) == Path.cwd() / "tmux"
+    assert birth["server"] == {"pid": 52, "start": 101, "token": token}
+    assert name == "rs_" + uuid.UUID(birth["session"]).hex + "_" + uuid.UUID(birth["runtime"]).hex
+    prefix = f"v1~52~101~{token}~{birth['operation']}~{birth['runtime']}~{nonce}~{ticket}~"
+    assert mask == f"set-environment -r -t ={name} RS_CREATE_TICKET"
+    assert initialize == (f"set-option -Fpo -t ={name}:0.0 @rs_create_initializer '{prefix}"
+                          "#{session_id}~#{window_id}~#{pane_id}~#{pane_pid}'")
+    assert stamp == (f"set-option -Fpo -t ={name}:0.0 @rs_create_nonce '{nonce}:"
+                     "#{session_id}:#{window_id}:#{pane_id}:#{pane_pid}'")
+    assert label == f"set-option -p -t ={name}:0.0 @rs_command codex"
+    assert not Path(name + ".nonce").exists() and not Path(name + ".birth").exists()
+    init = prefix + f"$0~@0~%0~{pid}"
+    tty = read("tty")
+    device = Path(tty).stat()
+    witness = f"{init}~{read('pane-start')}~{tty}~{device.st_dev}~{device.st_ino}~{device.st_rdev}"
+    write(name + ".initializer", init)
+    write(name + ".nonce", nonce)
+    write(name + ".birth", witness)
+    write("active", name)
+    with Path("names").open("a") as names:
+        names.write(name + "\n")
+    print(f"$0|@0|%0|{pid}")
 else:
     assert command == "if-shell"
     flag, target, pane, guard, branch, *otherwise = args
@@ -2887,27 +2947,27 @@ else:
         "window_panes": "1", "pane_dead": "0", "window-size": "manual",
         "@rs_resize_epoch": read("epoch"), "version": "3.8", "socket_path": sys.argv[3],
         "@rs_paste_launch": read("launch"), "@rs_paste_admission": read("marker"),
-        "pane_input_off": "0", "command-error": "",
+        "@rs_create_initializer": read(name + ".initializer"), "@rs_create_birth": read(name + ".birth"),
+        "pane_input_off": "0", "command-error": "", "after-if-shell": "",
     }
     for hook in ("load-buffer", "save-buffer", "paste-buffer", "delete-buffer",
                  "send-keys", "set-option", "display-message", "resize-window", "list-buffers"):
         actual["after-" + hook] = ""
-    guard = re.sub(r"#\{==:#\{([^}]+)\},([^}]*)\}",
-                   lambda match: str(int(actual[match[1]] == match[2])), guard)
-    while "#{" in guard:
-        reduced = re.sub(r"#\{&&:([01]),([01])\}",
-                         lambda match: str(int(match[1] == match[2] == "1")), guard)
-        assert reduced != guard, guard
-        guard = reduced
-    assert guard == "1", (guard, branch, otherwise)
+    assert allows(guard, actual), (guard, branch, otherwise)
     for node in branch.split(" ; "):
         action, *words = node.split()
         if action == "set-option":
             option, value = words[-2:]
-            assert words[:-2] in (["-p", "-t", pane], ["-p", "-o", "-t", pane])
+            assert words[:-2] in (["-p", "-t", pane], ["-p", "-o", "-t", pane], ["-po", "-t", pane])
             path = {"@rs_resize_epoch": "epoch", "@rs_paste_launch": "launch",
-                    "@rs_paste_admission": "marker"}[option]
-            if "-o" in words:
+                    "@rs_paste_admission": "marker", "@rs_create_birth": name + ".birth"}[option]
+            if option == "@rs_create_birth":
+                assert re.search(r"#\{==:#\{@rs_create_initializer\},[^}]+\}", guard)
+                assert f"#{{==:#{{@rs_create_birth}},{read(path)}}}" in guard
+                assert read(path).startswith(read(name + ".initializer") + "~")
+                assert value == "'used~" + read(path) + "'"
+                value = value[1:-1]
+            if "-o" in words or "-po" in words:
                 assert not Path(path).exists()
             Path(path).write_text(value)
         elif action == "load-buffer":
@@ -2972,6 +3032,13 @@ async fn start_catalog_terminal_fixture(
     fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(host.0.join("generation"), generation.to_string()).unwrap();
     fs::write(host.0.join("pane-pid"), std::process::id().to_string()).unwrap();
+    fs::write(
+        host.0.join("pane-start"),
+        remote_sessions_host::engine::launch_fixture_process_start(std::process::id())
+            .unwrap()
+            .to_string(),
+    )
+    .unwrap();
     fs::write(host.0.join("tty"), tty.to_str().unwrap()).unwrap();
     let project = host.0.join("project");
     fs::create_dir(&project).unwrap();
@@ -3843,6 +3910,7 @@ async fn w1_terminal_paste_same_token_renewal_accepts_fresh_grant() {
     fs::set_permissions(&mutations, fs::Permissions::from_mode(0o700)).unwrap();
     let (server, workspace_id) = start_catalog_terminal_fixture(&host, generation, &tty).await;
     let runtime = launch_catalog_terminal(&host, workspace_id).await;
+    let birth = host.0.join(format!("{}.birth", runtime.tmux_name));
     assert!(
         fs::read_to_string(host.0.join("marker"))
             .unwrap()
@@ -4125,6 +4193,39 @@ async fn w1_terminal_paste_same_token_renewal_accepts_fresh_grant() {
         [first_draft, fresh_draft].concat()
     );
 
+    let used = fs::read_to_string(&birth).unwrap();
+    assert!(used.starts_with("used~v1~"));
+    let mut replaced: Vec<_> = used.split('~').map(str::to_owned).collect();
+    replaced[8] = Uuid::new_v4().to_string();
+    for invalid in [String::new(), replaced.join("~")] {
+        fs::write(&birth, invalid).unwrap();
+        for query in [
+            Request::AcquireTerminal {
+                terminal: view.terminal.clone(),
+            },
+            Request::Input {
+                runtime_id,
+                token,
+                sequence: fresh_binding.sequence + 1,
+                data: vec![b'x'],
+                paste: false,
+            },
+        ] {
+            let reply = remote_sessions_host::request(&host.0, &query)
+                .await
+                .unwrap();
+            assert!(
+                matches!(reply, Response::ControlRecovering { .. }),
+                "{reply:?}"
+            );
+        }
+        assert_eq!(effects(), b"11");
+        assert_eq!(
+            fs::read(host.0.join("pane-bytes")).unwrap(),
+            [first_draft, fresh_draft].concat()
+        );
+    }
+    fs::write(birth, used).unwrap();
     bridge.detach(&id);
     assert!(
         matches!(forward().await, Request::Release { runtime_id: id, token: current }
