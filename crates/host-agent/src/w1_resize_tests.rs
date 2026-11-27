@@ -163,6 +163,7 @@ impl Fixture {
 from pathlib import Path
 import json
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -181,15 +182,50 @@ def until(name):
         time.sleep(.005)
     return (root / name).exists()
 def key(name, pane):
-    return name if pane == "%0" else name + "-1"
+    return name if pane == "%0" else name + "-" + pane[1:]
 def pane_row(pane):
     if pane == "%0" and not read("removed-0"):
         return 'PREFIX'.split("|")
     if pane == "%1" and not read("removed-1") and read("second-pane"):
         return read("second-pane").split("|")
+    if pane == "%2" and not read("removed-2") and read("canary-pane"):
+        return read("canary-pane").split("|")
     return None
 def panes():
-    return [(pane, row) for pane in ("%0", "%1") if (row := pane_row(pane))]
+    return [(pane, row) for pane in ("%0", "%1", "%2") if (row := pane_row(pane))]
+def options():
+    return [f"@rs_paste_custody_987_123456_{'GENERATION'.replace('-', '')}_{i:02}" for i in range(16)]
+def custody_path(option):
+    assert option in options()
+    return root / "custody" / option
+def custody_value(value):
+    assert len(value) <= 2048 and re.fullmatch(r"[a-zA-Z0-9:/_~-]+", value)
+    version, nonce, state, *fields = value.split("~")
+    assert version == "v1" and re.fullmatch(r"[0-9a-f-]{36}", nonce)
+    if state == "free":
+        assert not fields
+    else:
+        assert state in ("possible", "completed") and len(fields) == 19
+        assert fields[2] == "v1" and fields[4:7] == ["GENERATION", "987", "123456"]
+        assert fields[-4] == "l" and re.fullmatch(r"rs-paste-[0-9a-f]{32}", fields[-1])
+    return nonce, state, fields
+def allows(guard, expected):
+    seen = set()
+    def compare(match):
+        field, value = match.groups()
+        assert field in expected
+        seen.add(field)
+        return str(int(expected[field] == value))
+    guard = re.sub(r"#\{==:#\{([^}]+)\},([^}]*)\}", compare, guard)
+    assert seen == expected.keys()
+    while "#{" in guard:
+        reduced = re.sub(r"#\{&&:([01]),([01])\}", lambda m: str(int(m[1] == m[2] == "1")), guard)
+        assert reduced != guard
+        guard = reduced
+    return guard == "1"
+def custody_server():
+    return {"pid": "987", "start_time": "123456", "@rs_create_generation": "GENERATION",
+            "after-if-shell": "", "after-display-message": "", "command-error": ""}
 def check(guard, pane, write_input=False):
     row = pane_row(pane)
     if row is None:
@@ -202,6 +238,25 @@ def check(guard, pane, write_input=False):
         "@rs_paste_admission": read(key("marker", pane)),
         "@rs_paste_launch": read(key("launch", pane)),
     }
+    slots = re.findall(r"#\{==:#\{(@rs_paste_custody_[^}]+)\},", guard)
+    if slots:
+        option, = slots
+        path = custody_path(option)
+        expected.update(custody_server(), **{
+            option: path.read_text() if path.exists() else "",
+            "window_index": row[8], "pane_index": row[9], "@rs_create_nonce": row[10],
+            "pane_dead": row[11], "session_windows": row[12], "window_panes": row[13],
+            "window-size": row[14], "version": "3.7" if read("unsupported") else "3.8",
+            "socket_path": str(root / "tmux.sock"),
+        })
+        for hook in ("load-buffer", "save-buffer", "paste-buffer", "delete-buffer",
+                     "send-keys", "set-option", "resize-window"):
+            expected["after-" + hook] = ""
+        if "after-list-buffers" in guard:
+            expected["after-list-buffers"] = ""
+        if write_input:
+            expected["pane_input_off"] = "1" if read("input-off") else "0"
+        return not read("scope") and allows(guard, expected)
     match = (
         not read("scope") and not read("unsupported") and
         all(("#{{==:#{{{}}},{}}}".format(field, value)) in guard
@@ -257,7 +312,7 @@ if command == "list-sessions":
 elif command == "list-panes":
     for pane, row in panes():
         cols, rows = read(key("grid", pane)).split()
-        print(row[7], pane, row[6], 0, cols, rows, "fixture", sep="\t")
+        print(row[7], pane, row[6], row[11], cols, rows, "fixture", sep="\t")
 elif command == "list-commands":
     print("load-buffer (loadb) [-w] [-b buffer-name] path")
     flags = "dpr" if read("probe-mode") == "missing-flag" else "dprS"
@@ -272,6 +327,18 @@ elif command == "display-message":
             for listed, _ in panes():
                 print(listed)
     else:
+        if args[2] == "-t" and args[4:] and ";" in args:
+            row = pane_row(pane)
+            assert row is not None and row[10] == ""
+            name = row[7]
+            fmt = "#{pid}|#{start_time}|#{@rs_create_generation}|#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}|#{session_name}|#{pane_dead}|#{@rs_create_nonce}"
+            assert args[4:] == [fmt, ";", "show-environment", "-s", "-t", "=" + name,
+                                ";", "show-options", "-p", "-t", pane, ";",
+                                "display-message", "-p", "-t", pane, fmt]
+            value = "|".join(row[:8] + [row[11], row[10]])
+            print(value)
+            print(value)
+            sys.exit()
         append("geometry-targets", (pane + "\n").encode())
         row = pane_row(pane)
         if row is None:
@@ -288,10 +355,77 @@ elif command == "save-buffer":
     data = (root / args[2]).read_bytes()
     sys.stdout.buffer.write(data[:-1] if read("probe-mode") == "truncated" else data)
 elif command == "if-shell":
+    if args[1:2] == ["-F"] and args[2] != "-t":
+        _, _, guard, branch = args
+        expected = custody_server()
+        expected["after-show-options"] = ""
+        if not allows(guard, expected):
+            sys.exit()
+        nodes = [shlex.split(node) for node in branch.split(" ; ")]
+        assert nodes[-1] == ["display-message", "-p", "-l", "rs-custody-snapshot"]
+        assert len(nodes) == 17
+        row = "#{option_name} #{?#{m/r:^[a-zA-Z0-9:/_~-]+$,#{option_value}},#{option_value},invalid}"
+        for words, option in zip(nodes[:-1], options()):
+            assert words == ["show-options", "-sq", "-F", row, option]
+        mode = read("custody-snapshot")
+        if mode == "missing" or (mode == "hide-write" and read("custody-writes")):
+            sys.exit()
+        if mode == "over-budget":
+            print("a" * 40961)
+        for option in options():
+            path = custody_path(option)
+            if path.is_file():
+                value = path.read_text()
+                value = value if re.fullmatch(r"[a-zA-Z0-9:/_~-]+", value) else "invalid"
+                print(option, value)
+                if mode == "duplicate-row":
+                    print(option, value)
+        print("rs-custody-snapshot")
+        sys.exit()
     _, flags, target, pane, guard, branch, *otherwise = args
     assert (flags, target) == ("-F", "-t")
     write("last-write", guard + "\n" + branch + "\n")
-    if branch.startswith("resize-window"):
+    if "set-option -s" in branch and "@rs_paste_custody_" in branch:
+        assert not otherwise
+        if not check(guard, pane):
+            sys.exit()
+        nodes = branch.split(" ; ")
+        command, flag, option, value = nodes[-1].split()
+        assert command == "set-option" and flag in ("-s", "-so")
+        path = custody_path(option)
+        nonce, state, fields = custody_value(value)
+        prior = path.read_text() if path.exists() else None
+        if flag == "-so" and prior is not None:
+            sys.exit(1)
+        if prior is not None:
+            old_nonce, old_state, old_fields = custody_value(prior)
+            assert nonce != old_nonce
+            assert (old_state, state) in (("free", "possible"), ("possible", "completed"),
+                                          ("possible", "free"), ("completed", "free"))
+            if state == "completed":
+                assert old_fields == fields
+        else:
+            assert flag == "-so" and state == "possible"
+        if state == "possible":
+            assert fields[0] == pane_row(pane)[7] and fields[1] == pane_row(pane)[15]
+            assert "~".join(fields[2:]) == read(key("marker", pane))
+        if read("custody-write") == "before":
+            sys.exit(1)
+        if len(nodes) == 2:
+            assert state == "free" and nodes[0] == f"delete-buffer -b {old_fields[-1]}"
+            if read("cleanup-blocked"):
+                sys.exit(1)
+            (root / old_fields[-1]).unlink()
+            append("deletions", (old_fields[-1] + "\n").encode())
+        else:
+            assert len(nodes) == 1
+        path.parent.mkdir(exist_ok=True)
+        with path.open("x" if flag == "-so" else "w") as out:
+            out.write(value)
+        append("custody-writes", (option + "\n").encode())
+        if read("custody-write") == "lost" or (len(nodes) == 2 and read("lose-cleanup-reply")):
+            sys.exit(1)
+    elif branch.startswith("resize-window"):
         if mode == "stale":
             sys.exit()
         if mode == "lost-before":
@@ -319,8 +453,12 @@ elif command == "if-shell":
             assert (flag, source) == ("-b", "-") and buffer.startswith("rs-paste-")
             identifier = buffer.removeprefix("rs-paste-").removeprefix("probe-")
             assert re.fullmatch("[0-9a-f]{32}", identifier)
+            if read("load-mode") == "before":
+                sys.exit(1)
             (root / buffer).write_bytes(sys.stdin.buffer.read())
             write("last-load", buffer)
+            if read("load-mode") == "lost":
+                sys.exit(1)
         elif action[0] == "list-buffers":
             assert action[1:4] == ["-F", "present", "-f"]
             buffer = re.fullmatch(r"'#\{==:#\{buffer_name\},(rs-paste-[0-9a-f]{32})\}'",
@@ -576,7 +714,7 @@ async fn w1_terminal_paste_capability_gap_retains_exact_buffer_custody() {
         .unwrap();
     fixture
         .engine
-        .load_paste(&loading, &bound.name, draft)
+        .load_paste(&loading, &bound.name, draft, None)
         .await
         .unwrap();
     let canary = format!("rs-paste-{}", Uuid::new_v4().simple());
@@ -734,6 +872,238 @@ async fn w1_terminal_paste_replacement_preserves_unproved_custody() {
     assert_eq!(held.original.paste_marker, marker);
     assert_eq!(fs::read(root.join(&canary)).unwrap(), b"unrelated buffer");
     assert!(!root.join("deletions").exists());
+}
+
+async fn start_custody_agent(fixture: &Fixture) -> tokio::task::JoinHandle<Result<()>> {
+    let (engine, _) = fixture.restart();
+    let root = fixture.temp.path();
+    fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
+    let guard = Arc::new(crate::AgentLock::acquire(root).unwrap());
+    let agent = tokio::spawn(crate::serve_local(engine, guard, None));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            assert!(!agent.is_finished());
+            if matches!(
+                crate::request(root, &Request::Health {}).await,
+                Ok(Response::Health {
+                    remote_execution_enabled: false,
+                    ..
+                })
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    agent
+}
+
+async fn stop_custody_agent(agent: tokio::task::JoinHandle<Result<()>>) {
+    agent.abort();
+    assert!(agent.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn w1_resize_production_paste_custody_survives_pane_loss_and_agent_restart() {
+    let fixture = Fixture::paste();
+    let root = fixture.temp.path();
+    let runtime_id = fixture.terminal.target.runtime_id;
+    let local = async |request| crate::request(root, &request).await.unwrap();
+    let open = async || {
+        let Response::TerminalOpened { status } = local(Request::OpenTerminal {
+            runtime_id,
+            view_id: Uuid::new_v4(),
+        })
+        .await
+        else {
+            panic!("expected exact live managed pane");
+        };
+        status.terminal
+    };
+    let acquire = async |terminal| {
+        let reply = local(Request::AcquireTerminal { terminal }).await;
+        let Response::TerminalControl { token, epoch } = reply else {
+            panic!("expected independent writer authority, got {reply:?}");
+        };
+        (token, epoch)
+    };
+
+    let agent = start_custody_agent(&fixture).await;
+    let original = open().await;
+    let old_pane = original.target.pane.clone();
+    let (token, epoch) = acquire(original.clone()).await;
+    let binding = PasteBinding {
+        terminal: original,
+        token,
+        epoch,
+        incarnation: Uuid::new_v4(),
+        operation: 1,
+        sequence: 0,
+    };
+    let draft = "private fixture draft\n\tСніг".as_bytes();
+    let commit = || Request::PasteCommit {
+        binding: binding.clone(),
+        bytes: draft.len(),
+    };
+    assert!(matches!(
+        local(Request::PasteStage {
+            binding: binding.clone(),
+            offset: 0,
+            data: draft.into()
+        })
+        .await,
+        Response::Paste {
+            paste: PasteResult::Staged {}
+        }
+    ));
+    fs::write(root.join("load-mode"), "lost").unwrap();
+    assert!(matches!(
+        local(commit()).await,
+        Response::Paste {
+            paste: PasteResult::Unknown {}
+        }
+    ));
+    let server = fixture.engine.generation().await.unwrap();
+    let snapshot = fixture.engine.read_custody(server).await.unwrap();
+    let mut entries = snapshot.iter().flatten();
+    let slot = entries.next().expect("expected a production reservation");
+    assert!(entries.next().is_none());
+    let active = slot.active.as_ref().unwrap();
+    let loading = fixture
+        .engine
+        .geometry(runtime_id, &old_pane)
+        .await
+        .unwrap();
+    assert!(active.matches(&loading, &active.buffer));
+    assert_eq!(active.buffer.operation, binding.operation);
+    assert_eq!(active.marker, loading.paste_marker);
+    assert!(
+        slot.value
+            .starts_with(&format!("v1~{}~possible~", slot.mutation))
+    );
+    assert!(!active.completed);
+    assert!(
+        !slot
+            .value
+            .as_bytes()
+            .windows(draft.len())
+            .any(|bytes| bytes == draft)
+    );
+    assert!(!slot.value.contains(&token.to_string()));
+    let buffer = &active.buffer.name;
+    assert_eq!(fs::read_to_string(root.join("last-load")).unwrap(), *buffer);
+    let canary_buffer = format!("rs-paste-{}", Uuid::new_v4().simple());
+    fs::write(root.join(&canary_buffer), b"canary buffer").unwrap();
+    let canary_runtime = Uuid::new_v4();
+    let canary_name = tmux_name(Uuid::new_v4(), canary_runtime);
+    fs::write(
+        root.join("canary-pane"),
+        format!(
+            "{}|{}|{}|$2|@2|%2|{}|{canary_name}|0|0||0|1|1|manual|/dev/ttyscanary",
+            server.pid,
+            server.start,
+            server.token,
+            std::process::id()
+        ),
+    )
+    .unwrap();
+    fs::write(root.join("grid-2"), "100 30").unwrap();
+
+    let assert_held = async || {
+        let snapshot = fixture.engine.read_custody(server).await.unwrap();
+        assert_eq!(snapshot[slot.index].as_ref().unwrap().value, slot.value);
+        assert_eq!(fs::read(root.join(buffer)).unwrap(), draft);
+        assert_eq!(
+            fs::read(root.join(&canary_buffer)).unwrap(),
+            b"canary buffer"
+        );
+        assert!(!root.join("removed-1").exists());
+        assert!(!root.join("removed-2").exists());
+        assert!(!root.join("deletions").exists());
+        assert!(!root.join("submissions").exists());
+    };
+    assert_held().await;
+    let (replacement, mut provider) = fixture.second_pane(true);
+    fs::write(root.join("removed-0"), "1").unwrap();
+    fs::write(root.join("absence-unconfirmed"), "1").unwrap();
+    let before_restart = open().await;
+    assert_eq!(before_restart.target, replacement.target);
+    let (successor, _) = acquire(before_restart.clone()).await;
+    assert_ne!(successor, token);
+    assert_held().await;
+    stop_custody_agent(agent).await;
+
+    let agent = start_custody_agent(&fixture).await;
+    let restarted = open().await;
+    assert_ne!(restarted.agent_epoch, before_restart.agent_epoch);
+    assert_eq!(restarted.target, before_restart.target);
+    assert_eq!(fixture.engine.generation().await.unwrap(), server);
+    assert!(matches!(
+        local(commit()).await,
+        Response::Paste {
+            paste: PasteResult::Stale {}
+        }
+    ));
+    provider.kill().await.unwrap();
+    let row = fs::read_to_string(root.join("second-pane")).unwrap();
+    let mut row: Vec<_> = row.split('|').collect();
+    row[11] = "1";
+    fs::write(root.join("second-pane"), row.join("|")).unwrap();
+    let stop = || Request::Stop {
+        runtime_id,
+        expected_pane_id: replacement.target.pane.clone(),
+    };
+    assert!(matches!(local(stop()).await, Response::Error { .. }));
+    assert_held().await;
+
+    fs::remove_file(root.join("absence-unconfirmed")).unwrap();
+    fs::write(root.join("cleanup-blocked"), "1").unwrap();
+    assert!(matches!(local(stop()).await, Response::Error { .. }));
+    assert_held().await;
+    fs::remove_file(root.join("cleanup-blocked")).unwrap();
+    fs::write(root.join("lose-cleanup-reply"), "1").unwrap();
+    assert!(
+        matches!(local(stop()).await, Response::Stopped { runtime_id: stopped } if stopped == runtime_id)
+    );
+    let retired = fixture.engine.read_custody(server).await.unwrap();
+    let free = retired[slot.index].as_ref().unwrap();
+    assert!(free.active.is_none());
+    assert_ne!(free.mutation, slot.mutation);
+    assert_eq!(retired.iter().flatten().count(), 1);
+    assert!(!root.join(buffer).exists());
+    assert_eq!(
+        fs::read_to_string(root.join("deletions")).unwrap(),
+        format!("{buffer}\n")
+    );
+    assert_eq!(
+        fs::read(root.join(&canary_buffer)).unwrap(),
+        b"canary buffer"
+    );
+    let Response::Runtimes { runtimes } = local(Request::List {}).await else {
+        panic!("expected canary in inventory");
+    };
+    assert_eq!(runtimes.len(), 1);
+    assert_eq!(runtimes[0].runtime_id, canary_runtime);
+    assert_eq!(runtimes[0].pane_id, "%2");
+    assert!(matches!(
+        local(commit()).await,
+        Response::Paste {
+            paste: PasteResult::Stale {}
+        }
+    ));
+    for file in [
+        "submissions",
+        "effects",
+        "pane0-bytes",
+        "pane1-bytes",
+        "pane2-bytes",
+        "removed-2",
+    ] {
+        assert!(!root.join(file).exists(), "{file}");
+    }
+    stop_custody_agent(agent).await;
 }
 
 #[cfg(debug_assertions)]
@@ -1608,7 +1978,7 @@ os.execvp(cli[0], [*cli, *args])
         loading.paste_marker = buffer.marker(&loading, 'l');
         assert!(
             engine
-                .load_paste(&loading, &buffer.name, b"stale load")
+                .load_paste(&loading, &buffer.name, b"stale load", None)
                 .await
                 .is_err()
         );
@@ -1720,7 +2090,7 @@ os.execvp(cli[0], [*cli, *args])
             .unwrap()
             .unwrap();
         engine
-            .load_paste(&loading, &buffer.name, DRAFT)
+            .load_paste(&loading, &buffer.name, DRAFT, None)
             .await
             .unwrap();
         let retained = fixture.exit(&engine, &runtime).await;
