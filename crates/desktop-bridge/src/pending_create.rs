@@ -263,13 +263,11 @@ impl Store {
     fn open(directory: &Path) -> Result<Self> {
         validate_directory(directory)?;
         let path = directory.join("pending-create");
-        if let Err(error) = DirBuilder::new().mode(0o700).create(&path) {
-            if error.kind() != io::ErrorKind::AlreadyExists {
-                return Err(error.into());
-            }
-        } else {
-            File::open(directory)?.sync_all()?;
-        }
+        let _created = match DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+            Err(error) => return Err(error.into()),
+        };
         let meta = fs::symlink_metadata(&path)?;
         ensure!(
             meta.is_dir()
@@ -277,6 +275,10 @@ impl Store {
                 && meta.uid() == directory.metadata()?.uid(),
             "unsafe pending directory"
         );
+        let sync_parent = || File::open(directory)?.sync_all();
+        #[cfg(test)]
+        let sync_parent = || tests::observe_parent_sync(_created, sync_parent);
+        sync_parent()?;
         let lock_path = path.join("lock");
         let lock = match options()
             .read(true)
@@ -566,12 +568,21 @@ impl DesktopBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use remote_sessions_host::{
+        decode_local_fixture, encode_local_observation, model::LaunchOutcome,
+    };
     #[cfg(debug_assertions)]
     use std::os::unix::fs::PermissionsExt;
-    use std::time::Duration;
+    use std::{
+        os::unix::net::UnixListener as RawListener,
+        sync::{Arc, mpsc as thread_channel},
+        time::Duration,
+    };
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::{UnixListener, UnixStream},
+        sync::mpsc,
+        task::JoinHandle,
     };
 
     struct Fixture(PathBuf);
@@ -590,6 +601,13 @@ mod tests {
             let directory = self.0.join(name);
             DirBuilder::new().mode(0o700).create(&directory).unwrap();
             directory
+        }
+
+        fn bridge(&self) -> Arc<DesktopBridge> {
+            Arc::new(DesktopBridge::new(
+                Some(self.0.clone()),
+                "/unused/tmux".into(),
+            ))
         }
     }
 
@@ -610,6 +628,371 @@ mod tests {
             panic!("expected recorded operation")
         };
         operation
+    }
+
+    const FIXTURE_TIMEOUT: Duration = Duration::from_secs(5);
+    const PARK_TIMEOUT: Duration = Duration::from_secs(30);
+    const OPENED_NEW: SyncObservation = SyncObservation::Entered { created: true };
+    const OPENED_EXISTING: SyncObservation = SyncObservation::Entered { created: false };
+    const PARENT_SYNC_DENIED: Result<(), io::ErrorKind> = Err(io::ErrorKind::PermissionDenied);
+    const UNAVAILABLE: CreateSubmission = CreateSubmission::Blocked {
+        issue: ProductIssue::PendingUnavailable,
+    };
+
+    async fn wait_for<T>(future: impl Future<Output = T>) -> T {
+        tokio::time::timeout(FIXTURE_TIMEOUT, future)
+            .await
+            .expect("pending create fixture timed out")
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum SyncObservation {
+        Entered { created: bool },
+        Finished(Result<(), io::ErrorKind>),
+    }
+
+    struct ParentSyncGate {
+        observations: mpsc::UnboundedSender<SyncObservation>,
+        release: thread_channel::Receiver<Result<(), io::ErrorKind>>,
+    }
+
+    tokio::task_local! {
+        static PARENT_SYNC: ParentSyncGate;
+    }
+
+    pub(super) fn observe_parent_sync(
+        created: bool,
+        sync: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        let released = PARENT_SYNC
+            .try_with(|gate| {
+                gate.observations
+                    .send(SyncObservation::Entered { created })
+                    .unwrap();
+                tokio::task::block_in_place(|| {
+                    gate.release
+                        .recv_timeout(PARK_TIMEOUT)
+                        .expect("parent sync was not released")
+                })
+                .map_err(io::Error::from)
+            })
+            .unwrap_or(Ok(()));
+        let result = released.and_then(|()| sync());
+        let _ = PARENT_SYNC.try_with(|gate| {
+            gate.observations
+                .send(SyncObservation::Finished(
+                    result.as_ref().map(|_| ()).map_err(io::Error::kind),
+                ))
+                .unwrap();
+        });
+        result
+    }
+
+    struct GatedCreate {
+        task: JoinHandle<CreateSubmission>,
+        observations: mpsc::UnboundedReceiver<SyncObservation>,
+        release: thread_channel::Sender<Result<(), io::ErrorKind>>,
+    }
+
+    impl GatedCreate {
+        fn start(bridge: Arc<DesktopBridge>, workspace: Uuid, continuing: Option<Uuid>) -> Self {
+            let (observed, observations) = mpsc::unbounded_channel();
+            let (release, resume) = thread_channel::channel();
+            let gate = ParentSyncGate {
+                observations: observed,
+                release: resume,
+            };
+            let task = tokio::spawn(PARENT_SYNC.scope(gate, async move {
+                let continuing = continuing.map(|reference| reference.to_string());
+                bridge
+                    .create_session(
+                        &workspace.to_string(),
+                        ProviderProfile::Codex,
+                        None,
+                        continuing.as_deref(),
+                    )
+                    .await
+            }));
+            Self {
+                task,
+                observations,
+                release,
+            }
+        }
+
+        async fn expect_sync(&mut self, observation: SyncObservation) {
+            assert_eq!(wait_for(self.observations.recv()).await, Some(observation));
+        }
+
+        async fn release_sync(&mut self, result: Result<(), io::ErrorKind>) {
+            self.release.send(result).unwrap();
+            self.expect_sync(SyncObservation::Finished(result)).await;
+        }
+
+        async fn finish(self) -> CreateSubmission {
+            wait_for(self.task).await.unwrap()
+        }
+    }
+
+    fn pending_paths(directory: &Path) -> Vec<PathBuf> {
+        fs::read_dir(directory.join("pending-create"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(PREFIX)
+            })
+            .collect()
+    }
+
+    fn only_pending(directory: &Path) -> (Pending, String) {
+        let paths = pending_paths(directory);
+        let [path] = paths.as_slice() else {
+            panic!("expected one pending record")
+        };
+        let name = path.file_name().unwrap().to_str().unwrap();
+        let reference = parse_id(name.strip_prefix(PREFIX).unwrap()).unwrap();
+        let bytes = fs::read_to_string(path).unwrap();
+        (Pending::decode(&bytes, reference).unwrap(), bytes)
+    }
+
+    #[derive(serde::Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct FixtureEnvelope<T> {
+        product: T,
+    }
+
+    struct CreatePeer {
+        socket: RawListener,
+        listener: UnixListener,
+        runtime: Runtime,
+        creates: Vec<Uuid>,
+    }
+
+    impl CreatePeer {
+        fn bind(directory: &Path, workspace: Uuid) -> Self {
+            let socket = RawListener::bind(directory.join("agent.sock")).unwrap();
+            socket.set_nonblocking(true).unwrap();
+            let listener = UnixListener::from_std(socket.try_clone().unwrap()).unwrap();
+            let session_id = Uuid::new_v4();
+            let runtime_id = Uuid::new_v4();
+            let runtime = Runtime {
+                session_id,
+                runtime_id,
+                tmux_name: tmux_name(session_id, runtime_id),
+                pane_id: "%3".into(),
+                command: "codex".into(),
+                pane_pid: Some(501),
+                exited: false,
+                width: 100,
+                height: 30,
+                origin: RuntimeOrigin::Managed,
+                workspace_id: Some(workspace),
+                operation_id: Some(Uuid::new_v4()),
+            };
+            Self {
+                socket,
+                listener,
+                runtime,
+                creates: Vec::new(),
+            }
+        }
+
+        fn assert_quiet(&self) {
+            assert_eq!(
+                self.socket.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+
+        async fn accept(&self) -> UnixStream {
+            wait_for(self.listener.accept()).await.unwrap().0
+        }
+
+        async fn request(stream: &mut UnixStream) -> ProductRequest {
+            let line = wait_for(frame(stream)).await;
+            decode_local_fixture::<FixtureEnvelope<ProductRequest>>(line.as_bytes())
+                .unwrap()
+                .product
+        }
+
+        async fn confirm(&self, stream: &mut UnixStream) {
+            let response = FixtureEnvelope {
+                product: ProductResponse::Create {
+                    state: CreateState::Confirmed {
+                        outcome: LaunchOutcome {
+                            runtime: self.runtime.clone(),
+                            setup_issue: None,
+                        },
+                        current: PaneLiveness::Live,
+                        setup_issue: None,
+                    },
+                },
+            };
+            let mut line = encode_local_observation(&response).unwrap();
+            line.push('\n');
+            stream.write_all(line.as_bytes()).await.unwrap();
+        }
+
+        async fn confirm_create(&mut self, directory: &Path) -> Pending {
+            let mut stream = self.accept().await;
+            let (saved, _) = only_pending(directory);
+            assert_eq!(saved.submission, Submission::Sent);
+            assert!(!saved.presented);
+            assert_eq!(saved.previous, None);
+            let ProductRequest::CreateManaged {
+                key,
+                workspace_id,
+                profile,
+                reservation,
+            } = Self::request(&mut stream).await
+            else {
+                panic!("expected a create request")
+            };
+            assert_eq!(
+                (key, workspace_id, profile, reservation),
+                (saved.key, saved.workspace_id, saved.profile, None)
+            );
+            assert_eq!(Some(workspace_id), self.runtime.workspace_id);
+            assert_eq!(profile, ProviderProfile::Codex);
+            self.creates.push(key);
+            self.confirm(&mut stream).await;
+            saved
+        }
+
+        async fn confirm_status(&self, expected_key: Uuid) {
+            let mut stream = self.accept().await;
+            let ProductRequest::CreateStatus { key } = Self::request(&mut stream).await else {
+                panic!("expected a status request")
+            };
+            assert_eq!(key, expected_key);
+            self.confirm(&mut stream).await;
+        }
+
+        fn assert_confirmed(&self, operation: &LocalCreate, saved: &Pending) {
+            assert_eq!(operation.reference, saved.reference);
+            assert_eq!(operation.workspace_id, saved.workspace_id);
+            assert_eq!(operation.profile, saved.profile);
+            assert!(!operation.presented);
+            assert_eq!(
+                operation.disposition,
+                CreateDisposition::Launched {
+                    runtime: self.runtime.clone(),
+                    current: PaneLiveness::Live,
+                    readiness: ProviderReadiness::Unobserved,
+                }
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_create_overlapping_first_use_requires_parent_sync() {
+        let fixture = Fixture::new();
+        let directory = &fixture.0;
+        let workspace = Uuid::new_v4();
+        let mut peer = CreatePeer::bind(directory, workspace);
+        let b = fixture.bridge();
+        let mut first = GatedCreate::start(fixture.bridge(), workspace, None);
+        first.expect_sync(OPENED_NEW).await;
+        assert!(pending_paths(directory).is_empty());
+        peer.assert_quiet();
+
+        let mut failed = GatedCreate::start(Arc::clone(&b), workspace, None);
+        failed.expect_sync(OPENED_EXISTING).await;
+        assert!(pending_paths(directory).is_empty());
+        peer.assert_quiet();
+        failed.release_sync(PARENT_SYNC_DENIED).await;
+        assert_eq!(failed.finish().await, UNAVAILABLE);
+        assert!(pending_paths(directory).is_empty());
+        peer.assert_quiet();
+
+        let mut second = GatedCreate::start(Arc::clone(&b), workspace, None);
+        second.expect_sync(OPENED_EXISTING).await;
+        assert!(pending_paths(directory).is_empty());
+        peer.assert_quiet();
+        second.release_sync(Ok(())).await;
+        let saved = peer.confirm_create(directory).await;
+        let operation = recorded(second.finish().await);
+        peer.assert_confirmed(&operation, &saved);
+
+        let reference = operation.reference.to_string();
+        let (status, ()) = tokio::join!(
+            b.create_status(Some(&reference)),
+            peer.confirm_status(saved.key)
+        );
+        assert_eq!(
+            status,
+            LocalCreateStatus {
+                operations: vec![operation.clone()],
+                issue: None
+            }
+        );
+        first.release_sync(Ok(())).await;
+        peer.confirm_status(saved.key).await;
+        assert_eq!(recorded(first.finish().await), operation);
+        assert_eq!(only_pending(directory).0.key, saved.key);
+        assert_eq!(peer.creates, [saved.key]);
+        peer.assert_quiet();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_create_interrupted_init_preserves_key_and_blocks_unsynced_submit() {
+        let fixture = Fixture::new();
+        let directory = &fixture.0;
+        let workspace = Uuid::new_v4();
+        let peer = CreatePeer::bind(directory, workspace);
+        let mut first = GatedCreate::start(fixture.bridge(), workspace, None);
+        first.expect_sync(OPENED_NEW).await;
+        first.release_sync(Err(io::ErrorKind::Interrupted)).await;
+        assert_eq!(first.finish().await, UNAVAILABLE);
+        assert!(pending_paths(directory).is_empty());
+        peer.assert_quiet();
+
+        let bridge = fixture.bridge();
+        let mut failed = GatedCreate::start(Arc::clone(&bridge), workspace, None);
+        failed.expect_sync(OPENED_EXISTING).await;
+        failed.release_sync(PARENT_SYNC_DENIED).await;
+        assert_eq!(failed.finish().await, UNAVAILABLE);
+        assert!(pending_paths(directory).is_empty());
+        peer.assert_quiet();
+
+        drop(peer);
+        fs::remove_file(directory.join("agent.sock")).unwrap();
+        let pending = recorded(
+            bridge
+                .create_session(&workspace.to_string(), ProviderProfile::Codex, None, None)
+                .await,
+        );
+        assert_eq!(pending.disposition, CreateDisposition::Pending {});
+        let (original, bytes) = only_pending(directory);
+        assert_eq!(original.reference, pending.reference);
+        assert_eq!(original.submission, Submission::Fresh);
+
+        let mut peer = CreatePeer::bind(directory, workspace);
+        let restarted = fixture.bridge();
+        let mut failed = GatedCreate::start(Arc::clone(&restarted), workspace, None);
+        failed.expect_sync(OPENED_EXISTING).await;
+        peer.assert_quiet();
+        failed.release_sync(PARENT_SYNC_DENIED).await;
+        assert_eq!(failed.finish().await, UNAVAILABLE);
+        assert_eq!(only_pending(directory).1, bytes);
+        peer.assert_quiet();
+
+        let mut retry = GatedCreate::start(restarted, workspace, Some(original.reference));
+        retry.expect_sync(OPENED_EXISTING).await;
+        assert_eq!(only_pending(directory).1, bytes);
+        peer.assert_quiet();
+        retry.release_sync(Ok(())).await;
+        let sent = peer.confirm_create(directory).await;
+        assert_eq!(
+            (sent.reference, sent.key),
+            (original.reference, original.key)
+        );
+        peer.assert_confirmed(&recorded(retry.finish().await), &sent);
+        assert_eq!(peer.creates, [original.key]);
+        peer.assert_quiet();
     }
 
     #[tokio::test]
