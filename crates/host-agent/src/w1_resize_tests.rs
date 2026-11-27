@@ -212,11 +212,11 @@ def custody_value(value):
 def allows(guard, expected):
     seen = set()
     def compare(match):
-        field, value = match.groups()
+        operator, field, value = match.groups()
         assert field in expected
         seen.add(field)
-        return str(int(expected[field] == value))
-    guard = re.sub(r"#\{==:#\{([^}]+)\},([^}]*)\}", compare, guard)
+        return str(int((expected[field] == value) == (operator == "==")))
+    guard = re.sub(r"#\{([!=]=):#\{([^}]+)\},([^}]*)\}", compare, guard)
     assert seen == expected.keys()
     while "#{" in guard:
         reduced = re.sub(r"#\{&&:([01]),([01])\}", lambda m: str(int(m[1] == m[2] == "1")), guard)
@@ -238,12 +238,13 @@ def check(guard, pane, write_input=False):
         "@rs_paste_admission": read(key("marker", pane)),
         "@rs_paste_launch": read(key("launch", pane)),
     }
-    slots = re.findall(r"#\{==:#\{(@rs_paste_custody_[^}]+)\},", guard)
-    if slots:
-        option, = slots
-        path = custody_path(option)
+    slots = re.findall(r"#\{[!=]=:#\{(@rs_paste_custody_[^}]+)\},", guard)
+    if slots or "#{==:#{after-if-shell},}" in guard:
+        if slots:
+            option, = slots
+            path = custody_path(option)
+            expected[option] = path.read_text() if path.exists() else ""
         expected.update(custody_server(), **{
-            option: path.read_text() if path.exists() else "",
             "window_index": row[8], "pane_index": row[9], "@rs_create_nonce": row[10],
             "pane_dead": row[11], "session_windows": row[12], "window_panes": row[13],
             "window-size": row[14], "version": "3.7" if read("unsupported") else "3.8",
@@ -386,14 +387,27 @@ elif command == "if-shell":
     assert (flags, target) == ("-F", "-t")
     write("last-write", guard + "\n" + branch + "\n")
     if "set-option -s" in branch and "@rs_paste_custody_" in branch:
-        assert not otherwise
-        if not check(guard, pane):
-            sys.exit()
         nodes = branch.split(" ; ")
         command, flag, option, value = nodes[-1].split()
         assert command == "set-option" and flag in ("-s", "-so")
         path = custody_path(option)
         nonce, state, fields = custody_value(value)
+        assert len(otherwise) == int(state == "possible")
+        if otherwise:
+            shell, flag_arg, target, target_pane, changed, witness = shlex.split(otherwise[0])
+            assert (shell, flag_arg, target, target_pane) == ("if-shell", "-F", "-t", pane)
+            changed, witness = (
+                re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), word)
+                for word in (changed, witness)
+            )
+            assert changed == guard.replace(f"#{{==:#{{{option}}},", f"#{{!=:#{{{option}}},")
+            reply = f"rs-paste-custody-conflict-{nonce}"
+            assert witness == f"display-message -p -l -t {pane} {reply}"
+        if not check(guard, pane):
+            if otherwise and check(changed, pane):
+                append("custody-conflicts", (pane + "\n").encode())
+                print(reply)
+            sys.exit()
         prior = path.read_text() if path.exists() else None
         if flag == "-so" and prior is not None:
             sys.exit(1)
@@ -446,6 +460,8 @@ elif command == "if-shell":
             assert reply[:5] == ["set-option", "-p", "-t", pane, "@rs_paste_admission"]
         else:
             assert reply[:5] == ["display-message", "-p", "-l", "-t", pane]
+        if action[0] == "load-buffer" and not action[2].startswith("rs-paste-probe-"):
+            append("paste-load-attempts", (pane + "\n").encode())
         if not check(guard, pane):
             sys.exit()
         if action[0] == "load-buffer":
@@ -457,6 +473,8 @@ elif command == "if-shell":
                 sys.exit(1)
             (root / buffer).write_bytes(sys.stdin.buffer.read())
             write("last-load", buffer)
+            if not buffer.startswith("rs-paste-probe-"):
+                append("paste-loads", (pane + "\n").encode())
             if read("load-mode") == "lost":
                 sys.exit(1)
         elif action[0] == "list-buffers":
@@ -682,6 +700,334 @@ else:
             response => panic!("Expected a scoped status, got {response:?}"),
         }
     }
+}
+
+#[tokio::test]
+async fn w1_paste_collision() {
+    let fixture = Fixture::paste();
+    let engine = &fixture.engine;
+    *engine.paste_test.now.lock().unwrap() = Some(Instant::now());
+    let root = fixture.temp.path();
+    let (second, mut provider) = fixture.second_pane(false);
+    assert_ne!(fixture.terminal.target.runtime_id, second.target.runtime_id);
+    let acquire = async |terminal: TerminalView| {
+        let (token, epoch) = fixture.acquire(terminal.clone()).await;
+        PasteBinding {
+            terminal,
+            token,
+            epoch,
+            incarnation: Uuid::new_v4(),
+            operation: 1,
+            sequence: 0,
+        }
+    };
+    let loser = acquire(fixture.terminal.clone()).await;
+    let winner = acquire(second).await;
+    let server = engine
+        .scoped_geometry(&loser.terminal)
+        .await
+        .unwrap()
+        .server;
+    assert_eq!(
+        engine
+            .scoped_geometry(&winner.terminal)
+            .await
+            .unwrap()
+            .server,
+        server
+    );
+    assert!(
+        engine
+            .read_custody(server)
+            .await
+            .unwrap()
+            .iter()
+            .all(Option::is_none)
+    );
+
+    let canary_buffer = format!("rs-paste-{}", Uuid::new_v4().simple());
+    fs::write(root.join(&canary_buffer), b"paste canary").unwrap();
+    fs::write(root.join("unrelated-buffer"), b"unrelated buffer").unwrap();
+    let canary_runtime = Uuid::new_v4();
+    let canary_name = tmux_name(Uuid::new_v4(), canary_runtime);
+    fs::write(
+        root.join("canary-pane"),
+        format!(
+            "{}|{}|{}|$2|@2|%2|{}|{canary_name}|0|0||0|1|1|manual|/dev/ttyscanary",
+            server.pid,
+            server.start,
+            server.token,
+            std::process::id()
+        ),
+    )
+    .unwrap();
+    fs::write(root.join("grid-2"), "100 30").unwrap();
+    let file = |name: &str| fs::read(root.join(name)).unwrap();
+    let assert_paste_effects = |loads: &[u8], sends: &[u8]| {
+        assert_eq!(file("paste-load-attempts"), loads);
+        assert_eq!(file("paste-loads"), loads);
+        assert_eq!(file("submissions"), sends);
+        assert_eq!(file("effects"), sends);
+    };
+    let assert_canaries = || {
+        assert_eq!(file(&canary_buffer), b"paste canary");
+        assert_eq!(file("unrelated-buffer"), b"unrelated buffer");
+        for name in ["removed-2", "pane2-bytes", "deletions"] {
+            assert!(!root.join(name).exists(), "{name}");
+        }
+    };
+    let stage = async |binding: &PasteBinding, data: &[u8]| {
+        engine
+            .handle(
+                Request::PasteStage {
+                    binding: binding.clone(),
+                    offset: 0,
+                    data: data.into(),
+                },
+                None,
+            )
+            .await
+            .unwrap()
+    };
+    let ack = async |binding: &PasteBinding, receipt| {
+        assert!(matches!(
+            engine
+                .handle(
+                    Request::PasteAck {
+                        binding: binding.clone(),
+                        receipt
+                    },
+                    None
+                )
+                .await
+                .unwrap(),
+            Response::Paste {
+                paste: PasteResult::Acknowledged { writable: true }
+            }
+        ));
+    };
+
+    let losing_draft = b"losing draft";
+    let winning_draft = b"winning draft";
+    assert!(matches!(
+        stage(&loser, losing_draft).await,
+        Response::Paste {
+            paste: PasteResult::Staged {}
+        }
+    ));
+    assert!(matches!(
+        stage(&winner, winning_draft).await,
+        Response::Paste {
+            paste: PasteResult::Staged {}
+        }
+    ));
+    let original_commit = || Request::PasteCommit {
+        binding: loser.clone(),
+        bytes: losing_draft.len(),
+    };
+    let barrier = Arc::new(PasteBarrier::default());
+    *engine.paste_test.custody_claim.lock().unwrap() = Some(barrier.clone());
+    let losing_commit = original_commit();
+    let committing_engine = Arc::clone(engine);
+    let parked = tokio::spawn(async move { committing_engine.handle(losing_commit, None).await });
+    tokio::time::timeout(SEND_WATCHDOG, barrier.reached.notified())
+        .await
+        .unwrap();
+    let loading = engine.scoped_geometry(&loser.terminal).await.unwrap();
+    let lost_buffer = PasteBuffer::from_marker(&loading).unwrap();
+    assert_eq!(loading.paste_marker, lost_buffer.marker(&loading, 'l'));
+    assert!(
+        engine
+            .read_custody(server)
+            .await
+            .unwrap()
+            .iter()
+            .all(Option::is_none)
+    );
+    for name in [
+        "custody-writes",
+        "paste-load-attempts",
+        "paste-loads",
+        "submissions",
+        "effects",
+    ] {
+        assert!(!root.join(name).exists(), "{name}");
+    }
+
+    let Response::Paste {
+        paste: PasteResult::Committed { receipt },
+    } = engine
+        .handle(
+            Request::PasteCommit {
+                binding: winner.clone(),
+                bytes: winning_draft.len(),
+            },
+            None,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("Expected the second runtime to commit");
+    };
+    let claimed = engine.read_custody(server).await.unwrap();
+    let winner_slot = claimed[0].as_ref().unwrap();
+    let winning_claim = winner_slot.active.as_ref().unwrap();
+    assert!(winning_claim.completed);
+    assert_eq!(winning_claim.runtime, winner.terminal.target.runtime_id);
+    assert_eq!(winning_claim.pane, winner.terminal.target.pane);
+    assert!(!root.join(&winning_claim.buffer.name).exists());
+    ack(&winner, receipt).await;
+    let retired = engine.read_custody(server).await.unwrap();
+    let tombstone = retired[0].as_ref().unwrap();
+    assert!(tombstone.active.is_none());
+    assert_ne!(tombstone.mutation, winner_slot.mutation);
+    assert_eq!(retired.iter().flatten().count(), 1);
+    assert_paste_effects(b"%1\n", b"1");
+    assert_eq!(file("pane1-bytes"), winning_draft);
+    assert!(!root.join("pane0-bytes").exists());
+    let winner_marker = file("marker-1");
+
+    barrier.proceed.notify_one();
+    assert!(matches!(
+        tokio::time::timeout(SEND_WATCHDOG, parked)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        Response::Paste {
+            paste: PasteResult::Unavailable {}
+        }
+    ));
+    let recovered = engine.scoped_geometry(&loser.terminal).await.unwrap();
+    assert!(recovered.same_pane(&loading) && recovered.paste_ready());
+    assert_eq!(recovered.epoch, Some(loser.epoch));
+    assert_ne!(recovered.paste_marker, loading.paste_marker);
+    assert_eq!(file("custody-conflicts"), b"%0\n");
+    let after_collision = engine.read_custody(server).await.unwrap();
+    assert_eq!(after_collision.iter().flatten().count(), 1);
+    assert_eq!(after_collision[0].as_ref().unwrap().value, tombstone.value);
+    assert_eq!(file("marker-1"), winner_marker);
+    assert!(!root.join(&lost_buffer.name).exists());
+
+    assert!(matches!(
+        engine.handle(original_commit(), None).await.unwrap(),
+        Response::Paste {
+            paste: PasteResult::Stale {}
+        }
+    ));
+    assert!(matches!(
+        stage(&loser, losing_draft).await,
+        Response::Paste {
+            paste: PasteResult::Stale {}
+        }
+    ));
+    assert_paste_effects(b"%1\n", b"1");
+    assert_eq!(file("pane1-bytes"), winning_draft);
+    assert!(!root.join("pane0-bytes").exists());
+    assert_canaries();
+
+    for (binding, sequence, data) in [(&loser, 0, b'A'), (&winner, 1, b'B')] {
+        assert!(matches!(
+            engine
+                .handle(
+                    Request::Input {
+                        runtime_id: binding.terminal.target.runtime_id,
+                        token: binding.token,
+                        sequence,
+                        data: vec![data],
+                        paste: false,
+                    },
+                    None,
+                )
+                .await
+                .unwrap(),
+            Response::Accepted {}
+        ));
+    }
+    assert_eq!(file("pane0-bytes"), b"A");
+    assert_eq!(
+        file("pane1-bytes"),
+        [winning_draft.as_slice(), b"B"].concat()
+    );
+
+    let fresh = PasteBinding {
+        operation: loser.operation + 1,
+        sequence: 1,
+        ..loser.clone()
+    };
+    let fresh_draft = b"fresh draft";
+    assert!(matches!(
+        stage(&fresh, fresh_draft).await,
+        Response::Paste {
+            paste: PasteResult::Staged {}
+        }
+    ));
+    let Response::Paste {
+        paste: PasteResult::Committed { receipt },
+    } = engine
+        .handle(
+            Request::PasteCommit {
+                binding: fresh.clone(),
+                bytes: fresh_draft.len(),
+            },
+            None,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("Expected a fresh staged gesture to commit after recovery");
+    };
+    ack(&fresh, receipt).await;
+    let reused = engine.read_custody(server).await.unwrap();
+    let free = reused[0].as_ref().unwrap();
+    assert!(free.active.is_none());
+    assert_ne!(free.mutation, tombstone.mutation);
+    assert_eq!(reused.iter().flatten().count(), 1);
+    assert_paste_effects(b"%1\n%0\n", b"11");
+    assert_eq!(file("pane0-bytes"), [b"A".as_slice(), fresh_draft].concat());
+    assert_eq!(
+        file("pane1-bytes"),
+        [winning_draft.as_slice(), b"B"].concat()
+    );
+
+    let stop = async |runtime_id, expected_pane_id: &str| {
+        engine
+            .handle(
+                Request::Stop {
+                    runtime_id,
+                    expected_pane_id: expected_pane_id.into(),
+                },
+                None,
+            )
+            .await
+    };
+    assert!(
+        stop(
+            loser.terminal.target.runtime_id,
+            &winner.terminal.target.pane
+        )
+        .await
+        .is_err()
+    );
+    assert!(!root.join("removed-0").exists() && !root.join("removed-1").exists());
+    for (binding, removed) in [(&loser, "removed-0"), (&winner, "removed-1")] {
+        let target = &binding.terminal.target;
+        assert!(matches!(
+            stop(target.runtime_id, &target.pane).await.unwrap(),
+            Response::Stopped { runtime_id } if runtime_id == target.runtime_id
+        ));
+        assert_eq!(file(removed), b"1");
+        if removed == "removed-0" {
+            assert!(!root.join("removed-1").exists());
+        }
+    }
+    assert_canaries();
+    let runtimes = engine.list().await.unwrap();
+    assert_eq!(runtimes.len(), 1);
+    assert_eq!(runtimes[0].runtime_id, canary_runtime);
+    assert_eq!(runtimes[0].pane_id, "%2");
+    assert_paste_effects(b"%1\n%0\n", b"11");
+    provider.kill().await.unwrap();
 }
 
 #[tokio::test]
