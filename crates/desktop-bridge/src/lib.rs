@@ -12,12 +12,14 @@ pub use remote_sessions_host::encode_local_observation;
 pub use remote_sessions_host::model::{
     PasteResult, ProductIssue, ProviderProfile, WorkspaceDisplay,
 };
-pub use remote_sessions_host::model::{ResizeEpoch, ResizeResult, TerminalSize, TerminalStatus};
+pub use remote_sessions_host::model::{
+    ResizeEpoch, ResizeResult, TerminalSize, TerminalStatus, TerminalView,
+};
 use remote_sessions_host::{
     engine::set_local_pty_nonblocking,
     model::{
         INPUT_CHUNK_LIMIT, INPUT_LEASE_TTL, PasteAdmission, PasteBinding, ProductRequest,
-        ProductResponse, Request, Response, Runtime, RuntimeOrigin, TerminalView,
+        ProductResponse, Request, Response, Runtime, RuntimeOrigin,
     },
     product_launch::workspace_locator,
     product_request, request,
@@ -63,6 +65,48 @@ pub struct TerminalRestoration {
     operation_id: Option<Uuid>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalInventoryBinding {
+    agent_pid: u32,
+    session_id: Uuid,
+    operation_id: Option<Uuid>,
+    workspace_id: Option<Uuid>,
+}
+
+impl TerminalInventoryBinding {
+    fn current(terminal: &TerminalView, inventory: &Inventory) -> Result<Self> {
+        let mut rows = inventory
+            .runtimes
+            .iter()
+            .filter(|runtime| runtime.runtime_id == terminal.target.runtime_id);
+        let runtime = rows
+            .next()
+            .context("Terminal inventory binding unavailable")?;
+        ensure!(
+            rows.next().is_none()
+                && inventory.agent_pid != 0
+                && !runtime.session_id.is_nil()
+                && runtime.pane_id == terminal.target.pane
+                && runtime.pane_pid == Some(terminal.target.pid)
+                && !runtime.exited
+                && match (runtime.origin, runtime.operation_id, runtime.workspace_id) {
+                    (RuntimeOrigin::Legacy, None, None) => true,
+                    (RuntimeOrigin::Managed, Some(operation), Some(workspace)) =>
+                        !operation.is_nil() && !workspace.is_nil(),
+                    _ => false,
+                },
+            "Terminal inventory binding changed"
+        );
+        Ok(Self {
+            agent_pid: inventory.agent_pid,
+            session_id: runtime.session_id,
+            operation_id: runtime.operation_id,
+            workspace_id: runtime.workspace_id,
+        })
+    }
+}
+
 impl TerminalRestoration {
     fn check_target(&self, terminal: &TerminalView) -> Result<()> {
         ensure!(
@@ -75,27 +119,11 @@ impl TerminalRestoration {
         Ok(())
     }
 
-    fn check_inventory(&self, terminal: &TerminalView, inventory: &Inventory) -> Result<()> {
+    fn check_inventory(&self, binding: TerminalInventoryBinding) -> Result<()> {
         ensure!(
-            inventory.agent_pid == self.agent_pid
-                && inventory.runtimes.iter().any(|runtime| {
-                    runtime.runtime_id == terminal.target.runtime_id
-                        && runtime.session_id == self.session_id
-                        && runtime.pane_id == terminal.target.pane
-                        && runtime.pane_pid == Some(terminal.target.pid)
-                        && !runtime.exited
-                        && match (runtime.origin, self.operation_id) {
-                            (RuntimeOrigin::Legacy, None) => {
-                                runtime.workspace_id.is_none() && runtime.operation_id.is_none()
-                            }
-                            (RuntimeOrigin::Managed, Some(operation_id)) => {
-                                !operation_id.is_nil()
-                                    && runtime.workspace_id.is_some_and(|id| !id.is_nil())
-                                    && runtime.operation_id == Some(operation_id)
-                            }
-                            _ => false,
-                        }
-                }),
+            binding.agent_pid == self.agent_pid
+                && binding.session_id == self.session_id
+                && binding.operation_id == self.operation_id,
             "Terminal restoration is not corroborated by inventory"
         );
         Ok(())
@@ -310,6 +338,7 @@ const OUTPUT_SLOTS: usize = 16;
 const NOTICE_TTL: Duration = Duration::from_secs(120);
 const EOF_TTL: Duration = Duration::from_secs(10);
 const ATTACH_PROOF_TIMEOUT: Duration = Duration::from_secs(2);
+const WRITER_CANDIDATE_TTL: Duration = Duration::from_secs(10);
 const STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(150);
 const CLEANUP_BUDGET: Duration = Duration::from_secs(2);
 const CLEANUP_POLL: Duration = Duration::from_millis(5);
@@ -317,6 +346,7 @@ const CLEANUP_POLL: Duration = Duration::from_millis(5);
 #[derive(Default)]
 struct Views {
     live: HashMap<Uuid, Arc<View>>,
+    writer_candidates: HashMap<Uuid, WriterCandidate>,
     drains: HashMap<Uuid, EofDrain>,
     notices: VecDeque<ClosureNotice>,
     allocated: Arc<AtomicUsize>,
@@ -324,6 +354,12 @@ struct Views {
     control_samples: HashMap<Uuid, ControlSample>,
     #[cfg(test)]
     paste_fixture: Option<mpsc::UnboundedSender<PasteFixtureFrame>>,
+}
+
+struct WriterCandidate {
+    view_id: Uuid,
+    allocation: Weak<Allocation>,
+    proof: Option<(TerminalInventoryBinding, Instant)>,
 }
 
 #[cfg(test)]
@@ -387,6 +423,37 @@ impl EofDrain {
 }
 
 impl Views {
+    fn forget_writer_candidate(&mut self, terminal: &TerminalView) {
+        let runtime = terminal.target.runtime_id;
+        if self
+            .writer_candidates
+            .get(&runtime)
+            .is_some_and(|candidate| candidate.view_id == terminal.view_id)
+        {
+            self.writer_candidates.remove(&runtime);
+        }
+    }
+
+    fn writer_candidate(
+        &self,
+        terminal: &TerminalView,
+        expected: TerminalInventoryBinding,
+    ) -> Result<(&Arc<View>, Instant)> {
+        let view = self
+            .live
+            .get(&terminal.view_id)
+            .filter(|view| view.terminal == *terminal && !view.closed())
+            .context("Terminal candidate is no longer current")?;
+        let (_, expires) = self
+            .writer_candidates
+            .get(&terminal.target.runtime_id)
+            .filter(|candidate| candidate.view_id == terminal.view_id)
+            .and_then(|candidate| candidate.proof)
+            .filter(|(binding, expires)| *binding == expected && *expires > Instant::now())
+            .context("Terminal candidate cannot confirm writer control")?;
+        Ok((view, expires))
+    }
+
     fn readable_view(&self, id: &Uuid) -> Option<&Arc<View>> {
         self.live
             .get(id)
@@ -916,6 +983,7 @@ impl View {
         }
         views.paste_holds.remove(&id);
         views.control_samples.remove(&id);
+        views.forget_writer_candidate(&self.terminal);
         self.reader_state.store(CLOSE, Ordering::Release);
         if !self.reading.load(Ordering::Relaxed)
             && let Retirement::Typed(closure) = reason
@@ -1329,15 +1397,15 @@ async fn inventory(views: &Weak<Mutex<Views>>, directory: &Path) -> Result<Inven
 enum AttachmentMode {
     Ordinary,
     Observer,
+    Candidate,
     Restore(TerminalRestoration),
 }
 
-enum ControlStart {
-    Writer,
-    Observer,
-}
-
 impl AttachmentMode {
+    fn is_candidate(&self) -> bool {
+        matches!(self, Self::Candidate | Self::Restore(_))
+    }
+
     fn check_opened(&self, opened: &TerminalView) -> Result<()> {
         if let Self::Restore(expected) = self {
             expected.check_target(opened)?;
@@ -1345,29 +1413,25 @@ impl AttachmentMode {
         Ok(())
     }
 
-    async fn prepare_control(&self, view: &View, proof: &TerminalStatus) -> Result<ControlStart> {
-        match self {
-            Self::Ordinary => Ok(ControlStart::Writer),
-            Self::Observer => Ok(ControlStart::Observer),
-            Self::Restore(expected) => {
-                expected.check_target(&proof.terminal)?;
-                ensure!(
-                    view.terminal == proof.terminal,
-                    "Terminal attachment identity changed"
-                );
-                let current = inventory(&view.views, &view.directory).await?;
-                expected.check_inventory(&proof.terminal, &current)?;
-                Ok(ControlStart::Writer)
-            }
+    async fn prepare_control(
+        &self,
+        view: &View,
+        proof: &TerminalStatus,
+    ) -> Result<Option<TerminalInventoryBinding>> {
+        if !self.is_candidate() {
+            return Ok(None);
         }
-    }
-}
-
-impl ControlStart {
-    fn start(self, view: &Arc<View>) {
-        if matches!(self, Self::Writer) {
-            start_control(view);
+        self.check_opened(&proof.terminal)?;
+        ensure!(
+            view.terminal == proof.terminal,
+            "Terminal attachment identity changed"
+        );
+        let current = inventory(&view.views, &view.directory).await?;
+        let binding = TerminalInventoryBinding::current(&proof.terminal, &current)?;
+        if let Self::Restore(expected) = self {
+            expected.check_inventory(binding)?;
         }
+        Ok(Some(binding))
     }
 }
 
@@ -1876,6 +1940,11 @@ impl DesktopBridge {
         self.attach_view(runtime_id, AttachmentMode::Observer).await
     }
 
+    pub async fn prepare_attachment(&self, runtime_id: &str) -> Result<Attachment> {
+        self.attach_view(runtime_id, AttachmentMode::Candidate)
+            .await
+    }
+
     pub async fn restore_attachment(
         &self,
         runtime_id: &str,
@@ -1885,12 +1954,52 @@ impl DesktopBridge {
             .await
     }
 
+    pub async fn confirm_writer(
+        &self,
+        terminal: TerminalView,
+        expected: TerminalInventoryBinding,
+    ) -> Result<()> {
+        let generation = self.generation.load(Ordering::SeqCst);
+        let (view, expires) = {
+            let views = self.views.lock().unwrap();
+            let (view, expires) = views.writer_candidate(&terminal, expected)?;
+            (view.clone(), expires)
+        };
+        let corroborate = async {
+            let current = inventory(&view.views, &view.directory).await?;
+            ensure!(
+                TerminalInventoryBinding::current(&terminal, &current)? == expected,
+                "Terminal inventory binding changed"
+            );
+            client_grid(&view).await?;
+            terminal_status(&view).await?;
+            Ok::<(), anyhow::Error>(())
+        };
+        tokio::select! {
+            biased;
+            _ = view.retired() => bail!("Terminal candidate is no longer current"),
+            proof = tokio::time::timeout_at(expires.into(), corroborate) => {
+                proof.context("Terminal candidate expired")??;
+            }
+        }
+        let mut views = self.views.lock().unwrap();
+        let (current, _) = views.writer_candidate(&terminal, expected)?;
+        ensure!(
+            generation == self.generation.load(Ordering::SeqCst) && Arc::ptr_eq(current, &view),
+            "Terminal candidate is no longer current"
+        );
+        views.forget_writer_candidate(&terminal);
+        start_control(&view);
+        Ok(())
+    }
+
     async fn attach_view(&self, runtime_id: &str, mode: AttachmentMode) -> Result<Attachment> {
         let generation = self.generation.load(Ordering::SeqCst);
         let runtime_id = Uuid::parse_str(runtime_id)?;
         let directory = self.directory()?;
         let view_id = Uuid::new_v4();
-        let allocation = self.reserve(generation)?;
+        let writer = mode.is_candidate().then_some((runtime_id, view_id));
+        let allocation = self.reserve(generation, writer)?;
         let Response::TerminalOpened { status } = request(
             directory,
             &Request::OpenTerminal {
@@ -1973,7 +2082,7 @@ impl DesktopBridge {
             cleanup_confirmations: AtomicU64::new(0),
         };
         let status = prove_attachment(&view, &status).await?;
-        let control = mode.prepare_control(&view, &status).await?;
+        let binding = mode.prepare_control(&view, &status).await?;
         let output = view.output.get_mut();
         output.status = status.clone();
         output.refresh_at = Instant::now() + STATUS_REFRESH_INTERVAL;
@@ -1987,7 +2096,16 @@ impl DesktopBridge {
                 gate.park(view_id).await;
             }
         }
-        control.start(&view);
+        if let Some(binding) = binding {
+            let mut views = self.views.lock().unwrap();
+            if let Some(candidate) = views.writer_candidates.get_mut(&runtime_id)
+                && candidate.view_id == view_id
+            {
+                candidate.proof = Some((binding, Instant::now() + WRITER_CANDIDATE_TTL));
+            }
+        } else if matches!(mode, AttachmentMode::Ordinary) {
+            start_control(&view);
+        }
         Ok(Attachment {
             view_id: view_id.to_string(),
             cols: size.cols,
@@ -1996,7 +2114,7 @@ impl DesktopBridge {
         })
     }
 
-    fn reserve(&self, generation: u64) -> Result<Arc<Allocation>> {
+    fn reserve(&self, generation: u64, writer: Option<(Uuid, Uuid)>) -> Result<Arc<Allocation>> {
         let mut views = self.views.lock().unwrap();
         ensure!(
             generation == self.generation.load(Ordering::SeqCst),
@@ -2010,7 +2128,21 @@ impl DesktopBridge {
             "At most 8 local views may be attached"
         );
         views.allocated.fetch_add(1, Ordering::Relaxed);
-        Ok(Arc::new(Allocation(views.allocated.clone())))
+        let allocation = Arc::new(Allocation(views.allocated.clone()));
+        if let Some((runtime, view_id)) = writer {
+            views
+                .writer_candidates
+                .retain(|_, candidate| candidate.allocation.strong_count() != 0);
+            views.writer_candidates.insert(
+                runtime,
+                WriterCandidate {
+                    view_id,
+                    allocation: Arc::downgrade(&allocation),
+                    proof: None,
+                },
+            );
+        }
+        Ok(allocation)
     }
 
     fn start_attachment(
@@ -2550,6 +2682,7 @@ impl DesktopBridge {
     pub fn detach_all(&self) {
         let mut views = self.views.lock().unwrap();
         self.generation.fetch_add(1, Ordering::SeqCst);
+        views.writer_candidates.clear();
         let live = views
             .live
             .values()
@@ -3034,11 +3167,13 @@ mod tests {
         let ipc = PasteIpc::new();
         let (observer, _output) = ipc.attach();
         let status = observer.output.lock().await.status.clone();
-        AttachmentMode::Observer
-            .prepare_control(&observer, &status)
-            .await
-            .unwrap()
-            .start(&observer);
+        assert!(
+            AttachmentMode::Observer
+                .prepare_control(&observer, &status)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let observer_id = observer.terminal.view_id.to_string();
         let operation_id = Uuid::new_v4();
         let session_id = Uuid::new_v4();
@@ -3156,7 +3291,8 @@ mod tests {
             mode.prepare_control(&view, &proof),
             ipc.reply_inventory(agent_pid, vec![runtime])
         );
-        admission.unwrap().start(&view);
+        assert!(admission.unwrap().is_some());
+        start_control(&view);
         let (peer, request) = ipc.receive().await;
         assert!(
             matches!(request, Request::AcquireTerminal { terminal } if terminal == view.terminal)

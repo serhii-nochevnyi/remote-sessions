@@ -40,6 +40,12 @@ export interface TerminalRestoration {
   readonly session_id: string;
   readonly operation_id: string | null;
 }
+export interface TerminalInventoryBinding {
+  readonly agent_pid: number;
+  readonly session_id: string;
+  readonly operation_id: string | null;
+  readonly workspace_id: string | null;
+}
 export type TerminalAttachOptions = { readonly observer: true } | { readonly restoration: TerminalRestoration };
 export interface CommittedGeometry {
   readonly size: TerminalSize;
@@ -905,6 +911,9 @@ export const localClient = {
     parseCreateStatus(await invoke<unknown>("local_create_status", { reference, presented: true })),
   attach: async (runtimeId: string, options?: TerminalAttachOptions) =>
     parseLiveAttachment(await invoke<unknown>("terminal_attach", { runtimeId, ...options })),
+  confirmWriter: async (terminal: TerminalScope, expected: TerminalInventoryBinding) => {
+    await invoke<void>("terminal_confirm_writer", { terminal, expected });
+  },
   read: async (viewId: string) => parseChunk(await invoke<unknown>("terminal_read", { viewId })),
   terminalStatus: async (viewId: string): Promise<TerminalStatus> =>
     parseTerminalStatus(await invoke<unknown>("terminal_status", { viewId })),

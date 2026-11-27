@@ -5,7 +5,7 @@ import { Terminal } from "@xterm/xterm";
 import { bindTerminalPaste, bindTerminalProtocol } from "./terminal-protocol";
 import { localClient, TerminalViewScope } from "./local-client";
 import type { GeometryEvent, TerminalDelivery, TerminalSize, TerminalStatus, TerminalStreamFailure } from "./local-client";
-import { attachCurrentTerminal, desiredTerminalMode, explicitClosedReconnect, runMountedTerminalStream, TerminalAttachmentIdentityError,
+import { adoptCurrentTerminal, desiredTerminalMode, explicitClosedReconnect, runMountedTerminalStream, TerminalAttachmentIdentityError,
   terminalStreamAccess, updateMountedStream } from "./session-state";
 import type { AttachmentMode, BoundTerminal, MountedTerminal, TerminalBindingState } from "./session-state";
 import { GeometryBoundaryError, OrderedGeometry, ResizeProposals } from "./terminal-geometry";
@@ -259,7 +259,6 @@ export function TerminalView({ runtimeId, label, fontSize, mounted, previousBind
         reconnectDelay.current = Math.min(reconnectDelay.current * 2, 4000);
       },
     }, delivery);
-    scope.setInputEligible(attachmentMode === "ordinary");
     const protocol = bindTerminalProtocol(terminal, bytes => { void scope.send(bytes); });
     if (!reopening) openRenderer();
     const streamEligibility = { scope, access, revokeMutations };
@@ -307,25 +306,21 @@ export function TerminalView({ runtimeId, label, fontSize, mounted, previousBind
     async function stream() {
       try {
         setStatus("Підключення…");
-        const candidate = await attachCurrentTerminal(runtimeId, previous, attachmentMode, currentIntent,
-          () => delivery.mayRestore, () => scope.active, detached.current, localClient);
+        const candidate = await adoptCurrentTerminal(runtimeId, previous, attachmentMode, expected => {
+          const mounted = currentAttachment(runtimeId, expected, attempt);
+          return stale || (mounted.intent && mounted.intent.identity.agentPid !== agent) ? { mode: "missing" } : mounted;
+        }, () => delivery.mayRestore, scope, accepted => {
+          if (!onBinding(accepted, "bound", previous, attempt)) return false;
+          binding = accepted;
+          previousRef.current = accepted;
+          return true;
+        }, detached.current, localClient);
         if (!candidate) {
           if (scope.active) scope.retire({ error: Error("Очікуємо підтвердження термінала") });
           return;
         }
         const { attachment } = candidate;
-        const view = attachment.view_id;
-        if (!candidate.isCurrent() || !scope.bind(view)) {
-          await detach(view);
-          if (scope.active) scope.retire({ error: Error("Очікуємо підтвердження термінала") });
-          return;
-        }
-        if (!onBinding(candidate.binding, "bound", previous, attempt)) {
-          scope.retire();
-          return;
-        }
-        binding = candidate.binding;
-        previousRef.current = binding;
+        if (!scope.owns(attachment.view_id) || updateMountedStream(streamEligibility) === "stale") return;
         if (reopening) {
           retainedRenderer.current?.();
           retainedRenderer.current = null;
@@ -337,7 +332,7 @@ export function TerminalView({ runtimeId, label, fontSize, mounted, previousBind
         container.setAttribute("data-terminal-attached", "");
         layoutSoon();
         await runMountedTerminalStream({
-          ...streamEligibility, binding, routing: ordered, sink,
+          ...streamEligibility, binding: candidate.binding, routing: ordered, sink,
           read(view) {
             streamStage = "read_response";
             return localClient.read(view);
