@@ -238,6 +238,25 @@ struct GeometryReadback {
     input_enabled: bool,
 }
 
+struct GeometryIdentity<'a> {
+    target: &'a TerminalTarget,
+    state: PaneState,
+    server: ServerGeneration,
+    name: &'a str,
+    nonce: &'a str,
+}
+
+enum TerminalStatusFailure {
+    Changed,
+    Unavailable(anyhow::Error),
+}
+
+impl From<anyhow::Error> for TerminalStatusFailure {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Unavailable(error)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaneState {
     Live,
@@ -474,6 +493,16 @@ fn rejection_witness(pane: &str, witness: &str) -> String {
 }
 
 impl GeometryReadback {
+    fn identity(&self) -> GeometryIdentity<'_> {
+        GeometryIdentity {
+            target: &self.target,
+            state: self.state,
+            server: self.server,
+            name: &self.name,
+            nonce: &self.nonce,
+        }
+    }
+
     fn same_pane(&self, other: &Self) -> bool {
         self.target == other.target
             && self.server == other.server
@@ -615,7 +644,9 @@ fn process_start(_: u32) -> Result<u64> {
     bail!("Process identity unavailable on this platform")
 }
 
-fn tty_identity(metadata: &fs::Metadata) -> Result<(u64, u64, u64)> {
+type TtyIdentity = (u64, u64, u64);
+
+fn tty_identity(metadata: &fs::Metadata) -> Result<TtyIdentity> {
     ensure!(
         metadata.file_type().is_char_device() && metadata.uid() == nix::unistd::geteuid().as_raw(),
         "Unexpected provider terminal device"
@@ -623,7 +654,7 @@ fn tty_identity(metadata: &fs::Metadata) -> Result<(u64, u64, u64)> {
     Ok((metadata.dev(), metadata.ino(), metadata.rdev()))
 }
 
-fn sample_tty(path: &Path) -> Result<(ProviderSample, (u64, u64, u64))> {
+fn sample_tty(path: &Path) -> Result<(ProviderSample, TtyIdentity)> {
     use nix::libc;
     let tty = OpenOptions::new()
         .read(true)
@@ -1406,16 +1437,32 @@ impl Engine {
                 {
                     *runtime = observed.runtime;
                 }
-            } else if self.corroborate_legacy(runtime, proof).await.is_ok() {
+            } else if self
+                .corroborate_legacy(
+                    &runtime.pane_id,
+                    &runtime.tmux_name,
+                    runtime.pane_pid,
+                    runtime.exited,
+                    proof,
+                )
+                .await
+                .is_ok()
+            {
                 runtime.origin = RuntimeOrigin::Legacy;
             }
         }
         Ok(rows.into_iter().map(|(runtime, _)| runtime).collect())
     }
 
-    async fn corroborate_legacy(&self, runtime: &Runtime, scope: &str) -> Result<()> {
-        let pane = &runtime.pane_id;
-        let session = format!("={}", runtime.tmux_name);
+    async fn corroborate_legacy(
+        &self,
+        pane: &str,
+        name: &str,
+        pid: Option<u32>,
+        exited: bool,
+        scope: &str,
+    ) -> Result<()> {
+        let session = format!("={name}");
         let output = self
             .command(&[
                 "display-message",
@@ -1447,15 +1494,15 @@ impl Engine {
             .next_back()
             .context("Incomplete inventory pane proof")?;
         let fields: Vec<_> = before.split('|').collect();
-        let expected_pid = runtime.pane_pid.map(|pid| pid.to_string());
-        let expected_dead = if runtime.exited { "1" } else { "0" };
+        let expected_pid = pid.map(|pid| pid.to_string());
+        let expected_dead = if exited { "1" } else { "0" };
         ensure!(
             before == after
                 && fields.len() == 10
                 && fields[..5].join("|") == scope
                 && fields[5] == pane
                 && fields[6] == expected_pid.as_deref().unwrap_or_default()
-                && fields[7] == runtime.tmux_name
+                && fields[7] == name
                 && fields[8] == expected_dead
                 && fields[9].is_empty()
                 && !lines.any(|line| {
@@ -1482,38 +1529,62 @@ impl Engine {
         pane: &str,
         exited: bool,
     ) -> Result<GeometryReadback> {
+        let output = self.geometry_output(pane).await?;
+        let fields = Self::geometry_fields(&output)?;
+        ensure!(
+            parse_name(fields[7]).is_some_and(|(_, id)| id == runtime_id)
+                && fields[11] == if exited { "1" } else { "0" },
+            "Terminal target changed or is unsupported"
+        );
+        Self::check_geometry_layout(&fields)?;
+        let original_process = if exited && !fields[23].is_empty() {
+            Some(paste_process_stamp(fields[23])?)
+        } else {
+            None
+        };
+        let (target, state, server) =
+            Self::geometry_identity(&fields, runtime_id, exited, original_process)?;
+        self.decode_geometry(&fields, target, state, server)
+    }
+
+    async fn geometry_output(&self, pane: &str) -> Result<String> {
         ensure!(canonical_tmux_id(pane, '%'), "Invalid terminal pane ID");
         let format = format!("{GEOMETRY_FORMAT}|{}", self.sender_guard());
-        let output = self
-            .geometry_command(&["display-message", "-p", "-t", pane, &format])
-            .await?;
+        self.geometry_command(&["display-message", "-p", "-t", pane, &format])
+            .await
+    }
+
+    fn geometry_fields(output: &str) -> Result<[&str; 26]> {
         let mut lines = output.lines();
         let fields: Vec<_> = lines
             .next()
             .context("Missing terminal target")?
             .split('|')
             .collect();
+        ensure!(lines.next().is_none(), "Invalid terminal metadata");
+        fields
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid terminal metadata"))
+    }
+
+    fn check_geometry_layout(fields: &[&str; 26]) -> Result<()> {
         ensure!(
-            lines.next().is_none() && fields.len() == 26,
-            "Invalid terminal metadata"
-        );
-        let server = generation(&fields[..3].join("|")).context("Invalid terminal generation")?;
-        let dead = if exited { "1" } else { "0" };
-        ensure!(
-            parse_name(fields[7]).is_some_and(|(_, id)| id == runtime_id)
-                && fields[8..10] == ["0", "0"]
-                && fields[11..15] == [dead, "1", "1", "manual"],
+            fields[8..10] == ["0", "0"] && fields[12..15] == ["1", "1", "manual"],
             "Terminal target changed or is unsupported"
         );
+        Ok(())
+    }
+
+    fn geometry_identity(
+        fields: &[&str; 26],
+        runtime_id: Uuid,
+        exited: bool,
+        original_process: Option<(&str, u64)>,
+    ) -> Result<(TerminalTarget, PaneState, ServerGeneration)> {
+        let server = generation(&fields[..3].join("|")).context("Invalid terminal generation")?;
         let current_pid = match fields[6] {
             "" if exited => None,
             pid => Some(pid.parse::<u32>()?),
-        };
-        let paste_marker = fields[23];
-        let original_process = if exited && !paste_marker.is_empty() {
-            Some(paste_process_stamp(paste_marker)?)
-        } else {
-            None
         };
         let stamp = fields[10];
         let identity = if stamp.is_empty() {
@@ -1536,6 +1607,35 @@ impl Engine {
             );
             identity
         };
+        let process_start = if exited {
+            original_process.map_or(0, |(_, started)| started)
+        } else {
+            process_start(identity.pid)?
+        };
+        let target = TerminalTarget {
+            runtime_id,
+            generation: server.token,
+            session: identity.session,
+            window: identity.window,
+            pane: identity.pane,
+            pid: identity.pid,
+            process_start,
+        };
+        let state = if exited {
+            PaneState::Exited(current_pid)
+        } else {
+            PaneState::Live
+        };
+        Ok((target, state, server))
+    }
+
+    fn decode_geometry(
+        &self,
+        fields: &[&str; 26],
+        target: TerminalTarget,
+        state: PaneState,
+        server: ServerGeneration,
+    ) -> Result<GeometryReadback> {
         let tty = fields[15];
         ensure!(
             (tty.strip_prefix("/dev/ttys")
@@ -1555,20 +1655,6 @@ impl Engine {
                 && size.rows == fields[19].parse::<u16>()?,
             "Window and pane grids disagree or are unsupported"
         );
-        let process_start = if exited {
-            original_process.map_or(0, |(_, started)| started)
-        } else {
-            process_start(identity.pid)?
-        };
-        let target = TerminalTarget {
-            runtime_id,
-            generation: server.token,
-            session: identity.session,
-            window: identity.window,
-            pane: identity.pane,
-            pid: identity.pid,
-            process_start,
-        };
         #[cfg(debug_assertions)]
         ensure!(
             self.resize_fixture_target
@@ -1584,19 +1670,15 @@ impl Engine {
         );
         Ok(GeometryReadback {
             target,
-            state: if exited {
-                PaneState::Exited(current_pid)
-            } else {
-                PaneState::Live
-            },
+            state,
             server,
             name: fields[7].to_owned(),
-            nonce: stamp.to_owned(),
+            nonce: fields[10].to_owned(),
             tty: tty.into(),
             epoch,
             committed,
             paste_launch: fields[22].into(),
-            paste_marker: paste_marker.into(),
+            paste_marker: fields[23].into(),
             input_enabled: fields[24] == "0",
             sender_supported: matches!(fields[24], "0" | "1")
                 && fields[25] == "1"
@@ -1640,14 +1722,21 @@ impl Engine {
                 "{}|{}|{}|{}|{}",
                 server.pid, server.start, server.token, target.session, target.window
             );
-            self.corroborate_legacy(runtime, &scope).await?;
+            self.corroborate_legacy(
+                &runtime.pane_id,
+                &runtime.tmux_name,
+                runtime.pane_pid,
+                runtime.exited,
+                &scope,
+            )
+            .await?;
         }
-        self.observe_terminal(&read, catalog).await?;
+        self.observe_terminal(&read.identity(), catalog).await?;
         Ok(read)
     }
 
     async fn terminal_operation(
-        read: &GeometryReadback,
+        read: &GeometryIdentity<'_>,
         catalog: Option<&CatalogLane>,
     ) -> Result<Option<Operation>, ProductIssue> {
         let id = read.target.runtime_id;
@@ -1662,7 +1751,7 @@ impl Engine {
 
     async fn corroborate_terminal(
         &self,
-        read: &GeometryReadback,
+        read: &GeometryIdentity<'_>,
         nonce: &str,
     ) -> Result<PaneIdentity> {
         ensure!(
@@ -1671,9 +1760,9 @@ impl Engine {
                 .is_some_and(|(stamp, _)| stamp == nonce),
             "Managed terminal launch stamp changed"
         );
-        let evidence = self.observe_pane(&read.name, read.server, nonce).await?;
+        let evidence = self.observe_pane(read.name, read.server, nonce).await?;
         let identity = evidence.identity;
-        let target = &read.target;
+        let target = read.target;
         let matches_state = match read.state {
             PaneState::Live => {
                 !evidence.exited
@@ -1695,7 +1784,7 @@ impl Engine {
 
     async fn verify_terminal_operation(
         &self,
-        read: &GeometryReadback,
+        read: &GeometryIdentity<'_>,
         operation: Option<Operation>,
     ) -> Result<()> {
         let Some(operation) = operation else {
@@ -1720,10 +1809,19 @@ impl Engine {
 
     async fn observe_terminal(
         &self,
-        read: &GeometryReadback,
+        read: &GeometryIdentity<'_>,
         catalog: Option<&CatalogLane>,
     ) -> Result<()> {
-        match Self::terminal_operation(read, catalog).await {
+        self.observe_terminal_operation(read, Self::terminal_operation(read, catalog).await)
+            .await
+    }
+
+    async fn observe_terminal_operation(
+        &self,
+        read: &GeometryIdentity<'_>,
+        operation: Result<Option<Operation>, ProductIssue>,
+    ) -> Result<()> {
+        match operation {
             Ok(operation) => self.verify_terminal_operation(read, operation).await,
             Err(_) => {
                 if let Some((nonce, _)) = read.nonce.split_once(':') {
@@ -1734,11 +1832,45 @@ impl Engine {
         }
     }
 
+    async fn observe_status_identity(
+        &self,
+        read: &GeometryIdentity<'_>,
+        catalog: Option<&CatalogLane>,
+    ) -> Result<(), TerminalStatusFailure> {
+        let operation = Self::terminal_operation(read, catalog).await;
+        if let Ok(Some(operation)) = &operation
+            && let OperationStage::Finished(StoredOutcome::Launched { identity, .. }) =
+                &operation.stage
+            && read.name == operation.target
+        {
+            let current = self
+                .corroborate_terminal(read, &operation.nonce.to_string())
+                .await?;
+            if read.server != operation.generation || current != *identity {
+                let generation = operation.generation;
+                if generation.pid == 0
+                    || generation.start == 0
+                    || generation.token.is_nil()
+                    || !canonical_tmux_id(&identity.session, '$')
+                    || !canonical_tmux_id(&identity.window, '@')
+                    || !canonical_tmux_id(&identity.pane, '%')
+                {
+                    return Err(anyhow::anyhow!("Invalid catalog terminal identity").into());
+                }
+                return Err(TerminalStatusFailure::Changed);
+            }
+        } else {
+            self.observe_terminal_operation(read, operation).await?;
+        }
+        Ok(())
+    }
+
     async fn authorize_terminal_writer(
         &self,
         read: &GeometryReadback,
         catalog: Option<&CatalogLane>,
     ) -> Result<()> {
+        let read = &read.identity();
         match Self::terminal_operation(read, catalog).await {
             Ok(operation) => self.verify_terminal_operation(read, operation).await,
             Err(_) if read.nonce.is_empty() => Ok(()),
@@ -1762,22 +1894,92 @@ impl Engine {
         Ok(read)
     }
 
-    async fn sample_provider(&self, before: &GeometryReadback) -> Result<ProviderSample> {
+    async fn status_geometry(
+        &self,
+        expected: &TerminalTarget,
+        previous_server: Option<ServerGeneration>,
+        catalog: Option<&CatalogLane>,
+    ) -> Result<GeometryReadback, TerminalStatusFailure> {
+        let output = self.geometry_output(&expected.pane).await?;
+        let fields = Self::geometry_fields(&output)?;
+        let (_, runtime_id) = parse_name(fields[7])
+            .filter(|(session, runtime)| !session.is_nil() && !runtime.is_nil())
+            .context("Invalid terminal runtime name")?;
+        let exited = match fields[11] {
+            "0" => false,
+            "1" => true,
+            _ => return Err(anyhow::anyhow!("Invalid terminal liveness").into()),
+        };
+        let (target, state, server) = Self::geometry_identity(&fields, runtime_id, exited, None)?;
+        let same_target = target.runtime_id == expected.runtime_id
+            && target.generation == expected.generation
+            && previous_server.is_none_or(|previous| previous == server)
+            && target.session == expected.session
+            && target.window == expected.window
+            && target.pane == expected.pane
+            && target.pid == expected.pid
+            && (exited || target.process_start == expected.process_start);
+        if !same_target {
+            let identity = GeometryIdentity {
+                target: &target,
+                state,
+                server,
+                name: fields[7],
+                nonce: fields[10],
+            };
+            if target.runtime_id == expected.runtime_id {
+                self.observe_status_identity(&identity, catalog).await?;
+            } else {
+                self.observe_terminal(&identity, catalog).await?;
+            }
+            if identity.nonce.is_empty() {
+                let scope = format!(
+                    "{}|{}|{}|{}|{}",
+                    server.pid, server.start, server.token, target.session, target.window
+                );
+                let pid = match state {
+                    PaneState::Live => Some(target.pid),
+                    PaneState::Exited(pid) => pid,
+                };
+                self.corroborate_legacy(&target.pane, identity.name, pid, exited, &scope)
+                    .await?;
+                if !exited && process_start(target.pid)? != target.process_start {
+                    return Err(anyhow::anyhow!("Terminal process identity is unavailable").into());
+                }
+            }
+            return Err(TerminalStatusFailure::Changed);
+        }
+        if exited {
+            return Err(anyhow::anyhow!("Terminal pane has exited").into());
+        }
+        Self::check_geometry_layout(&fields)?;
+        Ok(self.decode_geometry(&fields, target, state, server)?)
+    }
+
+    fn measure_provider(
+        &self,
+        before: &GeometryReadback,
+    ) -> Result<(ProviderSample, Option<TtyIdentity>)> {
         #[cfg(test)]
         let simulated_sample = self.paste_test.provider_sample;
         #[cfg(not(test))]
         let simulated_sample = None;
-        let (sample, device) = match simulated_sample {
-            Some(sample) => (sample, None),
+        match simulated_sample {
+            Some(sample) => Ok((sample, None)),
             None => {
                 let (sample, device) = sample_tty(&before.tty)?;
-                (sample, Some(device))
+                Ok((sample, Some(device)))
             }
-        };
-        let after = self
-            .geometry(before.target.runtime_id, &before.target.pane)
-            .await?;
-        ensure!(*before == after, "Provider sample lost its target identity");
+        }
+    }
+
+    fn verify_provider_sample(
+        before: &GeometryReadback,
+        after: &GeometryReadback,
+        sample: ProviderSample,
+        device: Option<TtyIdentity>,
+    ) -> Result<ProviderSample> {
+        ensure!(before == after, "Provider sample lost its target identity");
         if let Some(device) = device {
             ensure!(
                 tty_identity(&fs::symlink_metadata(&after.tty)?)? == device,
@@ -1785,6 +1987,46 @@ impl Engine {
             );
         }
         Ok(sample)
+    }
+
+    async fn sample_provider(&self, before: &GeometryReadback) -> Result<ProviderSample> {
+        let (sample, device) = self.measure_provider(before)?;
+        let after = self
+            .geometry(before.target.runtime_id, &before.target.pane)
+            .await?;
+        Self::verify_provider_sample(before, &after, sample, device)
+    }
+
+    async fn observe_terminal_status(
+        &self,
+        terminal: TerminalView,
+        catalog: Option<&CatalogLane>,
+    ) -> Result<TerminalStatus, TerminalStatusFailure> {
+        if terminal.agent_epoch != self.agent_epoch {
+            return Err(TerminalStatusFailure::Changed);
+        }
+        if terminal.view_id.is_nil() {
+            return Err(anyhow::anyhow!("Invalid terminal view").into());
+        }
+        let before = self
+            .status_geometry(&terminal.target, None, catalog)
+            .await?;
+        self.observe_status_identity(&before.identity(), catalog)
+            .await?;
+        let measurement = self.measure_provider(&before);
+        let after = self
+            .status_geometry(&terminal.target, Some(before.server), catalog)
+            .await;
+        let provider = match after {
+            Ok(after) => measurement
+                .and_then(|(sample, device)| {
+                    Self::verify_provider_sample(&before, &after, sample, device)
+                })
+                .ok(),
+            Err(TerminalStatusFailure::Changed) => return Err(TerminalStatusFailure::Changed),
+            Err(TerminalStatusFailure::Unavailable(_)) => None,
+        };
+        Ok(before.status(terminal, provider))
     }
 
     async fn stamp_paste(
@@ -2758,7 +3000,7 @@ impl Engine {
             Some(self.prepare_paste_stop(&mut lane, read).await?)
         } else if let Ok(read) = self.geometry_for_runtime(&runtime).await {
             ensure!(read.server == server, "Stop target server changed");
-            self.observe_terminal(&read, catalog).await?;
+            self.observe_terminal(&read.identity(), catalog).await?;
             Some(self.prepare_paste_stop(&mut lane, read).await?)
         } else {
             ensure!(
@@ -2935,7 +3177,7 @@ impl Engine {
                 let read = self
                     .geometry_for_runtime(&self.find(runtime_id).await?)
                     .await?;
-                self.observe_terminal(&read, catalog).await?;
+                self.observe_terminal(&read.identity(), catalog).await?;
                 let terminal = TerminalView {
                     target: read.target.clone(),
                     agent_epoch: self.agent_epoch,
@@ -2951,22 +3193,11 @@ impl Engine {
                     .await
             }
             Request::TerminalStatus { terminal } => {
-                if terminal.agent_epoch != self.agent_epoch {
-                    return Ok(Response::TerminalChanged {});
+                match self.observe_terminal_status(terminal, catalog).await {
+                    Ok(status) => Ok(Response::TerminalStatus { status }),
+                    Err(TerminalStatusFailure::Changed) => Ok(Response::TerminalChanged {}),
+                    Err(TerminalStatusFailure::Unavailable(error)) => Err(error),
                 }
-                let read = self
-                    .geometry(terminal.target.runtime_id, &terminal.target.pane)
-                    .await?;
-                if read.target != terminal.target || terminal.view_id.is_nil() {
-                    return Ok(Response::TerminalChanged {});
-                }
-                if self.observe_terminal(&read, catalog).await.is_err() {
-                    return Ok(Response::TerminalChanged {});
-                }
-                let sample = self.sample_provider(&read).await.ok();
-                Ok(Response::TerminalStatus {
-                    status: read.status(terminal, sample),
-                })
             }
             Request::ResizeTerminal {
                 terminal,

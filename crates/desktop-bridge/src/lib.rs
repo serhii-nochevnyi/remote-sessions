@@ -1435,22 +1435,68 @@ impl AttachmentMode {
     }
 }
 
-async fn terminal_status(view: &View) -> Result<TerminalStatus> {
+enum StatusFailure {
+    Changed,
+    Unavailable(anyhow::Error),
+}
+
+impl StatusFailure {
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Changed => anyhow::anyhow!("Terminal attachment identity changed"),
+            Self::Unavailable(error) => error,
+        }
+    }
+}
+
+async fn status_reply(view: &View) -> Result<TerminalStatus, StatusFailure> {
     match request(
         &view.directory,
         &Request::TerminalStatus {
             terminal: view.terminal.clone(),
         },
     )
-    .await?
+    .await
+    .map_err(StatusFailure::Unavailable)?
     {
         Response::TerminalStatus { status } if status.terminal == view.terminal => Ok(status),
         Response::TerminalStatus { .. } | Response::TerminalChanged {} => {
-            view.retire(Retirement::Failed);
-            bail!("Terminal attachment identity changed")
+            Err(StatusFailure::Changed)
         }
-        _ => bail!("Розмір термінала недоступний"),
+        _ => Err(StatusFailure::Unavailable(anyhow::anyhow!(
+            "Розмір термінала недоступний"
+        ))),
     }
+}
+
+fn arbitrate_status(
+    views: &mut Views,
+    view: &View,
+    reply: &Result<TerminalStatus, StatusFailure>,
+) -> Result<bool> {
+    let id = view.terminal.view_id;
+    ensure!(
+        views
+            .readable_view(&id)
+            .is_some_and(|registered| std::ptr::eq(registered.as_ref(), view)),
+        "View detached"
+    );
+    views.expire_eof(id, Instant::now());
+    let draining = views.drains.contains_key(&id) && view.eof_draining();
+    ensure!(!view.closed() || draining, "View detached");
+    let changed = matches!(reply, Err(StatusFailure::Changed));
+    if changed || (!draining && reply.is_err()) {
+        view.retire_locked(views, Retirement::Failed);
+    }
+    Ok(draining && !changed)
+}
+
+async fn terminal_status(view: &View) -> Result<TerminalStatus> {
+    let reply = status_reply(view).await;
+    if matches!(reply, Err(StatusFailure::Changed)) {
+        view.retire(Retirement::Failed);
+    }
+    reply.map_err(StatusFailure::into_error)
 }
 
 fn drain_budget(started: Option<Instant>, now: Instant) -> Result<Option<Duration>> {
@@ -1702,29 +1748,25 @@ async fn poll_output(
     let reading_at = now();
     let remaining = drain_budget(output.drain_started, reading_at)?;
     let refresh = if reading_at >= output.refresh_at {
-        Some(terminal_status_during_drain(view, remaining).await)
+        Some(match remaining {
+            Some(time) => tokio::time::timeout(time, status_reply(view))
+                .await
+                .context(DRAIN_TIMEOUT_ERROR)?,
+            None => status_reply(view).await,
+        })
     } else {
         None
     };
     let draining_at = {
         let registry = refresh.as_ref().and_then(|_| view.views.upgrade());
-        let views = registry.as_ref().map(|registry| registry.lock().unwrap());
+        let mut views = registry.as_ref().map(|registry| registry.lock().unwrap());
         if let Some(status) = refresh {
             drain_budget(output.drain_started, now())?;
-            if view.eof_draining() {
-                ensure!(
-                    views
-                        .as_ref()
-                        .and_then(|views| views.drains.get(&view.terminal.view_id))
-                        .is_some_and(|drain| {
-                            std::ptr::eq(drain.view.as_ref(), view)
-                                && drain.expires > Instant::now()
-                        }),
-                    "View detached"
-                );
+            let views = views.as_deref_mut().context("View detached")?;
+            if arbitrate_status(views, view, &status)? {
                 return output.drain_eof();
             }
-            let status = status?;
+            let status = status.map_err(StatusFailure::into_error)?;
             ensure!(
                 status.committed.revision >= output.status.committed.revision,
                 "Terminal geometry revision went backwards"
@@ -2209,13 +2251,14 @@ impl DesktopBridge {
     pub async fn status(&self, view_id: &str) -> Result<TerminalStatus> {
         let view = self.view(view_id)?;
         ensure!(!view.closed(), "View detached");
-        let status = terminal_status(&view).await;
-        if status.is_err() {
-            view.retire(Retirement::Failed);
-            return status;
-        }
-        ensure!(!view.closed(), "View detached");
-        status
+        let reply = status_reply(&view).await;
+        let draining = {
+            let mut views = self.views.lock().unwrap();
+            arbitrate_status(&mut views, &view, &reply)?
+        };
+        let status = reply.map_err(StatusFailure::into_error)?;
+        ensure!(!draining, "View detached");
+        Ok(status)
     }
 
     pub async fn read(&self, view_id: &str) -> Result<Chunk> {
