@@ -574,6 +574,7 @@ mod tests {
     #[cfg(debug_assertions)]
     use std::os::unix::fs::PermissionsExt;
     use std::{
+        fs::TryLockError,
         os::unix::net::UnixListener as RawListener,
         sync::{Arc, mpsc as thread_channel},
         time::Duration,
@@ -615,6 +616,31 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    async fn wait_store_lock_release(directory: &Path) -> Result<()> {
+        let path = directory.join("pending-create");
+        let lock = open_record(&path.join("lock")).context("open pending creation fixture lock")?;
+        private_file(&lock, &path).context("validate pending creation fixture lock")?;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match lock.try_lock() {
+                    Ok(()) => {
+                        return lock
+                            .unlock()
+                            .context("unlock pending creation fixture lock");
+                    }
+                    Err(TryLockError::WouldBlock) => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(TryLockError::Error(error)) => {
+                        return Err(error).context("acquire pending creation fixture lock");
+                    }
+                }
+            }
+        })
+        .await
+        .context("pending creation fixture lock remained owned")?
     }
 
     async fn frame(stream: &mut UnixStream) -> String {
@@ -1039,6 +1065,7 @@ mod tests {
             let (mut initial, _) = listener.accept().await.unwrap();
             let create_one = frame(&mut initial).await;
             assert!(create_one.contains("\"op\":\"create_managed\""));
+            wait_store_lock_release(directory).await.unwrap();
             let one = Store::open(directory).unwrap().list().unwrap().0.remove(0);
             assert_eq!(one.submission, Submission::Sent);
             assert!(create_one.contains(&one.key.to_string()));
@@ -1056,6 +1083,7 @@ mod tests {
             let (mut second, _) = listener.accept().await.unwrap();
             let create_two = frame(&mut second).await;
             assert!(create_two.contains("\"op\":\"create_managed\""));
+            wait_store_lock_release(directory).await.unwrap();
             let records = Store::open(directory).unwrap().list().unwrap().0;
             let two = records
                 .iter()
@@ -1113,6 +1141,7 @@ mod tests {
         .unwrap();
 
         let path = {
+            wait_store_lock_release(directory).await.unwrap();
             let store = Store::open(directory).unwrap();
             let records = store.list().unwrap().0;
             assert_eq!(records.len(), 2);
@@ -1139,6 +1168,7 @@ mod tests {
                 .await,
         );
         assert_eq!(pending.disposition, CreateDisposition::Pending {});
+        wait_store_lock_release(directory).await.unwrap();
         let saved = Store::open(directory)
             .unwrap()
             .read(pending.reference)
@@ -1261,6 +1291,7 @@ esac
                 let response = frame(&mut agent).await;
                 if input.contains("\"op\":\"create_managed\"") {
                     assert!(!dropped, "create was replayed");
+                    wait_store_lock_release(&relay_native).await.unwrap();
                     let saved = Store::open(&relay_native)
                         .unwrap()
                         .list()

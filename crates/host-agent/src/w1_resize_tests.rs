@@ -1180,6 +1180,13 @@ async fn w1_resize_private_fixture_socket() {
         .unwrap_err();
         assert!(error.to_string().contains(expected), "{error}");
         assert!(!endpoint.join("agent.sock").exists());
+        crate::w1_create_tests::wait_lock_release(
+            &endpoint.join("agent.lock"),
+            Duration::from_secs(3),
+            || {},
+        )
+        .await
+        .unwrap_or_else(|error| panic!("fixture lock handoff after {socket:?} failed: {error}"));
     }
     let error = crate::serve_resize_fixture(
         root.into(),
@@ -1191,7 +1198,7 @@ async fn w1_resize_private_fixture_socket() {
     .unwrap_err();
     assert!(error.to_string().contains("isolated agent directory"));
 
-    let agent = tokio::spawn(crate::serve_resize_fixture(
+    let mut agent = tokio::spawn(crate::serve_resize_fixture(
         endpoint.clone(),
         f.engine.tmux.clone(),
         f.engine.socket.clone(),
@@ -1199,7 +1206,12 @@ async fn w1_resize_private_fixture_socket() {
     ));
     tokio::time::timeout(Duration::from_secs(5), async {
         while !endpoint.join("agent.sock").exists() {
-            assert!(!agent.is_finished());
+            if agent.is_finished() {
+                panic!(
+                    "fixture agent exited before publishing its socket: {:?}",
+                    (&mut agent).await
+                );
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
