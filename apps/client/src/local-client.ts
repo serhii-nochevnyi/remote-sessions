@@ -329,18 +329,23 @@ class StaleNativeInput extends Error {
     this.#incarnation = incarnation;
   }
 
-  matches(viewId: string, incarnation: string) {
-    return this.#viewId === viewId && this.#incarnation === incarnation;
+  static matches(error: unknown, viewId: string, incarnation: string) {
+    return typeof error === "object" && error !== null && #viewId in error &&
+      error.#viewId === viewId && error.#incarnation === incarnation;
   }
 }
 
 function isStaleNativeInput(error: unknown, viewId: string): boolean {
   try {
     const value = record(error);
+    if (Object.getPrototypeOf(value) !== Object.prototype ||
+      Reflect.ownKeys(value).length !== 4 ||
+      Object.values(Object.getOwnPropertyDescriptors(value)).some(field => !("value" in field))) return false;
     expectKeys(value, "reason", "view_id", "rejection_id", "event_time_us");
     const rejection = scopeId(value.rejection_id);
     return value.reason === "stale_input" && scopeId(value.view_id) === viewId &&
-      rejection !== viewId && rejection[14] === "4" && /^[89ab]$/.test(rejection[19] ?? "") &&
+      rejection !== viewId && rejection === rejection.toLowerCase() &&
+      rejection[14] === "4" && /^[89ab]$/.test(rejection[19] ?? "") &&
       integer(value.event_time_us, 1, Number.MAX_SAFE_INTEGER) > 0;
   } catch {
     return false;
@@ -367,7 +372,12 @@ export class TerminalDelivery {
   }
 
   holdInput(error: unknown) {
-    this.ordinaryIssue ??= typeof error === "string" || error instanceof Error ? String(error) : "";
+    if (this.ordinaryIssue === undefined) {
+      this.ordinaryIssue = "";
+      try {
+        if (typeof error === "string" || error instanceof Error) this.ordinaryIssue = String(error);
+      } catch {}
+    }
     this.onChange?.();
   }
 
@@ -470,14 +480,15 @@ export class TerminalViewScope {
   async consume(view: string, chunk: Chunk, render: () => Promise<void>): Promise<boolean> {
     if (!this.owns(view)) return false;
     if (chunk.paste_admission === "prior_send_unknown" && this.delivery.pasteIssue === undefined) this.holdPaste("unknown");
-    if (samePaste(chunk.paste_completion, this.acknowledgedPaste)) {
+    if (samePaste(chunk.paste_completion, this.acknowledgedPaste) ||
+      (chunk.writable && chunk.paste_incarnation !== undefined && this.rejectedIncarnations.has(chunk.paste_incarnation))) {
       await render();
       return this.owns(view);
     }
     const snapshot = ++this.snapshot;
     const eligibility = this.eligibilityVersion;
     const writable = chunk.writable && (chunk.paste_incarnation === undefined ||
-      (chunk.paste_incarnation !== this.endedPasteIncarnation && !this.rejectedIncarnations.has(chunk.paste_incarnation)));
+      chunk.paste_incarnation !== this.endedPasteIncarnation);
     const incarnation = writable ? chunk.paste_incarnation : undefined;
     if (this.pendingPaste && (
       (incarnation && incarnation !== this.pendingPaste.incarnation)
@@ -554,7 +565,7 @@ export class TerminalViewScope {
         try {
           await this.callbacks.input(view, Array.from(bytes), incarnation);
         } catch (error) {
-          if (error instanceof StaleNativeInput && error.matches(view, incarnation)) {
+          if (StaleNativeInput.matches(error, view, incarnation)) {
             this.rejectedIncarnations.add(incarnation);
             for (const queued of this.pendingInput) {
               if (queued.incarnation === incarnation) queued.bytes = null;
@@ -901,11 +912,11 @@ export const localClient = {
     parseResizeResult(await invoke<unknown>("terminal_resize", { viewId, epoch, size })),
   acknowledgeGrid: async (viewId: string, acknowledgement: GridAcknowledgement) =>
     parseGeometryEvent(await invoke<unknown>("terminal_acknowledge_grid", { viewId, acknowledgement })),
-  input: async (input: { viewId: string; data: readonly number[]; incarnation: string }) => {
+  input: async ({ viewId, data, incarnation }: { viewId: string; data: readonly number[]; incarnation: string }) => {
     try {
-      await invoke("terminal_input", input);
+      await invoke("terminal_input", { viewId, data, incarnation });
     } catch (error) {
-      if (isStaleNativeInput(error, input.viewId)) throw new StaleNativeInput(input.viewId, input.incarnation);
+      if (isStaleNativeInput(error, viewId)) throw new StaleNativeInput(viewId, incarnation);
       throw error;
     }
   },

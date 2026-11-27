@@ -212,6 +212,20 @@ impl std::fmt::Display for StaleInput {
 
 impl std::error::Error for StaleInput {}
 
+fn stale_input(view_id: Uuid) -> anyhow::Error {
+    match sample_clock() {
+        Ok(event_time_us) if (1..=(1 << 53) - 1).contains(&event_time_us) && !view_id.is_nil() => {
+            StaleInput(NativeRejection::StaleInput {
+                view_id,
+                rejection_id: Uuid::new_v4(),
+                event_time_us,
+            })
+            .into()
+        }
+        _ => anyhow::anyhow!("Керування змінилося"),
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum TerminalInputError {
@@ -583,6 +597,13 @@ pub enum PasteAction {
 impl NativeLease {
     fn writable(&self, now: Instant) -> bool {
         self.pending_paste.is_none() && self.deadline > now
+    }
+
+    fn extend(&mut self, applied_at: Instant, deadline: Instant) {
+        if self.deadline <= applied_at {
+            self.incarnation = Uuid::new_v4();
+        }
+        self.deadline = deadline;
     }
 }
 
@@ -1210,25 +1231,26 @@ async fn refresh_control(view: &View) {
         },
     };
     let deadline = Instant::now() + INPUT_LEASE_TTL;
-    match view.agent_request(&message).await {
-        Ok(Response::TerminalControl { token, epoch }) => {
-            {
-                let views = view.views.upgrade();
-                let mut registry = views.as_ref().map(|views| views.lock().unwrap());
-                if !view.closed()
-                    && Instant::now() < deadline
-                    && epoch.agent == view.terminal.agent_epoch
+    let result = view.agent_request(&message).await;
+    {
+        let views = view.views.upgrade();
+        let mut registry = views.as_ref().map(|views| views.lock().unwrap());
+        let applied_at = Instant::now();
+        if !view.closed() && applied_at < deadline {
+            match &result {
+                Ok(Response::TerminalControl { token, epoch })
+                    if epoch.agent == view.terminal.agent_epoch =>
                 {
                     if let Some(lease) = control
                         .lease
                         .as_mut()
-                        .filter(|lease| lease.token == token && lease.epoch == epoch)
+                        .filter(|lease| lease.token == *token && lease.epoch == *epoch)
                     {
-                        lease.deadline = deadline;
+                        lease.extend(applied_at, deadline);
                     } else {
                         control.lease = Some(NativeLease {
-                            token,
-                            epoch,
+                            token: *token,
+                            epoch: *epoch,
                             deadline,
                             input_sequence: 0,
                             resize_sequence: 0,
@@ -1242,15 +1264,21 @@ async fn refresh_control(view: &View) {
                     }
                     return;
                 }
+                Ok(Response::Accepted {}) if let Some(lease) = control.lease.as_mut() => {
+                    lease.extend(applied_at, deadline);
+                    if let Some(registry) = registry.as_mut() {
+                        registry.publish_control(view.terminal.view_id, &control);
+                    }
+                    return;
+                }
+                _ => {}
             }
+        }
+    }
+    match result {
+        Ok(Response::TerminalControl { token, .. }) => {
             drop(control);
             view.release(token).await;
-        }
-        Ok(Response::Accepted {})
-            if !view.closed() && Instant::now() < deadline && control.lease.is_some() =>
-        {
-            control.lease.as_mut().unwrap().deadline = deadline;
-            view.publish_control(&control);
         }
         result => {
             if let Ok(Response::ControlRecovering { paste_admission }) = result {
@@ -1609,57 +1637,66 @@ async fn poll_output(
     let mut chunk = Chunk::empty();
     let reading_at = now();
     let remaining = drain_budget(output.drain_started, reading_at)?;
-    if reading_at >= output.refresh_at {
-        let status = terminal_status_during_drain(view, remaining).await;
-        drain_budget(output.drain_started, now())?;
-        if status.is_err()
-            && let Some(registry) = view.views.upgrade()
-        {
-            let views = registry.lock().unwrap();
-            if view.eof_draining()
-                && views
-                    .drains
-                    .get(&view.terminal.view_id)
-                    .is_some_and(|drain| {
-                        std::ptr::eq(drain.view.as_ref(), view) && drain.expires > Instant::now()
-                    })
-            {
+    let refresh = if reading_at >= output.refresh_at {
+        Some(terminal_status_during_drain(view, remaining).await)
+    } else {
+        None
+    };
+    let draining_at = {
+        let registry = refresh.as_ref().and_then(|_| view.views.upgrade());
+        let views = registry.as_ref().map(|registry| registry.lock().unwrap());
+        if let Some(status) = refresh {
+            drain_budget(output.drain_started, now())?;
+            if view.eof_draining() {
+                ensure!(
+                    views
+                        .as_ref()
+                        .and_then(|views| views.drains.get(&view.terminal.view_id))
+                        .is_some_and(|drain| {
+                            std::ptr::eq(drain.view.as_ref(), view)
+                                && drain.expires > Instant::now()
+                        }),
+                    "View detached"
+                );
                 return output.drain_eof();
             }
+            let status = status?;
+            ensure!(
+                status.committed.revision >= output.status.committed.revision,
+                "Terminal geometry revision went backwards"
+            );
+            output.status = status;
+            output.refresh_at = now() + STATUS_REFRESH_INTERVAL;
+            chunk.status = Some(output.status.clone());
         }
-        let status = status?;
-        ensure!(
-            status.committed.revision >= output.status.committed.revision,
-            "Terminal geometry revision went backwards"
-        );
-        output.status = status;
-        output.refresh_at = now() + STATUS_REFRESH_INTERVAL;
-        chunk.status = Some(output.status.clone());
-    }
-    let draining_at = now();
-    if output.status.committed.revision > output.applied_revision {
-        match view
-            .reader_state
-            .compare_exchange(RESUME, DRAIN, Ordering::AcqRel, Ordering::Acquire)
-        {
-            Ok(_) => {
-                output.drain_started = Some(draining_at);
-                let revision = output.status.committed.revision;
-                view.drain_revision.store(revision, Ordering::Relaxed);
-                let deadline = draining_at + DRAIN_TIMEOUT;
-                let active = view.views.clone();
-                let id = view.terminal.view_id;
-                view.handle.spawn(async move {
-                    tokio::time::sleep_until(deadline.into()).await;
-                    if let Some(views) = active.upgrade() {
-                        expire_drain(&views, id, revision);
-                    }
-                });
+        let draining_at = now();
+        if output.status.committed.revision > output.applied_revision {
+            match view.reader_state.compare_exchange(
+                RESUME,
+                DRAIN,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    output.drain_started = Some(draining_at);
+                    let revision = output.status.committed.revision;
+                    view.drain_revision.store(revision, Ordering::Relaxed);
+                    let deadline = draining_at + DRAIN_TIMEOUT;
+                    let active = view.views.clone();
+                    let id = view.terminal.view_id;
+                    view.handle.spawn(async move {
+                        tokio::time::sleep_until(deadline.into()).await;
+                        if let Some(views) = active.upgrade() {
+                            expire_drain(&views, id, revision);
+                        }
+                    });
+                }
+                Err(CLOSE) => bail!(DRAIN_TIMEOUT_ERROR),
+                Err(_) => {}
             }
-            Err(CLOSE) => bail!(DRAIN_TIMEOUT_ERROR),
-            Err(_) => {}
         }
-    }
+        draining_at
+    };
     let poll = Duration::from_millis(150);
     let wait = drain_budget(output.drain_started, draining_at)?
         .unwrap_or(poll)
@@ -2313,19 +2350,12 @@ impl DesktopBridge {
         if view.closed() {
             return Err(detached(view.terminal.view_id, command));
         }
-        let lease = control.lease.as_mut().context("Керування ще не отримано")?;
-        ensure!(lease.writable(Instant::now()), "Керування втрачено");
-        if lease.incarnation != incarnation {
-            if let Ok(event_time_us) = sample_clock() {
-                return Err(StaleInput(NativeRejection::StaleInput {
-                    view_id: view.terminal.view_id,
-                    rejection_id: Uuid::new_v4(),
-                    event_time_us,
-                })
-                .into());
-            }
-            bail!("Керування змінилося");
-        }
+        let lease = control
+            .lease
+            .as_mut()
+            .filter(|lease| lease.deadline > Instant::now() && lease.incarnation == incarnation)
+            .ok_or_else(|| stale_input(view.terminal.view_id))?;
+        ensure!(lease.pending_paste.is_none(), "Керування втрачено");
         let token = lease.token;
         let sequence = lease.input_sequence;
         lease.input_sequence = sequence

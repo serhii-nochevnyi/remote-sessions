@@ -1765,11 +1765,17 @@ async fn w1_terminal_exact_attachment() {
 }
 
 enum EofRefresh {
+    Newer,
     Unavailable,
     Changed,
     Replaced,
     Detached,
     Expired,
+}
+
+#[tokio::test]
+async fn w1_terminal_eof_successful_newer_refresh_preserves_verified_fifo() {
+    check_eof_refresh(EofRefresh::Newer).await;
 }
 
 #[tokio::test]
@@ -1872,8 +1878,19 @@ async fn check_eof_refresh(outcome: EofRefresh) {
     assert_eq!(view.cleanup_confirmations.load(Ordering::Acquire), 3);
     assert!(view.master.lock().unwrap().is_none());
 
+    let expires = bridge.views.lock().unwrap().drains[&view.terminal.view_id].expires;
+    let revision = status.committed.revision;
     let reply = match outcome {
-        EofRefresh::Unavailable | EofRefresh::Detached | EofRefresh::Expired => Response::Error {
+        EofRefresh::Newer | EofRefresh::Detached | EofRefresh::Expired => {
+            status.committed.revision += 1;
+            status.committed.size.cols += 1;
+            status.committed.intent = Some(remote_sessions_host::model::ResizeIntent {
+                id: Uuid::new_v4(),
+                epoch: status.epoch.unwrap(),
+            });
+            Response::TerminalStatus { status }
+        }
+        EofRefresh::Unavailable => Response::Error {
             message: "later observation failed".into(),
         },
         EofRefresh::Changed => Response::TerminalChanged {},
@@ -1897,8 +1914,12 @@ async fn check_eof_refresh(outcome: EofRefresh) {
     respond(&mut refresh, reply).await;
     let result = reading.await;
     match outcome {
-        EofRefresh::Unavailable => {
+        EofRefresh::Newer | EofRefresh::Unavailable => {
             let mut chunk = result.unwrap();
+            assert_eq!(
+                bridge.views.lock().unwrap().drains[&view.terminal.view_id].expires,
+                expires
+            );
             let mut data = Vec::new();
             let mut frames = 0;
             loop {
@@ -1943,12 +1964,58 @@ async fn check_eof_refresh(outcome: EofRefresh) {
         "View detached"
     );
     until(|| allocation_counts(&bridge) == (0, 0)).await;
-    assert!(view.output.lock().await.receiver.is_empty());
+    {
+        let output = view.output.lock().await;
+        assert!(output.receiver.is_empty());
+        assert_eq!(output.status.committed.revision, revision);
+        assert!(output.pending.is_none() && output.renderer_id.is_none());
+        assert_eq!(view.drain_revision.load(Ordering::Relaxed), 0);
+    }
     assert!(
         tokio::time::timeout(Duration::from_millis(25), listener.accept())
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn w1_terminal_status_refresh_respects_active_geometry_timeout() {
+    let fixture = AgentFixture::new();
+    let listener = UnixListener::bind(fixture.0.join("agent.sock")).unwrap();
+    let bridge = DesktopBridge::new(Some(fixture.0.clone()), "/unused/tmux".into());
+    let (view, mut reader, _) = controlled_view(&bridge, &target(), Uuid::new_v4(), 1);
+    let id = view.terminal.view_id.to_string();
+    reader.requested().await;
+    reader.data(b"before boundary");
+    assert_eq!(bridge.read(&id).await.unwrap().data, b"before boundary");
+    reader.requested().await;
+    assert_eq!(view.reader_state.load(Ordering::Acquire), DRAIN);
+    view.output.lock().await.refresh_at = Instant::now();
+
+    let mut reading = std::pin::pin!(bridge.read(&id));
+    let (refresh, request) = tokio::select! {
+        request = receive(&listener) => request,
+        _ = &mut reading => panic!("read finished before the scoped refresh"),
+    };
+    let Request::TerminalStatus { terminal } = request else {
+        panic!("expected scoped status refresh");
+    };
+    assert_eq!(terminal, view.terminal);
+    reader.data(b"unverified across boundary");
+    reader.requested().await;
+    let chunk = tokio::time::timeout(DRAIN_TIMEOUT + Duration::from_secs(1), reading)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(chunk.closure, Some(TerminalClosure::GeometryTimeout));
+    assert!(chunk.closed && chunk.data.is_empty());
+    assert_read_only_drain(&chunk);
+    assert!(!view.eof_draining());
+    drop(refresh);
+    assert!(bridge.read(&id).await.is_err());
+    reader.finish();
+    until(|| allocation_counts(&bridge) == (0, 0)).await;
+    assert!(view.output.lock().await.receiver.is_empty());
 }
 
 #[tokio::test]
@@ -2070,6 +2137,464 @@ async fn w1_terminal_parked_read_gets_producer_full_and_late_lease_is_released_o
     );
     reader.finish();
     fresh_reader.finish();
+}
+
+async fn grant_fixture_writer(
+    listener: &UnixListener,
+    bridge: &DesktopBridge,
+    view: &Arc<View>,
+) -> (Uuid, ResizeEpoch, Uuid) {
+    let token = Uuid::new_v4();
+    let epoch = view.output.lock().await.status.epoch.unwrap();
+    let acquiring = refresh_fixture_control(view);
+    let mut peer = acquire_fixture_writer(listener, view).await;
+    respond(&mut peer, Response::TerminalControl { token, epoch }).await;
+    acquiring.await.unwrap();
+    let chunk = bridge
+        .read(&view.terminal.view_id.to_string())
+        .await
+        .unwrap();
+    assert!(chunk.writable);
+    (token, epoch, chunk.paste_incarnation.unwrap())
+}
+
+async fn rejected_fixture_input(bridge: &DesktopBridge, view: &View, incarnation: Uuid) -> Uuid {
+    let before = sample_clock().unwrap();
+    let error = bridge
+        .input(
+            &view.terminal.view_id.to_string(),
+            b"obsolete".to_vec(),
+            &incarnation.to_string(),
+            false,
+        )
+        .await
+        .unwrap_err();
+    let after = sample_clock().unwrap();
+    let (rejection, observation) = terminal_rejection(error, None, true);
+    let TerminalInputError::Rejected(NativeRejection::StaleInput {
+        view_id,
+        rejection_id,
+        event_time_us,
+    }) = rejection
+    else {
+        panic!("expected pre-dispatch stale input metadata, got {rejection:?}");
+    };
+    assert_eq!(view_id, view.terminal.view_id);
+    assert_ne!(rejection_id, view_id);
+    assert_eq!(rejection_id.get_version_num(), 4);
+    assert!((before..=after).contains(&event_time_us));
+    assert!(observation.is_none());
+    rejection_id
+}
+
+async fn send_fixture_input(
+    listener: &UnixListener,
+    bridge: &DesktopBridge,
+    view: &View,
+    token: Uuid,
+    incarnation: Uuid,
+    sequence: u64,
+    bytes: &[u8],
+) {
+    let id = view.terminal.view_id.to_string();
+    let incarnation = incarnation.to_string();
+    let input = bridge.input(&id, bytes.to_vec(), &incarnation, false);
+    let accept = async {
+        let (
+            mut peer,
+            Request::Input {
+                runtime_id,
+                token: actual_token,
+                sequence: actual_sequence,
+                data,
+                paste,
+            },
+        ) = receive(listener).await
+        else {
+            panic!("expected one ordinary input");
+        };
+        assert_eq!(
+            (
+                runtime_id,
+                actual_token,
+                actual_sequence,
+                data.as_slice(),
+                paste
+            ),
+            (
+                view.terminal.target.runtime_id,
+                token,
+                sequence,
+                bytes,
+                false
+            )
+        );
+        respond(&mut peer, Response::Accepted {}).await;
+    };
+    let (result, ()) = tokio::join!(input, accept);
+    result.unwrap();
+}
+
+async fn assert_no_fixture_request(listener: &UnixListener) {
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn w1_terminal_missing_grant_rejects_before_dispatch() {
+    let fixture = AgentFixture::new();
+    let listener = UnixListener::bind(fixture.0.join("agent.sock")).unwrap();
+    let bridge = DesktopBridge::new(Some(fixture.0.clone()), "/unused/tmux".into());
+    let (view, reader, _) = controlled_view(&bridge, &target(), Uuid::new_v4(), 0);
+    let captured = Uuid::new_v4();
+    let first = rejected_fixture_input(&bridge, &view, captured).await;
+    let second = rejected_fixture_input(&bridge, &view, captured).await;
+    assert_ne!(first, second);
+    assert!(view.control.lock().await.lease.is_none());
+    assert_no_fixture_request(&listener).await;
+
+    let (token, _, current) = grant_fixture_writer(&listener, &bridge, &view).await;
+    assert_ne!(current, captured);
+    send_fixture_input(&listener, &bridge, &view, token, current, 0, b"fresh").await;
+    bridge.detach(&view.terminal.view_id.to_string());
+    release_fixture_writer(&listener, &view, token).await;
+    reader.finish();
+    until(|| allocation_counts(&bridge) == (0, 0)).await;
+    assert_no_fixture_request(&listener).await;
+}
+
+#[derive(Clone, Copy)]
+enum RenewalTiming {
+    Live,
+    ExpiredBeforeRequest,
+    ExpiredWhileWaitingForReply,
+}
+
+#[tokio::test]
+async fn w1_terminal_expired_input_recovers_through_accepted_renewal() {
+    for timing in [
+        RenewalTiming::ExpiredBeforeRequest,
+        RenewalTiming::ExpiredWhileWaitingForReply,
+        RenewalTiming::Live,
+    ] {
+        check_same_token_renewal(timing, false).await;
+    }
+}
+
+#[tokio::test]
+async fn w1_terminal_same_token_control_reply_fences_expired_incarnation() {
+    check_same_token_renewal(RenewalTiming::ExpiredBeforeRequest, true).await;
+    check_same_token_renewal(RenewalTiming::Live, true).await;
+}
+
+async fn check_same_token_renewal(timing: RenewalTiming, terminal_control_reply: bool) {
+    use std::{future::Future, task::Poll};
+
+    let fixture = AgentFixture::new();
+    let listener = UnixListener::bind(fixture.0.join("agent.sock")).unwrap();
+    let bridge = DesktopBridge::new(Some(fixture.0.clone()), "/unused/tmux".into());
+    let (view, reader, _) = controlled_view(&bridge, &target(), Uuid::new_v4(), 0);
+    let id = view.terminal.view_id.to_string();
+    let (token, epoch, captured) = grant_fixture_writer(&listener, &bridge, &view).await;
+    send_fixture_input(&listener, &bridge, &view, token, captured, 0, b"seed").await;
+    let original_deadline = {
+        let mut control = view.control.lock().await;
+        let lease = control.lease.as_mut().unwrap();
+        lease.resize_sequence = 7;
+        lease.deadline = match timing {
+            RenewalTiming::Live => lease.deadline,
+            RenewalTiming::ExpiredBeforeRequest => Instant::now(),
+            RenewalTiming::ExpiredWhileWaitingForReply => Instant::now() + Duration::from_secs(1),
+        };
+        let deadline = lease.deadline;
+        view.publish_control(&control);
+        deadline
+    };
+    let rejected_before = if matches!(timing, RenewalTiming::ExpiredBeforeRequest) {
+        let rejection = rejected_fixture_input(&bridge, &view, captured).await;
+        {
+            let control = view.control.lock().await;
+            let lease = control.lease.as_ref().unwrap();
+            assert_eq!(
+                (lease.token, lease.epoch, lease.incarnation),
+                (token, epoch, captured)
+            );
+            assert_eq!((lease.input_sequence, lease.resize_sequence), (1, 7));
+        }
+        assert_no_fixture_request(&listener).await;
+        Some(rejection)
+    } else {
+        None
+    };
+
+    let renewing = refresh_fixture_control(&view);
+    let (
+        mut peer,
+        Request::Renew {
+            runtime_id,
+            token: renewing_token,
+        },
+    ) = receive(&listener).await
+    else {
+        panic!("expected renewal of the original lease");
+    };
+    assert_eq!(
+        (runtime_id, renewing_token),
+        (view.terminal.target.runtime_id, token)
+    );
+    match timing {
+        RenewalTiming::ExpiredWhileWaitingForReply => {
+            assert!(Instant::now() < original_deadline);
+            tokio::time::sleep_until(original_deadline.into()).await;
+        }
+        RenewalTiming::Live => assert!(Instant::now() < original_deadline),
+        RenewalTiming::ExpiredBeforeRequest => {}
+    }
+    let live = matches!(timing, RenewalTiming::Live);
+    if !live {
+        let expired = bridge.read(&id).await.unwrap();
+        assert!(!expired.writable && expired.paste_incarnation.is_none());
+    }
+    let mut old_input = std::pin::pin!(rejected_fixture_input(&bridge, &view, captured));
+    if matches!(timing, RenewalTiming::ExpiredWhileWaitingForReply) {
+        std::future::poll_fn(|cx| {
+            assert!(old_input.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+    }
+    let reply = if terminal_control_reply {
+        Response::TerminalControl { token, epoch }
+    } else {
+        Response::Accepted {}
+    };
+    respond(&mut peer, reply).await;
+    renewing.await.unwrap();
+
+    let published = bridge.read(&id).await.unwrap();
+    assert!(published.writable);
+    let current = published.paste_incarnation.unwrap();
+    assert_eq!(current == captured, live);
+    if !live {
+        let rejected_again = old_input.await;
+        assert_ne!(rejected_before, Some(rejected_again));
+        assert_no_fixture_request(&listener).await;
+    }
+    {
+        let control = view.control.lock().await;
+        let lease = control.lease.as_ref().unwrap();
+        assert_eq!(
+            (lease.token, lease.epoch, lease.incarnation),
+            (token, epoch, current)
+        );
+        assert_eq!((lease.input_sequence, lease.resize_sequence), (1, 7));
+    }
+    send_fixture_input(&listener, &bridge, &view, token, current, 1, b"fresh").await;
+    bridge.detach(&id);
+    release_fixture_writer(&listener, &view, token).await;
+    reader.finish();
+    until(|| allocation_counts(&bridge) == (0, 0)).await;
+    assert_no_fixture_request(&listener).await;
+}
+
+#[tokio::test]
+async fn w1_terminal_pending_paste_denies_ordinary_input_and_keeps_its_receipt() {
+    let fixture = AgentFixture::new();
+    let listener = UnixListener::bind(fixture.0.join("agent.sock")).unwrap();
+    let bridge = DesktopBridge::new(Some(fixture.0.clone()), "/unused/tmux".into());
+    let (view, reader, _) = controlled_view(&bridge, &target(), Uuid::new_v4(), 0);
+    let id = view.terminal.view_id.to_string();
+    let (token, epoch, incarnation) = grant_fixture_writer(&listener, &bridge, &view).await;
+    let incarnation_id = incarnation.to_string();
+    let operation = 1;
+    let binding = PasteBinding {
+        terminal: view.terminal.clone(),
+        token,
+        epoch,
+        incarnation,
+        operation,
+        sequence: 0,
+    };
+    let staging = bridge.paste(
+        &id,
+        &incarnation_id,
+        operation,
+        PasteAction::Stage {
+            offset: 0,
+            data: vec![b'P'],
+        },
+    );
+    let stage_reply = async {
+        let (
+            mut peer,
+            Request::PasteStage {
+                binding: actual,
+                offset,
+                data,
+            },
+        ) = receive(&listener).await
+        else {
+            panic!("expected scoped paste stage");
+        };
+        assert_eq!(actual, binding);
+        assert_eq!((offset, data.as_slice()), (0, b"P".as_slice()));
+        respond(
+            &mut peer,
+            Response::Paste {
+                paste: PasteResult::Staged {},
+            },
+        )
+        .await;
+    };
+    let (staged, ()) = tokio::join!(staging, stage_reply);
+    assert_eq!(staged, PasteResult::Staged {});
+
+    let receipt = Uuid::new_v4();
+    let committing = bridge.paste(
+        &id,
+        &incarnation_id,
+        operation,
+        PasteAction::Commit { bytes: 1 },
+    );
+    let commit_reply = async {
+        let (
+            mut peer,
+            Request::PasteCommit {
+                binding: actual,
+                bytes,
+            },
+        ) = receive(&listener).await
+        else {
+            panic!("expected scoped paste commit");
+        };
+        assert_eq!((actual, bytes), (binding.clone(), 1));
+        respond(
+            &mut peer,
+            Response::Paste {
+                paste: PasteResult::Committed { receipt },
+            },
+        )
+        .await;
+    };
+    let (committed, ()) = tokio::join!(committing, commit_reply);
+    assert_eq!(committed, PasteResult::Committed { receipt });
+
+    let error = bridge
+        .input(&id, b"blocked".to_vec(), &incarnation_id, false)
+        .await
+        .unwrap_err();
+    let (rejection, observation) = terminal_rejection(error, None, true);
+    assert_eq!(rejection, TerminalInputError::from("Керування втрачено"));
+    assert!(observation.is_none());
+    refresh_control(&view).await;
+    {
+        let control = view.control.lock().await;
+        let lease = control.lease.as_ref().unwrap();
+        let pending = lease.pending_paste.as_ref().unwrap();
+        assert_eq!(lease.incarnation, incarnation);
+        assert_eq!((lease.input_sequence, lease.resize_sequence), (1, 0));
+        assert_eq!(pending.binding, binding);
+        assert_eq!(pending.receipt, Some(receipt));
+    }
+    let pending = bridge.read(&id).await.unwrap();
+    assert!(!pending.writable && pending.paste_incarnation.is_none());
+    let completion = pending.paste_completion.unwrap();
+    assert_eq!(
+        (completion.incarnation, completion.operation),
+        (incarnation, operation)
+    );
+    assert_eq!(
+        bridge
+            .paste(
+                &id,
+                &incarnation_id,
+                operation,
+                PasteAction::Ack {
+                    receipt: Uuid::new_v4().to_string()
+                }
+            )
+            .await,
+        PasteResult::Stale {}
+    );
+    assert_no_fixture_request(&listener).await;
+
+    let acknowledging = bridge.paste(
+        &id,
+        &incarnation_id,
+        operation,
+        PasteAction::Ack {
+            receipt: receipt.to_string(),
+        },
+    );
+    let ack_reply = async {
+        let (
+            mut peer,
+            Request::PasteAck {
+                binding: actual,
+                receipt: actual_receipt,
+            },
+        ) = receive(&listener).await
+        else {
+            panic!("expected receipt-bound paste acknowledgement");
+        };
+        assert_eq!((actual, actual_receipt), (binding, receipt));
+        respond(
+            &mut peer,
+            Response::Paste {
+                paste: PasteResult::Acknowledged { writable: true },
+            },
+        )
+        .await;
+    };
+    let (acknowledged, ()) = tokio::join!(acknowledging, ack_reply);
+    assert_eq!(acknowledged, PasteResult::Acknowledged { writable: true });
+    let current = bridge.read(&id).await.unwrap();
+    assert!(current.writable && current.paste_completion.is_none());
+    assert_eq!(current.paste_incarnation, Some(incarnation));
+    send_fixture_input(&listener, &bridge, &view, token, incarnation, 1, b"fresh").await;
+    bridge.detach(&id);
+    release_fixture_writer(&listener, &view, token).await;
+    reader.finish();
+    until(|| allocation_counts(&bridge) == (0, 0)).await;
+    assert_no_fixture_request(&listener).await;
+}
+
+#[tokio::test]
+async fn w1_terminal_dispatched_input_with_lost_reply_stays_uncertain() {
+    let fixture = AgentFixture::new();
+    let listener = UnixListener::bind(fixture.0.join("agent.sock")).unwrap();
+    let bridge = DesktopBridge::new(Some(fixture.0.clone()), "/unused/tmux".into());
+    let (view, reader, _) = controlled_view(&bridge, &target(), Uuid::new_v4(), 0);
+    let id = view.terminal.view_id.to_string();
+    let (token, _, incarnation) = grant_fixture_writer(&listener, &bridge, &view).await;
+    let incarnation = incarnation.to_string();
+    let input = bridge.input(&id, b"unconfirmed".to_vec(), &incarnation, false);
+    let lose_reply = async {
+        let (peer, request) = receive(&listener).await;
+        assert!(matches!(
+            request,
+            Request::Input { runtime_id, token: actual, sequence: 0, data, paste: false }
+                if runtime_id == view.terminal.target.runtime_id && actual == token && data == b"unconfirmed"
+        ));
+        drop(peer);
+        release_fixture_writer(&listener, &view, token).await;
+    };
+    let (result, ()) = tokio::join!(input, lose_reply);
+    let (rejection, observation) = terminal_rejection(result.unwrap_err(), Some(true), true);
+    assert_eq!(
+        rejection,
+        TerminalInputError::from("Input outcome unknown; input was not retried")
+    );
+    assert!(observation.is_none());
+    assert!(!bridge.read(&id).await.unwrap().writable);
+    assert!(view.control.lock().await.lease.is_none());
+    bridge.detach(&id);
+    reader.finish();
+    until(|| allocation_counts(&bridge) == (0, 0)).await;
+    assert_no_fixture_request(&listener).await;
 }
 
 #[tokio::test]
