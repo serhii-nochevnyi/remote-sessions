@@ -9,7 +9,7 @@ import { acceptMountedRenderer, adoptCurrentTerminal, confirmMountedWriter, desi
   mountedTerminalEntry, runMountedTerminalStream, TerminalAttachmentIdentityError, terminalProofOnly, terminalStreamAccess,
   updateMountedStream } from "./session-state";
 import type { AttachmentMode, BoundTerminal, MountedTerminal, TerminalBindingState } from "./session-state";
-import { GeometryBoundaryError, OrderedGeometry, ResizeProposals } from "./terminal-geometry";
+import { GeometryBoundaryError, mountedResize, OrderedGeometry, sameTerminal } from "./terminal-geometry";
 import "@xterm/xterm/css/xterm.css";
 
 function geometryText(status: TerminalStatus): string {
@@ -100,14 +100,12 @@ export function TerminalView({ runtimeId, label, fontSize, mounted, previousBind
     const fit = new FitAddon();
     terminal.loadAddon(fit);
 
-    const proposals = new ResizeProposals();
     let routing: OrderedGeometry | undefined;
     let resizeUnavailable = false;
     let inputIssue: string | undefined;
     let finishWrite: (() => void) | undefined;
     let reconnect: ReturnType<typeof setTimeout> | undefined;
     let frame = 0;
-    let layoutReady = false;
     let binding: BoundTerminal | undefined;
     let identityChanged = false;
     let proofOnly = false;
@@ -148,47 +146,32 @@ export function TerminalView({ runtimeId, label, fontSize, mounted, previousBind
       setStatus(`Наживо · ${control} · ${geometryText(routing.status)}${resizeUnavailable ? " · зміна розміру недоступна" : ""}${paste ? ` · ${paste}` : ""}`);
     }
 
-    async function propose() {
-      if (!scope.canWrite || !layoutReady) return;
-      const proposal = proposals.take();
-      if (!proposal) return;
-      try {
-        const result = await localClient.resize(proposal.terminal.view_id, proposal.epoch, proposal.size);
-        if (!scope.owns(proposal.terminal.view_id) || access() !== "attached") return;
-        if (proposals.complete(proposal, result)) {
-          resizeUnavailable = result.result !== "committed";
-          report();
-        }
-      } catch {
-        if (scope.owns(proposal.terminal.view_id) && access() === "attached" && proposals.complete(proposal)) {
-          resizeUnavailable = true;
-          report();
-        }
-      } finally {
-        if (scope.viewId) void propose();
-      }
-    }
+    const resize = mountedResize({
+      owns: terminal => binding !== undefined && sameTerminal(binding.terminal, terminal) &&
+        scope.owns(terminal.view_id) && access() !== "stale",
+      canWrite: () => scope.canWrite,
+      ordered: () => routing,
+      invoke: localClient.resize,
+      scheduleLayout: () => { frame = requestAnimationFrame(layout); },
+      cancelLayout: () => cancelAnimationFrame(frame),
+      settled(unavailable) {
+        resizeUnavailable = unavailable;
+        report();
+      },
+    });
 
     function layout() {
       if (!routing || !scope.canWrite || !container.clientWidth || !container.clientHeight) return;
       const size = fit.proposeDimensions();
       if (!size || !Number.isFinite(size.cols) || !Number.isFinite(size.rows)) return;
-      proposals.offer({ cols: Math.min(500, Math.max(2, size.cols)), rows: Math.min(200, Math.max(2, size.rows)) });
-      layoutReady = true;
-      void propose();
-    }
-
-    function layoutSoon() {
-      layoutReady = false;
-      cancelAnimationFrame(frame);
-      frame = requestAnimationFrame(layout);
+      void resize.offer({ cols: Math.min(500, Math.max(2, size.cols)), rows: Math.min(200, Math.max(2, size.rows)) });
     }
 
     const setRendererFont = (size: number) => {
       terminal.options.fontSize = size;
-      layoutSoon();
+      resize.scheduleLayout();
     };
-    const observer = new ResizeObserver(layoutSoon);
+    const observer = new ResizeObserver(resize.scheduleLayout);
     function openRenderer() {
       terminal.options.fontSize = font.current;
       terminal.open(container);
@@ -199,10 +182,8 @@ export function TerminalView({ runtimeId, label, fontSize, mounted, previousBind
     }
 
     function revokeMutations() {
-      proposals.close();
+      resize.suspend();
       protocol.pauseInput();
-      layoutReady = false;
-      cancelAnimationFrame(frame);
     }
 
     function disposeRenderer() {
@@ -229,16 +210,12 @@ export function TerminalView({ runtimeId, label, fontSize, mounted, previousBind
         },
       },
       inputFailure(error) {
-        proposals.close();
-        protocol.pauseInput();
+        revokeMutations();
         if (error === undefined && !delivery.held) inputIssue = "Ввід завеликий. Перепідключіть термінал перед продовженням.";
         report();
       },
       grantRejected() {
-        if (!scope.canWrite) {
-          proposals.close();
-          protocol.pauseInput();
-        }
+        if (resize.grantRejected()) protocol.pauseInput();
         report();
       },
       retire(view) {
@@ -255,7 +232,8 @@ export function TerminalView({ runtimeId, label, fontSize, mounted, previousBind
         container.removeAttribute("data-terminal-attached");
         updateEligibility.current = null;
         routing?.close();
-        revokeMutations();
+        resize.close();
+        protocol.pauseInput();
         finishWrite?.();
         observer.disconnect();
         clipboard?.dispose();
@@ -357,7 +335,7 @@ export function TerminalView({ runtimeId, label, fontSize, mounted, previousBind
             if (reopening || attachmentMode === "observer") openRenderer();
             rendererOpened = true;
             container.setAttribute("data-terminal-attached", "");
-            layoutSoon();
+            resize.scheduleLayout();
             return true;
           },
           read(view) {
@@ -369,14 +347,13 @@ export function TerminalView({ runtimeId, label, fontSize, mounted, previousBind
             return protocol.consume(scope, view, chunk, render);
           },
           rendered(chunk) {
-            if (access() === "attached" && proposals.observe(ordered.status, scope.canWrite, ordered.applied)) {
+            if (access() === "attached" && resize.observe(chunk)) {
               resizeUnavailable = false;
-              layoutSoon();
             }
             if (chunk.geometry) resizeUnavailable = false;
             reconnectDelay.current = 500;
             report();
-            void propose();
+            void resize.propose();
           },
           eof(state) {
             retained = onBinding(candidate.binding, state, candidate.binding, attempt);

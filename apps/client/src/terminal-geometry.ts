@@ -23,48 +23,60 @@ interface Proposal {
   readonly epoch: ResizeEpoch;
   readonly size: TerminalSize;
   readonly revision: number;
+  readonly grant: ResizeGrant;
+}
+
+interface ResizeGrant {
+  readonly epoch: ResizeEpoch;
+  readonly incarnation: string | undefined;
 }
 
 export class ResizeProposals {
   private current: TerminalStatus | undefined;
   private applied = 0;
-  private owner = "";
+  private grant: ResizeGrant | undefined;
   private queued: TerminalSize | undefined;
   private sending: Proposal | undefined;
-  private waiting = 0;
+  private committedFence = 0;
+  private blockedAt: number | undefined;
+  private closed = false;
 
-  observe(status: TerminalStatus, writable: boolean, applied: number): boolean {
-    const owner = writable && status.epoch?.agent === status.terminal.agent_epoch
-      ? epochKey(status.epoch) : "";
-    const changed = owner !== this.owner || !this.current || !sameTerminal(this.current.terminal, status.terminal);
-    if (changed) {
-      this.queued = undefined;
-      this.waiting = 0;
+  observe(status: TerminalStatus, writable: boolean, applied: number, incarnation?: string): boolean {
+    if (this.closed) return false;
+    if (this.current && !sameTerminal(this.current.terminal, status.terminal)) {
+      this.close();
+      return false;
     }
     this.current = status;
     this.applied = applied;
-    this.owner = owner;
-    return changed;
+    if (applied >= this.committedFence) this.committedFence = 0;
+    const epoch = status.epoch;
+    if (!writable || !epoch || epoch.agent !== status.terminal.agent_epoch) {
+      this.suspend();
+      return false;
+    }
+    if (!this.grant || epochKey(this.grant.epoch) !== epochKey(epoch) || this.grant.incarnation !== incarnation) {
+      this.suspend();
+      this.grant = { epoch, incarnation };
+      return true;
+    }
+    if (this.blockedAt === undefined || applied <= this.blockedAt) return false;
+    this.blockedAt = undefined;
+    return true;
   }
 
   offer(size: TerminalSize) {
-    if (!this.owner || !this.current) return;
-    const sent = this.sending;
-    if (sent && sameTerminal(sent.terminal, this.current.terminal) && epochKey(sent.epoch) === this.owner) {
-      this.queued = sameSize(size, sent.size) ? undefined : size;
-    } else {
-      this.queued = size;
-    }
+    if (this.grant && this.blockedAt === undefined) this.queued = size;
   }
 
-  take(): Proposal | undefined {
-    const current = this.current;
+  take(current = this.current): Proposal | undefined {
     const size = this.queued;
-    if (this.sending || !this.owner || !current?.epoch || !size ||
-      this.applied < Math.max(this.waiting, current.committed.revision)) return;
+    const grant = this.grant;
+    if (this.sending || !grant || this.blockedAt !== undefined || !current || current !== this.current || !size ||
+      this.applied < Math.max(this.committedFence, current.committed.revision)) return;
     this.queued = undefined;
     if (sameSize(size, current.committed.size)) return;
-    this.sending = { terminal: current.terminal, epoch: current.epoch, size, revision: current.committed.revision };
+    this.sending = { terminal: current.terminal, epoch: grant.epoch, size, revision: current.committed.revision, grant };
     return this.sending;
   }
 
@@ -72,29 +84,126 @@ export class ResizeProposals {
     if (this.sending !== proposal) return false;
     this.sending = undefined;
     const current = this.current;
+    if (!current || !sameTerminal(current.terminal, proposal.terminal)) return false;
+    const sameGrant = this.grant === proposal.grant;
     const owner = epochKey(proposal.epoch);
-    if (!current || owner !== this.owner || !sameTerminal(current.terminal, proposal.terminal)) return false;
     if (result?.result === "committed") {
       const { status } = result;
-      if (!sameTerminal(status.terminal, proposal.terminal) || epochKey(status.epoch) !== owner ||
-        status.committed.revision <= proposal.revision || status.committed.revision < current.committed.revision ||
-        !sameSize(status.committed.size, proposal.size)) return false;
-      this.waiting = status.committed.revision;
-      return true;
+      const { revision, intent, size } = status.committed;
+      if (sameTerminal(status.terminal, proposal.terminal) && epochKey(status.epoch) === owner &&
+        intent && epochKey(intent.epoch) === owner && epochKey(result.admission.epoch) === owner &&
+        intent.id === result.admission.id && revision > proposal.revision && sameSize(size, proposal.size)) {
+        if (revision < current.committed.revision) return false;
+        if (revision > this.applied) this.committedFence = Math.max(this.committedFence, revision);
+        return sameGrant;
+      }
     }
-    if (result && (!sameTerminal(result.terminal, proposal.terminal) || epochKey(result.intent.epoch) !== owner)) return false;
-    if (result) {
-      this.queued = undefined;
-      this.owner = "";
-    }
-    return true;
+    if (!sameGrant) return false;
+    this.queued = undefined;
+    this.blockedAt = this.applied;
+    return !result || (result.result !== "committed" &&
+      sameTerminal(result.terminal, proposal.terminal) && epochKey(result.intent.epoch) === owner);
+  }
+
+  suspend() {
+    this.grant = undefined;
+    this.queued = undefined;
+    this.blockedAt = undefined;
   }
 
   close() {
-    this.owner = "";
-    this.queued = undefined;
-    this.sending = undefined;
+    this.closed = true;
+    this.suspend();
+    this.current = undefined;
+    this.committedFence = 0;
   }
+}
+
+export function mountedResize(callbacks: {
+  owns(terminal: TerminalScope): boolean;
+  canWrite(): boolean;
+  ordered(): OrderedGeometry | undefined;
+  invoke(view: string, epoch: ResizeEpoch, size: TerminalSize): Promise<ResizeResult>;
+  scheduleLayout(): void;
+  cancelLayout(): void;
+  settled(unavailable: boolean): void;
+}) {
+  const proposals = new ResizeProposals();
+  let layoutReady = false;
+  let incarnation: string | undefined;
+
+  function cancelLayout() {
+    layoutReady = false;
+    callbacks.cancelLayout();
+  }
+
+  function scheduleLayout() {
+    cancelLayout();
+    const ordered = callbacks.ordered();
+    if (ordered && callbacks.owns(ordered.status.terminal) && callbacks.canWrite()) callbacks.scheduleLayout();
+  }
+
+  function suspend() {
+    proposals.suspend();
+    incarnation = undefined;
+    cancelLayout();
+  }
+
+  function close() {
+    proposals.close();
+    incarnation = undefined;
+    cancelLayout();
+  }
+
+  async function propose() {
+    if (!layoutReady || !callbacks.canWrite()) return;
+    const ordered = callbacks.ordered();
+    if (!ordered || !callbacks.owns(ordered.status.terminal)) return;
+    const proposal = proposals.take(ordered.status);
+    if (!proposal) return;
+    let result: ResizeResult | undefined;
+    try {
+      result = await callbacks.invoke(proposal.terminal.view_id, proposal.epoch, proposal.size);
+    } catch {}
+    const current = callbacks.owns(proposal.terminal);
+    if (!current) close();
+    if (proposals.complete(proposal, result) && callbacks.canWrite() &&
+      (result?.result !== "committed" || result.status.committed.revision >= ordered.status.committed.revision)) {
+      callbacks.settled(result?.result !== "committed");
+    }
+    if (current) void propose();
+  }
+
+  return {
+    scheduleLayout,
+    suspend,
+    grantRejected() {
+      if (callbacks.canWrite()) return false;
+      suspend();
+      return true;
+    },
+    close,
+    observe(chunk: Chunk) {
+      const ordered = callbacks.ordered();
+      if (!ordered || !callbacks.owns(ordered.status.terminal)) return false;
+      const writable = callbacks.canWrite();
+      if (!writable) {
+        incarnation = undefined;
+        cancelLayout();
+      } else if (chunk.writable) {
+        incarnation = chunk.paste_incarnation;
+      }
+      const changed = proposals.observe(ordered.status, writable, ordered.applied, incarnation);
+      if (changed) scheduleLayout();
+      return changed;
+    },
+    offer(size: TerminalSize) {
+      proposals.offer(size);
+      layoutReady = true;
+      return propose();
+    },
+    propose,
+  };
 }
 
 type VtState = "ground" | "escape" | "escapeIntermediate" | "osc" | "sosPmApc"
