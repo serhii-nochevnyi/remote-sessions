@@ -3,8 +3,9 @@ import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import { bindTerminalPaste, bindTerminalProtocol } from "./terminal-protocol";
 import { localClient, TerminalViewScope } from "./local-client";
-import type { GeometryEvent, RuntimeInfo, TerminalSize, TerminalStatus, TerminalStreamFailure } from "./local-client";
-import type { BoundTerminal } from "./session-state";
+import type { GeometryEvent, TerminalDelivery, TerminalSize, TerminalStatus, TerminalStreamFailure } from "./local-client";
+import { attachCurrentTerminal, desiredTerminalMode, updateTerminalEligibility } from "./session-state";
+import type { AttachmentMode, BoundTerminal, TerminalAttachmentIntent } from "./session-state";
 import { GeometryBoundaryError, OrderedGeometry, ResizeProposals, sameTerminal } from "./terminal-geometry";
 import "@xterm/xterm/css/xterm.css";
 
@@ -31,46 +32,49 @@ function streamFailure(error: unknown, stage: TerminalStreamFailure): TerminalSt
 
 interface TerminalViewProps {
   readonly runtimeId: string;
-  readonly epoch: number;
   readonly label: string;
   readonly fontSize: number;
-  readonly runtime: RuntimeInfo | undefined;
+  readonly intent: TerminalAttachmentIntent | undefined;
   readonly previousBinding: BoundTerminal | null;
-  readonly allowWriter: boolean;
+  readonly delivery: TerminalDelivery;
+  readonly currentAttachment: (id: string, previous: BoundTerminal | null) => TerminalAttachmentIntent | undefined;
   readonly onBinding: (binding: BoundTerminal, state: "bound" | "retired" | "changed") => void;
 }
 
-export function TerminalView({ runtimeId, epoch, label, fontSize, runtime, previousBinding, allowWriter, onBinding }: TerminalViewProps) {
+export function TerminalView({ runtimeId, label, fontSize, intent, previousBinding, delivery, currentAttachment, onBinding }: TerminalViewProps) {
   const element = useRef<HTMLDivElement>(null);
   const font = useRef(fontSize);
   const updateFont = useRef<((size: number) => void) | null>(null);
   const reconnectDelay = useRef(500);
-  const runtimeRef = useRef(runtime);
   const previousRef = useRef(previousBinding);
-  const writable = useRef(allowWriter);
-  const updateEligibility = useRef<((eligible: boolean) => void) | null>(null);
+  const activeMode = useRef<AttachmentMode | undefined>(undefined);
+  const detached = useRef(Promise.resolve());
+  const updateEligibility = useRef<((mode: AttachmentMode | undefined) => void) | null>(null);
   const [status, setStatus] = useState("Підключення…");
   const [retry, setRetry] = useState(0);
+  const [, refreshDelivery] = useState(0);
+  const mode = desiredTerminalMode(intent, activeMode.current, delivery.mayRestore);
   useLayoutEffect(() => {
-    runtimeRef.current = runtime;
     previousRef.current = previousBinding;
-  }, [runtime, previousBinding]);
+  }, [previousBinding]);
   useLayoutEffect(() => {
-    if (allowWriter && !writable.current && !updateEligibility.current) setRetry(value => value + 1);
-    writable.current = allowWriter;
-    updateEligibility.current?.(allowWriter);
-    return () => {
-      writable.current = false;
-      updateEligibility.current?.(false);
+    updateEligibility.current?.(mode);
+  }, [mode]);
+  useLayoutEffect(() => {
+    delivery.onChange = () => {
+      if (activeMode.current !== "ordinary") refreshDelivery(value => value + 1);
     };
-  }, [allowWriter]);
+    return () => { delivery.onChange = undefined; };
+  }, [delivery]);
   useEffect(() => {
     font.current = fontSize;
     updateFont.current?.(fontSize);
   }, [fontSize]);
   useEffect(() => {
     const mountedElement = element.current;
-    if (!mountedElement || !writable.current) return;
+    if (!mountedElement || !mode) return;
+    const attachmentMode = mode;
+    activeMode.current = attachmentMode;
     const container = mountedElement;
     const rendererId = crypto.randomUUID();
     const terminal = new Terminal({ disableStdin: true, fontSize: font.current, lineHeight: 1.25,
@@ -96,8 +100,11 @@ export function TerminalView({ runtimeId, epoch, label, fontSize, runtime, previ
     function report() {
       if (!routing || !scope.viewId) return;
       const paste = scope.pasteMessage;
-      if (inputIssue) {
-        setStatus(paste ? `${inputIssue} · ${paste}` : inputIssue);
+      const deliveryIssue = delivery.inputIssue;
+      const issue = deliveryIssue === undefined ? inputIssue
+        : `Ввід перервано; автоматично не повторюємо.${deliveryIssue ? ` ${deliveryIssue}` : ""}`;
+      if (issue) {
+        setStatus(paste ? `${issue} · ${paste}` : issue);
         return;
       }
       const control = !protocol.inputAvailable ? "ввід недоступний" : scope.canWrite ? "ви керуєте" : "режим перегляду";
@@ -151,6 +158,8 @@ export function TerminalView({ runtimeId, epoch, label, fontSize, runtime, previ
     let failure: TerminalStreamFailure | undefined;
     const scope = new TerminalViewScope({
       input: (viewId, data, incarnation) => localClient.input({ viewId, data, incarnation }),
+      inputEligible: () => attachmentMode === "ordinary" &&
+        currentAttachment(runtimeId, binding ?? previousRef.current)?.mode === "live",
       paste: {
         stage: localClient.pasteStage,
         commit: localClient.pasteCommit,
@@ -163,13 +172,20 @@ export function TerminalView({ runtimeId, epoch, label, fontSize, runtime, previ
       inputFailure(error) {
         proposals.close();
         protocol.pauseInput();
-        inputIssue = error === undefined
-          ? "Ввід завеликий. Перепідключіть термінал перед продовженням."
-          : `Ввід перервано; автоматично не повторюємо. ${String(error)}`;
+        if (error === undefined && !delivery.held) inputIssue = "Ввід завеликий. Перепідключіть термінал перед продовженням.";
+        report();
+      },
+      grantRejected() {
+        if (!scope.canWrite) {
+          proposals.close();
+          protocol.pauseInput();
+        }
         report();
       },
       retire(view) {
         if (binding) onBinding(binding, identityChanged ? "changed" : "retired");
+        else if (identityChanged && previousRef.current) onBinding(previousRef.current, "changed");
+        activeMode.current = undefined;
         container.removeAttribute("data-terminal-attached");
         protocol.dispose();
         clipboard.dispose();
@@ -180,28 +196,23 @@ export function TerminalView({ runtimeId, epoch, label, fontSize, runtime, previ
         proposals.close();
         finishWrite?.();
         observer.disconnect();
-        if (view) void detach(view, failure);
+        if (view) detached.current = detach(view, failure);
         if (terminal.textarea === document.activeElement && container.isConnected) container.focus();
         terminal.dispose();
       },
       reconnect(error) {
         setStatus(`Перепідключення… ${String(error)}`);
-        if (identityChanged || !writable.current) return;
+        if (identityChanged) return;
         reconnect = setTimeout(() => {
-          if (writable.current) setRetry(value => value + 1);
+          if (currentAttachment(runtimeId, previousRef.current)) setRetry(value => value + 1);
         }, reconnectDelay.current);
         reconnectDelay.current = Math.min(reconnectDelay.current * 2, 4000);
       },
-    });
+    }, delivery);
+    scope.setInputEligible(attachmentMode === "ordinary");
     const protocol = bindTerminalProtocol(terminal, bytes => { void scope.send(bytes); });
     const clipboard = bindTerminalPaste(container, bytes => { void scope.paste(bytes); });
-    updateEligibility.current = eligible => {
-      scope.setInputEligible(eligible);
-      layoutReady = false;
-      protocol.pauseInput();
-      if (routing) proposals.observe(routing.status, false, routing.applied);
-      report();
-    };
+    updateEligibility.current = desired => updateTerminalEligibility(scope, attachmentMode, desired);
     const sink = {
       write: (data: readonly number[]) => new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => {
@@ -234,23 +245,23 @@ export function TerminalView({ runtimeId, epoch, label, fontSize, runtime, previ
     async function stream() {
       try {
         setStatus("Підключення…");
-        const attachment = await localClient.attach(runtimeId);
-        const view = attachment.view_id;
-        if (!scope.bind(view)) { await detach(view); return; }
-        const terminalScope = attachment.status.terminal;
-        binding = { agentPid: epoch, terminal: terminalScope };
-        const target = terminalScope.target;
-        const current = runtimeRef.current;
         const previous = previousRef.current;
-        const sameTarget = !previous || sameTerminal({
-          ...previous.terminal, view_id: view,
-          agent_epoch: previous.agentPid === epoch ? previous.terminal.agent_epoch : terminalScope.agent_epoch,
-        }, terminalScope);
-        if (!writable.current || !current || target.runtime_id !== runtimeId || current.pane_pid !== target.pid ||
-            (current.pane_id && current.pane_id !== target.pane) || !sameTarget) {
-          identityChanged = true;
-          throw Error("Сесія змінилася");
+        const candidate = await attachCurrentTerminal(runtimeId, previous, attachmentMode,
+          () => currentAttachment(runtimeId, previous), () => delivery.mayRestore, () => scope.active, detached.current, localClient);
+        if (!candidate) {
+          if (scope.active) scope.retire({ error: Error("Очікуємо підтвердження термінала") });
+          return;
         }
+        const { attachment } = candidate;
+        const view = attachment.view_id;
+        if (!candidate.isCurrent() || !scope.bind(view)) {
+          await detach(view);
+          if (scope.active) scope.retire({ error: Error("Очікуємо підтвердження термінала") });
+          return;
+        }
+        const terminalScope = attachment.status.terminal;
+        binding = candidate.binding;
+        previousRef.current = binding;
         const ordered = new OrderedGeometry(attachment.status);
         routing = ordered;
         terminal.resize(attachment.cols, attachment.rows);
@@ -262,6 +273,10 @@ export function TerminalView({ runtimeId, epoch, label, fontSize, runtime, previ
           const checkEligibility = scope.captureReadEligibility();
           const chunk = await localClient.read(view);
           if (!scope.owns(view)) return;
+          if (desiredTerminalMode(currentAttachment(runtimeId, candidate.binding), attachmentMode, delivery.mayRestore) !== attachmentMode) {
+            scope.retire();
+            return;
+          }
           if (chunk.closure) {
             failure = "stream_closed";
             scope.acceptClosure(view, chunk.closure);
@@ -285,7 +300,7 @@ export function TerminalView({ runtimeId, epoch, label, fontSize, runtime, previ
         }
       } catch (error) {
         if (!scope.active) return;
-        if (String(error) === "Terminal attachment identity changed") identityChanged = true;
+        if ((error instanceof Error ? error.message : String(error)) === "Terminal attachment identity changed") identityChanged = true;
         failure = streamFailure(error, streamStage);
         scope.retire({ error });
       }
@@ -295,9 +310,10 @@ export function TerminalView({ runtimeId, epoch, label, fontSize, runtime, previ
       clearTimeout(reconnect);
       scope.retire();
     };
-  }, [runtimeId, epoch, retry, onBinding]);
-  return <><div className="stream-status" role="status"><span>{status}</span><button type="button" disabled={!allowWriter} onClick={() => {
+  }, [runtimeId, mode, retry, currentAttachment, delivery, onBinding]);
+  return <><div className="stream-status" role="status"><span>{intent ? status : "Очікуємо підтвердження термінала…"}</span><button type="button" disabled={!intent} onClick={() => {
     element.current?.focus();
+    updateEligibility.current?.(undefined);
     setRetry(value => value + 1);
   }}>Перепідключити</button></div>
     <div className="terminal-view"><div className="live-terminal" ref={element} role="region" aria-label={label} tabIndex={0} /></div></>;

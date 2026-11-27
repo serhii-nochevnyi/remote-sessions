@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { localClient, parseInventory, parseAttachment, parseChunk, TerminalViewScope } from "./local-client.ts";
+import { localClient, parseInventory, parseAttachment, parseChunk, parseCreateSubmission, TerminalViewScope } from "./local-client.ts";
 import type { GeometryEvent, TerminalStatus } from "./local-client.ts";
 import { OrderedGeometry } from "./terminal-geometry.ts";
 import { closeView, openView } from "./session-state.ts";
@@ -55,7 +55,7 @@ test("terminal read decodes only exact typed closure shapes and preserves legacy
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  let reject!: (error: Error) => void;
+  let reject!: (error: unknown) => void;
   const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
   return { promise, resolve, reject };
 }
@@ -74,6 +74,108 @@ function terminalStatus(view_id: string, revision: number): TerminalStatus {
   };
 }
 const liveChunk = { closed: false, writable: true, data: [], paste_incarnation: id };
+
+test("inventory distinguishes corroborated legacy, verified managed and unverified wire rows", () => {
+  const base = { runtime_id: id, session_id: id, command: "fixture", pane_pid: 42, pane_id: "%2",
+    exited: false, width: 100, height: 30 };
+  const parse = (fields: object) => parseInventory({ agent_pid: 12, runtimes: [{ ...base, ...fields }] }).runtimes[0];
+  const unverified = { origin: "managed", workspace_id: null, operation_id: null };
+  assert.equal(parse({ ...unverified, origin: "legacy" })?.origin, "legacy");
+  assert.equal(parse(unverified)?.origin, "unverified");
+  assert.equal(parse({ ...unverified, workspace_id: id, operation_id: freshId })?.origin, "managed");
+  for (const fields of [{ ...unverified, workspace_id: id }, { ...unverified, operation_id: freshId }, { origin: "managed" }]) {
+    assert.throws(() => parse(fields));
+  }
+  assert.throws(() => parseCreateSubmission({
+    result: "recorded",
+    operation: {
+      reference: id, workspace_id: id, profile: "codex", presented: false,
+      disposition: { result: "launched", current: "live", readiness: "unobserved", runtime: { ...base, ...unverified } },
+    },
+  }));
+});
+
+const nativeRejection = {
+  reason: "stale_input", view_id: id, rejection_id: "33333333-3333-4333-8333-333333333333",
+  event_time_us: 1_800_000_000_000_000,
+};
+
+for (const successorFirst of [false, true]) {
+  for (const [label, rejection, recover] of [
+    ["definite native rejection", nativeRejection, true],
+    ["transport uncertainty", Error("Input outcome unknown"), false],
+    ["host error with the same message", "Керування змінилося", false],
+    ["serialized string lookalike", JSON.stringify(nativeRejection), false],
+    ["wrong view", { ...nativeRejection, view_id: freshId }, false],
+    ["invalid identity", { ...nativeRejection, rejection_id: "00000000-0000-0000-0000-000000000000" }, false],
+    ["invalid event time", { ...nativeRejection, event_time_us: 0 }, false],
+    ["unrecognized reason", { ...nativeRejection, reason: "attachment_changed" }, false],
+    ["extra fields", { ...nativeRejection, incarnation: id }, false],
+  ] as const) {
+    test(`${label} with successor ${successorFirst ? "already observed" : "observed after rejection"}`, async t => {
+      const first = deferred<void>();
+      const sent: unknown[] = [];
+      const failures: unknown[] = [];
+      const revoked: boolean[] = [];
+      const original = Object.getOwnPropertyDescriptor(globalThis, "window");
+      Object.defineProperty(globalThis, "window", {
+        configurable: true,
+        value: { __TAURI_INTERNALS__: {
+          invoke(command: string, args: unknown) {
+            assert.equal(command, "terminal_input");
+            sent.push(args);
+            return sent.length === 1 ? first.promise : Promise.resolve();
+          },
+        } },
+      });
+      t.after(() => {
+        if (original) Object.defineProperty(globalThis, "window", original);
+        else Reflect.deleteProperty(globalThis, "window");
+      });
+      const scope = new TerminalViewScope({
+        input: (viewId, data, incarnation) => localClient.input({ viewId, data, incarnation }),
+        inputFailure: error => failures.push(error),
+        grantRejected: () => { revoked.push(scope.canWrite); },
+        paste: {
+          stage: () => assert.fail("obsolete paste staged"),
+          commit: () => assert.fail("obsolete paste committed"),
+          ack: () => assert.fail("obsolete paste acknowledged"),
+          changed: () => {},
+        },
+        retire: () => {},
+        reconnect: () => {},
+      });
+      const successor = { ...liveChunk, paste_incarnation: freshId };
+      assert.ok(scope.bind(id));
+      await scope.consume(id, liveChunk, async () => {});
+      const sending = scope.send(new Uint8Array(4097).fill(1));
+      const queuedKey = scope.send(Uint8Array.of(2));
+      const queuedPaste = scope.paste(Uint8Array.of(3));
+      await Promise.resolve();
+      assert.equal(sent.length, 1);
+      if (successorFirst) await scope.consume(id, successor, async () => {});
+      first.reject(rejection);
+      await Promise.all([sending, queuedKey, queuedPaste]);
+      assert.equal(scope.canWrite, recover && successorFirst);
+      assert.equal(sent.length, 1);
+      assert.deepEqual(revoked, recover ? [successorFirst] : []);
+      assert.deepEqual(failures, recover ? [] : [rejection]);
+      if (!successorFirst) {
+        for (let repeat = 0; repeat < 2; repeat++) {
+          await scope.consume(id, liveChunk, async () => {});
+          assert.equal(scope.canWrite, false);
+        }
+      }
+      await scope.consume(id, successor, async () => {});
+      assert.equal(scope.canWrite, recover);
+      await scope.send(Uint8Array.of(4));
+      assert.deepEqual(sent, [
+        { viewId: id, data: new Array(4096).fill(1), incarnation: id },
+        ...(recover ? [{ viewId: id, data: [4], incarnation: freshId }] : []),
+      ]);
+    });
+  }
+}
 
 test("ordinary input sends the captured grant with each native invoke", async t => {
   const calls: unknown[] = [];
@@ -111,6 +213,39 @@ test("ordinary input sends the captured grant with each native invoke", async t 
     ["terminal_input", { viewId: id, data: [0x80], incarnation: id }],
     ["terminal_input", { viewId: id, data: [27, 2], incarnation: freshId }],
   ]);
+});
+
+test("a typed rejection from another scoped invoke cannot retire this grant", async t => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: { __TAURI_INTERNALS__: { invoke() { return Promise.reject(nativeRejection); } } },
+  });
+  t.after(() => {
+    if (original) Object.defineProperty(globalThis, "window", original);
+    else Reflect.deleteProperty(globalThis, "window");
+  });
+  let rejection: unknown;
+  await assert.rejects(localClient.input({ viewId: id, incarnation: id, data: [1] }), error => {
+    rejection = error;
+    return error instanceof Error && error.message === "Керування змінилося";
+  });
+  for (const [view, incarnation] of [[freshId, id], [id, freshId]] as const) {
+    const failures: unknown[] = [];
+    const scope = new TerminalViewScope({
+      async input() { throw rejection; },
+      inputFailure: error => failures.push(error),
+      grantRejected: () => assert.fail("reused rejection retired the current grant"),
+      retire: () => {},
+      reconnect: () => {},
+    });
+    assert(scope.bind(view));
+    await scope.consume(view, { ...liveChunk, paste_incarnation: incarnation }, async () => {});
+    await scope.send(Uint8Array.of(2));
+    await scope.consume(view, { ...liveChunk, paste_incarnation: nativeRejection.rejection_id }, async () => {});
+    assert.deepEqual(failures, [rejection]);
+    assert.equal(scope.canWrite, false);
+  }
 });
 
 for (const held of ["write", "ack"] as const) {
@@ -219,6 +354,32 @@ test("native status reads the existing view and decodes its exact target without
   assert.deepEqual(calls, [
     ["terminal_status", { viewId: id }],
     ["terminal_status", { viewId: id }],
+  ]);
+});
+
+test("native attach keeps the default command and forwards observer and restoration selectors", async t => {
+  const calls: unknown[] = [];
+  const original = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const status = terminalStatus(freshId, 0);
+  const payload = { view_id: freshId, cols: 100, rows: 30, status };
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: { __TAURI_INTERNALS__: {
+      invoke(command: string, args: unknown) { calls.push([command, args]); return payload; },
+    } },
+  });
+  t.after(() => {
+    if (original) Object.defineProperty(globalThis, "window", original);
+    else Reflect.deleteProperty(globalThis, "window");
+  });
+  const restoration = { previous: terminalStatus(id, 0).terminal, agent_pid: 12, session_id: id, operation_id: id };
+  assert.deepEqual(await localClient.attach(id), payload);
+  assert.deepEqual(await localClient.attach(id, { observer: true }), payload);
+  assert.deepEqual(await localClient.attach(id, { restoration }), payload);
+  assert.deepEqual(calls, [
+    ["terminal_attach", { runtimeId: id }],
+    ["terminal_attach", { runtimeId: id, observer: true }],
+    ["terminal_attach", { runtimeId: id, restoration }],
   ]);
 });
 

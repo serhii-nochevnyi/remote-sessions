@@ -8,8 +8,9 @@ mod desktop {
     use remote_sessions_desktop_bridge::{
         Attachment, Chunk, CreateSubmission, DesktopBridge, GeometryEvent, GridAcknowledgement,
         Inventory, LocalCreateStatus, PasteAction, PasteResult, ProductIssue, ProviderProfile,
-        ResizeEpoch, ResizeResult, TerminalSize, TerminalStatus, WorkspaceReadiness,
-        WorkspaceSelection, encode_local_observation, encode_renderer_observation,
+        ResizeEpoch, ResizeResult, TerminalInputError, TerminalRestoration, TerminalSize,
+        TerminalStatus, WorkspaceReadiness, WorkspaceSelection, encode_local_observation,
+        encode_renderer_observation,
     };
     use tauri::{State, WebviewWindow, async_runtime};
     use tauri_plugin_dialog::{DialogExt, FilePath};
@@ -555,9 +556,17 @@ mod desktop {
     #[tauri::command]
     pub async fn terminal_attach(
         runtime_id: String,
+        observer: Option<bool>,
+        restoration: Option<TerminalRestoration>,
         bridge: State<'_, DesktopBridge>,
     ) -> Result<Attachment, String> {
-        bridge.attach(&runtime_id).await.map_err(|e| e.to_string())
+        match (observer.unwrap_or(false), restoration) {
+            (true, None) => bridge.attach_observer(&runtime_id).await,
+            (false, Some(expected)) => bridge.restore_attachment(&runtime_id, expected).await,
+            (false, None) => bridge.attach(&runtime_id).await,
+            (true, Some(_)) => return Err("Observer attachment cannot restore control".into()),
+        }
+        .map_err(|error| error.to_string())
     }
     #[tauri::command]
     pub async fn terminal_read(
@@ -691,21 +700,21 @@ mod desktop {
         incarnation: Option<String>,
         paste: Option<bool>,
         bridge: State<'_, DesktopBridge>,
-    ) -> Result<(), String> {
+    ) -> Result<(), TerminalInputError> {
         ordinary_input(paste, async move || {
             let incarnation = incarnation.as_deref().ok_or("Керування ще не отримано")?;
             bridge
                 .input(&view_id, data, incarnation, false)
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(TerminalInputError::from)
         })
         .await
     }
 
     async fn ordinary_input(
         paste: Option<bool>,
-        dispatch: impl AsyncFnOnce() -> Result<(), String>,
-    ) -> Result<(), String> {
+        dispatch: impl AsyncFnOnce() -> Result<(), TerminalInputError>,
+    ) -> Result<(), TerminalInputError> {
         if paste == Some(true) {
             return Err("PasteUnavailable".into());
         }

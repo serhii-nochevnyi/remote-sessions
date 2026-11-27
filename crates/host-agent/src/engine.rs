@@ -245,6 +245,20 @@ const EVIDENCE_FORMAT: &str = concat!(
     "#{session_name}|#{window_index}|#{pane_index}|#{@rs_create_nonce}|",
     "#{pane_dead}|#{pane_width}|#{pane_height}"
 );
+const INVENTORY_PANE_FORMAT: &str = concat!(
+    "#{pid}|#{start_time}|#{@rs_create_generation}|",
+    "#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}|",
+    "#{session_name}|#{pane_dead}|#{@rs_create_nonce}"
+);
+const LIST_FORMAT: &str = concat!(
+    "#{session_name}\t#{pane_id}\t#{pane_pid}\t#{pane_dead}\t#{pane_width}\t#{pane_height}\t",
+    "#{?@rs_command,#{@rs_command},#{pane_current_command}}"
+);
+const INVENTORY_SCOPE_FORMAT: &str = concat!(
+    "#{pid}|#{start_time}|",
+    "#{?#{m/r:^[0-9a-f-]*$,#{@rs_create_generation}},#{@rs_create_generation},invalid}|",
+    "#{session_id}|#{window_id}"
+);
 const RUNTIME_LIMIT: usize = 16;
 
 struct Observation {
@@ -809,6 +823,15 @@ impl Engine {
     }
 
     pub async fn list(&self) -> Result<Vec<Runtime>> {
+        Ok(self
+            .list_runtimes(false)
+            .await?
+            .into_iter()
+            .map(|(runtime, _)| runtime)
+            .collect())
+    }
+
+    async fn list_runtimes(&self, with_scope: bool) -> Result<Vec<(Runtime, Option<String>)>> {
         // list-panes needs a target even with -a when the live server is empty.
         // list-sessions distinguishes that valid state from an unavailable server.
         if self
@@ -818,11 +841,16 @@ impl Engine {
         {
             return Ok(Vec::new());
         }
-        let output = self.command(&["list-panes", "-a", "-F", "#{session_name}\t#{pane_id}\t#{pane_pid}\t#{pane_dead}\t#{pane_width}\t#{pane_height}\t#{?@rs_command,#{@rs_command},#{pane_current_command}}"]).await?;
-        let mut runtimes = Vec::new();
+        let scoped_format = with_scope.then(|| format!("{LIST_FORMAT}\t{INVENTORY_SCOPE_FORMAT}"));
+        let format = scoped_format.as_deref().unwrap_or(LIST_FORMAT);
+        let output = self.command(&["list-panes", "-a", "-F", format]).await?;
+        let mut runtimes: Vec<(Runtime, Option<String>)> = Vec::new();
         for line in output.lines() {
             let fields: Vec<_> = line.split('\t').collect();
-            ensure!(fields.len() == 7, "unexpected tmux metadata");
+            ensure!(
+                fields.len() == 7 || (with_scope && fields.len() == 8),
+                "unexpected tmux metadata"
+            );
             let Some((session_id, runtime_id)) = parse_name(fields[0]) else {
                 continue;
             };
@@ -830,10 +858,10 @@ impl Engine {
             ensure!(
                 !runtimes
                     .iter()
-                    .any(|r: &Runtime| r.runtime_id == runtime_id),
+                    .any(|(runtime, _)| runtime.runtime_id == runtime_id),
                 "multiple panes for one runtime are unsupported"
             );
-            runtimes.push(Runtime {
+            let runtime = Runtime {
                 session_id,
                 runtime_id,
                 tmux_name: fields[0].into(),
@@ -850,7 +878,8 @@ impl Engine {
                 origin: RuntimeOrigin::Legacy,
                 workspace_id: None,
                 operation_id: None,
-            });
+            };
+            runtimes.push((runtime, fields.get(7).map(|scope| (*scope).to_owned())));
         }
         Ok(runtimes)
     }
@@ -1295,30 +1324,118 @@ impl Engine {
     }
 
     pub(crate) async fn inventory(&self, catalog: Option<&CatalogLane>) -> Result<Vec<Runtime>> {
-        let mut runtimes = self.list().await?;
-        if let Some(catalog) = catalog {
-            let ids: Vec<_> = runtimes.iter().map(|runtime| runtime.runtime_id).collect();
-            if !ids.is_empty()
-                && let Ok(operations) = catalog.run(move |db, _| db.by_runtime(&ids)).await
+        let mut rows = self.list_runtimes(true).await?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let operations = if let Some(catalog) = catalog {
+            let ids: Vec<_> = rows.iter().map(|(runtime, _)| runtime.runtime_id).collect();
+            catalog
+                .run(move |db, _| db.by_runtime(&ids))
+                .await
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        for (runtime, scope) in &mut rows {
+            runtime.origin = RuntimeOrigin::Managed;
+            let Some(proof) = scope else { continue };
+            let fields: Vec<_> = proof.split('|').collect();
+            let [_, _, _, session, window] = fields.as_slice() else {
+                continue;
+            };
+            let server = fields[..3].join("|");
+            let managed_generation = generation(&server);
+            if !canonical_tmux_id(session, '$')
+                || !canonical_tmux_id(window, '@')
+                || !server_fields(&server)
+                    .is_some_and(|(_, _, token)| token.is_empty() || managed_generation.is_some())
             {
-                // @contract: Catalog or identity faults leave the underlying tmux inventory visible.
-                for operation in operations {
-                    if let OperationStage::Finished(StoredOutcome::Launched { identity, .. }) =
-                        &operation.stage
-                        && let Some(runtime) = runtimes.iter_mut().find(|runtime| {
-                            runtime.runtime_id == operation.runtime_id
-                                && runtime.session_id == operation.session_id
-                                && runtime.pane_id == identity.pane
-                        })
-                        && let Ok(observed) = self.observe(&operation).await
-                        && observed.identity == *identity
-                    {
-                        *runtime = observed.runtime;
-                    }
+                continue;
+            }
+            if let Some(operation) = operations
+                .iter()
+                .find(|op| op.runtime_id == runtime.runtime_id)
+            {
+                if let OperationStage::Finished(StoredOutcome::Launched { identity, .. }) =
+                    &operation.stage
+                    && Some(operation.generation) == managed_generation
+                    && operation.session_id == runtime.session_id
+                    && operation.target == runtime.tmux_name
+                    && identity.session == *session
+                    && identity.window == *window
+                    && identity.pane == runtime.pane_id
+                    && let Ok(observed) = self.observe(operation).await
+                    && observed.identity == *identity
+                    && observed.runtime.pane_pid == runtime.pane_pid
+                    && observed.runtime.exited == runtime.exited
+                {
+                    *runtime = observed.runtime;
                 }
+            } else if self.corroborate_legacy(runtime, proof).await.is_ok() {
+                runtime.origin = RuntimeOrigin::Legacy;
             }
         }
-        Ok(runtimes)
+        Ok(rows.into_iter().map(|(runtime, _)| runtime).collect())
+    }
+
+    async fn corroborate_legacy(&self, runtime: &Runtime, scope: &str) -> Result<()> {
+        let pane = &runtime.pane_id;
+        let session = format!("={}", runtime.tmux_name);
+        let output = self
+            .command(&[
+                "display-message",
+                "-p",
+                "-t",
+                pane,
+                INVENTORY_PANE_FORMAT,
+                ";",
+                "show-environment",
+                "-s",
+                "-t",
+                &session,
+                ";",
+                "show-options",
+                "-p",
+                "-t",
+                pane,
+                ";",
+                "display-message",
+                "-p",
+                "-t",
+                pane,
+                INVENTORY_PANE_FORMAT,
+            ])
+            .await?;
+        let mut lines = output.lines();
+        let before = lines.next().context("Missing inventory pane proof")?;
+        let after = lines
+            .next_back()
+            .context("Incomplete inventory pane proof")?;
+        let fields: Vec<_> = before.split('|').collect();
+        let expected_pid = runtime.pane_pid.map(|pid| pid.to_string());
+        let expected_dead = if runtime.exited { "1" } else { "0" };
+        ensure!(
+            before == after
+                && fields.len() == 10
+                && fields[..5].join("|") == scope
+                && fields[5] == pane
+                && fields[6] == expected_pid.as_deref().unwrap_or_default()
+                && fields[7] == runtime.tmux_name
+                && fields[8] == expected_dead
+                && fields[9].is_empty()
+                && !lines.any(|line| {
+                    line.starts_with(PANE_OPTION)
+                        || line
+                            .strip_prefix("unset ")
+                            .is_some_and(|name| name.trim_end_matches(';') == NONCE_ENV)
+                        || line
+                            .strip_prefix(NONCE_ENV)
+                            .is_some_and(|rest| rest.starts_with('='))
+                }),
+            "Legacy terminal provenance is uncorroborated"
+        );
+        Ok(())
     }
 
     async fn geometry(&self, runtime_id: Uuid, pane: &str) -> Result<GeometryReadback> {

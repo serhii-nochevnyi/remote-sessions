@@ -12,7 +12,7 @@ export interface RuntimeInfo {
   readonly exited: boolean;
   readonly width: number;
   readonly height: number;
-  readonly origin?: "legacy" | "managed";
+  readonly origin?: "legacy" | "managed" | "unverified";
   readonly workspace_id?: string | null;
   readonly operation_id?: string | null;
 }
@@ -34,6 +34,13 @@ export interface TerminalScope {
     readonly process_start: number;
   };
 }
+export interface TerminalRestoration {
+  readonly previous: TerminalScope;
+  readonly agent_pid: number;
+  readonly session_id: string;
+  readonly operation_id: string | null;
+}
+export type TerminalAttachOptions = { readonly observer: true } | { readonly restoration: TerminalRestoration };
 export interface CommittedGeometry {
   readonly size: TerminalSize;
   readonly revision: number;
@@ -200,11 +207,11 @@ function integer(value: unknown, min: number, max: number): number {
 export function parseInventory(value: unknown): Inventory {
   const item = record(value);
   if (!Array.isArray(item.runtimes) || item.runtimes.length > 16) throw Error("Некоректний список сесій");
-  const runtimes = item.runtimes.map(parseRuntime);
+  const runtimes = item.runtimes.map(runtime => parseRuntime(runtime, true));
   if (new Set(runtimes.map(r => r.runtime_id)).size !== runtimes.length) throw Error("Повторений runtime ID");
   return { agent_pid: integer(item.agent_pid, 1, 2 ** 31), runtimes };
 }
-function parseRuntime(value: unknown): RuntimeInfo {
+function parseRuntime(value: unknown, inventory = false): RuntimeInfo {
   const runtime = record(value);
   if (typeof runtime.command !== "string" || runtime.command.length > 256 || typeof runtime.exited !== "boolean") throw Error("Некоректний опис сесії");
   const base = { runtime_id: id(runtime.runtime_id), session_id: id(runtime.session_id), command: runtime.command,
@@ -213,7 +220,10 @@ function parseRuntime(value: unknown): RuntimeInfo {
     ...(runtime.pane_id === undefined ? {} : { pane_id: tmuxId(runtime.pane_id, "%") }) };
   if (runtime.origin === undefined) return base;
   if (runtime.origin === "managed") {
-    return { ...base, origin: "managed", workspace_id: id(runtime.workspace_id), operation_id: id(runtime.operation_id) };
+    if (inventory && runtime.workspace_id === null && runtime.operation_id === null) {
+      return { ...base, origin: "unverified", workspace_id: null, operation_id: null };
+    }
+    return { ...base, origin: "managed", workspace_id: scopeId(runtime.workspace_id), operation_id: scopeId(runtime.operation_id) };
   }
   if (runtime.origin === "legacy" && runtime.workspace_id === null && runtime.operation_id === null) {
     return { ...base, origin: "legacy", workspace_id: null, operation_id: null };
@@ -301,10 +311,71 @@ interface TerminalPasteCallbacks {
 }
 interface TerminalViewCallbacks {
   input(view: string, data: number[], incarnation: string): Promise<void>;
+  inputEligible?(): boolean;
   paste?: TerminalPasteCallbacks;
   inputFailure(error?: unknown): void;
+  grantRejected?(): void;
   retire(view: string | null): void;
   reconnect(error: unknown): void;
+}
+
+class StaleNativeInput extends Error {
+  #viewId: string;
+  #incarnation: string;
+
+  constructor(viewId: string, incarnation: string) {
+    super("Керування змінилося");
+    this.#viewId = viewId;
+    this.#incarnation = incarnation;
+  }
+
+  matches(viewId: string, incarnation: string) {
+    return this.#viewId === viewId && this.#incarnation === incarnation;
+  }
+}
+
+function isStaleNativeInput(error: unknown, viewId: string): boolean {
+  try {
+    const value = record(error);
+    expectKeys(value, "reason", "view_id", "rejection_id", "event_time_us");
+    const rejection = scopeId(value.rejection_id);
+    return value.reason === "stale_input" && scopeId(value.view_id) === viewId &&
+      rejection !== viewId && rejection[14] === "4" && /^[89ab]$/.test(rejection[19] ?? "") &&
+      integer(value.event_time_us, 1, Number.MAX_SAFE_INTEGER) > 0;
+  } catch {
+    return false;
+  }
+}
+
+export class TerminalDelivery {
+  private pending = 0;
+  private ordinaryIssue: string | undefined;
+  private pasteHold: "stageStopped" | "unknown" | undefined;
+  onChange: (() => void) | undefined;
+
+  get inputIssue() { return this.ordinaryIssue; }
+  get pasteIssue() { return this.pasteHold; }
+  get held() { return this.ordinaryIssue !== undefined || this.pasteHold !== undefined; }
+  get mayRestore() { return this.pending === 0 && !this.held; }
+
+  begin() {
+    this.pending++;
+    return () => {
+      this.pending--;
+      if (this.pending === 0) this.onChange?.();
+    };
+  }
+
+  holdInput(error: unknown) {
+    this.ordinaryIssue ??= typeof error === "string" || error instanceof Error ? String(error) : "";
+    this.onChange?.();
+  }
+
+  holdPaste(issue: "stageStopped" | "unknown") {
+    if (this.pasteHold === issue) return;
+    this.pasteHold = issue;
+    this.onChange?.();
+  }
 }
 
 export class TerminalViewScope {
@@ -315,6 +386,7 @@ export class TerminalViewScope {
   private eligibilityVersion = 0;
   private inputFailed = false;
   private incarnation: string | undefined;
+  private readonly rejectedIncarnations = new Set<string>();
   private completion: PasteCompletion | undefined;
   private admission: PasteAdmission | undefined;
   private pasteIssue: PasteIssue | undefined;
@@ -327,20 +399,26 @@ export class TerminalViewScope {
   private operation = 0;
   private pendingBytes = 0;
   private inputChain = Promise.resolve();
-  private readonly pendingInput = new Set<{ bytes: Uint8Array | null }>();
+  private readonly pendingInput = new Set<{ bytes: Uint8Array | null; incarnation: string }>();
 
   private readonly callbacks: TerminalViewCallbacks;
+  private readonly delivery: TerminalDelivery;
 
-  constructor(callbacks: TerminalViewCallbacks) { this.callbacks = callbacks; }
+  constructor(callbacks: TerminalViewCallbacks, delivery = new TerminalDelivery()) {
+    this.callbacks = callbacks;
+    this.delivery = delivery;
+  }
 
   get viewId() { return this.attached; }
   get active() { return !this.retired; }
   get canWrite() {
-    return this.active && this.inputEligible && this.writable && this.incarnation !== undefined && !this.inputFailed && !this.pasteHeld;
+    return this.active && this.inputEligible && this.writable && this.incarnation !== undefined &&
+      !this.rejectedIncarnations.has(this.incarnation) && !this.inputFailed && !this.delivery.held &&
+      (this.callbacks.inputEligible?.() ?? true);
   }
   get pasteMessage() {
     return this.pasteIssue ? pasteIssueText[this.pasteIssue]
-      : this.pasteHeld ? pasteIssueText.unknown
+      : this.delivery.pasteIssue ? pasteIssueText[this.delivery.pasteIssue]
       : this.admission === "unavailable" ? pasteIssueText.unavailable : undefined;
   }
 
@@ -391,15 +469,15 @@ export class TerminalViewScope {
 
   async consume(view: string, chunk: Chunk, render: () => Promise<void>): Promise<boolean> {
     if (!this.owns(view)) return false;
-    if (chunk.paste_admission === "prior_send_unknown") this.holdPaste();
+    if (chunk.paste_admission === "prior_send_unknown" && this.delivery.pasteIssue === undefined) this.holdPaste("unknown");
     if (samePaste(chunk.paste_completion, this.acknowledgedPaste)) {
       await render();
       return this.owns(view);
     }
     const snapshot = ++this.snapshot;
     const eligibility = this.eligibilityVersion;
-    const writable = chunk.writable
-      && (chunk.paste_incarnation === undefined || chunk.paste_incarnation !== this.endedPasteIncarnation);
+    const writable = chunk.writable && (chunk.paste_incarnation === undefined ||
+      (chunk.paste_incarnation !== this.endedPasteIncarnation && !this.rejectedIncarnations.has(chunk.paste_incarnation)));
     const incarnation = writable ? chunk.paste_incarnation : undefined;
     if (this.pendingPaste && (
       (incarnation && incarnation !== this.pendingPaste.incarnation)
@@ -424,26 +502,30 @@ export class TerminalViewScope {
 
   private failInput(error?: unknown) {
     this.inputFailed = true;
+    this.writeGeneration++;
+    for (const frame of this.pendingInput) frame.bytes = null;
     this.callbacks.inputFailure(error);
   }
 
-  private holdPaste() {
+  private holdPaste(issue: "stageStopped" | "unknown") {
+    this.delivery.holdPaste(issue);
     if (this.pasteHeld) return;
     this.pasteHeld = true;
     this.writeGeneration++;
     this.pasteIssue = undefined;
+    for (const frame of this.pendingInput) frame.bytes = null;
   }
 
   private showPaste(issue?: PasteIssue) {
-    if (issue === "stageStopped" || issue === "unknown") this.holdPaste();
-    else if (this.pasteHeld) return;
+    if (issue === "stageStopped" || issue === "unknown") this.holdPaste(issue);
+    else if (this.delivery.pasteIssue) return;
     this.pasteIssue = issue;
     this.callbacks.paste?.changed();
   }
 
-  private enqueue(data: Uint8Array, work: (frame: { bytes: Uint8Array | null }) => Promise<void>) {
+  private enqueue(data: Uint8Array, incarnation: string, work: (frame: { bytes: Uint8Array | null }) => Promise<void>) {
     const length = data.length;
-    const frame = { bytes: data };
+    const frame = { bytes: data, incarnation };
     this.pendingBytes += length;
     this.pendingInput.add(frame);
     this.inputChain = this.inputChain.then(() => work(frame)).finally(() => {
@@ -464,15 +546,28 @@ export class TerminalViewScope {
     const generation = this.writeGeneration;
     const live = () => this.owns(view) && this.canWrite && this.incarnation === incarnation
       && this.writeGeneration === generation;
-    return this.enqueue(data, async frame => {
-      try {
-        if (!frame.bytes) return;
-        for (const { bytes } of terminalInputChunks(frame.bytes)) {
-          if (!live()) return;
+    return this.enqueue(data, incarnation, async frame => {
+      if (!frame.bytes) return;
+      for (const { bytes } of terminalInputChunks(frame.bytes)) {
+        if (!live()) return;
+        const finish = this.delivery.begin();
+        try {
           await this.callbacks.input(view, Array.from(bytes), incarnation);
+        } catch (error) {
+          if (error instanceof StaleNativeInput && error.matches(view, incarnation)) {
+            this.rejectedIncarnations.add(incarnation);
+            for (const queued of this.pendingInput) {
+              if (queued.incarnation === incarnation) queued.bytes = null;
+            }
+            if (this.owns(view)) this.callbacks.grantRejected?.();
+          } else {
+            this.delivery.holdInput(error);
+            if (this.owns(view)) this.failInput(error);
+          }
+          return;
+        } finally {
+          finish();
         }
-      } catch (error) {
-        if (live()) this.failInput(error);
       }
     });
   }
@@ -494,12 +589,16 @@ export class TerminalViewScope {
     const generation = this.writeGeneration;
     const live = () => this.owns(viewId) && this.canWrite && this.incarnation === incarnation
       && this.writeGeneration === generation;
-    return this.enqueue(data, async frame => {
+    return this.enqueue(data, incarnation, async frame => {
       let submitted = false;
-      const issue = (result: PasteIssue) => { if (this.owns(viewId)) this.showPaste(result); };
+      if (!frame.bytes) return;
+      if (!live()) { this.showPaste("stale"); return; }
+      const finish = this.delivery.begin();
+      const issue = (result: PasteIssue) => {
+        if (this.owns(viewId)) this.showPaste(result);
+        else if (result === "stageStopped" || result === "unknown") this.delivery.holdPaste(result);
+      };
       try {
-        if (!frame.bytes) return;
-        if (!live()) { issue("stale"); return; }
         this.showPaste();
         for (const { offset, bytes } of terminalInputChunks(frame.bytes)) {
           if (!live()) { issue("stale"); return; }
@@ -515,16 +614,19 @@ export class TerminalViewScope {
         submitted = true;
         this.pendingPaste = gesture;
         const result = await paste.commit(gesture, frame.bytes.length);
-        if (!this.owns(viewId)) return;
         if (result.result !== "committed") {
           issue(result.result === "stale" || result.result === "invalid" || result.result === "unavailable"
             ? result.result : "unknown");
           return;
         }
+        if (!this.owns(viewId) || this.callbacks.inputEligible?.() === false) { issue("unknown"); return; }
         // @invariant: The exact receipt permits Ack after a read-only sample, even when completion polling lags.
         if (this.pendingPaste !== gesture) { issue("unknown"); return; }
         const ack = await paste.ack(gesture, result.receipt);
-        if (!this.owns(viewId)) return;
+        if (!this.owns(viewId)) {
+          if (ack.result !== "acknowledged") issue("unknown");
+          return;
+        }
         if (ack.result !== "acknowledged") { issue("unknown"); return; }
         this.acknowledgedPaste = gesture;
         if (ack.writable && this.pendingPaste === gesture
@@ -547,6 +649,7 @@ export class TerminalViewScope {
         issue(submitted ? "unknown" : "unavailable");
       } finally {
         if (this.pendingPaste === gesture) this.pendingPaste = undefined;
+        finish();
       }
     });
   }
@@ -789,7 +892,8 @@ export const localClient = {
     parseCreateStatus(await invoke<unknown>("local_create_status", reference ? { reference } : {})),
   acknowledgeCreate: async (reference: string) =>
     parseCreateStatus(await invoke<unknown>("local_create_status", { reference, presented: true })),
-  attach: async (runtimeId: string) => parseLiveAttachment(await invoke<unknown>("terminal_attach", { runtimeId })),
+  attach: async (runtimeId: string, options?: TerminalAttachOptions) =>
+    parseLiveAttachment(await invoke<unknown>("terminal_attach", { runtimeId, ...options })),
   read: async (viewId: string) => parseChunk(await invoke<unknown>("terminal_read", { viewId })),
   terminalStatus: async (viewId: string): Promise<TerminalStatus> =>
     parseTerminalStatus(await invoke<unknown>("terminal_status", { viewId })),
@@ -798,7 +902,12 @@ export const localClient = {
   acknowledgeGrid: async (viewId: string, acknowledgement: GridAcknowledgement) =>
     parseGeometryEvent(await invoke<unknown>("terminal_acknowledge_grid", { viewId, acknowledgement })),
   input: async (input: { viewId: string; data: readonly number[]; incarnation: string }) => {
-    await invoke("terminal_input", input);
+    try {
+      await invoke("terminal_input", input);
+    } catch (error) {
+      if (isStaleNativeInput(error, input.viewId)) throw new StaleNativeInput(input.viewId, input.incarnation);
+      throw error;
+    }
   },
   pasteStage: async (gesture: PasteGesture, offset: number, data: number[]) =>
     parsePasteResult(await invoke("terminal_paste_stage", { ...gesture, offset, data })),
