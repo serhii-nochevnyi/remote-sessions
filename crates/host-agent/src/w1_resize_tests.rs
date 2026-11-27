@@ -900,9 +900,16 @@ async fn start_custody_agent(fixture: &Fixture) -> tokio::task::JoinHandle<Resul
     agent
 }
 
-async fn stop_custody_agent(agent: tokio::task::JoinHandle<Result<()>>) {
+async fn stop_custody_agent(root: &Path, agent: tokio::task::JoinHandle<Result<()>>) {
     agent.abort();
     assert!(agent.await.unwrap_err().is_cancelled());
+    crate::w1_create_tests::wait_lock_release(
+        &root.join("agent.lock"),
+        Duration::from_secs(3),
+        || {},
+    )
+    .await
+    .expect("custody fixture agent lock did not release");
 }
 
 #[tokio::test]
@@ -1033,7 +1040,7 @@ async fn w1_resize_production_paste_custody_survives_pane_loss_and_agent_restart
     let (successor, _) = acquire(before_restart.clone()).await;
     assert_ne!(successor, token);
     assert_held().await;
-    stop_custody_agent(agent).await;
+    stop_custody_agent(root, agent).await;
 
     let agent = start_custody_agent(&fixture).await;
     let restarted = open().await;
@@ -1103,7 +1110,7 @@ async fn w1_resize_production_paste_custody_survives_pane_loss_and_agent_restart
     ] {
         assert!(!root.join(file).exists(), "{file}");
     }
-    stop_custody_agent(agent).await;
+    stop_custody_agent(root, agent).await;
 }
 
 #[cfg(debug_assertions)]
