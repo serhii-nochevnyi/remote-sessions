@@ -63,13 +63,20 @@ case "$4" in
           printf '42|100|%s|%s\n' "$next_token" "$row"
           exit 0
         fi
-        nonce=$(cat "$name.nonce")
-        stamp=$(cat "$name.stamp")
+        if test "$8" = '#{@rs_create_initializer}|#{@rs_create_birth}'; then
+          printf '%s|%s\n' "$(option_value "$name.initializer")" "$(option_value "$name.birth")"
+          exit 0
+        fi
+        nonce=$(option_value "$name.nonce")
+        stamp=$(option_value "$name.stamp")
+        proof=""
+        if test -n "$stamp"; then proof="$nonce:$stamp"; fi
         epoch=$(cat epoch 2>/dev/null || :)
         launch=$(cat paste-launch 2>/dev/null || :)
         marker=$(cat marker 2>/dev/null || :)
-        printf '42|100|%s|%s|%s|0|0|%s:%s|%s|1|1|manual|%s|100|30|100|30|%s||%s|%s|0|1\n' \
-          "$token" "$(cat "$name.pane")" "$name" "$nonce" "$stamp" "$(cat "$name.dead")" \
+        case "$launch" in ??????????????8*) launch="$launch~$(option_value "$name.birth")" ;; esac
+        printf '42|100|%s|%s|%s|0|0|%s|%s|1|1|manual|%s|100|30|100|30|%s||%s|%s|0|1\n' \
+          "$token" "$(cat "$name.pane")" "$name" "$proof" "$(cat "$name.dead")" \
           "$(cat tty)" "$epoch" "$launch" "$marker"
         exit 0
       done
@@ -148,6 +155,47 @@ case "$4" in
         'set-option -p -o -t '*' @rs_paste_launch '*)
           printf '%s\n' "$9" | awk '{print $7}' > paste-launch
           printf '%s\n' "$9" | awk '{for(i=1;i<NF;i++) if ($i=="@rs_paste_admission") print $(i+1)}' > marker ;;
+        'set-option -p -t '*' @rs_create_birth '*)
+          guard=$8
+          target=$7
+          for name in $(cat names); do
+            IFS='|' read -r session window pane pid < "$name.pane"
+            if test "$pane" != "$target"; then continue; fi
+            init=$(cat "$name.initializer")
+            birth=$(cat "$name.birth")
+            nonce=$(cat "$name.nonce")
+            stamp=$(cat "$name.stamp")
+            guard_equals pid 42 && guard_equals start_time 100 &&
+              guard_equals @rs_create_generation "$token" && guard_equals session_name "$name" &&
+              guard_equals session_id "$session" && guard_equals window_id "$window" &&
+              guard_equals pane_id "$pane" && guard_equals pane_pid "$pid" &&
+              guard_equals pane_tty "$(cat tty)" && guard_equals pane_input_off 0 &&
+              guard_equals @rs_create_nonce "$nonce:$stamp" && guard_equals pane_dead 0 &&
+              guard_equals @rs_create_initializer "$init" && guard_equals @rs_create_birth "$birth" &&
+              guard_equals @rs_resize_epoch "$(option_value epoch)" &&
+              guard_equals @rs_paste_launch "$(option_value paste-launch)" &&
+              guard_equals @rs_paste_admission "$(option_value marker)" &&
+              guard_equals session_windows 1 && guard_equals window_panes 1 &&
+              guard_equals window_index 0 && guard_equals pane_index 0 &&
+              guard_equals window-size manual &&
+              guard_equals version 3.8 && guard_equals socket_path "$3" || exit 0
+            for hook in after-if-shell after-load-buffer after-save-buffer after-paste-buffer after-delete-buffer after-send-keys after-set-option after-display-message after-resize-window command-error; do
+              guard_equals "$hook" "" || exit 0
+            done
+            case "$birth" in "$init~"*) ;; *) exit 1 ;; esac
+            set -f
+            set -- $9
+            test "$#" = 20
+            test "$1 $2 $3 $4 $5 $6" = "set-option -p -t $pane @rs_create_birth 'used~$birth'"
+            test "$7 $8 $9 ${10} ${11} ${12}" = "; set-option -po -t $pane @rs_paste_launch"
+            test "${14} ${15} ${16} ${17} ${18} ${19}" = "; set-option -po -t $pane @rs_paste_admission"
+            test ! -e paste-launch && test ! -e marker
+            printf 'used~%s\n' "$birth" > "$name.birth"
+            printf '%s\n' "${13}" > paste-launch
+            printf '%s\n' "${20}" > marker
+            exit 0
+          done
+          exit 1 ;;
         'set-option -p '*' @rs_resize_epoch '*)
           printf '%s\n' "$9" | awk '{for(i=1;i<NF;i++) if ($i=="@rs_resize_epoch") print $(i+1)}' > epoch
           printf '%s\n' "$9" | awk '{for(i=1;i<NF;i++) if ($i=="@rs_paste_admission") print $(i+1)}' > marker
@@ -168,16 +216,39 @@ case "$4" in
         printf '%s\n' "$7" | awk '{print $4}' > generation ;;
       'new-session '*)
         branch=$7
+        guard=$6
         name=$(printf '%s\n' "$branch" | awk '{for(i=1;i<NF;i++) if ($i=="-s") {print $(i+1); exit}}')
         nonce=$(printf '%s\n' "$branch" | awk '{for(i=1;i<=NF;i++) if ($i~/^RS_CREATE_NONCE=/) {sub(/^RS_CREATE_NONCE=/,"",$i); print $i; exit}}')
-        case "$6" in *"$token"*) ;; *) exit 0 ;; esac
+        if test -f roll-generation-at-spawn; then
+          cat roll-generation-at-spawn > generation
+          token=$(cat generation)
+        fi
+        guard_equals pid 42 && guard_equals start_time 100 &&
+          guard_equals @rs_create_generation "$token" || exit 0
+        for hook in after-if-shell after-new-session session-created session-window-changed window-linked window-layout-changed after-set-environment after-set-option command-error; do
+          guard_equals "$hook" "" || exit 1
+        done
+        test ! -e "$name.pane" || exit 1
         test -n "$name"
-        test -n "$nonce"
+        if test -z "$nonce"; then
+          case "$branch" in *" -- /usr/bin/env "*" ; set-option -t =$name:0.0 @rs_command "*) ;; *) exit 1 ;; esac
+          printf '%s\n' "$name" >> diagnostic-dispatched
+          printf '%s\n' "$name" >> names
+          printf '$99|@99|%%99|299\n' > "$name.pane"
+          printf '0\n' > "$name.dead"
+          cat "$name.pane"
+          exit 0
+        fi
+        ticket=$(printf '%s\n' "$branch" | awk '{for(i=1;i<=NF;i++) if ($i~/^RS_CREATE_TICKET=/) {sub(/^RS_CREATE_TICKET=/,"",$i); print $i; exit}}')
         stamp_format='#{session_id}:#{window_id}:#{pane_id}:#{pane_pid}'
+        init_format='#{session_id}~#{window_id}~#{pane_id}~#{pane_pid}'
+        prefix=$(printf '%s\n' "$branch" | awk -F"'" '{print $4}')
         case "$branch" in
-          *"__managed-launch "*" ; set-option -Fp -t =$name:0.0 @rs_create_nonce '$nonce:$stamp_format' ; set-option -p -t =$name:0.0 @rs_command codex") ;;
+          *"__managed-launch "*" ; set-environment -r -t =$name RS_CREATE_TICKET ; set-option -Fpo -t =$name:0.0 @rs_create_initializer '$prefix' ; set-option -Fpo -t =$name:0.0 @rs_create_nonce '$nonce:$stamp_format' ; set-option -p -t =$name:0.0 @rs_command codex") ;;
           *) exit 1 ;;
         esac
+        prefix=${prefix%"$init_format"}
+        case "$prefix" in "v1~42~100~$token~"*"~$nonce~$ticket~") ;; *) exit 1 ;; esac
         printf '%s %s\n' "$name" "$nonce" >> dispatched
         mode=normal
         if test -f mode; then mode=$(cat mode); fi
@@ -185,11 +256,13 @@ case "$4" in
         count=$(wc -l < dispatched | tr -d ' ')
         slot=$(option_value pane-slot)
         if test -z "$slot"; then slot=$count; fi
-        printf '%s\n' "$name" >> names
+        if test "$mode" != hidden; then printf '%s\n' "$name" >> names; fi
         printf '%s\n' "$nonce" > "$name.nonce"
         pid=$((300 + count))
         if test -f pane-pid; then pid=$(cat pane-pid); fi
         printf '$%s|@%s|%%%s|%s\n' "$slot" "$slot" "$slot" "$pid" > "$name.pane"
+        init="$prefix$(tr '|' '~' < "$name.pane")"
+        printf '%s\n' "$init" > "$name.initializer"
         tr '|' ':' < "$name.pane" > "$name.stamp"
         printf '0\n' > "$name.dead"
         receipt=$(cat "$name.pane")
@@ -197,7 +270,26 @@ case "$4" in
           printf '1\n' > "$name.dead"
           printf '%s|\n' "${receipt%|*}" > "$name.pane"
         fi
-        if test "$mode" = effect-lost; then exit 1; fi
+        if test -f birth-device && test "$mode" != exited; then
+          capsule=$(printf '%s\n' "$branch" | awk '{for(i=1;i<NF;i++) if ($i=="__managed-launch") {print $(i+1); exit}}')
+          python3 - "$capsule" "$token" "$name" "$init" "$nonce" "$ticket" "$PWD" <<'PY'
+import json
+from pathlib import Path
+import sys
+import uuid
+encoded, token, name, init, nonce, ticket, root = sys.argv[1:]
+capsule = json.loads(bytes.fromhex(encoded))
+birth = capsule["birth"]
+assert capsule["nonce"] == nonce and birth["ticket"] == ticket and uuid.UUID(ticket).version == 4
+assert birth["server"] == {"pid": 42, "start": 100, "token": token}
+assert name == "rs_" + uuid.UUID(birth["session"]).hex + "_" + uuid.UUID(birth["runtime"]).hex
+assert init.split("~")[4:8] == [birth["operation"], birth["runtime"], nonce, ticket]
+assert Path(capsule["service_state"]) == Path(root) and Path(birth["tmux"]) == Path(root) / "tmux"
+PY
+          test ! -e "$name.birth"
+          printf '%s~%s\n' "$init" "$(cat birth-device)" > "$name.birth"
+        fi
+        if test "$mode" = effect-lost || test "$mode" = hidden; then exit 1; fi
         printf '%s\n' "$receipt" ;;
       *) exit 1 ;;
     esac ;;
@@ -222,6 +314,17 @@ case "$4" in
       esac
       printf '\n'
     done ;;
+  new-session)
+    test "$1" = -N && test "$2" = -S
+    test "$5 $6 $7 ${9}" = "-d -P -F -s"
+    name=${10}
+    printf '%s\n' "$name" >> diagnostic-dispatched
+    printf '%s\n' "$name" >> names
+    printf '$99|@99|%%99|299\n' > "$name.pane"
+    printf '0\n' > "$name.dead"
+    cat "$name.pane" ;;
+  set-option)
+    test "$5" = -t && test "$7" = @rs_command ;;
   list-commands)
     printf 'paste-buffer [-dprS]\nload-buffer path\n' ;;
   save-buffer)
@@ -398,6 +501,22 @@ impl Fixture {
         (buffers, deletions)
     }
 
+    fn birth_device(&self, tty: &str) {
+        let device = fs::metadata(tty).unwrap();
+        let start = crate::engine::launch_fixture_process_start(std::process::id()).unwrap();
+        self.set("tty", tty);
+        self.set("pane-pid", std::process::id().to_string());
+        self.set(
+            "birth-device",
+            format!(
+                "{start}~{tty}~{}~{}~{}",
+                device.dev(),
+                device.ino(),
+                device.rdev()
+            ),
+        );
+    }
+
     async fn register(&self) -> Uuid {
         let ProductResponse::WorkspaceRegistered { workspace } = product_request(
             &self.root,
@@ -544,6 +663,239 @@ fn create(key: Uuid, workspace_id: Uuid, reservation: Option<Uuid>) -> ProductRe
     }
 }
 
+fn diagnostic_create(fixture: &Fixture, session_id: Uuid, runtime_id: Uuid) -> Request {
+    Request::Create {
+        session_id,
+        runtime_id,
+        cwd: fixture.workspace.clone(),
+        argv: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+    }
+}
+
+fn seed_visible(fixture: &Fixture, count: usize) -> Vec<String> {
+    let mut names = Vec::new();
+    for slot in 30..30 + count {
+        let name = tmux_name(Uuid::new_v4(), Uuid::new_v4());
+        fixture.set(
+            &format!("{name}.pane"),
+            format!("${slot}|@{slot}|%{slot}|{slot}\n"),
+        );
+        fixture.set(&format!("{name}.dead"), "0\n");
+        names.push(name);
+    }
+    fixture.set(
+        "names",
+        names
+            .iter()
+            .map(|name| format!("{name}\n"))
+            .collect::<String>(),
+    );
+    names
+}
+
+#[tokio::test]
+async fn w1_create_shared_capacity_keeps_original_reservation_and_deduplicates_visible_marks() {
+    for already_visible in [false, true] {
+        let fixture = Fixture::new();
+        let lane = fixture.lane().await;
+        let job = fixture.serve(lane.clone()).await;
+        let workspace = fixture.register().await;
+        let names = seed_visible(&fixture, if already_visible { 14 } else { 15 });
+        fixture.set(
+            "mode",
+            if already_visible {
+                "effect-lost"
+            } else {
+                "hidden"
+            },
+        );
+        let key = Uuid::new_v4();
+        let create = create(key, workspace, None);
+        assert!(matches!(
+            fixture.call(&create).await,
+            CreateState::Unknown { .. }
+        ));
+        let original = lane
+            .run(move |db, _| Ok(db.operation(key)?.unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(original.stage, OperationStage::Marked);
+        let command = diagnostic_create(&fixture, Uuid::new_v4(), Uuid::new_v4());
+        let response = request(&fixture.root, &command).await.unwrap();
+        if already_visible {
+            assert!(matches!(response, Response::Created { .. }), "{response:?}");
+            assert!(fixture.root.join("diagnostic-dispatched").exists());
+        } else {
+            assert!(
+                matches!(response, Response::Error { message } if message.contains("limit is 16"))
+            );
+            assert!(!fixture.root.join("diagnostic-dispatched").exists());
+            fixture.set(
+                "names",
+                names
+                    .iter()
+                    .chain(std::iter::once(&original.target))
+                    .map(|name| format!("{name}\n"))
+                    .collect::<String>(),
+            );
+        }
+        let recovered = fixture.status(key).await;
+        let CreateState::Confirmed {
+            outcome,
+            current: PaneLiveness::Live,
+            ..
+        } = &recovered
+        else {
+            panic!("original creation did not settle: {recovered:?}");
+        };
+        assert_eq!(outcome.runtime.session_id, original.session_id);
+        assert_eq!(outcome.runtime.runtime_id, original.runtime_id);
+        assert_eq!(outcome.runtime.operation_id, Some(original.id));
+        assert_eq!(fixture.call(&create).await, recovered);
+        let Response::Runtimes { runtimes } =
+            request(&fixture.root, &Request::List {}).await.unwrap()
+        else {
+            panic!("expected capacity-bounded inventory");
+        };
+        assert_eq!(runtimes.len(), 16);
+        assert_eq!(fixture.dispatches(), 1);
+        stop(job).await;
+    }
+}
+
+#[tokio::test]
+async fn w1_create_generation_rollover_at_dispatch_cannot_spawn_through_either_route() {
+    for managed in [false, true] {
+        let fixture = Fixture::new();
+        let job = fixture.serve(fixture.lane().await).await;
+        let workspace = fixture.register().await;
+        let names = seed_visible(&fixture, 1);
+        let before = fs::read(fixture.root.join(format!("{}.pane", names[0]))).unwrap();
+        let generation = Uuid::new_v4().to_string();
+        fixture.set("generation", Uuid::new_v4().to_string());
+        fixture.set("roll-generation-at-spawn", &generation);
+        if managed {
+            let key = Uuid::new_v4();
+            let command = create(key, workspace, None);
+            assert!(matches!(
+                fixture.call(&command).await,
+                CreateState::Unknown { .. }
+            ));
+            assert!(matches!(
+                fixture.status(key).await,
+                CreateState::Unknown { .. }
+            ));
+        } else {
+            let command = diagnostic_create(&fixture, Uuid::new_v4(), Uuid::new_v4());
+            assert!(matches!(request(&fixture.root, &command).await.unwrap(),
+                    Response::Error { message } if message.contains("admitted generation")));
+        }
+        assert_eq!(fixture.dispatches(), 0);
+        assert!(!fixture.root.join("diagnostic-dispatched").exists());
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("generation")).unwrap(),
+            generation
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("names")).unwrap(),
+            format!("{}\n", names[0])
+        );
+        assert_eq!(
+            fs::read(fixture.root.join(format!("{}.pane", names[0]))).unwrap(),
+            before
+        );
+        stop(job).await;
+    }
+}
+
+#[tokio::test]
+async fn w1_create_admission_rejects_duplicate_ids_and_overflow_but_ignores_foreign_marks() {
+    let fixture = Fixture::new();
+    let lane = fixture.lane().await;
+    let job = fixture.serve(lane).await;
+    let workspace = fixture.register().await;
+    let names = seed_visible(&fixture, 15);
+    fixture.set("mode", "hidden");
+    assert!(matches!(
+        fixture.call(&create(Uuid::new_v4(), workspace, None)).await,
+        CreateState::Unknown { .. }
+    ));
+    fixture.set("generation", Uuid::new_v4().to_string());
+    let (session, runtime) = crate::model::parse_name(&names[0]).unwrap();
+    for (session, runtime) in [(session, Uuid::new_v4()), (Uuid::new_v4(), runtime)] {
+        assert!(
+            matches!(request(&fixture.root, &diagnostic_create(&fixture, session, runtime)).await.unwrap(),
+                Response::Error { message } if message.contains("already exists"))
+        );
+    }
+    assert!(!fixture.root.join("diagnostic-dispatched").exists());
+    assert!(matches!(
+        request(
+            &fixture.root,
+            &diagnostic_create(&fixture, Uuid::new_v4(), Uuid::new_v4())
+        )
+        .await
+        .unwrap(),
+        Response::Created { .. }
+    ));
+    seed_visible(&fixture, 17);
+    assert_eq!(
+        fixture.call(&create(Uuid::new_v4(), workspace, None)).await,
+        CreateState::Failed {
+            issue: ProductIssue::RuntimeLimit
+        }
+    );
+    let dispatches = fs::read(fixture.root.join("diagnostic-dispatched")).unwrap();
+    assert!(matches!(
+        request(
+            &fixture.root,
+            &diagnostic_create(&fixture, Uuid::new_v4(), Uuid::new_v4())
+        )
+        .await
+        .unwrap(),
+        Response::Error { .. }
+    ));
+    assert_eq!(
+        fs::read(fixture.root.join("diagnostic-dispatched")).unwrap(),
+        dispatches
+    );
+    assert_eq!(fixture.dispatches(), 1);
+    stop(job).await;
+}
+
+#[tokio::test]
+async fn w1_create_catalog_free_diagnostic_uses_visible_capacity() {
+    let fixture = Fixture::new();
+    seed_visible(&fixture, 15);
+    let job = FixtureServer(tokio::spawn(serve_local(
+        fixture.engine(),
+        Arc::new(AgentLock::acquire(&fixture.root).unwrap()),
+        None,
+    )));
+    fixture.wait_listening(&job).await;
+    for expected_created in [true, false] {
+        let response = request(
+            &fixture.root,
+            &diagnostic_create(&fixture, Uuid::new_v4(), Uuid::new_v4()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            matches!(response, Response::Created { .. }),
+            expected_created,
+            "{response:?}"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("diagnostic-dispatched"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    stop(job).await;
+}
+
 #[tokio::test]
 async fn w1_create_restart_waits_for_agent_lock() {
     let fixture = Fixture::new();
@@ -605,8 +957,7 @@ async fn w1_create_guarded_paste_probe() {
 
     let fixture = Fixture::new();
     let (_master, _slave, tty) = observation_pty();
-    fixture.set("tty", tty);
-    fixture.set("pane-pid", std::process::id().to_string());
+    fixture.birth_device(&tty);
     let unrelated = "rs-paste-11111111111111111111111111111111";
     fixture.set(&format!("buffers/{unrelated}"), b"unrelated");
     fixture.set("corrupt-buffer-readback", b"");
@@ -1006,8 +1357,7 @@ async fn w1_create_terminal_status_classifies_first_and_second_sample_replacemen
 async fn w1_create_catalog_fault_read_only() {
     let fixture = Fixture::new();
     let (_master, _slave, tty) = observation_pty();
-    fixture.set("tty", tty);
-    fixture.set("pane-pid", std::process::id().to_string());
+    fixture.birth_device(&tty);
     let local = async |message| request(&fixture.root, &message).await.unwrap();
     let read = |path| fs::read_to_string(fixture.root.join(path)).unwrap();
     let lane = fixture.lane().await;
@@ -1100,6 +1450,11 @@ async fn w1_create_catalog_fault_read_only() {
             issue: Some(ProductIssue::CatalogMissing)
         }
     );
+    assert!(
+        matches!(local(diagnostic_create(&fixture, Uuid::new_v4(), Uuid::new_v4())).await,
+            Response::Error { message } if message == "Creation capacity unavailable: CatalogMissing")
+    );
+    assert!(!fixture.root.join("diagnostic-dispatched").exists());
     let Response::TerminalStatus { status } = local(Request::TerminalStatus {
         terminal: before.terminal.clone(),
     })
@@ -1733,6 +2088,502 @@ async fn w1_create_effect_before_reply_requires_exact_generation_nonce_and_pane(
 }
 
 #[tokio::test]
+async fn w1_create_unproved_or_previously_used_birth_stays_read_only_after_reconciliation() {
+    for mode in [
+        "missing",
+        "used",
+        "other-ticket",
+        "other-generation",
+        "prior-send",
+    ] {
+        let fixture = Fixture::new();
+        let (_master, _slave, tty) = observation_pty();
+        fixture.birth_device(&tty);
+        let job = fixture
+            .serve_engine(fixture.engine().with_fixture_sender(), fixture.lane().await)
+            .await;
+        let workspace = fixture.register().await;
+        let key = Uuid::new_v4();
+        fixture.set("mode", "effect-lost");
+        assert!(matches!(
+            fixture.call(&create(key, workspace, None)).await,
+            CreateState::Unknown { .. }
+        ));
+        let name = fs::read_to_string(fixture.root.join("names")).unwrap();
+        let name = name.trim_end();
+        let file = format!("{name}.birth");
+        let birth = fs::read_to_string(fixture.root.join(&file)).unwrap();
+        let changed = match mode {
+            "missing" => {
+                fs::remove_file(fixture.root.join(&file)).unwrap();
+                None
+            }
+            "used" => Some(format!("used~{}", birth.trim_end())),
+            "other-ticket" | "other-generation" => {
+                let mut fields: Vec<_> = birth.trim_end().split('~').map(str::to_owned).collect();
+                fields[if mode == "other-ticket" { 7 } else { 3 }] = Uuid::new_v4().to_string();
+                Some(fields.join("~"))
+            }
+            "prior-send" => {
+                let fields: Vec<_> = birth.trim_end().split('~').collect();
+                let launch = Uuid::new_v4();
+                let epoch = format!("{}:{}", Uuid::new_v4(), Uuid::new_v4());
+                let paste_nonce = Uuid::new_v4();
+                let buffer = Uuid::new_v4().simple();
+                fixture.set("epoch", &epoch);
+                fixture.set("paste-launch", launch.to_string());
+                fixture.set("marker", format!(
+                    "v1~{}~{}~42~100~1~1~1~{}~{}~{}~{launch}~{epoch}~s~{paste_nonce}~1~rs-paste-{buffer}",
+                    fields[5], fields[3], fields[11], fields[12], fields[6],
+                ));
+                Some(birth.trim_end().to_owned())
+            }
+            _ => unreachable!(),
+        };
+        if let Some(edited) = &changed {
+            fixture.set(&file, edited);
+        }
+        let marker = fs::read(fixture.root.join("marker")).ok();
+        let recovered = fixture.status(key).await;
+        let CreateState::Confirmed {
+            outcome,
+            current: PaneLiveness::Live,
+            ..
+        } = &recovered
+        else {
+            panic!("original pane lost observation in {mode}: {recovered:?}");
+        };
+        let runtime_id = outcome.runtime.runtime_id;
+        let local = async |request_value| request(&fixture.root, &request_value).await.unwrap();
+        let opened = local(Request::OpenTerminal {
+            runtime_id,
+            view_id: Uuid::new_v4(),
+        })
+        .await;
+        let Response::TerminalOpened { status } = opened else {
+            panic!("pane unavailable in {mode}: {opened:?}");
+        };
+        let acquire = local(Request::AcquireTerminal {
+            terminal: status.terminal,
+        })
+        .await;
+        assert!(
+            matches!(acquire, Response::ControlRecovering { .. }),
+            "{mode}: {acquire:?}"
+        );
+        assert!(matches!(
+            local(Request::Input {
+                runtime_id,
+                token: Uuid::new_v4(),
+                sequence: 0,
+                data: b"x".to_vec(),
+                paste: false
+            })
+            .await,
+            Response::Error { .. }
+        ));
+        assert_eq!(fixture.status(key).await, recovered);
+        assert_eq!(fixture.dispatches(), 1);
+        assert_eq!(fs::read(fixture.root.join("marker")).ok(), marker);
+        assert_eq!(fs::read_to_string(fixture.root.join(file)).ok(), changed);
+        for effect in ["inputs", "buffer-loads", "unexpected-terminal-mutations"] {
+            assert!(!fixture.root.join(effect).exists(), "{mode}: {effect}");
+        }
+        stop(job).await;
+    }
+}
+
+#[tokio::test]
+async fn w1_create_collision_aborts_without_stamping_the_existing_pane() {
+    let fixture = Fixture::new();
+    let lane = fixture.lane().await;
+    let job = fixture.serve(lane.clone()).await;
+    let workspace = fixture.register().await;
+    let (key, runtime_id) = fixture.reserve(&lane, workspace).await;
+    let original = lane
+        .run(move |db, _| Ok(db.operation(key)?.unwrap()))
+        .await
+        .unwrap();
+    fixture.set(&format!("{}.pane", original.target), "$4|@4|%4|304\n");
+    let command = create(key, workspace, Some(runtime_id));
+    assert!(matches!(
+        fixture.call(&command).await,
+        CreateState::Unknown { .. }
+    ));
+    assert!(matches!(
+        fixture.status(key).await,
+        CreateState::Unknown { .. }
+    ));
+    assert_eq!(fixture.dispatches(), 0);
+    for option in ["initializer", "birth", "nonce", "stamp"] {
+        assert!(
+            !fixture
+                .root
+                .join(format!("{}.{option}", original.target))
+                .exists()
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(fixture.root.join(format!("{}.pane", original.target))).unwrap(),
+        "$4|@4|%4|304\n"
+    );
+    stop(job).await;
+}
+
+#[cfg(target_os = "macos")]
+struct PrivateCreateTmux {
+    binary: PathBuf,
+    socket: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+impl PrivateCreateTmux {
+    fn command(&self) -> std::process::Command {
+        let mut command = std::process::Command::new(&self.binary);
+        command
+            .args(["-N", "-S"])
+            .arg(&self.socket)
+            .env_remove("TMUX");
+        command
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for PrivateCreateTmux {
+    fn drop(&mut self) {
+        let _ = self.command().arg("kill-server").output();
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn check_real_create_reply_loss(replacement: bool) {
+    use std::process::Command;
+
+    let fixture = Fixture::new();
+    let tmux = PrivateCreateTmux {
+        binary: find_executable("tmux")
+            .expect("tmux 3.8 is required for private launch verification"),
+        socket: fixture.root.join("tmux.sock"),
+    };
+    assert_eq!(
+        Command::new(&tmux.binary)
+            .arg("-V")
+            .output()
+            .unwrap()
+            .stdout,
+        b"tmux 3.8\n"
+    );
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/tmux.conf");
+    let started = Command::new(&tmux.binary)
+        .arg("-f")
+        .arg(config)
+        .arg("-S")
+        .arg(&tmux.socket)
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            "canary",
+            "--",
+            "/bin/sleep",
+            "75",
+        ])
+        .env_remove("TMUX")
+        .output()
+        .unwrap();
+    assert!(started.status.success(), "{started:?}");
+    tests::fixture_program(
+        &fixture.root.join("tmux"),
+        &format!(
+            "#!/bin/sh\nset -eu\ncase \"${{7-}}\" in\n  'new-session '*' __managed-launch '*)\n    '{bin}' \"$@\" > '{root}/real-receipt'\n    printf 'spawned\\n' >> '{root}/real-spawns'\n    exit 1 ;;\nesac\nexec '{bin}' \"$@\"\n",
+            bin = tmux.binary.display(),
+            root = fixture.root.display(),
+        ),
+    );
+    let launch = fixture.root.join("launch");
+    tests::fixture_program(
+        &launch,
+        &format!(
+            "#!/bin/sh\ntest \"$1\" = __managed-launch || exit 2\nexport RS_W1_LAUNCH_POLICY=\"$2\"\nexec '{}' --exact w1_create_tests::launcher_child_fixture --ignored\n",
+            std::env::current_exe().unwrap().display(),
+        ),
+    );
+    tests::fixture_program(
+        &fixture.root.join("codex"),
+        &format!(
+            "#!/bin/sh\nset -eu\ntest -z \"${{RS_CREATE_NONCE+x}}${{RS_CREATE_TICKET+x}}\"\n/bin/stty -echo -icanon min 1 time 0\nprintf 'start\\n' >> '{root}/provider-starts'\n/bin/dd bs=1 count=1 of='{root}/provider-input' 2>/dev/null\nexec /bin/sleep 45\n",
+            root = fixture.root.display(),
+        ),
+    );
+    let lane = fixture.lane().await;
+    let job = fixture
+        .serve_engine(
+            fixture.engine().with_creation_fixture(Some(launch), None),
+            lane.clone(),
+        )
+        .await;
+    let workspace = fixture.register().await;
+    let key = Uuid::new_v4();
+    let command = create(key, workspace, None);
+    assert_eq!(
+        fixture.call(&command).await,
+        CreateState::Unknown {
+            issue: Some(ProductIssue::TmuxUnavailable)
+        }
+    );
+    assert_eq!(
+        fs::read(fixture.root.join("real-spawns")).unwrap(),
+        b"spawned\n"
+    );
+    let original = lane
+        .run(move |db, _| Ok(db.operation(key)?.unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(original.stage, OperationStage::Marked);
+    let receipt = fs::read_to_string(fixture.root.join("real-receipt")).unwrap();
+    let pid: u32 = receipt
+        .trim_end()
+        .rsplit_once('|')
+        .unwrap()
+        .1
+        .parse()
+        .unwrap();
+    let start = crate::engine::launch_fixture_process_start(pid).unwrap();
+    let pane = receipt.split('|').nth(2).unwrap();
+    let pane_scope = || {
+        let output = tmux
+            .command()
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                pane,
+                "#{pane_id}|#{pane_pid}|#{pane_tty}|#{@rs_create_nonce}",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        output.stdout
+    };
+    let before = pane_scope();
+    let wait = async |name: &str| {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(content) = fs::read(fixture.root.join(name))
+                    && !content.is_empty()
+                {
+                    return content;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap()
+    };
+    assert_eq!(wait("provider-starts").await, b"start\n");
+    let mask = tmux
+        .command()
+        .args([
+            "show-environment",
+            "-t",
+            &format!("={}", original.target),
+            "RS_CREATE_TICKET",
+        ])
+        .output()
+        .unwrap();
+    assert!(mask.status.success(), "{mask:?}");
+    assert_eq!(mask.stdout, b"-RS_CREATE_TICKET\n");
+    drop(lane);
+    stop(job).await;
+    fixture.wait_restart_released().await;
+    let job = fixture
+        .serve_engine(
+            fixture
+                .engine()
+                .with_creation_fixture(None, replacement.then_some(start + 1)),
+            fixture.lane().await,
+        )
+        .await;
+    let recovered = fixture.status(key).await;
+    let CreateState::Confirmed {
+        outcome,
+        current: PaneLiveness::Live,
+        ..
+    } = &recovered
+    else {
+        panic!("original guarded launch did not recover: {recovered:?}");
+    };
+    let runtime = &outcome.runtime;
+    assert_eq!(
+        (runtime.session_id, runtime.runtime_id, runtime.operation_id),
+        (original.session_id, original.runtime_id, Some(original.id))
+    );
+    let open = Request::OpenTerminal {
+        runtime_id: runtime.runtime_id,
+        view_id: Uuid::new_v4(),
+    };
+    let Response::TerminalOpened { status } = request(&fixture.root, &open).await.unwrap() else {
+        panic!("original pane cannot be observed");
+    };
+    assert_eq!(
+        status.terminal.target.process_start,
+        start + u64::from(replacement)
+    );
+    assert_eq!(status.terminal.target.pid, pid);
+    assert_eq!(status.terminal.target.pane, runtime.pane_id);
+    assert_eq!(pane_scope(), before);
+    let acquire = Request::AcquireTerminal {
+        terminal: status.terminal,
+    };
+    let granted = request(&fixture.root, &acquire).await.unwrap();
+    let token = if replacement {
+        assert!(
+            matches!(granted, Response::ControlRecovering { .. }),
+            "{granted:?}"
+        );
+        Uuid::new_v4()
+    } else {
+        let Response::TerminalControl { token, .. } = granted else {
+            panic!("original child did not grant fresh control: {granted:?}");
+        };
+        token
+    };
+    let input = Request::Input {
+        runtime_id: runtime.runtime_id,
+        token,
+        sequence: 0,
+        data: b"x".to_vec(),
+        paste: false,
+    };
+    let reply = request(&fixture.root, &input).await.unwrap();
+    if replacement {
+        assert!(matches!(reply, Response::Error { .. }), "{reply:?}");
+        assert!(
+            fs::read(fixture.root.join("provider-input"))
+                .unwrap_or_default()
+                .is_empty()
+        );
+        assert!(matches!(
+            request(&fixture.root, &acquire).await.unwrap(),
+            Response::ControlRecovering { .. }
+        ));
+    } else {
+        assert!(matches!(reply, Response::Accepted {}), "{reply:?}");
+        assert_eq!(wait("provider-input").await, b"x");
+        assert!(matches!(
+            request(&fixture.root, &input).await.unwrap(),
+            Response::Error { .. }
+        ));
+    }
+    assert_eq!(fixture.call(&command).await, recovered);
+    assert_eq!(
+        fs::read(fixture.root.join("real-spawns")).unwrap(),
+        b"spawned\n"
+    );
+    assert_eq!(
+        fs::read(fixture.root.join("provider-starts")).unwrap(),
+        b"start\n"
+    );
+    if !replacement {
+        let pane = runtime.pane_id.as_str();
+        let birth = || {
+            tmux.command()
+                .args(["show-options", "-pqv", "-t", pane, "@rs_create_birth"])
+                .output()
+                .unwrap()
+        };
+        let used = birth();
+        assert!(
+            used.status.success() && used.stdout.starts_with(b"used~v1~"),
+            "{used:?}"
+        );
+        fs::remove_file(fixture.root.join("provider-starts")).unwrap();
+        fs::remove_file(fixture.root.join("provider-input")).unwrap();
+        let respawn = tmux
+            .command()
+            .args(["respawn-pane", "-k", "-t", pane])
+            .output()
+            .unwrap();
+        assert!(respawn.status.success(), "{respawn:?}");
+        assert_eq!(wait("provider-starts").await, b"start\n");
+        assert_eq!(birth().stdout, used.stdout);
+        assert!(matches!(
+            fixture.status(key).await,
+            CreateState::Confirmed {
+                current: PaneLiveness::Unavailable,
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(&fixture.root, &acquire).await.unwrap(),
+            Response::Error { .. }
+        ));
+        let stale = Request::Input {
+            runtime_id: runtime.runtime_id,
+            token,
+            sequence: 1,
+            data: b"y".to_vec(),
+            paste: false,
+        };
+        assert!(matches!(
+            request(&fixture.root, &stale).await.unwrap(),
+            Response::Error { .. }
+        ));
+        assert!(
+            fs::read(fixture.root.join("provider-input"))
+                .unwrap_or_default()
+                .is_empty()
+        );
+        assert_eq!(
+            fs::read(fixture.root.join("real-spawns")).unwrap(),
+            b"spawned\n"
+        );
+        let diagnostic = Request::Create {
+            session_id: Uuid::new_v4(),
+            runtime_id: Uuid::new_v4(),
+            cwd: fixture.workspace.clone(),
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf '%s\\n%s' \"$(/bin/pwd)\" \"$2\" > \"$1.tmp\"; /bin/mv \"$1.tmp\" \"$1\""
+                    .into(),
+                "fixture".into(),
+                fixture
+                    .root
+                    .join("diagnostic-output")
+                    .to_str()
+                    .unwrap()
+                    .into(),
+                "literal #{} $name ' \" ; value".into(),
+            ],
+        };
+        let created = request(&fixture.root, &diagnostic).await.unwrap();
+        assert!(matches!(created, Response::Created { .. }), "{created:?}");
+        assert_eq!(
+            wait("diagnostic-output").await,
+            format!(
+                "{}\nliteral #{{}} $name ' \" ; value",
+                fixture.workspace.display()
+            )
+            .as_bytes()
+        );
+    }
+    stop(job).await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn w1_create_real_lost_tmux_reply_keeps_original_birth_and_admits_fresh_input() {
+    check_real_create_reply_loss(false).await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn w1_create_real_lost_tmux_reply_holds_same_pid_with_changed_kernel_start() {
+    check_real_create_reply_loss(true).await;
+}
+
+#[tokio::test]
 async fn w1_create_quick_exit_with_no_current_pid_finalizes_and_survives_restart() {
     let fixture = Fixture::new();
     let job = fixture.serve(fixture.lane().await).await;
@@ -1892,7 +2743,7 @@ fn w1_create_guard_rejects_tmux_fallback_and_replaced_cwd_before_provider_exec()
     tests::fixture_program(
         &fixture.root.join("codex"),
         &format!(
-            "#!/bin/sh\ntest -z \"$RS_CREATE_NONCE\" || exit 20\n/bin/pwd > '{}'\n",
+            "#!/bin/sh\ntest -z \"$RS_CREATE_NONCE$RS_CREATE_TICKET\" || exit 20\n/bin/pwd > '{}'\n",
             witness.display()
         ),
     );
@@ -1908,6 +2759,7 @@ fn w1_create_guard_rejects_tmux_fallback_and_replaced_cwd_before_provider_exec()
             .unwrap(),
         service_state: fixture.root.clone(),
         nonce: Uuid::new_v4(),
+        birth: None,
     };
     let run = |directory: &Path, guard: &LaunchGuard| {
         std::process::Command::new(std::env::current_exe().unwrap())
@@ -1918,6 +2770,7 @@ fn w1_create_guard_rejects_tmux_fallback_and_replaced_cwd_before_provider_exec()
             ])
             .env("RS_W1_LAUNCH_POLICY", guard.argument().unwrap())
             .env(NONCE_ENV, guard.nonce.to_string())
+            .env("RS_CREATE_TICKET", Uuid::new_v4().to_string())
             .current_dir(directory)
             .output()
             .unwrap()

@@ -1,4 +1,7 @@
-use crate::model::{ProductIssue, ProviderProfile};
+use crate::{
+    engine::LaunchBirth,
+    model::{ProductIssue, ProviderProfile},
+};
 use nix::libc;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -92,6 +95,7 @@ pub struct PreparedLaunch {
 }
 
 pub(crate) const NONCE_ENV: &str = "RS_CREATE_NONCE";
+pub(crate) const TICKET_ENV: &str = "RS_CREATE_TICKET";
 pub(crate) const LAUNCH_COMMAND: &str = "__managed-launch";
 
 #[derive(Serialize, Deserialize)]
@@ -101,6 +105,8 @@ pub(crate) struct LaunchGuard {
     pub policy: PreparedLaunch,
     pub service_state: PathBuf,
     pub nonce: Uuid,
+    #[serde(default)]
+    pub birth: Option<LaunchBirth>,
 }
 
 impl LaunchGuard {
@@ -149,9 +155,18 @@ impl LaunchGuard {
             Ok(_) => return ProductIssue::ProviderNotExecutable,
             Err(issue) => return issue,
         }
+        if let Some(birth) = &self.birth
+            && std::env::var(TICKET_ENV).ok().as_deref() == Some(&birth.ticket.to_string())
+            && let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+        {
+            let _ = runtime.block_on(birth.publish(&self.service_state, self.nonce));
+        }
         let _error = std::process::Command::new(&self.policy.executable)
             .env("PATH", &self.policy.path)
             .env_remove(NONCE_ENV)
+            .env_remove(TICKET_ENV)
             .exec();
         ProductIssue::LaunchSetupFailed
     }
