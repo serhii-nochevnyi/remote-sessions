@@ -86,7 +86,7 @@ impl PasteBuffer {
             .paste_marker
             .strip_prefix(&read.paste_prefix(read.epoch))?;
         let mut fields = marker.split('~');
-        if !matches!(fields.next()?, "l" | "a" | "s" | "q") {
+        if !matches!(fields.next()?, "l" | "a" | "s" | "q" | "f") {
             return None;
         }
         let nonce = parse_uuid(fields.next()?).ok()?;
@@ -110,6 +110,24 @@ impl PasteBuffer {
             name: name.into(),
         })
     }
+
+    fn requires_deletion(&self, read: &GeometryReadback) -> bool {
+        read.paste_marker == self.marker(read, 'l') || read.paste_marker == self.marker(read, 'f')
+    }
+}
+
+fn paste_process_stamp(marker: &str) -> Result<(&str, u64)> {
+    let mut fields = marker.split('~').skip(8);
+    let pid = fields.next().context("Missing original paste process ID")?;
+    let started = fields
+        .next()
+        .context("Missing original paste process start")?;
+    let value: u64 = started.parse()?;
+    ensure!(
+        value > 0 && value.to_string() == started,
+        "Invalid original paste process start"
+    );
+    Ok((pid, value))
 }
 
 impl PasteScope {
@@ -207,6 +225,7 @@ impl PasteTest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GeometryReadback {
     target: TerminalTarget,
+    state: PaneState,
     server: ServerGeneration,
     name: String,
     nonce: String,
@@ -217,6 +236,12 @@ struct GeometryReadback {
     paste_marker: String,
     sender_supported: bool,
     input_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneState {
+    Live,
+    Exited(Option<u32>),
 }
 
 const EPOCH_OPTION: &str = "@rs_resize_epoch";
@@ -501,6 +526,10 @@ impl GeometryReadback {
     }
 
     fn guard(&self, predecessor: Option<ResizeEpoch>) -> String {
+        let (dead, pid) = match self.state {
+            PaneState::Live => (0, Some(self.target.pid)),
+            PaneState::Exited(pid) => (1, pid),
+        };
         format_all([
             format_equal("pid", self.server.pid),
             format_equal("start_time", self.server.start),
@@ -509,12 +538,17 @@ impl GeometryReadback {
             format_equal("session_id", &self.target.session),
             format_equal("window_id", &self.target.window),
             format_equal("pane_id", &self.target.pane),
-            format_equal("pane_pid", self.target.pid),
+            format_equal("window_index", 0),
+            format_equal("pane_index", 0),
+            format_equal(
+                "pane_pid",
+                pid.map_or_else(String::new, |pid| pid.to_string()),
+            ),
             format_equal("pane_tty", self.tty.display()),
             format_equal(PANE_OPTION, &self.nonce),
             format_equal("session_windows", 1),
             format_equal("window_panes", 1),
-            format_equal("pane_dead", 0),
+            format_equal("pane_dead", dead),
             format_equal("window-size", "manual"),
             format_equal("after-set-option", ""),
             format_equal("after-resize-window", ""),
@@ -1439,6 +1473,15 @@ impl Engine {
     }
 
     async fn geometry(&self, runtime_id: Uuid, pane: &str) -> Result<GeometryReadback> {
+        self.geometry_in_state(runtime_id, pane, false).await
+    }
+
+    async fn geometry_in_state(
+        &self,
+        runtime_id: Uuid,
+        pane: &str,
+        exited: bool,
+    ) -> Result<GeometryReadback> {
         ensure!(canonical_tmux_id(pane, '%'), "Invalid terminal pane ID");
         let format = format!("{GEOMETRY_FORMAT}|{}", self.sender_guard());
         let output = self
@@ -1455,25 +1498,44 @@ impl Engine {
             "Invalid terminal metadata"
         );
         let server = generation(&fields[..3].join("|")).context("Invalid terminal generation")?;
-        let identity = pane_identity(&fields[3..7]).context("Invalid terminal pane")?;
+        let dead = if exited { "1" } else { "0" };
         ensure!(
             parse_name(fields[7]).is_some_and(|(_, id)| id == runtime_id)
                 && fields[8..10] == ["0", "0"]
-                && fields[11..15] == ["0", "1", "1", "manual"],
+                && fields[11..15] == [dead, "1", "1", "manual"],
             "Terminal target changed or is unsupported"
         );
+        let current_pid = match fields[6] {
+            "" if exited => None,
+            pid => Some(pid.parse::<u32>()?),
+        };
+        let paste_marker = fields[23];
+        let original_process = if exited && !paste_marker.is_empty() {
+            Some(paste_process_stamp(paste_marker)?)
+        } else {
+            None
+        };
         let stamp = fields[10];
-        if !stamp.is_empty() {
+        let identity = if stamp.is_empty() {
+            let pid = match (current_pid, original_process) {
+                (None, Some((original_pid, _))) => original_pid,
+                _ => fields[6],
+            };
+            pane_identity(&[fields[3], fields[4], fields[5], pid])
+                .context("Invalid terminal pane")?
+        } else {
             let (nonce, ids) = stamp
                 .split_once(':')
                 .context("Invalid terminal launch stamp")?;
             parse_uuid(nonce)?;
             let parsed: Vec<_> = ids.split(':').collect();
+            let identity = pane_identity(&parsed).context("Invalid terminal launch stamp")?;
             ensure!(
-                pane_identity(&parsed) == Some(identity.clone()),
+                fields[3..6] == parsed[..3] && current_pid.is_none_or(|pid| pid == identity.pid),
                 "Terminal launch stamp changed"
             );
-        }
+            identity
+        };
         let tty = fields[15];
         ensure!(
             (tty.strip_prefix("/dev/ttys")
@@ -1493,6 +1555,11 @@ impl Engine {
                 && size.rows == fields[19].parse::<u16>()?,
             "Window and pane grids disagree or are unsupported"
         );
+        let process_start = if exited {
+            original_process.map_or(0, |(_, started)| started)
+        } else {
+            process_start(identity.pid)?
+        };
         let target = TerminalTarget {
             runtime_id,
             generation: server.token,
@@ -1500,7 +1567,7 @@ impl Engine {
             window: identity.window,
             pane: identity.pane,
             pid: identity.pid,
-            process_start: process_start(identity.pid)?,
+            process_start,
         };
         #[cfg(debug_assertions)]
         ensure!(
@@ -1517,6 +1584,11 @@ impl Engine {
         );
         Ok(GeometryReadback {
             target,
+            state: if exited {
+                PaneState::Exited(current_pid)
+            } else {
+                PaneState::Live
+            },
             server,
             name: fields[7].to_owned(),
             nonce: stamp.to_owned(),
@@ -1524,7 +1596,7 @@ impl Engine {
             epoch,
             committed,
             paste_launch: fields[22].into(),
-            paste_marker: fields[23].into(),
+            paste_marker: paste_marker.into(),
             input_enabled: fields[24] == "0",
             sender_supported: matches!(fields[24], "0" | "1")
                 && fields[25] == "1"
@@ -1543,6 +1615,34 @@ impl Engine {
                 && read.name == runtime.tmux_name,
             "Terminal identity changed"
         );
+        Ok(read)
+    }
+
+    async fn retained_geometry(
+        &self,
+        runtime: &Runtime,
+        server: ServerGeneration,
+        catalog: Option<&CatalogLane>,
+    ) -> Result<GeometryReadback> {
+        let read = self
+            .geometry_in_state(runtime.runtime_id, &runtime.pane_id, true)
+            .await?;
+        let target = &read.target;
+        ensure!(
+            read.server == server
+                && read.name == runtime.tmux_name
+                && target.pane == runtime.pane_id
+                && read.state == PaneState::Exited(runtime.pane_pid),
+            "Retained Stop target changed"
+        );
+        if read.nonce.is_empty() {
+            let scope = format!(
+                "{}|{}|{}|{}|{}",
+                server.pid, server.start, server.token, target.session, target.window
+            );
+            self.corroborate_legacy(runtime, &scope).await?;
+        }
+        self.observe_terminal(&read, catalog).await?;
         Ok(read)
     }
 
@@ -1574,13 +1674,20 @@ impl Engine {
         let evidence = self.observe_pane(&read.name, read.server, nonce).await?;
         let identity = evidence.identity;
         let target = &read.target;
+        let matches_state = match read.state {
+            PaneState::Live => {
+                !evidence.exited
+                    && evidence.pane_pid == Some(target.pid)
+                    && process_start(target.pid)? == target.process_start
+            }
+            PaneState::Exited(pid) => evidence.exited && evidence.pane_pid == pid,
+        };
         ensure!(
-            !evidence.exited
+            matches_state
                 && identity.session == target.session
                 && identity.window == target.window
                 && identity.pane == target.pane
-                && evidence.pane_pid == Some(target.pid)
-                && process_start(target.pid)? == target.process_start,
+                && identity.pid == target.pid,
             "Managed terminal identity changed"
         );
         Ok(identity)
@@ -1790,15 +1897,30 @@ impl Engine {
             return Ok(None);
         }
         // @contract: An exact readback can resolve a lost no-effect transition reply.
-        let after = self.geometry(from.target.runtime_id, pane).await?;
+        self.read_paste_marker(from, next).await.map(Some)
+    }
+
+    async fn read_paste_marker(
+        &self,
+        from: &GeometryReadback,
+        expected: &str,
+    ) -> Result<GeometryReadback> {
+        let after = self
+            .geometry_in_state(
+                from.target.runtime_id,
+                &from.target.pane,
+                from.state != PaneState::Live,
+            )
+            .await?;
         ensure!(
             after.same_pane(from)
+                && after.state == from.state
                 && after.epoch == from.epoch
                 && after.sender_supported
-                && after.paste_marker == next,
+                && after.paste_marker == expected,
             "Paste marker transition unconfirmed"
         );
-        Ok(Some(after))
+        Ok(after)
     }
 
     async fn load_paste(&self, read: &GeometryReadback, name: &str, data: &[u8]) -> Result<()> {
@@ -1887,6 +2009,34 @@ impl Engine {
         Ok(())
     }
 
+    async fn delete_loading_paste(
+        &self,
+        fenced: &GeometryReadback,
+        buffer: &PasteBuffer,
+    ) -> Result<GeometryReadback> {
+        ensure!(
+            fenced.sender_supported && self.private_sender_socket(),
+            "Paste cleanup unavailable"
+        );
+        let pane = &fenced.target.pane;
+        let retired = buffer.marker(fenced, 'q');
+        let branch = format!(
+            "delete-buffer -b {} ; set-option -p -t {pane} {PASTE_OPTION} {retired}",
+            buffer.name,
+        );
+        let _ = self
+            .geometry_command(&[
+                "if-shell",
+                "-F",
+                "-t",
+                pane,
+                &self.paste_guard(fenced),
+                &branch,
+            ])
+            .await;
+        self.read_paste_marker(fenced, &retired).await
+    }
+
     async fn reclaim_superseded_paste(
         &self,
         scope: &PasteScope,
@@ -1924,7 +2074,7 @@ impl Engine {
         }
         ensure!(current_seen, "Current paste cleanup target is unconfirmed");
         if let Some(buffer) = &scope.buffer {
-            let allow_absent = original.paste_marker != buffer.marker(original, 'l');
+            let allow_absent = !buffer.requires_deletion(original);
             self.delete_paste(current, &buffer.name, allow_absent)
                 .await?;
         }
@@ -2540,46 +2690,51 @@ impl Engine {
         lane: &mut ResizeLane,
         mut read: GeometryReadback,
     ) -> Result<GeometryReadback> {
-        self.reconcile_paste(lane, &read).await;
+        if read.state == PaneState::Live {
+            self.reconcile_paste(lane, &read).await;
+        }
+        let sampled = PasteScope::sampled(&read);
         ensure!(
-            read.sender_supported || read.paste_marker.is_empty() || read.paste_ready(),
+            sampled.buffer.is_some()
+                || read.paste_ready()
+                || (read.paste_launch.is_empty() && read.paste_marker.is_empty()),
             "Original paste marker cannot be checked"
         );
-        let sampled = PasteScope::sampled(&read);
         let scopes = lane
             .paste_quarantines
             .iter()
             .chain(lane.pending_paste.iter().map(|pending| &pending.scope));
-        for saved in scopes.filter(|scope| scope.may_be_same_pane(&read)) {
-            if saved.buffer.is_some() {
-                ensure!(
-                    saved.original.same_pane(&read)
-                        && saved.original.epoch == read.epoch
-                        && saved.buffer == sampled.buffer,
-                    "Original paste buffer identity is unconfirmed"
-                );
-            }
+        for saved in
+            scopes.filter(|scope| read.state != PaneState::Live || scope.may_be_same_pane(&read))
+        {
+            let recovered = PasteBuffer::from_marker(&saved.original);
+            let buffer = saved.buffer.as_ref().or(recovered.as_ref());
+            ensure!(
+                saved.original.same_pane(&read)
+                    && saved.original.epoch == read.epoch
+                    && buffer.is_some()
+                    && buffer == sampled.buffer.as_ref(),
+                "Original paste buffer identity is unconfirmed"
+            );
         }
         let Some(buffer) = sampled.buffer else {
             return Ok(read);
         };
         lane.retain_paste(PasteScope::sampled(&read));
-        let loading = read.paste_marker == buffer.marker(&read, 'l');
-        let fenced = buffer.marker(&read, 'q');
-        if !loading && read.paste_marker != fenced {
+        let requires_deletion = buffer.requires_deletion(&read);
+        let fenced = buffer.marker(&read, if requires_deletion { 'f' } else { 'q' });
+        if read.paste_marker != fenced {
             read = self
                 .transition_marker(&read, &fenced)
                 .await?
                 .context("Original paste sender was not fenced")?;
         }
-        self.delete_paste(&read, &buffer.name, !loading).await?;
-        if loading {
-            read = self
-                .transition_marker(&read, &fenced)
-                .await?
-                .context("Original paste buffer reclamation is unconfirmed")?;
+        if requires_deletion {
+            self.delete_loading_paste(&read, &buffer).await
+        } else {
+            self.delete_paste(&read, &buffer.name, true).await?;
+            Ok(read)
         }
-        Ok(read)
     }
 
     async fn stop_runtime(
@@ -2599,17 +2754,18 @@ impl Engine {
         let pane = &runtime.pane_id;
         ensure!(pane == expected_pane_id, "runtime precondition failed");
         let checked = if runtime.exited {
-            None
+            let read = self.retained_geometry(&runtime, server, catalog).await?;
+            Some(self.prepare_paste_stop(&mut lane, read).await?)
+        } else if let Ok(read) = self.geometry_for_runtime(&runtime).await {
+            ensure!(read.server == server, "Stop target server changed");
+            self.observe_terminal(&read, catalog).await?;
+            Some(self.prepare_paste_stop(&mut lane, read).await?)
         } else {
-            self.geometry_for_runtime(&runtime).await.ok()
-        };
-        let checked = match checked {
-            Some(read) => {
-                ensure!(read.server == server, "Stop target server changed");
-                self.observe_terminal(&read, catalog).await?;
-                Some(self.prepare_paste_stop(&mut lane, read).await?)
-            }
-            None => None,
+            ensure!(
+                !lane.has_paste_hold(),
+                "Original paste custody is unconfirmed"
+            );
+            None
         };
         let identity_guard = format_all([
             format_equal("pid", server.pid),
@@ -2635,8 +2791,11 @@ impl Engine {
                 format_equal(PASTE_LAUNCH_OPTION, &read.paste_launch),
                 format_equal(PASTE_OPTION, &read.paste_marker),
             ]),
-            None if !runtime.exited => format_all([identity_guard, format_equal(PASTE_OPTION, "")]),
-            None => identity_guard,
+            None => format_all([
+                identity_guard,
+                format_equal(PASTE_LAUNCH_OPTION, ""),
+                format_equal(PASTE_OPTION, ""),
+            ]),
         };
         let witness = format!("rs-stopped-{}", Uuid::new_v4());
         let printed = pane_witness(pane, &witness);

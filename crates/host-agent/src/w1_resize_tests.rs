@@ -141,6 +141,7 @@ impl Fixture {
         };
         let initial = GeometryReadback {
             target: terminal.target.clone(),
+            state: PaneState::Live,
             server,
             name: name.clone(),
             nonce: String::new(),
@@ -306,7 +307,11 @@ elif command == "if-shell":
         action, reply = nodes
         if action[0] == "display-message":
             action, reply = reply, action
-        assert reply[:5] == ["display-message", "-p", "-l", "-t", pane]
+        cleanup_marker = action[0] == "delete-buffer" and reply[0] == "set-option"
+        if cleanup_marker:
+            assert reply[:5] == ["set-option", "-p", "-t", pane, "@rs_paste_admission"]
+        else:
+            assert reply[:5] == ["display-message", "-p", "-l", "-t", pane]
         if not check(guard, pane):
             sys.exit()
         if action[0] == "load-buffer":
@@ -329,6 +334,9 @@ elif command == "if-shell":
                 sys.exit(1)
             (root / buffer).unlink()
             append("deletions", (buffer + "\n").encode())
+            if cleanup_marker:
+                write(key("marker", pane), reply[-1])
+                sys.exit()
         else:
             assert action == ["kill-session", "-t", "=" + pane_row(pane)[7]]
             write("removed-" + pane[1:], "1")
@@ -447,6 +455,7 @@ else:
         let tty = "/dev/ttyssecond";
         let read = GeometryReadback {
             target: target.clone(),
+            state: PaneState::Live,
             server: ServerGeneration {
                 pid: 987,
                 start: 123456,
@@ -1055,4 +1064,581 @@ async fn w1_resize_reconciliation_waits_for_a_fresh_identity_bracketed_sample() 
             .await
             .reconcile
     );
+}
+
+#[cfg(target_os = "macos")]
+mod exited_stop {
+    use super::*;
+
+    const DRAFT: &[u8] = "fixture draft\n\t日本語".as_bytes();
+    const CANARY: &str = "unrelated fixture buffer";
+    const SCOPE: &str = "#{pid}|#{start_time}|#{@rs_create_generation}|#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}|#{pane_dead}";
+    const PARKED_SEND: &str = r#"#!/usr/bin/env python3
+from pathlib import Path
+import os
+import subprocess
+import sys
+
+root = Path(__file__).parent
+assert sys.argv[1:4] == ["-N", "-S", str(root / "tmux.sock")]
+cli = ["tmux", *sys.argv[1:4]]
+args = sys.argv[4:]
+if args[0:3] == ["if-shell", "-F", "-t"]:
+    branch = args[5]
+    if " ; paste-buffer " in branch:
+        with (root / "delayed-send").open("xb") as reply:
+            subprocess.Popen([*cli, "display-message", "-p", "-l", "parked", ";",
+                              "wait-for", "-L", "old-paste", ";", *args],
+                             stdin=subprocess.DEVNULL, stdout=reply, stderr=reply,
+                             start_new_session=True)
+        sys.exit(1)
+    if branch.startswith(("list-buffers ", "delete-buffer ")) and (root / "block-cleanup").is_file():
+        sys.exit(1)
+    if branch.startswith("delete-buffer ") and (root / "lose-cleanup-reply").is_file():
+        result = subprocess.run([*cli, *args], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        if result.returncode == 0:
+            (root / "cleanup-reply-lost").touch()
+        sys.exit(1)
+os.execvp(cli[0], [*cli, *args])
+"#;
+
+    struct PrivateTmux {
+        temp: tempfile::TempDir,
+        stock: Engine,
+        canary: String,
+        survivor: String,
+    }
+
+    impl PrivateTmux {
+        async fn start() -> Self {
+            let temp = tempfile::tempdir_in("/tmp").unwrap();
+            let root = temp.path();
+            fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
+            let config = root.join("tmux.conf");
+            let socket = root.join("tmux.sock");
+            fs::write(&config, include_str!("../../../config/tmux.conf")).unwrap();
+            let wrapper = root.join("tmux-fixture");
+            fs::write(&wrapper, PARKED_SEND).unwrap();
+            fs::set_permissions(wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+
+            let output = Command::new("tmux")
+                .arg("-S")
+                .arg(&socket)
+                .arg("-f")
+                .arg(config)
+                .args([
+                    "new-session",
+                    "-d",
+                    "-s",
+                    "survivor",
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    "/bin/stty raw -echo; exec /bin/cat > \"$1\"",
+                    "fixture",
+                ])
+                .arg(root.join("survivor-input"))
+                .env_remove("TMUX")
+                .stdin(Stdio::null())
+                .output()
+                .await
+                .unwrap();
+
+            let mut fixture = Self {
+                temp,
+                stock: Engine::new("tmux".into(), socket),
+                canary: format!("rs-paste-{}", Uuid::new_v4().simple()),
+                survivor: String::new(),
+            };
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            fixture.wait_file("survivor-input").await;
+            fixture.survivor = fixture.scope("=survivor:0.0").await;
+            fixture
+                .tmux(&["set-buffer", "-b", &fixture.canary, CANARY])
+                .await;
+            fixture
+        }
+
+        fn engine(&self) -> Engine {
+            let engine = Engine::new(
+                self.temp.path().join("tmux-fixture"),
+                self.stock.socket.clone(),
+            );
+            *engine.paste_test.now.lock().unwrap() = Some(Instant::now());
+            engine
+        }
+
+        async fn tmux(&self, args: &[&str]) -> String {
+            self.stock.command(args).await.unwrap()
+        }
+
+        async fn scope(&self, pane: &str) -> String {
+            self.tmux(&["display-message", "-p", "-t", pane, SCOPE])
+                .await
+        }
+
+        async fn wait_file(&self, name: &str) {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !self.temp.path().join(name).is_file() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+
+        async fn create(&mut self, engine: &Engine) -> Runtime {
+            let response = engine
+                .handle(
+                    Request::Create {
+                        session_id: Uuid::new_v4(),
+                        runtime_id: Uuid::new_v4(),
+                        cwd: self.temp.path().into(),
+                        argv: vec!["/bin/sh".into(), "-c".into(), "read -r line".into()],
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            let Response::Created { runtime } = response else {
+                panic!("Expected a runtime, got {response:?}");
+            };
+            self.survivor = self.scope("=survivor:0.0").await;
+            runtime
+        }
+
+        async fn exit(&self, engine: &Engine, runtime: &Runtime) -> Runtime {
+            self.tmux(&["send-keys", "-t", &runtime.pane_id, "Enter"])
+                .await;
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let retained = engine.find(runtime.runtime_id).await.unwrap();
+                    if retained.exited {
+                        return retained;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("The real pane must exit and be retained")
+        }
+
+        async fn marker(&self, pane: &str) -> String {
+            self.tmux(&[
+                "display-message",
+                "-p",
+                "-t",
+                pane,
+                "#{@rs_paste_admission}",
+            ])
+            .await
+            .trim_end()
+            .into()
+        }
+
+        async fn set_marker(&self, pane: &str, marker: &str) {
+            self.tmux(&["set-option", "-p", "-t", pane, PASTE_OPTION, marker])
+                .await;
+        }
+
+        async fn assert_buffer(&self, name: &str, expected: Option<&[u8]>) {
+            let names = self.tmux(&["list-buffers", "-F", "#{buffer_name}"]).await;
+            assert_eq!(names.lines().any(|item| item == name), expected.is_some());
+            if let Some(bytes) = expected {
+                assert_eq!(
+                    self.tmux(&["save-buffer", "-b", name, "-"])
+                        .await
+                        .as_bytes(),
+                    bytes
+                );
+            }
+        }
+
+        async fn assert_survivor(&self) {
+            assert_eq!(self.scope("=survivor:0.0").await, self.survivor);
+            self.assert_buffer(&self.canary, Some(CANARY.as_bytes()))
+                .await;
+            assert!(
+                fs::read(self.temp.path().join("survivor-input"))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        async fn stop(&self, engine: &Engine, runtime: &Runtime) -> Result<Response> {
+            engine
+                .handle(
+                    Request::Stop {
+                        runtime_id: runtime.runtime_id,
+                        expected_pane_id: runtime.pane_id.clone(),
+                    },
+                    None,
+                )
+                .await
+        }
+
+        fn block_cleanup(&self, blocked: bool) {
+            let flag = self.temp.path().join("block-cleanup");
+            if blocked {
+                fs::write(flag, "").unwrap();
+            } else {
+                fs::remove_file(flag).unwrap();
+            }
+        }
+
+        async fn assert_stopped(&self, runtime: &Runtime, buffer: &PasteBuffer) {
+            let panes = self.tmux(&["list-panes", "-a", "-F", "#{pane_id}"]).await;
+            assert!(!panes.lines().any(|pane| pane == runtime.pane_id));
+            let sessions = self.tmux(&["list-sessions", "-F", "#{session_name}"]).await;
+            assert_eq!(sessions.trim_end(), "survivor");
+            self.assert_buffer(&buffer.name, None).await;
+            self.assert_survivor().await;
+        }
+    }
+
+    impl Drop for PrivateTmux {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new(&self.stock.tmux)
+                .args(["-N", "-S"])
+                .arg(&self.stock.socket)
+                .arg("kill-server")
+                .env_remove("TMUX")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+
+    #[tokio::test]
+    async fn w1_resize_exited_stop_reclaims_only_bound_paste() {
+        let mut fixture = PrivateTmux::start().await;
+        let engine = fixture.engine();
+        let runtime = fixture.create(&engine).await;
+        let pane = &runtime.pane_id;
+        let read = engine.geometry(runtime.runtime_id, pane).await.unwrap();
+        let terminal = TerminalView {
+            target: read.target,
+            view_id: Uuid::new_v4(),
+            agent_epoch: engine.agent_epoch,
+        };
+        let Response::TerminalControl { token, epoch } = engine
+            .handle(
+                Request::AcquireTerminal {
+                    terminal: terminal.clone(),
+                },
+                None,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("Expected a real pane writer");
+        };
+        let binding = PasteBinding {
+            terminal,
+            token,
+            epoch,
+            incarnation: Uuid::new_v4(),
+            operation: 1,
+            sequence: 0,
+        };
+        assert!(matches!(
+            engine
+                .handle(
+                    Request::PasteStage {
+                        binding: binding.clone(),
+                        offset: 0,
+                        data: DRAFT.into()
+                    },
+                    None
+                )
+                .await
+                .unwrap(),
+            Response::Paste {
+                paste: PasteResult::Staged {}
+            }
+        ));
+        let commit = || Request::PasteCommit {
+            binding: binding.clone(),
+            bytes: DRAFT.len(),
+        };
+        fixture.tmux(&["wait-for", "-L", "old-paste"]).await;
+        assert!(matches!(
+            engine.handle(commit(), None).await.unwrap(),
+            Response::Paste {
+                paste: PasteResult::Unknown {}
+            }
+        ));
+        let reply = fixture.temp.path().join("delayed-send");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while fs::read_to_string(&reply).unwrap_or_default() != "parked\n" {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("The original sender must be queued before exit");
+        let armed = engine.geometry(runtime.runtime_id, pane).await.unwrap();
+        let buffer = PasteBuffer::from_marker(&armed).unwrap();
+        assert_eq!(armed.paste_marker, buffer.marker(&armed, 'a'));
+        fixture.assert_buffer(&buffer.name, Some(DRAFT)).await;
+
+        let retained = fixture.exit(&engine, &runtime).await;
+        let scope = fixture.scope(pane).await;
+        let screen = fixture.tmux(&["capture-pane", "-p", "-t", pane]).await;
+        let foreign = armed.paste_marker.replace(&buffer.name, &fixture.canary);
+        fixture.set_marker(pane, &foreign).await;
+        assert!(fixture.stop(&engine, &retained).await.is_err());
+        assert_eq!(fixture.marker(pane).await, foreign);
+        assert_eq!(fixture.scope(pane).await, scope);
+        fixture.assert_buffer(&buffer.name, Some(DRAFT)).await;
+        fixture.assert_survivor().await;
+        fixture.set_marker(pane, &armed.paste_marker).await;
+        fixture.block_cleanup(true);
+        assert!(fixture.stop(&engine, &retained).await.is_err());
+        assert_eq!(fixture.scope(pane).await, scope);
+        assert_eq!(fixture.marker(pane).await, buffer.marker(&armed, 'q'));
+
+        fixture.tmux(&["wait-for", "-U", "old-paste"]).await;
+        let rejected = format!("parked\nrs-paste-rejected-{}\n", buffer.nonce);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while fs::read_to_string(&reply).unwrap() != rejected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("The queued guard must reject while the original pane still exists");
+        let mut loading = armed;
+        loading.paste_marker = buffer.marker(&loading, 'l');
+        assert!(
+            engine
+                .load_paste(&loading, &buffer.name, b"stale load")
+                .await
+                .is_err()
+        );
+        fixture.assert_buffer(&buffer.name, Some(DRAFT)).await;
+        assert_eq!(
+            fixture.tmux(&["capture-pane", "-p", "-t", pane]).await,
+            screen
+        );
+        fixture.block_cleanup(false);
+        fixture.assert_survivor().await;
+
+        assert!(
+            matches!(fixture.stop(&engine, &retained).await.unwrap(), Response::Stopped { runtime_id } if runtime_id == runtime.runtime_id)
+        );
+        assert!(matches!(
+            engine.handle(commit(), None).await.unwrap(),
+            Response::Paste {
+                paste: PasteResult::Stale {}
+            }
+        ));
+        assert!(
+            engine
+                .handle(
+                    Request::Input {
+                        runtime_id: runtime.runtime_id,
+                        token,
+                        sequence: 0,
+                        data: vec![b'K'],
+                        paste: false,
+                    },
+                    None,
+                )
+                .await
+                .is_err()
+        );
+        fixture.assert_stopped(&retained, &buffer).await;
+    }
+
+    #[tokio::test]
+    async fn w1_resize_exited_stop_recovers_paste_custody_after_restart() {
+        let mut fixture = PrivateTmux::start().await;
+        let engine = fixture.engine();
+        let runtime = fixture.create(&engine).await;
+        let pane = &runtime.pane_id;
+        let legacy = engine.geometry(runtime.runtime_id, pane).await.unwrap();
+        let identity = PaneIdentity {
+            session: legacy.target.session.clone(),
+            window: legacy.target.window.clone(),
+            pane: pane.clone(),
+            pid: legacy.target.pid,
+        };
+        let session = format!("={}", runtime.tmux_name);
+        let nonce = Uuid::new_v4();
+        let stamp = format!(
+            "{nonce}:{}:{}:{pane}:{}",
+            identity.session, identity.window, identity.pid
+        );
+        fixture
+            .tmux(&[
+                "set-environment",
+                "-t",
+                &session,
+                NONCE_ENV,
+                &nonce.to_string(),
+                ";",
+                "set-option",
+                "-p",
+                "-t",
+                pane,
+                PANE_OPTION,
+                &stamp,
+                ";",
+                "set-option",
+                "-pu",
+                "-t",
+                pane,
+                PASTE_LAUNCH_OPTION,
+                ";",
+                "set-option",
+                "-pu",
+                "-t",
+                pane,
+                PASTE_OPTION,
+            ])
+            .await;
+        engine
+            .stamp_paste(&runtime, legacy.server, &identity, Some(nonce))
+            .await
+            .unwrap();
+        let ready = engine.geometry(runtime.runtime_id, pane).await.unwrap();
+        let ready = engine
+            .rotate_epoch(
+                &ready,
+                ResizeEpoch {
+                    agent: engine.agent_epoch,
+                    owner: Uuid::new_v4(),
+                },
+            )
+            .await
+            .unwrap();
+        let buffer = PasteBuffer {
+            nonce: Uuid::new_v4(),
+            operation: 1,
+            name: format!("rs-paste-{}", Uuid::new_v4().simple()),
+        };
+        let loading = engine
+            .transition_marker(&ready, &buffer.marker(&ready, 'l'))
+            .await
+            .unwrap()
+            .unwrap();
+        engine
+            .load_paste(&loading, &buffer.name, DRAFT)
+            .await
+            .unwrap();
+        let retained = fixture.exit(&engine, &runtime).await;
+        let scope = fixture.scope(pane).await;
+        let old_epoch = engine.agent_epoch;
+        drop(engine);
+        let engine = fixture.engine();
+        assert_ne!(engine.agent_epoch, old_epoch);
+        assert!(engine.existing_lane(runtime.runtime_id).is_none());
+        assert_eq!(fixture.marker(pane).await, loading.paste_marker);
+        fixture.assert_buffer(&buffer.name, Some(DRAFT)).await;
+
+        let foreign = loading.paste_marker.replace(&buffer.name, &fixture.canary);
+        let foreign = foreign.replace(
+            &legacy.server.token.to_string(),
+            &Uuid::new_v4().to_string(),
+        );
+        for marker in ["malformed".to_owned(), foreign] {
+            fixture.set_marker(pane, &marker).await;
+            assert!(fixture.stop(&engine, &retained).await.is_err());
+            assert_eq!(fixture.marker(pane).await, marker);
+            assert_eq!(fixture.scope(pane).await, scope);
+            fixture.assert_buffer(&buffer.name, Some(DRAFT)).await;
+            fixture.assert_survivor().await;
+        }
+        fixture.set_marker(pane, &loading.paste_marker).await;
+        let replacement_generation = Uuid::new_v4().to_string();
+        fixture
+            .tmux(&[
+                "set-option",
+                "-s",
+                GENERATION_OPTION,
+                &replacement_generation,
+            ])
+            .await;
+        let replaced_scope = fixture.scope(pane).await;
+        assert_ne!(replaced_scope, scope);
+        assert!(fixture.stop(&engine, &retained).await.is_err());
+        assert_eq!(fixture.marker(pane).await, loading.paste_marker);
+        assert_eq!(fixture.scope(pane).await, replaced_scope);
+        fixture.assert_buffer(&buffer.name, Some(DRAFT)).await;
+        fixture
+            .assert_buffer(&fixture.canary, Some(CANARY.as_bytes()))
+            .await;
+        fixture
+            .tmux(&[
+                "set-option",
+                "-s",
+                GENERATION_OPTION,
+                &legacy.server.token.to_string(),
+            ])
+            .await;
+        fixture
+            .tmux(&[
+                "set-environment",
+                "-t",
+                &session,
+                NONCE_ENV,
+                &Uuid::new_v4().to_string(),
+            ])
+            .await;
+        assert!(fixture.stop(&engine, &retained).await.is_err());
+        assert_eq!(fixture.marker(pane).await, loading.paste_marker);
+        assert_eq!(fixture.scope(pane).await, scope);
+        fixture.assert_buffer(&buffer.name, Some(DRAFT)).await;
+        fixture
+            .tmux(&[
+                "set-environment",
+                "-t",
+                &session,
+                NONCE_ENV,
+                &nonce.to_string(),
+            ])
+            .await;
+
+        fixture.block_cleanup(true);
+        assert!(fixture.stop(&engine, &retained).await.is_err());
+        let fenced = buffer.marker(&loading, 'f');
+        assert_eq!(fixture.marker(pane).await, fenced);
+        assert_eq!(fixture.scope(pane).await, scope);
+        assert!(
+            engine
+                .transition_marker(&loading, &buffer.marker(&loading, 'a'))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        fixture.assert_buffer(&buffer.name, Some(DRAFT)).await;
+        fixture.assert_survivor().await;
+        fixture.block_cleanup(false);
+        fixture.tmux(&["delete-buffer", "-b", &buffer.name]).await;
+        let engine = fixture.engine();
+        assert!(fixture.stop(&engine, &retained).await.is_err());
+        assert_eq!(fixture.marker(pane).await, fenced);
+        assert_eq!(fixture.scope(pane).await, scope);
+        fixture.assert_buffer(&buffer.name, None).await;
+        fixture.assert_survivor().await;
+
+        fixture
+            .tmux(&[
+                "set-buffer",
+                "-b",
+                &buffer.name,
+                std::str::from_utf8(DRAFT).unwrap(),
+            ])
+            .await;
+        fs::write(fixture.temp.path().join("lose-cleanup-reply"), "").unwrap();
+        assert!(
+            matches!(fixture.stop(&engine, &retained).await.unwrap(), Response::Stopped { runtime_id } if runtime_id == runtime.runtime_id)
+        );
+        assert!(fixture.temp.path().join("cleanup-reply-lost").is_file());
+        fixture.assert_stopped(&retained, &buffer).await;
+    }
 }
