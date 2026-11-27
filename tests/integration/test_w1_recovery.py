@@ -110,6 +110,26 @@ class ManifestTests(unittest.TestCase):
         self.tmux = '/dev/null'
         self.argv = runtime_lab.job_argv(self.state, self.catalog, self.tmux, self.tmux)
 
+    def startup_command(self, *args, **kwargs):
+        socket_args = (self.tmux, '-N', '-S', self.state / 'tmux.sock')
+        if args == (self.tmux, '-V'):
+            self.assertFalse(kwargs['check'])
+            stdout = 'tmux 3.8\n'
+        elif args == (*socket_args, 'display-message', '-p', '#{version}'):
+            self.assertFalse(kwargs['check'])
+            stdout = '3.8\n'
+        elif args == (*socket_args, 'show-options', '-s', 'exit-empty'):
+            stdout = 'exit-empty off\n'
+        elif args == (self.manifest.parent / 'target/debug/host-agent', '--state-dir', self.state,
+                      '--tmux', self.tmux, 'health'):
+            stdout = '{"agent_pid": 123}'
+        elif (args[:2] == ('launchctl', 'bootstrap')
+              or args == (self.state / 'host-agent', '--catalog-dir', self.catalog, 'catalog-init')):
+            stdout = ''
+        else:
+            self.fail(f'Unexpected startup command {args}')
+        return subprocess.CompletedProcess(args, 0, stdout, '')
+
     def resolve_paths(self, lab_id):
         self.assertEqual(lab_id, self.lab_id)
         return self.state, self.catalog
@@ -284,7 +304,8 @@ class ManifestTests(unittest.TestCase):
                 return self.absent(*args, **kwargs)
             if args[:2] == ('launchctl', 'bootout'):
                 loaded.remove(args[2])
-            return subprocess.CompletedProcess(args, 0, '', '')
+                return subprocess.CompletedProcess(args, 0, '', '')
+            return self.startup_command(*args, **kwargs)
 
         with (patch.object(desktop_lab, 'W1_MANIFEST', self.manifest),
               patch.object(runtime_lab, 'run', side_effect=fake_run) as command):
@@ -304,7 +325,6 @@ class ManifestTests(unittest.TestCase):
 
     def test_second_job_bootstrap_interrupted(self):
         self.prepare_start()
-        lab = runtime_lab.Lab(w1=True, manifest=self.manifest)
         recovery = runtime_lab.w1_recovery_path(self.manifest)
         loaded = set()
 
@@ -324,9 +344,11 @@ class ManifestTests(unittest.TestCase):
                 return self.absent(*args, **kwargs)
             elif args[:2] == ('launchctl', 'bootout'):
                 loaded.remove(args[2])
-            return subprocess.CompletedProcess(args, 0, '', '')
+                return subprocess.CompletedProcess(args, 0, '', '')
+            return self.startup_command(*args, **kwargs)
 
         with patch.object(runtime_lab, 'run', side_effect=fake_run) as command:
+            lab = runtime_lab.Lab(w1=True, manifest=self.manifest)
             with self.assertRaises(KeyboardInterrupt):
                 lab.start()
             self.assertTrue(recovery.is_file())
@@ -342,8 +364,8 @@ class ManifestTests(unittest.TestCase):
     def test_private_recovery_available_before_manifest(self):
         self.prepare_start()
         recovery = runtime_lab.w1_recovery_path(self.manifest)
-        with (patch.object(runtime_lab, 'run'),
-              patch.object(runtime_lab, 'wait_for', side_effect=[123, True, 'local catalog ready (fixture)'])):
+        with (patch.object(runtime_lab, 'run', side_effect=self.startup_command),
+              patch.object(runtime_lab, 'catalog_message', return_value='local catalog ready (fixture)')):
             runtime_lab.Lab(w1=True, manifest=self.manifest).start()
         self.assertFalse(self.manifest.exists())
         self.assertEqual(stat.S_IMODE(recovery.stat().st_mode), 0o600)
@@ -360,9 +382,8 @@ class ManifestTests(unittest.TestCase):
 
     def test_down_after_partial_plist_cleanup(self):
         self.prepare_start()
-        with (patch.object(runtime_lab, 'run'),
-              patch.object(runtime_lab, 'catalog_message', return_value='local catalog ready (fixture)'),
-              patch.object(runtime_lab, 'wait_for', side_effect=[123, True, 'local catalog ready (fixture)'])):
+        with (patch.object(runtime_lab, 'run', side_effect=self.startup_command),
+              patch.object(runtime_lab, 'catalog_message', return_value='local catalog ready (fixture)')):
             runtime_lab.Lab(w1=True, manifest=self.manifest).start().publish_w1_manifest()
         recovery = runtime_lab.w1_recovery_path(self.manifest)
 
@@ -447,19 +468,174 @@ class ManifestTests(unittest.TestCase):
 
     def test_start_provisions_before_bootstrap_and_uses_exact_path(self):
         self.prepare_start()
-        lab = runtime_lab.Lab(w1=True, manifest=self.manifest)
-        with (patch.object(runtime_lab, 'run') as command,
-              patch.object(runtime_lab, 'wait_for', side_effect=[123, True, 'local catalog ready (fixture)'])):
-            lab.start()
-        self.assertEqual(command.call_args_list[0].args,
-                         (lab.service_host, '--catalog-dir', self.catalog, 'catalog-init'))
-        self.assertEqual(command.call_args_list[1].args[:2], ('launchctl', 'bootstrap'))
+        recovery = runtime_lab.w1_recovery_path(self.manifest)
+
+        def seed_legacy(lab):
+            self.assertTrue(json.loads(recovery.read_text())['startup_complete'])
+            self.assertFalse(self.manifest.exists())
+            return {'runtime_id': 'legacy-fixture'}
+
+        with (patch.object(desktop_lab, 'W1_MANIFEST', self.manifest),
+              patch.object(runtime_lab, 'run', side_effect=self.startup_command) as command,
+              patch.object(runtime_lab, 'catalog_message', return_value='local catalog ready (fixture)'),
+              patch.object(desktop_lab, 'seed_legacy', side_effect=seed_legacy) as seed,
+              redirect_stdout(io.StringIO())):
+            desktop_lab.start_w1()
+        self.assertEqual(seed.call_count, 1)
+        lab = seed.call_args.args[0]
+        socket_args = (self.tmux, '-N', '-S', self.state / 'tmux.sock')
+        self.assertEqual([call.args for call in command.call_args_list], [
+            (self.tmux, '-V'),
+            (lab.service_host, '--catalog-dir', self.catalog, 'catalog-init'),
+            ('launchctl', 'bootstrap', lab.domain, self.state / 'tmux.plist'),
+            ('launchctl', 'bootstrap', lab.domain, self.state / 'agent.plist'),
+            (*socket_args, 'show-options', '-s', 'exit-empty'),
+            (*socket_args, 'display-message', '-p', '#{version}'),
+            (lab.host, '--state-dir', self.state, '--tmux', self.tmux, 'health'),
+        ])
         self.assertEqual(plistlib.loads((self.state / 'agent.plist').read_bytes())['ProgramArguments'],
                          self.argv['agent'])
         self.assertEqual(lab.loaded, self.targets)
-        with patch.object(runtime_lab, 'catalog_message', return_value='local catalog ready (fixture)'):
-            lab.publish_w1_manifest()
-        self.assertEqual(list(runtime_lab.W1Record(self.manifest).targets.values()), self.targets)
+        self.assertTrue(json.loads(recovery.read_text())['startup_complete'])
+        ready = runtime_lab.W1Record(self.manifest)
+        self.assertEqual(list(ready.targets.values()), self.targets)
+        self.assertEqual(ready.record['runtimes'], [{'runtime_id': 'legacy-fixture'}])
+
+    def test_w1_binary_refusal_has_no_startup_effects(self):
+        self.prepare_start()
+        recovery = runtime_lab.w1_recovery_path(self.manifest)
+        canary = self.manifest.parent / 'unrelated'
+        canary.write_bytes(b'canary')
+        argv = (self.tmux, '-V')
+        for result, observed in [
+            (subprocess.CompletedProcess(argv, 0, 'tmux 3.8a\n', ''), "'tmux 3.8a'"),
+            (subprocess.CompletedProcess(argv, 0, 'tmux 3.8\nextra\n', ''), "'tmux 3.8\\nextra'"),
+            (subprocess.TimeoutExpired(argv, 15), 'unavailable (TimeoutExpired)'),
+        ]:
+            with (self.subTest(observed=observed),
+                  patch.object(desktop_lab, 'W1_MANIFEST', self.manifest),
+                  patch.object(runtime_lab, 'run', side_effect=[result]) as command,
+                  patch.object(Path, 'mkdir', autospec=True) as mkdir,
+                  patch.object(runtime_lab.shutil, 'copy2') as copy,
+                  patch.object(runtime_lab, 'write_w1_manifest') as write):
+                with self.assertRaisesRegex(RuntimeError, "requires 'tmux 3.8'") as error:
+                    desktop_lab.start_w1()
+                self.assertIn(self.tmux, str(error.exception))
+                self.assertIn(f'Observed {observed}', str(error.exception))
+                self.assertIn('first on PATH', str(error.exception))
+                command.assert_called_once_with(*argv, check=False)
+                mkdir.assert_not_called()
+                copy.assert_not_called()
+                write.assert_not_called()
+                self.assertFalse(any(path.exists() for path in (self.state, self.catalog, recovery, self.manifest)))
+                self.assertEqual(canary.read_bytes(), b'canary')
+
+    def assert_w1_server_refusal(self, returncode, stdout, observed, *, socket_ready=True):
+        self.prepare_start()
+        recovery = runtime_lab.w1_recovery_path(self.manifest)
+        canary = self.manifest.parent / 'unrelated'
+        canary.write_bytes(b'canary')
+        foreign = f'gui/{os.getuid()}/unrelated.tmux'
+        loaded = {foreign}
+        socket_path = self.state / 'tmux.sock'
+        socket_args = (self.tmux, '-N', '-S', socket_path)
+        responsiveness_args = (*socket_args, 'show-options', '-s', 'exit-empty')
+        version_args = (*socket_args, 'display-message', '-p', '#{version}')
+        health_args = (self.manifest.parent / 'target/debug/host-agent', '--state-dir', self.state,
+                       '--tmux', self.tmux, 'health')
+
+        def sample_readiness(check):
+            result = check()
+            if not result:
+                raise TimeoutError('fixture readiness deadline')
+            return result
+
+        def fake_run(*args, **kwargs):
+            if args[:2] == ('launchctl', 'bootstrap'):
+                name = args[3].stem
+                record = json.loads(recovery.read_text())
+                self.assertIn(name, record['attempted'])
+                self.assertFalse(record['startup_complete'])
+                loaded.add(self.targets[('tmux', 'agent').index(name)])
+            elif args == responsiveness_args and not socket_ready:
+                self.assertFalse(kwargs['check'])
+                return subprocess.CompletedProcess(args, 1, '', '')
+            elif args == health_args and not socket_ready:
+                return subprocess.CompletedProcess(args, 0, '{}', '')
+            elif args == version_args:
+                self.assertTrue(socket_ready)
+                self.assertFalse(kwargs['check'])
+                self.assertEqual(loaded, {*self.targets, foreign})
+                return subprocess.CompletedProcess(args, returncode, stdout, '')
+            elif args[:2] == ('launchctl', 'print'):
+                self.assertIn(args[2], self.targets)
+                if args[2] in loaded:
+                    return subprocess.CompletedProcess(args, 0, self.printed(args[2].rsplit('.', 1)[1]), '')
+                return self.absent(*args, **kwargs)
+            elif args[:2] == ('launchctl', 'bootout'):
+                self.assertIn(args[2], self.targets)
+                loaded.remove(args[2])
+                return subprocess.CompletedProcess(args, 0, '', '')
+            return self.startup_command(*args, **kwargs)
+
+        with (patch.object(desktop_lab, 'W1_MANIFEST', self.manifest),
+              patch.object(runtime_lab, 'run', side_effect=fake_run) as command,
+              patch.object(runtime_lab, 'wait_for', side_effect=sample_readiness),
+              patch.object(runtime_lab, 'catalog_message', return_value='local catalog ready (fixture)'),
+              patch.object(desktop_lab, 'seed_legacy') as seed):
+            with self.assertRaisesRegex(RuntimeError, "requires '3.8'") as error:
+                desktop_lab.start_w1()
+            for detail in (str(socket_path), self.tmux, f'Observed {observed}', 'scoped down command'):
+                self.assertIn(detail, str(error.exception))
+            seed.assert_not_called()
+            self.assertEqual(command.call_args.args, version_args if socket_ready else responsiveness_args)
+            self.assertEqual(loaded, {*self.targets, foreign})
+            self.assertFalse(self.manifest.exists())
+            record = runtime_lab.W1Record(recovery, recovery=True)
+            self.assertFalse(record.record['startup_complete'])
+            self.assertEqual(record.attempted, ('tmux', 'agent'))
+            self.assertTrue(self.state.is_dir() and self.catalog.is_dir())
+            self.assertEqual(canary.read_bytes(), b'canary')
+            command.reset_mock()
+            self.desktop_down()
+        self.assertEqual([call.args[2] for call in command.call_args_list if call.args[1] == 'bootout'],
+                         self.targets[::-1])
+        self.assertEqual(loaded, {foreign})
+        self.assertEqual(canary.read_bytes(), b'canary')
+        self.assertFalse(any(path.exists() for path in (self.state, self.catalog, recovery, self.manifest)))
+
+    def test_w1_wrong_server_version_preserves_scoped_recovery(self):
+        self.assert_w1_server_refusal(0, '3.8a\n', "'3.8a'")
+
+    def test_w1_unavailable_server_version_preserves_scoped_recovery(self):
+        self.assert_w1_server_refusal(1, '', 'unavailable (exit 1)')
+
+    def test_w1_unavailable_socket_diagnosed_before_agent_health(self):
+        self.assert_w1_server_refusal(1, '', 'unavailable (TimeoutError)', socket_ready=False)
+
+    def test_w1_record_can_list_without_startup_version_checks(self):
+        self.save()
+        inventory = {'runtimes': [{'runtime_id': 'existing-runtime'}]}
+        with patch.object(runtime_lab, 'run', return_value=subprocess.CompletedProcess(
+                [], 0, json.dumps(inventory), '')) as command:
+            lab = self.load()
+            self.assertEqual(lab.call('list'), inventory)
+        command.assert_called_once_with(lab.host, '--state-dir', self.state, '--tmux', self.tmux, 'list')
+
+    def test_catalog_free_start_does_not_require_w1_versions(self):
+        self.prepare_start()
+        self.state.mkdir(mode=0o700)
+        with (patch.object(runtime_lab.tempfile, 'mkdtemp', return_value=str(self.state)),
+              patch.object(runtime_lab, 'run', side_effect=self.startup_command) as command):
+            lab = runtime_lab.Lab().start()
+        self.assertIsNone(lab.catalog)
+        self.assertFalse(self.manifest.exists())
+        self.assertEqual([call.args for call in command.call_args_list], [
+            ('launchctl', 'bootstrap', lab.domain, self.state / 'tmux.plist'),
+            ('launchctl', 'bootstrap', lab.domain, self.state / 'agent.plist'),
+            (lab.host, '--state-dir', self.state, '--tmux', self.tmux, 'health'),
+            (self.tmux, '-N', '-S', self.state / 'tmux.sock', 'show-options', '-s', 'exit-empty'),
+        ])
 
     def test_fixture_and_pressure_callers_preserve_recoverable_startup(self):
         for caller in ('fixture', 'pressure'):
@@ -485,7 +661,8 @@ class ManifestTests(unittest.TestCase):
                         return self.absent(*args, **kwargs)
                     if args[:2] == ('launchctl', 'bootout'):
                         loaded.remove(args[2])
-                    return subprocess.CompletedProcess(args, 0, '', '')
+                        return subprocess.CompletedProcess(args, 0, '', '')
+                    return self.startup_command(*args, **kwargs)
 
                 with (patch.object(runtime_lab, 'run', side_effect=fake_run),
                       patch.object(w1_recovery, 'FIXTURE_MANIFEST', manifest),

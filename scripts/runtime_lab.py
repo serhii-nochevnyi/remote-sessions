@@ -23,6 +23,7 @@ W1_MANIFEST = ROOT / '.cache/runtime-lab-w1.json'
 W1_LABEL = 'dev.remotesessions.w1.'
 W1_ID = re.compile(r'[0-9a-f]{12}')
 W1_JOBS = ('tmux', 'agent')
+W1_TMUX_VERSION = '3.8'
 CATALOG_DB = 'catalog.sqlite3'
 
 
@@ -50,6 +51,22 @@ def wait_for(check, timeout=15):
             pass
         time.sleep(0.1)
     raise TimeoutError('condition did not become true within timeout')
+
+
+def require_w1_tmux_version(probe, expected, source, remedy):
+    try:
+        result = probe()
+    except (OSError, subprocess.SubprocessError, UnicodeError) as error:
+        observed = f'unavailable ({type(error).__name__})'
+    else:
+        if result.returncode == 0:
+            version = result.stdout.removesuffix('\n')
+            if version == expected:
+                return
+            observed = repr(version[:160]) if version else 'unavailable (empty output)'
+        else:
+            observed = f'unavailable (exit {result.returncode})'
+    raise RuntimeError(f'W1 requires {expected!r} from {source}. Observed {observed}. {remedy}')
 
 
 def support_directory():
@@ -374,6 +391,9 @@ class Lab:
             raise ValueError('Pressure requires its own W1 lab')
         self.host = ROOT / 'target/debug/host-agent'
         self.tmux = shutil.which('tmux')
+        tmux_remedy = f'Put tmux {W1_TMUX_VERSION} first on PATH and retry setup.'
+        if w1 and not self.tmux:
+            raise RuntimeError(f'W1 requires tmux {W1_TMUX_VERSION} on PATH. Observed unavailable. {tmux_remedy}')
         if not self.host.is_file() or not self.tmux:
             raise RuntimeError('build host-agent and install tmux first')
         self.w1 = w1
@@ -393,7 +413,15 @@ class Lab:
             if (self.catalog.parent.resolve(strict=True) != self.catalog.parent
                     or self.catalog.parent.stat().st_dev != internal_device()):
                 raise RuntimeError('W1 requires a real Application Support directory on the internal data volume')
-            self.tmux = str(Path(self.tmux).resolve(strict=True))
+            try:
+                self.tmux = str(Path(self.tmux).resolve(strict=True))
+            except (OSError, RuntimeError) as error:
+                raise RuntimeError(f'W1 requires tmux {W1_TMUX_VERSION} at {self.tmux}. Observed unavailable. '
+                                   f'{tmux_remedy}') from error
+            require_w1_tmux_version(
+                lambda: run(self.tmux, '-V', check=False), f'tmux {W1_TMUX_VERSION}',
+                f'the selected binary at {self.tmux}', tmux_remedy,
+            )
             self.state.mkdir(mode=0o700)
             self.state_identity = directory_identity(self.state)
         else:
@@ -486,13 +514,24 @@ class Lab:
                     path.chmod(0o600)
                 run('launchctl', 'bootstrap', self.domain, path, pass_fds=launch_fds)
                 self.loaded.append(self.domain + '/' + label)
+            if self.w1:
+                def server_version():
+                    self.wait_for_tmux()
+                    return self.tmux_call('display-message', '-p', '#{version}')
+
+                require_w1_tmux_version(
+                    server_version, W1_TMUX_VERSION,
+                    f'the dedicated tmux server at {self.state / "tmux.sock"} using {self.tmux}',
+                    f'Run the scoped down command for this lab, then retry with tmux {W1_TMUX_VERSION}.',
+                )
             wait_for(lambda: self.call('health').get('agent_pid'))
-            wait_for(lambda: self.tmux_call('show-options', '-s', 'exit-empty').returncode == 0)
             if self.w1:
                 if not wait_for(lambda: catalog_message(self.state)).startswith('local catalog ready ('):
                     raise RuntimeError('W1 catalog failed to open')
                 self.recovery['startup_complete'] = True
                 write_w1_manifest(self.recovery_path, self.recovery, replace=True)
+            else:
+                self.wait_for_tmux()
             return self
         except (Exception, KeyboardInterrupt):
             if self.w1:
@@ -514,6 +553,9 @@ class Lab:
 
     def tmux_call(self, *args):
         return run(self.tmux, '-N', '-S', self.state / 'tmux.sock', *args, check=False)
+
+    def wait_for_tmux(self):
+        wait_for(lambda: self.tmux_call('show-options', '-s', 'exit-empty').returncode == 0)
 
     def close(self):
         if self.w1:
