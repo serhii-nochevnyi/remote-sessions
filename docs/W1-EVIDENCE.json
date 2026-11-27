@@ -1,0 +1,1243 @@
+{
+  "schema": "w1-deferred-report-1",
+  "installed_acceptance": "DEFERRED",
+  "completion": {
+    "w1": "HELD",
+    "p0": "HELD",
+    "pilot": "HELD"
+  },
+  "follow_up": {
+    "status": "OPEN",
+    "url": "https://github.com/serhii-nochevnyi/remote-sessions/issues/10"
+  },
+  "source_handoff": {
+    "inspected_revision": "086365f61368678fb780cfa1e7f4befa9d606276",
+    "requirements": [
+      "REQ-11",
+      "REQ-12"
+    ],
+    "scoped_check": {
+      "argv": [
+        "python3",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests/integration",
+        "-p",
+        "test_w1_evidence.py"
+      ],
+      "status": "PENDING",
+      "exit_status": null,
+      "test_count": null,
+      "test_names": null
+    }
+  },
+  "preparation": {
+    "positive_paste_producer": "HOLD",
+    "paste_mode_build_record_supported": true,
+    "positive_paste_workload_supported": false,
+    "positive_paste_evidence_consumer_supported": false,
+    "test_paste_evidence_supported": false
+  },
+  "native_observations": {
+    "outcome": null,
+    "tested_commit": null,
+    "tested_tree": null,
+    "provider_executable": null,
+    "provider_version": null,
+    "tmux_version": null,
+    "os_version": null,
+    "sqlite_version": null,
+    "runtime_id": null,
+    "server_generation": null,
+    "session_id": null,
+    "window_id": null,
+    "pane_id": null,
+    "pid": null,
+    "process_start": null,
+    "view_id": null,
+    "agent_epoch": null,
+    "owner_epoch": null,
+    "paste_receipt": null,
+    "submitted_model_prompts": null,
+    "geometry": {
+      "committed_tmux_target": null,
+      "committed_target_revision": null,
+      "provider_tty": null,
+      "bridge_pty_client": null,
+      "xterm": null
+    },
+    "provenance": {
+      "bridge": {
+        "tested_commit": null,
+        "tested_tree": null,
+        "producer_log": null,
+        "producer_record": null,
+        "producer_digest": null,
+        "tool_versions": null,
+        "host_executable": null,
+        "probe_executable": null,
+        "owner_app_bundle": null,
+        "victim_app_bundle": null,
+        "operator_evidence": null,
+        "private_capture_digest": null,
+        "cleanup": null
+      },
+      "installed": {
+        "tested_commit": null,
+        "tested_tree": null,
+        "producer_log": null,
+        "producer_record": null,
+        "producer_digest": null,
+        "tool_versions": null,
+        "host_executable": null,
+        "probe_executable": null,
+        "owner_app_bundle": null,
+        "victim_app_bundle": null,
+        "operator_evidence": null,
+        "private_capture_digest": null,
+        "cleanup": null
+      },
+      "paste": {
+        "tested_commit": null,
+        "tested_tree": null,
+        "producer_log": null,
+        "producer_record": null,
+        "producer_digest": null,
+        "tool_versions": null,
+        "host_executable": null,
+        "probe_executable": null,
+        "owner_app_bundle": null,
+        "victim_app_bundle": null,
+        "operator_evidence": null,
+        "private_capture_digest": null,
+        "cleanup": null
+      }
+    }
+  },
+  "cases": [
+    {
+      "id": "R1",
+      "status": "DEFERRED",
+      "reason": "Durable create acceptance is deferred.",
+      "owed_witness": "In the installed app, double-submit one native create. Correlate the stable operation and reserved identities, host spawn count and surviving process. Require at most one runtime and no automatic respawn.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R1-DURABLE-BOUNDARIES",
+      "status": "UNRUN",
+      "reason": "Crash injection around launch is unrun.",
+      "owed_witness": "Interrupt before and after durable reservation, the may-have-launched marker, spawn and reply. For each boundary, reconcile the exact reserved engine generation, count spawns and compare surviving process identity. Require at most one runtime per operation and no automatic respawn.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R1-EQUAL-CONCURRENT",
+      "status": "UNRUN",
+      "reason": "Concurrent equal host requests are unrun.",
+      "owed_witness": "Submit the same key and normalized inputs concurrently. Correlate replies and recovery to the same operation, reserved identities and at most one spawn.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R1-CONFLICT-KEY",
+      "status": "UNRUN",
+      "reason": "Conflicting reuse has no installed witness.",
+      "owed_witness": "Reuse the accepted key with different inputs. Record typed rejection, unchanged original binding and no additional spawn.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R1-LOST-REPLY",
+      "status": "UNRUN",
+      "reason": "Installed create reply loss is unobserved.",
+      "owed_witness": "Lose the launch reply, query or retry the same operation and corroborate one runtime, spawn count and the same process identity with no automatic respawn.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R1-EARLY-EXIT",
+      "status": "UNRUN",
+      "reason": "Quick provider exit has no installed result.",
+      "owed_witness": "Start a quickly exiting process. Observe typed exited status and retained operation and pane identity, distinct from provider readiness.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R1-TMUX-OUTAGE-GENERATION",
+      "status": "UNRUN",
+      "reason": "Outage and server replacement are unrun.",
+      "owed_witness": "Hide or stop access to tmux, then test a replaced generation. Record visible unknown when exact reconciliation is unavailable and no respawn or adoption from reused numeric identities.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R1-UNKNOWN-DISTINCT-OP",
+      "status": "UNRUN",
+      "reason": "The native recovery and explicit new-launch flow is unrun.",
+      "owed_witness": "Show visible unknown, refresh or reconcile the same operation with no new spawn, then deliberately start a distinct operation while retaining the first unknown result.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R1-LEGACY-CONTINUITY",
+      "status": "UNRUN",
+      "reason": "Retained P0 identity needs installed restart evidence.",
+      "owed_witness": "Restart the agent with tmux surviving and match original legacy session, runtime, pane and process identities. Keep workspace and launch history unknown where absent.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R2",
+      "status": "DEFERRED",
+      "reason": "Installed catalog acceptance is deferred.",
+      "owed_witness": "Exercise validated internal storage, upgrade and rollback, retained operation identity and actionable catalog faults with surviving panes and no empty reset.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R2-INTERNAL-CATALOG",
+      "status": "UNRUN",
+      "reason": "The installed host's actual catalog location and settings are unobserved.",
+      "owed_witness": "Check filesystem identity on the internal macOS data volume, private per-user ownership/modes and SQLite journal, sync, fullfsync, foreign keys, trusted schema and version settings.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R2-DISK-FULL-WRITE",
+      "status": "UNRUN",
+      "reason": "Disk-full and write-failure injection are unrun.",
+      "owed_witness": "Inject disk full and a write failure. Record the actionable create/storage failure, durable boundary and retained catalog and panes without an empty reset.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R2-CORRUPT",
+      "status": "UNRUN",
+      "reason": "Recovery from corrupt catalog bytes is unrun.",
+      "owed_witness": "Open a corrupt catalog and observe actionable failure, preserved original bytes and exact surviving-pane observation without new writer or create authority.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R2-NEWER-SCHEMA",
+      "status": "UNRUN",
+      "reason": "An unsupported newer schema has no installed witness.",
+      "owed_witness": "Open a newer schema and record the typed refusal, original version/data and surviving pane identities without downgrade or empty reset.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R2-MIGRATION-ROLLBACK",
+      "status": "UNRUN",
+      "reason": "Upgrade and rollback effects are unobserved.",
+      "owed_witness": "Upgrade a supported older catalog and inject a migration failure to verify transactional rollback. Compare schema, data, operation identity and live panes.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R2-TOMBSTONES-PANES",
+      "status": "UNRUN",
+      "reason": "Catalog continuity across restart has no installed witness.",
+      "owed_witness": "After restart, compare accepted operations and tombstones, legacy identity and surviving pane/process identity without resetting the store.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R3",
+      "status": "DEFERRED",
+      "reason": "Installed folder and provider readiness acceptance is deferred.",
+      "owed_witness": "Exercise the native picker, service-side host revalidation, safe failure paths, and both installed provider profiles on internal and accessible KINGSTON workspaces.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R3-CANCEL-PICKER",
+      "status": "UNRUN",
+      "reason": "No installed picker-cancel trace is available.",
+      "owed_witness": "Cancel the native picker. Correlate a live request recorder with no registration, readiness or create requests, unchanged pending/catalog state, no spawn and a usable retry action.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R3-FORGED-WORKSPACE",
+      "status": "UNRUN",
+      "reason": "An unregistered workspace refusal is unobserved.",
+      "owed_witness": "Send an unregistered opaque workspace ID through the installed host boundary. Record typed refusal, no process and a route back to native selection.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R3-MISSING-NONEXEC-CLI",
+      "status": "UNRUN",
+      "reason": "Service-context missing and non-executable CLI cases are unrun.",
+      "owed_witness": "Test absent and non-executable provider candidates separately. Show the actionable readiness failure, no process and recovery after the service can resolve an eligible CLI.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R3-CHANGED-DENIED-PATH",
+      "status": "UNRUN",
+      "reason": "Service revalidation failures are unrun.",
+      "owed_witness": "Change, remove or replace a selected folder and separately deny service access. Record host revalidation failure, no process and required reselection or access recovery.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R3-SYMLINK-NONUTF8",
+      "status": "UNRUN",
+      "reason": "Symlink identity changes and unsupported path encoding are unrun.",
+      "owed_witness": "Resolve a selected symlink and then change its target. Separately select an unsupported non-UTF-8 path. Record no spawn and actionable refusal or reselection in each negative case.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R3-CLAUDE-INTERNAL",
+      "status": "UNRUN",
+      "reason": "Claude Code internal startup is unobserved.",
+      "owed_witness": "On an internal project path with spaces and Unicode, witness picker selection, actual service access, host readiness, the installed Claude executable/version and normal provider trust/defaults through startup.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R3-CLAUDE-KINGSTON",
+      "status": "UNRUN",
+      "reason": "Claude Code removable-volume startup is unobserved.",
+      "owed_witness": "On an accessible KINGSTON project path with spaces and Unicode, witness picker selection, actual service access, host readiness, the installed Claude executable/version and normal provider trust/defaults through startup.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R3-CODEX-INTERNAL",
+      "status": "UNRUN",
+      "reason": "Codex internal startup is unobserved.",
+      "owed_witness": "On an internal project path with spaces and Unicode, witness picker selection, actual service access, host readiness, the installed Codex executable/version and normal provider trust/defaults through startup.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R3-CODEX-KINGSTON",
+      "status": "UNRUN",
+      "reason": "Codex removable-volume startup is unobserved.",
+      "owed_witness": "On an accessible KINGSTON project path with spaces and Unicode, witness picker selection, actual service access, host readiness, the installed Codex executable/version and normal provider trust/defaults through startup.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R4",
+      "status": "DEFERRED",
+      "reason": "Installed resize admission and convergence acceptance is deferred.",
+      "owed_witness": "Correlate exact host admission, committed tmux target/revision, independent provider TTY, bridge PTY/client and actual xterm grid. Verify same-view identity through healthy resize, rejected mutations, eventual convergence and fresh-view recovery.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R4-EXPIRED-NO-SUCCESSOR",
+      "status": "UNRUN",
+      "reason": "Expiry before host admission has no installed result.",
+      "owed_witness": "With no successor and the original lease already expired, submit a fresh resize. Correlate explicit expiry rejection to the attempt and verify no new target revision or geometry effect.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R4-PRIOR-PROPAGATION",
+      "status": "UNRUN",
+      "reason": "Accepted late geometry propagation is unobserved.",
+      "owed_witness": "Admit a resize while live and observe a prior accepted effect propagating after expiry or handoff. Correlate the committed target/revision, lagging provider sample and eventual latest-target convergence.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R4-STALE-BEFORE-GUARD",
+      "status": "UNRUN",
+      "reason": "Predecessor work at the engine guard is unrun.",
+      "owed_witness": "Retire the predecessor with an acknowledged exact-target fence, then let its delayed command reach the guard. Record rejection and unchanged authoritative target/revision.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R4-YIELDING-CONTROL",
+      "status": "UNRUN",
+      "reason": "The deliberately yielding disposable control is unrun.",
+      "owed_witness": "Pause a disposable command after its guard, advance the fence and resume it as a counterexample. Compare its effect with the fixed non-yielding guard and exact-target mutation route.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R4-DELAYED-SETTER",
+      "status": "UNRUN",
+      "reason": "Delayed predecessor epoch installation is untested in the installed run.",
+      "owed_witness": "Delay the predecessor setter until the successor fence is acknowledged. Record conditional refusal and proof that the obsolete epoch cannot regain admission.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R4-TIMEOUT-PRECOMMIT",
+      "status": "UNRUN",
+      "reason": "A timeout before target commit is unobserved.",
+      "owed_witness": "Force an unknown reply before commit. Observe closed admission, a confirmed conditional fence and fresh exact-target observations before any current owner proposal, with no replay or inverse resize.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R4-TIMEOUT-POSTCOMMIT",
+      "status": "UNRUN",
+      "reason": "A timeout after target commit is unobserved.",
+      "owed_witness": "Lose the reply after commit. Observe fencing, readback of the committed revision and a separate provider sample before a new proposal. Compare the surviving runtime and latest convergence without replay.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R4-AGENT-RESTART",
+      "status": "UNRUN",
+      "reason": "Surviving-server resize reconciliation is unrun.",
+      "owed_witness": "Restart the agent while tmux and the provider survive. Match exact pane/process identity, retire the prior agent epoch, obtain fresh correlated readback and suppress stale replies before reopening admission.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R4-SAME-SIZE-ABA",
+      "status": "UNRUN",
+      "reason": "Same-size and repeated-target ordering evidence is missing.",
+      "owed_witness": "Exercise no-op same-size and A-to-B-to-A targets with delayed effects. Correlate scoped revisions and samples without treating equal dimensions as proof that prior work drained.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R4-CORRELATED-READBACK",
+      "status": "UNRUN",
+      "reason": "Independent same-target grid samples are missing.",
+      "owed_witness": "Bind host admission and target/revision to a provider TTY sample revalidated against pane/process/TTY, a bridge PTY/client reading and an actual xterm reading. Observe eventual convergence once proposals stop.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R4-SPLIT-OUTPUT-REDRAW",
+      "status": "UNRUN",
+      "reason": "Geometry redraw under fragmented output is unrun.",
+      "owed_witness": "Join ordered output around a resize barrier, bridge readback, xterm write completion and grid change, then current-view redraw. Check stale acknowledgement suppression and stable healthy view/runtime identity.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R4-CLAUDE-OWNER",
+      "status": "UNRUN",
+      "reason": "Claude Code owner resize has no installed observation.",
+      "owed_witness": "Record Claude Code owner admission, committed tmux target/revision, provider TTY, bridge PTY/client and actual xterm grid on the same run as its spectator readback. Correlate eventual convergence and unchanged runtime, pane, process and owner view.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R4-CLAUDE-SPECTATOR",
+      "status": "UNRUN",
+      "reason": "Claude Code spectator readback is unobserved.",
+      "owed_witness": "Read the committed tmux target/revision, provider TTY, spectator bridge PTY/client and actual xterm grid on the same Claude Code run as the owner. Correlate convergence and local zoom/pan with the retained spectator view identity.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R4-CODEX-OWNER",
+      "status": "UNRUN",
+      "reason": "Codex owner resize has no installed observation.",
+      "owed_witness": "Record Codex owner admission, committed tmux target/revision, provider TTY, bridge PTY/client and actual xterm grid on the same run as its spectator readback. Correlate eventual convergence and unchanged runtime, pane, process and owner view.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R4-CODEX-SPECTATOR",
+      "status": "UNRUN",
+      "reason": "Codex spectator readback is unobserved.",
+      "owed_witness": "Read the committed tmux target/revision, provider TTY, spectator bridge PTY/client and actual xterm grid on the same Codex run as the owner. Correlate convergence and local zoom/pan with the retained spectator view identity.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R4-RECONNECT",
+      "status": "UNRUN",
+      "reason": "Installed close, reopen and fresh redraw are unrun.",
+      "owed_witness": "Close and reopen the view, correlate fresh view identity and redraw to the same surviving runtime, pane, process and unsubmitted draft, and independently check no input replay.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R4-CLAUDE-SPECTATOR-REJECTION",
+      "status": "UNRUN",
+      "reason": "No actual Claude Code spectator resize attempt has been observed.",
+      "owed_witness": "Submit a different-size spectator resize on the Claude Code runtime while the legitimate owner retains control. Correlate explicit host rejection with the actual request, spectator view, owner epoch and exact runtime/server/window/pane. Bracket the attempt with independent before and after readings of the same owner's four grids (committed tmux target/revision, provider TTY, bridge PTY/client and actual xterm grid). Require unchanged dimensions and target revision and no unauthorized geometry effect. Keep spectator readback as a separate witness.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null,
+        "host_rejection": null,
+        "request": null,
+        "spectator_view_id": null,
+        "stale_view_id": null,
+        "owner_epoch": null,
+        "previous_owner_epoch": null,
+        "runtime_id": null,
+        "server_generation": null,
+        "window_id": null,
+        "pane_id": null,
+        "owner_grids_before": {
+          "committed_tmux_target": null,
+          "committed_target_revision": null,
+          "provider_tty": null,
+          "bridge_pty_client": null,
+          "xterm": null
+        },
+        "owner_grids_after": {
+          "committed_tmux_target": null,
+          "committed_target_revision": null,
+          "provider_tty": null,
+          "bridge_pty_client": null,
+          "xterm": null
+        }
+      }
+    },
+    {
+      "id": "R4-CODEX-SPECTATOR-REJECTION",
+      "status": "UNRUN",
+      "reason": "No actual Codex spectator resize attempt has been observed.",
+      "owed_witness": "Submit a different-size spectator resize on the Codex runtime while the legitimate owner retains control. Correlate explicit host rejection with the actual request, spectator view, owner epoch and exact runtime/server/window/pane. Bracket the attempt with independent before and after readings of the same owner's four grids (committed tmux target/revision, provider TTY, bridge PTY/client and actual xterm grid). Require unchanged dimensions and target revision and no unauthorized geometry effect. Keep spectator readback as a separate witness.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null,
+        "host_rejection": null,
+        "request": null,
+        "spectator_view_id": null,
+        "stale_view_id": null,
+        "owner_epoch": null,
+        "previous_owner_epoch": null,
+        "runtime_id": null,
+        "server_generation": null,
+        "window_id": null,
+        "pane_id": null,
+        "owner_grids_before": {
+          "committed_tmux_target": null,
+          "committed_target_revision": null,
+          "provider_tty": null,
+          "bridge_pty_client": null,
+          "xterm": null
+        },
+        "owner_grids_after": {
+          "committed_tmux_target": null,
+          "committed_target_revision": null,
+          "provider_tty": null,
+          "bridge_pty_client": null,
+          "xterm": null
+        }
+      }
+    },
+    {
+      "id": "R4-STALE-LEASE-REJECTION",
+      "status": "UNRUN",
+      "reason": "No installed stale-lease resize after handoff has been observed.",
+      "owed_witness": "Submit a new different-size resize under the stale lease after handoff. Bind explicit host rejection to the request, stale view and old/current owner epochs and exact runtime/server/window/pane. Independently compare before and after readings of the current owner's four grids (committed tmux target/revision, provider TTY, bridge PTY/client and actual xterm grid) for unchanged dimensions and target revision.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null,
+        "host_rejection": null,
+        "request": null,
+        "spectator_view_id": null,
+        "stale_view_id": null,
+        "owner_epoch": null,
+        "previous_owner_epoch": null,
+        "runtime_id": null,
+        "server_generation": null,
+        "window_id": null,
+        "pane_id": null,
+        "owner_grids_before": {
+          "committed_tmux_target": null,
+          "committed_target_revision": null,
+          "provider_tty": null,
+          "bridge_pty_client": null,
+          "xterm": null
+        },
+        "owner_grids_after": {
+          "committed_tmux_target": null,
+          "committed_target_revision": null,
+          "provider_tty": null,
+          "bridge_pty_client": null,
+          "xterm": null
+        }
+      }
+    },
+    {
+      "id": "R5",
+      "status": "DEFERRED",
+      "reason": "Installed pressure and isolation acceptance is deferred.",
+      "owed_witness": "Observe bounded queues and resource use, independent healthy views and heartbeats, responsive control and resize, fresh redraw and isolation between sessions under pressure.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R5-STARTUP-PRESSURE",
+      "status": "UNRUN",
+      "reason": "Native startup flood has no measurement.",
+      "owed_witness": "Flood a newly attached view during startup. Record observed queue limits, closure behavior and resource use, with independent process progress.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R5-STEADY-PRESSURE",
+      "status": "UNRUN",
+      "reason": "Installed steady output flood is unmeasured.",
+      "owed_witness": "Flood an established view and record independent resource and queue behavior, control responsiveness and continuing runtime progress.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R5-STALL-ISOLATION",
+      "status": "UNRUN",
+      "reason": "A stalled installed observer has no run evidence.",
+      "owed_witness": "Stall the victim observer and witness bounded overflow and isolation. Correlate exact victim closure and ensure other views and the runtime continue to make progress.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R5-HEALTHY-PROGRESS",
+      "status": "UNRUN",
+      "reason": "Healthy-view and runtime heartbeat evidence is missing.",
+      "owed_witness": "During the victim stall, separately measure healthy rendered output and independent runtime heartbeat progress.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R5-PRESSURE-RESIZE",
+      "status": "UNRUN",
+      "reason": "Installed control and resize under pressure are unrun.",
+      "owed_witness": "Correlate control and an owner resize through pressure to a committed revision and independent provider, bridge and renderer observations.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R5-FRESH-REDRAW",
+      "status": "UNRUN",
+      "reason": "Installed recovery ordering is unobserved.",
+      "owed_witness": "Record scoped closure before fresh attachment and redraw. Match the replacement view to the same runtime, require clean rendering and independently confirm no input replay.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R5-TWO-SESSION-ISOLATION",
+      "status": "UNRUN",
+      "reason": "Concurrent installed pressure isolation is unrun.",
+      "owed_witness": "Record distinct output and input destinations in two sessions under pressure, bounded affected queues, healthy control and no cross-session leakage.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6",
+      "status": "DEFERRED",
+      "reason": "Installed protocol and guarded clipboard acceptance is deferred.",
+      "owed_witness": "Observe ordered split parsing, local queries, focus and color, exact provider/mode paste and independently witnessed safety, disposition and no replay.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-SPLIT-CSI",
+      "status": "UNRUN",
+      "reason": "Fragmented CSI under pressure is unrun.",
+      "owed_witness": "Split CSI across output chunks under pressure. Verify ordered parsing, applicable local query response and independent pane input without a leaked reply.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-SPLIT-DCS",
+      "status": "UNRUN",
+      "reason": "Fragmented DCS under pressure is unrun.",
+      "owed_witness": "Split DCS across output chunks under pressure. Verify ordered local handling and independent pane input without a leaked reply.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-SPLIT-OSC",
+      "status": "UNRUN",
+      "reason": "Fragmented OSC under pressure is unrun.",
+      "owed_witness": "Split OSC across output chunks under pressure. Observe ordered parsing and local query handling without forwarding generated bytes as user input.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-FOCUS",
+      "status": "UNRUN",
+      "reason": "Native terminal focus transitions are unobserved.",
+      "owed_witness": "Observe actual focus changes and ordered focus updates under terminal output pressure. Distinguish emulator-generated effects and accepted user input independently.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-COLOR",
+      "status": "UNRUN",
+      "reason": "Native terminal color transitions are unobserved.",
+      "owed_witness": "Exercise color updates and queries under pressure, including fragmented output. Observe local handling and independently verify the input path remains separate.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-CLAUDE-NORMAL-SHORT",
+      "status": "UNRUN",
+      "reason": "The short normal-mode Claude Code WebView paste is unobserved.",
+      "owed_witness": "Witness one short clipboard gesture in the actual Claude Code WebView on a stamped app-created pane. Independently observe normal mode and compare exact Unicode and LF bytes without bracket delimiters to the unsubmitted draft. Correlate guarded admission, consumed marker before one paste command, named-buffer deletion, receipt Ack and fresh Ready. Bind provider executable/version and runtime, pane, process and view. Observe one effect, zero ordinary copies and zero submitted model prompts.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-CLAUDE-NORMAL-MULTICHUNK",
+      "status": "UNRUN",
+      "reason": "The multi-chunk normal-mode Claude Code WebView paste is unobserved.",
+      "owed_witness": "Witness one multi-chunk clipboard gesture in the actual Claude Code WebView on a stamped app-created pane. Independently observe normal mode and compare exact Unicode and LF bytes without bracket delimiters to the unsubmitted draft. Correlate guarded admission, consumed marker before one paste command, named-buffer deletion, receipt Ack and fresh Ready. Bind provider executable/version and runtime, pane, process and view. Observe one effect, zero ordinary copies and zero submitted model prompts.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-CLAUDE-BRACKETED-SHORT",
+      "status": "UNRUN",
+      "reason": "The short bracketed-mode Claude Code WebView paste is unobserved.",
+      "owed_witness": "Witness one short clipboard gesture in the actual Claude Code WebView on a stamped app-created pane. Independently observe bracketed mode and compare exact Unicode and LF bytes with the expected bracket delimiters to the unsubmitted draft. Correlate guarded admission, consumed marker before one paste command, named-buffer deletion, receipt Ack and fresh Ready. Bind provider executable/version and runtime, pane, process and view. Observe one effect, zero ordinary copies and zero submitted model prompts.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-CLAUDE-BRACKETED-MULTICHUNK",
+      "status": "UNRUN",
+      "reason": "The multi-chunk bracketed-mode Claude Code WebView paste is unobserved.",
+      "owed_witness": "Witness one multi-chunk clipboard gesture in the actual Claude Code WebView on a stamped app-created pane. Independently observe bracketed mode and compare exact Unicode and LF bytes with the expected bracket delimiters to the unsubmitted draft. Correlate guarded admission, consumed marker before one paste command, named-buffer deletion, receipt Ack and fresh Ready. Bind provider executable/version and runtime, pane, process and view. Observe one effect, zero ordinary copies and zero submitted model prompts.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-CODEX-NORMAL-SHORT",
+      "status": "UNRUN",
+      "reason": "The short normal-mode Codex WebView paste is unobserved.",
+      "owed_witness": "Witness one short clipboard gesture in the actual Codex WebView on a stamped app-created pane. Independently observe normal mode and compare exact Unicode and LF bytes without bracket delimiters to the unsubmitted draft. Correlate guarded admission, consumed marker before one paste command, named-buffer deletion, receipt Ack and fresh Ready. Bind provider executable/version and runtime, pane, process and view. Observe one effect, zero ordinary copies and zero submitted model prompts.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-CODEX-NORMAL-MULTICHUNK",
+      "status": "UNRUN",
+      "reason": "The multi-chunk normal-mode Codex WebView paste is unobserved.",
+      "owed_witness": "Witness one multi-chunk clipboard gesture in the actual Codex WebView on a stamped app-created pane. Independently observe normal mode and compare exact Unicode and LF bytes without bracket delimiters to the unsubmitted draft. Correlate guarded admission, consumed marker before one paste command, named-buffer deletion, receipt Ack and fresh Ready. Bind provider executable/version and runtime, pane, process and view. Observe one effect, zero ordinary copies and zero submitted model prompts.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-CODEX-BRACKETED-SHORT",
+      "status": "UNRUN",
+      "reason": "The short bracketed-mode Codex WebView paste is unobserved.",
+      "owed_witness": "Witness one short clipboard gesture in the actual Codex WebView on a stamped app-created pane. Independently observe bracketed mode and compare exact Unicode and LF bytes with the expected bracket delimiters to the unsubmitted draft. Correlate guarded admission, consumed marker before one paste command, named-buffer deletion, receipt Ack and fresh Ready. Bind provider executable/version and runtime, pane, process and view. Observe one effect, zero ordinary copies and zero submitted model prompts.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-CODEX-BRACKETED-MULTICHUNK",
+      "status": "UNRUN",
+      "reason": "The multi-chunk bracketed-mode Codex WebView paste is unobserved.",
+      "owed_witness": "Witness one multi-chunk clipboard gesture in the actual Codex WebView on a stamped app-created pane. Independently observe bracketed mode and compare exact Unicode and LF bytes with the expected bracket delimiters to the unsubmitted draft. Correlate guarded admission, consumed marker before one paste command, named-buffer deletion, receipt Ack and fresh Ready. Bind provider executable/version and runtime, pane, process and view. Observe one effect, zero ordinary copies and zero submitted model prompts.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-STOCK-SAFETY",
+      "status": "UNRUN",
+      "reason": "The installed stock safety leg is unrun.",
+      "owed_witness": "Record any stock route refusal and independent zero-command and zero-byte witnesses. Keep this safety result separate from positive installed paste.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-EXPIRED-BEFORE-ADMISSION",
+      "status": "UNRUN",
+      "reason": "No installed held-to-expiry commit has been observed.",
+      "owed_witness": "Stage a paste, hold its commit past lease expiry with no successor, and verify explicit admission refusal, zero submitted commands and zero pane bytes.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-STALE-HANDOFF",
+      "status": "UNRUN",
+      "reason": "Stale paste rejection after handoff is unobserved.",
+      "owed_witness": "Attempt commit under the predecessor lease after handoff. Verify pre-submission refusal with zero commands and bytes and an independently scoped current owner.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-LEGACY-REJECTION",
+      "status": "UNRUN",
+      "reason": "Legacy pane paste rejection is unobserved.",
+      "owed_witness": "Attempt guarded paste on a legacy pane. Record explicit pre-submission refusal with independent zero commands and bytes.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-MISSING-SENDER-PROOF",
+      "status": "UNRUN",
+      "reason": "Missing sender proof has no installed result.",
+      "owed_witness": "Exercise a staged paste without exact sender proof. Observe guard refusal and independently verify zero submitted commands and pane bytes.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-ADMITTED-POST-TTL",
+      "status": "UNRUN",
+      "reason": "An admitted command held past expiry is unrun.",
+      "owed_witness": "Admit and submit one guarded command under the exact live lease. Hold it past expiry, show blocked handoff and all new input while pending, then independently observe its one permitted effect on the original pane, cleanup and no replay.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-KNOWN-HANDOFF",
+      "status": "UNRUN",
+      "reason": "Handoff after known delivery is unrun.",
+      "owed_witness": "Observe a known paste disposition, receipt acknowledgement and buffer cleanup. Confirm eligible successor input and zero paste replay after handoff.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-KNOWN-RESTART",
+      "status": "UNRUN",
+      "reason": "Restart after known delivery is unrun.",
+      "owed_witness": "Restart after known paste delivery with the pane surviving. Check durable disposition, buffer deletion, fresh eligible input and zero replay.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-POST-MARKER-ERROR",
+      "status": "UNRUN",
+      "reason": "Error after durable marker consumption is unrun.",
+      "owed_witness": "Inject an error after consuming the durable marker. Independently observe commands and bytes, hold the exact pane if uncertain, verify named-buffer cleanup and require zero replay.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-LOST-REPLY-BEFORE-BYTES",
+      "status": "UNRUN",
+      "reason": "A lost commit reply before witnessed bytes is unrun.",
+      "owed_witness": "Drop the commit reply after marker consumption before bytes are witnessed. Block handoff and new input while unresolved, check buffer disposition and independently verify zero replay.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-LOST-REPLY-AFTER-BYTES",
+      "status": "UNRUN",
+      "reason": "A lost commit reply after witnessed bytes is unrun.",
+      "owed_witness": "Drop the commit reply after independently witnessing original pane bytes. Compare the consumed marker and effect, hold unresolved admission, check buffer disposition and verify zero replay.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-TIMEOUT-QUARANTINE",
+      "status": "UNRUN",
+      "reason": "Timeout quarantine has no installed witness.",
+      "owed_witness": "After a timed-out possibly submitted operation, retain the consumed marker and exact-pane quarantine despite geometry retirement. Both acquire routes and every write route remain held. Witness named-buffer cleanup or its unresolved disposition and zero replay.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-RESTART-QUARANTINE",
+      "status": "UNRUN",
+      "reason": "Prior-build quarantine on a surviving server is unrun.",
+      "owed_witness": "Restart the agent with a prior-build consumed marker and surviving server. Match the exact pane despite geometry retirement, verify both acquire routes and every write route remain held, and record buffer disposition and zero replay.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-FRESH-PANE",
+      "status": "UNRUN",
+      "reason": "Independent eligible input on a fresh pane is unobserved.",
+      "owed_witness": "Beside the quarantined pane, identify a distinct eligible pane, observe only its own exact fresh input and verify no replay or cross-pane delivery.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R7",
+      "status": "DEFERRED",
+      "reason": "Both-provider workflow, build and device acceptance is deferred.",
+      "owed_witness": "Retain distinct CLI and native WebView runs for both providers, per-workflow private capture digests, native presentation/restarts and legacy regressions, plus the signed physical-device prerequisite.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R7-CLAUDE-CLI",
+      "status": "UNRUN",
+      "reason": "Real Claude Code CLI regression is unrun.",
+      "owed_witness": "Separately observe actual CLI startup, trust, Unicode draft editing and zero submitted model prompts. Record executable version, runtime identity, report and private captures.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R7-CODEX-CLI",
+      "status": "UNRUN",
+      "reason": "Real Codex CLI regression is unrun.",
+      "owed_witness": "Separately observe actual CLI startup, trust, Unicode draft editing and zero submitted model prompts. Record executable version, runtime identity, report and private captures.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R7-CLAUDE-WEBVIEW",
+      "status": "UNRUN",
+      "reason": "Installed Claude Code WebView workflow is unrun.",
+      "owed_witness": "Observe Claude Code startup, trust and draft editing through the built native terminal. Record zero submitted model prompts, actual bundle/provider/runtime/view identity and authorized capture digest.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R7-CODEX-WEBVIEW",
+      "status": "UNRUN",
+      "reason": "Installed Codex WebView workflow is unrun.",
+      "owed_witness": "Observe Codex startup, trust and draft editing through the built native terminal. Record zero submitted model prompts, actual bundle/provider/runtime/view identity and authorized capture digest.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R7-CLAUDE-WEBVIEW-MENU",
+      "status": "UNRUN",
+      "reason": "The actual Claude Code WebView menu is unobserved.",
+      "owed_witness": "On the built Claude Code WebView's empty input line, type slash, observe menu opening, move the highlight with arrows and dismiss with Escape or Backspace before draft edits. Record all transitions, machine-readable build/runtime/view identity, private capture digest and zero submitted model prompts.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R7-CODEX-WEBVIEW-MENU",
+      "status": "UNRUN",
+      "reason": "The actual Codex WebView menu is unobserved.",
+      "owed_witness": "On the built Codex WebView's empty input line, type slash, observe menu opening, move the highlight with arrows and dismiss with Escape or Backspace before draft edits. Record all transitions, machine-readable build/runtime/view identity, private capture digest and zero submitted model prompts.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R7-KEYBOARD-REORDER-RESTORE",
+      "status": "UNRUN",
+      "reason": "Installed tab navigation and restoration are unrun.",
+      "owed_witness": "Observe keyboard focus and navigation, explicit tab reorder, and restoration of open/active selection, order and presentation preferences against inventory after relaunch.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R7-ZOOM-EXPAND-FULLSCREEN",
+      "status": "UNRUN",
+      "reason": "Installed presentation controls are unobserved.",
+      "owed_witness": "Exercise font increase/decrease/reset and shortcuts, narrow layout, expand/restore controls, then native fullscreen entry and exit. Record readable input cursor, predictable grid, terminal focus and input on the same session.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R7-APP-AGENT-RESTART",
+      "status": "UNRUN",
+      "reason": "Separate installed app and agent restarts are unrun.",
+      "owed_witness": "Restart the app and agent in separate legs. In each record surviving runtime/pane/process and draft identity, restored presentation preferences, fresh view/redraw as needed and accurate UI status.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R7-RUNTIME-BRIDGE-REGRESSION",
+      "status": "UNRUN",
+      "reason": "Current legacy lifecycle and bridge runs are unobserved.",
+      "owed_witness": "Run the legacy launchd lifecycle and native bridge regressions on the applicable finalized source. Record independent service lifetime, reconnect, leased input and cleanup.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R7-PHYSICAL-DEVICE",
+      "status": "UNRUN",
+      "reason": "Signed device feasibility is still owed.",
+      "owed_witness": "Record the applicable signed physical iPhone prerequisite, artifact and observed terminal input, presentation and lifecycle usability on device.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R7-CLAUDE-CREATE-ONE-TAB",
+      "status": "UNRUN",
+      "reason": "No successful installed Claude Code create has been observed.",
+      "owed_witness": "Record before and after tab inventory and selection for successful native Claude Code create. Verify exactly one new selected tab maps to the new runtime for the requested provider and project, and terminal focus returns to that tab.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R7-CODEX-CREATE-ONE-TAB",
+      "status": "UNRUN",
+      "reason": "No successful installed Codex create has been observed.",
+      "owed_witness": "Record before and after tab inventory and selection for successful native Codex create. Verify exactly one new selected tab maps to the new runtime for the requested provider and project, and terminal focus returns to that tab.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R7-RAPID-CONCURRENT-TABS",
+      "status": "UNRUN",
+      "reason": "Rapid switches between concurrent installed sessions are unobserved.",
+      "owed_witness": "With two live sessions in distinct tabs, switch rapidly in both directions while each emits distinguishable output and receives session-specific unsubmitted draft input. Correlate selected tab, view and runtime identities, input destination and rendered output. Require each session's own input/output with no cross-routing.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R7-BRIDGE-PROVENANCE",
+      "status": "UNRUN",
+      "reason": "No finalized bridge acceptance build or run is recorded.",
+      "owed_witness": "Bind the clean finalized product commit/tree, fresh bridge-only build record and independently retained producer digest to tool versions and the actual executed host and probe, sanitized observations and confirmed cleanup.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R7-INSTALLED-PROVENANCE",
+      "status": "UNRUN",
+      "reason": "No finalized installed acceptance build or run is recorded.",
+      "owed_witness": "Bind clean finalized product commit/tree, fresh installed record and independently retained producer digest to tool versions, actual host and probe, owner and victim bundles, and installed operator observations and cleanup. Correlate each native workflow's machine-readable identity to an authorized private screenshot digest.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R7-PASTE-PROVENANCE",
+      "status": "UNRUN",
+      "reason": "Positive paste build/run evidence is pending preparation.",
+      "owed_witness": "Bind clean finalized product commit/tree, fresh paste record and independently retained producer digest to tool versions, actual host, probe and owner bundle, independent provider/mode observations, authorized private WebView capture digests and cleanup.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-PREP-PROBE-SENDER",
+      "status": "DEFERRED",
+      "reason": "The installed disposable paste sender proof route is owed.",
+      "owed_witness": "Implement and check exact native IPC sender proof on a disposable app-created pane, bound to the runtime, server, pane and lease.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-PREP-CATALOG-REOPEN",
+      "status": "DEFERRED",
+      "reason": "Durable catalog fixture restart support is owed.",
+      "owed_witness": "Provision a missing fixture catalog once, then reopen and validate the existing catalog through normal safety checks after restart while preserving its durable state.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-PREP-LIVE-WORKLOAD",
+      "status": "DEFERRED",
+      "reason": "The current positive workload raises a provenance hold.",
+      "owed_witness": "Implement the real per-gesture installed workload, bind the live host, probe and owner app artifacts, and independently observe exact pane effects and disposition.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-PREP-EVIDENCE-CONSUMER",
+      "status": "DEFERRED",
+      "reason": "Mode-matched positive evidence wiring is owed.",
+      "owed_witness": "Implement and check the positive producer/consumer route for mode-matched records and native clipboard observations with bound artifact, provider, pane, lease and receipt proofs.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    },
+    {
+      "id": "R6-PREP-NEGATIVE-FIXTURES",
+      "status": "DEFERRED",
+      "reason": "The separate positive paste evidence fixture command is absent.",
+      "owed_witness": "Add independent negatives rejecting stock refusal, test-sink bytes, obsolete geometry, tmux exit status, or missing provider/mode, pane, lease, consumed marker or receipt witnesses.",
+      "observations": {
+        "outcome": null,
+        "submitted_model_prompts": null
+      }
+    }
+  ]
+}

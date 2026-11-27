@@ -1,12 +1,15 @@
 # Development waves — Mac + iPhone MVP
 
-Updated: 2026-11-21. Planning mode: vertical MVP slices, explicitly selected by the user. This roadmap replaces the old phase-only status summary; historical product scope and acceptance IDs remain in [MVP-PLAN](planning/MVP-PLAN.md) and [UI-SPEC](planning/UI-SPEC.md). [ADR-12](STACK.md) supersedes the Go stack.
+Historical product scope and acceptance IDs remain in [MVP-PLAN](planning/MVP-PLAN.md) and [UI-SPEC](planning/UI-SPEC.md). [ADR-12](STACK.md) supersedes the Go stack.
+
+**Installed acceptance:** DEFERRED\
+**Follow-up:** OPEN — [GitHub issue #10](https://github.com/serhii-nochevnyi/remote-sessions/issues/10)
 
 ## Baseline: what is already proven
 
 Rust host/server/native core; independent macOS tmux and agent service lifetimes; real local desktop tabs and live output; same-runtime reconnect; leased local input; Unicode/paste/Enter; selection in Claude; unsent Codex draft continuity. Evidence: [desktop](P0-DESKTOP-VERIFICATION.md), [runtime](P0-RUNTIME-VERIFICATION.md), [CLI](P0-CLI-VERIFICATION.md).
 
-This is a local development spike. P0 is still open: physical iPhone usability and E2EE/key-store feasibility have not passed. Model response/approval-task completion, production installation, durable operations, remote transport and release readiness are not established by the existing tests.
+The historical P0 reports cover the local spike. W1 source adds the private SQLite catalog and durable native operations. Physical iPhone usability, E2EE/key-store feasibility, model response and approval-task completion, production installation, remote transport and release readiness remain outside the historical P0 results.
 
 ## Operating model
 
@@ -45,9 +48,9 @@ W2 is an early feasibility lane, not an excuse to delay platform evidence until 
 
 The old P0–P5 names are scope categories, not a second execution schedule: W1 covers part of P1/P2; W2 covers the phone portion of P0; W3 completes local P1/P2 hardening; W4 covers the security part of P0 and prerequisite P3 work; W5 covers P3; W6 covers P4; W7 covers P5. Completed spikes stay completed; this does not restart the project.
 
-## Wave 1 intended scope
+## Wave 1 local desktop source handoff
 
-Outcome: create and use a session entirely from the Mac interface. Technical choices are fixed in accepted [ADR-13](decisions/ADR-13-local-desktop-workflow.md); the checked [W1 delivery plan](W1-PLAN.md) defines implementation order and acceptance.
+The W1 source implements the intended local Mac workflow. Its acceptance matrix remains deferred. [Local desktop workflow](LOCAL-DESKTOP-WORKFLOW.md) · [W1 delivery plan](W1-PLAN.md) · [W1 verification](W1-VERIFICATION.md)
 
 - Native folder picker with cancel semantics; bounded, typed workspace identity; project path/name shown before launch.
 - Host-resolved Claude/Codex profiles with readiness errors; provider authentication and approval/sandbox defaults remain on the Mac.
@@ -64,31 +67,19 @@ Outcome: create and use a session entirely from the Mac interface. Technical cho
 | Native create for each provider | Correct project and installed executable; new runtime ID and selected tab |
 | Cancel picker / unavailable CLI / inaccessible folder | No process created; clear recovery action |
 | Double submission / lost reply / agent crash around spawn | One operation reconciles to at most one runtime; no automatic respawn |
-| Font increase/decrease/reset, expand, fullscreen | Readable input cursor and predictable grid; input/focus stay with the same session |
-| Spectator resize / stale lease | Host rejects runtime mutation; other owner dimensions stay stable |
+| Font increase/decrease/reset, expand, fullscreen | Readable input cursor and predictable grid with focus and input on the same session |
+| Spectator resize / stale lease | Actual host rejection of each attempted mutation with the current owner's four grids and target revision unchanged. Spectator readback is witnessed separately. |
 | Close/reopen, app restart, agent restart | Runtime identity survives where tmux survives; UI restores preferences and reports state honestly |
-| Two sessions and output pressure | No cross-session input/output leakage; bounded queues and responsive control |
-| Actual native acceptance | Real Mac WebView + real Claude/Codex startup and safe input/menu tests, with screenshot and machine-readable identity evidence |
+| Rapid switching and output pressure | Two live tabs, each with correctly routed output and draft input through rapid switching. Bounded queues and responsive control under pressure. |
+| Actual native acceptance | Separate real CLI and Mac WebView workflows for Claude Code and Codex, including separate menu, one-tab creation, exact provider/mode paste, safety and no-replay witnesses, with build and capture provenance |
 
 Relevant existing acceptance IDs: A01, A02, A04 (local ownership subset), A06 (agent subset), A11, A13, A15; D1–D4, D7, D9. Remote/device portions remain later gates, not implicitly passed here.
 
-## Wave 1 planning status
+## Wave 1 delivery status
 
-All four Wave 1 research lines completed against baseline `91d9695`; durable receipts and materialized artifact digests were verified. The user accepted [ADR-13](decisions/ADR-13-local-desktop-workflow.md) on 2026-11-21, selecting SQLite-backed operation identity, a restricted native launch path and in-place owner resize. Gate 1 passed. Formal MVP decomposition passed the independent typed checker with no findings. Gate 2 generated nine tickets in eight execution waves; all 12 accepted requirements and 20 task validation rows are covered. Implementation is pending.
+The accepted local workflow decision selected SQLite-backed operation identity and restricted native launch. The active resize decision fences authority at admission and allows propagation of previously admitted effects. The current baseline includes the nine source repair areas. The source handoff was projected separately after Gate 2. It follows current-head checks, source review and applicable aggregate integration and architecture review under recorded delegation. [Local workflow decision](decisions/ADR-13-local-desktop-workflow.md) · [Source handoff issue](https://github.com/serhii-nochevnyi/remote-sessions/issues/79) · [W1 milestone](https://github.com/serhii-nochevnyi/remote-sessions/milestone/1)
 
-See the [W1 delivery plan](W1-PLAN.md) for the nine linked GitHub Issues, dependency graph, planned branches, review rules and acceptance evidence. Next: implement T-01-01 (workspace picker and provider readiness). Detailed internal planning artifacts and receipts remain local. All merges are manual; current-head review is required.
-
-The private [repository](https://github.com/serhii-nochevnyi/remote-sessions), seven [wave milestones](https://github.com/serhii-nochevnyi/remote-sessions/milestones), branches and PR workflow are user-authorized. Jira is not this project's tracker. No feature implementation or automatic merge permission follows from this planning PR.
-
-## Research implications for W1
-
-- Current create can spawn before its reply succeeds (`crates/host-agent/src/engine.rs`); persist request identity and reconcile exact reserved IDs before any retry. SQLite cannot include the external tmux action in its transaction.
-- Native create must receive only workspace/profile IDs; the host checks actual service access and installed provider environment (`apps/client/src-tauri/src/lib.rs`, `scripts/runtime_lab.py`). Internal and accessible KINGSTON project paths need explicit native acceptance.
-- Current terminal geometry is part of the React key (`apps/client/src/App.tsx`); remove it from connection identity and coordinate tmux, PTY and xterm dimensions under the owner lease.
-- The bounded viewer channel currently blocks when full (`crates/desktop-bridge/src/lib.rs`). Prove runtime/healthy-view progress with a stalled observer and fresh-redraw recovery. Cover fragmented query, focus and large Unicode paste behavior as well.
-- Shared host/native/frontend files make creation and resize poor candidates for simultaneous unrestricted edits. Plans must sequence the shared boundaries and give every slice executable acceptance.
-
-The research freshly passed six frontend tests. Earlier native/launchd/real-provider reports remain historical; none prove the proposed W1 flows. W1 needs dedicated crash/resize/pressure tests and logged-in Mac evidence for both providers, separate from P0 reports. Initial clean-checkout CI exposed documentation links into local planning; this PR repairs them. Full core/native CI passed on the first PR revision.
+The open installed follow-up retains the complete R1–R7 matrix, the applicable signed physical-device prerequisite and remaining positive paste preparation. Before acceptance, complete the preparation, bind finalized build inputs and gather fresh, independent observations. Prompt counts are unknown and W1, P0 and pilot completion remain held. Source merge leaves the follow-up open. [W1 verification](W1-VERIFICATION.md)
 
 ## Scheduling and external inputs
 

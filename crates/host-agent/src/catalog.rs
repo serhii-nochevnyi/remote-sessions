@@ -977,6 +977,7 @@ impl CatalogLane {
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::time::Instant;
 
     fn fixture() -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir_in("/tmp").unwrap();
@@ -1074,6 +1075,69 @@ mod tests {
         assert_eq!(count, 0);
     }
 
+    fn open_fault_fixture(dir: &Path) -> CatalogResult<Catalog> {
+        open_fault_fixture_with_wait(dir, Duration::from_secs(3), || {})
+    }
+
+    fn open_fault_fixture_with_wait(
+        dir: &Path,
+        budget: Duration,
+        mut on_contention: impl FnMut(),
+    ) -> CatalogResult<Catalog> {
+        let deadline = Instant::now() + budget;
+        loop {
+            let result = Catalog::open(dir);
+            if !matches!(result, Err(ProductIssue::CatalogBusy)) {
+                return result;
+            }
+            on_contention();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                std::thread::sleep(remaining.min(Duration::from_millis(5)));
+            }
+            if Instant::now() >= deadline {
+                return result;
+            }
+        }
+    }
+
+    fn empty_locked_fixture() -> (tempfile::TempDir, PathBuf, CatalogLock) {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let dir = temp.path().canonicalize().unwrap().join("catalog");
+        DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let owner = CatalogLock::acquire(&dir, true).unwrap();
+        (temp, dir, owner)
+    }
+
+    #[test]
+    fn w1_readiness_catalog_fault_waits_for_fixture_lock_release() {
+        let (_temp, dir, owner) = empty_locked_fixture();
+        assert_eq!(Catalog::open(&dir).err(), Some(ProductIssue::CatalogBusy));
+        let mut observed = false;
+        let result = open_fault_fixture_with_wait(&dir, Duration::from_secs(3), || {
+            assert!(!observed);
+            observed = true;
+            owner.file.unlock().unwrap();
+        });
+        assert!(observed);
+        assert_eq!(result.err(), Some(ProductIssue::CatalogMissing));
+        assert!(!dir.join(DB).exists() && !dir.join(RECORD).exists());
+
+        let (_held_temp, held_dir, _held_owner) = empty_locked_fixture();
+        let budget = Duration::from_millis(30);
+        let start = Instant::now();
+        let mut observed = false;
+        let result = open_fault_fixture_with_wait(&held_dir, budget, || observed = true);
+        assert!(observed);
+        assert!(start.elapsed() >= budget);
+        assert_eq!(result.err(), Some(ProductIssue::CatalogBusy));
+        assert_eq!(
+            Catalog::open(&held_dir).err(),
+            Some(ProductIssue::CatalogBusy)
+        );
+        assert!(!held_dir.join(DB).exists() && !held_dir.join(RECORD).exists());
+    }
+
     #[test]
     fn w1_readiness_unsafe_missing_and_unsupported_catalogs_preserve_files() {
         let (temp, dir) = fixture();
@@ -1090,24 +1154,30 @@ mod tests {
         let backup = dir.join("backup");
         fs::rename(&db, &backup).unwrap();
         assert_eq!(
-            Catalog::open(&dir).err(),
+            open_fault_fixture(&dir).err(),
             Some(ProductIssue::CatalogMissing)
         );
         assert_eq!(provision(&dir), Err(ProductIssue::CatalogUnsafe));
         assert!(!db.exists());
         symlink(&backup, &db).unwrap();
-        assert_eq!(Catalog::open(&dir).err(), Some(ProductIssue::CatalogUnsafe));
+        assert_eq!(
+            open_fault_fixture(&dir).err(),
+            Some(ProductIssue::CatalogUnsafe)
+        );
         fs::remove_file(&db).unwrap();
         fs::rename(&backup, &db).unwrap();
         fs::set_permissions(&db, fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(Catalog::open(&dir).err(), Some(ProductIssue::CatalogUnsafe));
+        assert_eq!(
+            open_fault_fixture(&dir).err(),
+            Some(ProductIssue::CatalogUnsafe)
+        );
         fs::set_permissions(&db, fs::Permissions::from_mode(0o600)).unwrap();
 
         let record = dir.join(RECORD);
         let saved = fs::read(&record).unwrap();
         fs::remove_file(&record).unwrap();
         assert_eq!(
-            Catalog::open(&dir).err(),
+            open_fault_fixture(&dir).err(),
             Some(ProductIssue::CatalogMissing)
         );
         let mut file = file_options()
@@ -1117,14 +1187,17 @@ mod tests {
             .unwrap();
         file.write_all(Uuid::new_v4().to_string().as_bytes())
             .unwrap();
-        assert_eq!(Catalog::open(&dir).err(), Some(ProductIssue::CatalogUnsafe));
+        assert_eq!(
+            open_fault_fixture(&dir).err(),
+            Some(ProductIssue::CatalogUnsafe)
+        );
         fs::write(&record, saved).unwrap();
 
         let journal = dir.join(SIDECARS[0]);
         fs::write(&journal, "retain rollback evidence").unwrap();
         let before = fs::read(&db).unwrap();
         assert_eq!(
-            Catalog::open(&dir).err(),
+            open_fault_fixture(&dir).err(),
             Some(ProductIssue::CatalogUnavailable)
         );
         assert_eq!(
@@ -1141,14 +1214,14 @@ mod tests {
         drop(connection);
         let before = fs::read(&db).unwrap();
         assert_eq!(
-            Catalog::open(&dir).err(),
+            open_fault_fixture(&dir).err(),
             Some(ProductIssue::CatalogUnsupported)
         );
         assert_eq!(fs::read(&db).unwrap(), before);
         fs::rename(&db, &backup).unwrap();
         fs::remove_file(&record).unwrap();
         assert_eq!(
-            Catalog::open(&dir).err(),
+            open_fault_fixture(&dir).err(),
             Some(ProductIssue::CatalogMissing)
         );
         assert_eq!(provision(&dir), Err(ProductIssue::CatalogUnsafe));
