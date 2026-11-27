@@ -1776,6 +1776,173 @@ async fn w1_terminal_confirmation_rechecks_inventory_and_parked_native_validatio
     }
 }
 
+#[tokio::test]
+async fn w1_terminal_candidate_drains_eof_during_confirmation() {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let fixture = WriterCandidateFixture::new();
+        let original = fixture.epoch;
+        fs::write(fixture._directory.0.join("hold"), "").unwrap();
+        let candidate = fixture.prepare(AttachmentMode::Candidate).await;
+        let view = fixture.bridge.view(&candidate.view_id).unwrap();
+        assert_eq!(view.terminal, candidate.status.terminal);
+        view.output.lock().await.refresh_at = Instant::now() + Duration::from_secs(60);
+        assert_eq!(
+            read_until_bytes(
+                &fixture.bridge,
+                &candidate.view_id,
+                b"buffered attachment output"
+            )
+            .await,
+            b"buffered attachment output"
+        );
+
+        let confirmation = fixture.confirming(candidate.status.terminal.clone());
+        assert!(!fixture.row.exited);
+        fixture
+            .reply_inventory(fixture.expected.agent_pid, fixture.row.clone())
+            .await;
+        let validation = attachment_status_peer(&fixture.listener, &candidate.status).await;
+        assert!(!confirmation.is_finished());
+        fs::write(fixture._directory.0.join("continue"), "").unwrap();
+        tokio::time::timeout(Duration::from_secs(2), view.retired())
+            .await
+            .unwrap();
+        assert!(view.eof_draining());
+        {
+            let views = fixture.bridge.views.lock().unwrap();
+            let id = view.terminal.view_id;
+            assert!(!views.live.contains_key(&id));
+            let drain = &views.drains[&id];
+            assert!(Arc::ptr_eq(&drain.view, &view));
+            let now = Instant::now();
+            assert!(drain.expires > now && drain.expires <= now + EOF_TTL);
+        }
+        assert_eq!(
+            confirmation.await.unwrap().unwrap_err().to_string(),
+            "Terminal candidate is no longer current"
+        );
+        drop(validation);
+
+        assert!(
+            fixture
+                .bridge
+                .input(
+                    &candidate.view_id,
+                    vec![65],
+                    &Uuid::new_v4().to_string(),
+                    false
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            fixture
+                .bridge
+                .resize(
+                    &candidate.view_id,
+                    candidate.status.committed.size,
+                    original
+                )
+                .await
+                .is_err()
+        );
+        fixture.no_effects(original).await;
+        let mut exited = fixture.row.clone();
+        exited.exited = true;
+        exited.pane_pid = None;
+        let (inventory, ()) = tokio::join!(
+            fixture.bridge.inventory(),
+            fixture.reply_inventory(fixture.expected.agent_pid, exited)
+        );
+        let inventory = inventory.unwrap();
+        assert_eq!(inventory.agent_pid, fixture.expected.agent_pid);
+        assert_eq!(inventory.runtimes.len(), 1);
+        assert!(inventory.runtimes[0].exited);
+        assert_eq!(inventory.runtimes[0].pane_pid, None);
+        assert_eq!(inventory.runtimes[0].runtime_id, fixture.target.runtime_id);
+
+        let mut data = Vec::new();
+        let mut frames = 0;
+        loop {
+            let chunk = fixture.bridge.read(&candidate.view_id).await.unwrap();
+            assert_read_only_drain(&chunk);
+            if chunk.closed {
+                assert_eq!(chunk.closure, Some(TerminalClosure::Eof));
+                assert!(chunk.data.is_empty());
+                break;
+            }
+            frames += 1;
+            assert!(frames <= OUTPUT_SLOTS && !chunk.data.is_empty());
+            assert!(chunk.closure.is_none() && chunk.data.len() <= OUTPUT_CHUNK_SIZE);
+            data.extend(chunk.data);
+        }
+        assert!(frames > 1);
+        assert_eq!(
+            data,
+            [
+                b"first diagnostic".as_slice(),
+                &[0; OUTPUT_CHUNK_SIZE],
+                b"last diagnostic".as_slice(),
+            ]
+            .concat()
+        );
+        assert!(fixture.bridge.read(&candidate.view_id).await.is_err());
+        assert_eq!(allocation_counts(&fixture.bridge), (0, 0));
+        fixture.no_effects(original).await;
+        fixture.finish().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn w1_terminal_candidate_inventory_mismatch_leaves_queued_readable_bytes() {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let fixture = WriterCandidateFixture::new();
+        let original = fixture.epoch;
+        fs::write(fixture._directory.0.join("hold"), "").unwrap();
+        let candidate = fixture.prepare(AttachmentMode::Candidate).await;
+        let view = fixture.bridge.view(&candidate.view_id).unwrap();
+        let read_clock = view.output.lock().await.refresh_at - Duration::from_millis(1);
+        let confirmation = fixture.confirming(candidate.status.terminal.clone());
+        let mut conflicting = fixture.row.clone();
+        conflicting.operation_id = Some(Uuid::new_v4());
+        fixture
+            .reply_inventory(fixture.expected.agent_pid, conflicting)
+            .await;
+        assert_eq!(
+            confirmation.await.unwrap().unwrap_err().to_string(),
+            "Terminal inventory binding changed"
+        );
+        {
+            let views = fixture.bridge.views.lock().unwrap();
+            assert!(Arc::ptr_eq(
+                &views.live[&candidate.status.terminal.view_id],
+                &view
+            ));
+            assert!(views.drains.is_empty());
+        }
+        let expected = b"buffered attachment output";
+        let mut data = Vec::new();
+        while data.len() < expected.len() {
+            let chunk = fixture
+                .bridge
+                .read_with_clock(&candidate.view_id, || read_clock)
+                .await
+                .unwrap();
+            assert_read_only_drain(&chunk);
+            assert!(!chunk.closed && chunk.closure.is_none());
+            data.extend(chunk.data);
+        }
+        assert_eq!(data, expected);
+        fixture.no_effects(original).await;
+        fixture.bridge.detach(&candidate.view_id);
+        fixture.finish().await;
+    })
+    .await
+    .unwrap();
+}
+
 struct GeometryFixture {
     bridge: DesktopBridge,
     listener: UnixListener,

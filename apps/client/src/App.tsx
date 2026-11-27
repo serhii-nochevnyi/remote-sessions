@@ -6,9 +6,10 @@ import { TerminalToolbar } from "./TerminalToolbar";
 import type { FullscreenExitFocus } from "./TerminalToolbar";
 import { CreateSessionDialog } from "./CreateSessionDialog";
 import { SessionTabs } from "./SessionTabs";
-import { canRestoreTerminalFocus, explicitClosedReconnect, explicitTerminalOpen, inventoryBindingState, inventoryOpen, moveView, openView,
-  requiresTerminalReopen, restoreFullscreenExitFocus, sameRuntime, terminalPanel, viewAvailability } from "./session-state.ts";
-import type { BoundTerminal, MountedTerminal, SessionViews, TerminalBindingState, TerminalFocusTarget } from "./session-state.ts";
+import { beginTerminalReconnect, cancelTerminalReconnect, canRestoreTerminalFocus, explicitTerminalOpen, inventoryOpen, moveView, openView,
+  refreshTerminalRecord, requiresTerminalReopen, restoreFullscreenExitFocus, sameRuntime, terminalPanel, updateTerminalRecord,
+  viewAvailability } from "./session-state.ts";
+import type { BoundTerminal, MountedTerminal, SessionViews, TerminalBindingState, TerminalFocusTarget, TerminalRecord } from "./session-state.ts";
 import { createdRuntime, PresentationStore, zoomFont, zoomShortcut } from "./presentation-preferences.ts";
 import type { ZoomAction } from "./presentation-preferences.ts";
 import { localClient, runtimeTitle, TerminalDelivery } from "./local-client";
@@ -21,9 +22,6 @@ interface FullscreenFocusIntent {
   keepTerminal: boolean;
   target: HTMLElement | null;
 }
-
-type AttachmentState = { binding: BoundTerminal; state: TerminalBindingState; attempt: number; reconnect?: true }
-  | { binding: null; state: "closed"; attempt: number };
 
 function PanelTerminal(props: Omit<ComponentProps<typeof TerminalView>, "delivery" | "detached">) {
   const [delivery] = useState(() => new TerminalDelivery());
@@ -47,15 +45,23 @@ export default function App() {
   const inventoryRef = useRef<Inventory | null>(null);
   const [external, setExternal] = useState<ReadonlyMap<string, { operationId: string | null; sessionId: string }>>(() => new Map());
   const externalRef = useRef(external);
-  const [attachments, setAttachments] = useState<ReadonlyMap<string, AttachmentState>>(() => new Map());
+  const [attachments, setAttachments] = useState<ReadonlyMap<string, TerminalRecord>>(() => new Map());
   const attachmentsRef = useRef(attachments);
-  const updateAttachment = useCallback((id: string, value: AttachmentState | null) => {
+  const updateAttachment = useCallback((id: string, value: TerminalRecord | null) => {
     const next = new Map(attachmentsRef.current);
     if (value) next.set(id, value);
     else next.delete(id);
     attachmentsRef.current = next;
     setAttachments(next);
   }, []);
+  const advanceSelection = useCallback(() => {
+    const selection = ++selectionRevision.current;
+    for (const [id, record] of attachmentsRef.current) {
+      const canceled = cancelTerminalReconnect(record);
+      if (canceled && canceled !== record) updateAttachment(id, canceled);
+    }
+    return selection;
+  }, [updateAttachment]);
   const focusRuntime = useRef<string | null>(null);
   const app = useRef<HTMLDivElement>(null);
   const panel = useRef<HTMLElement>(null);
@@ -74,10 +80,8 @@ export default function App() {
     const exposure = preferences.exposures?.find(record => record.runtimeId === id);
     const attachment = attachments.get(id);
     const previousBinding = attachment?.binding ?? null;
-    const closed = exposure?.state === "closed" || attachment?.state === "closed";
     const mounted = terminalPanel(views, id, inventory, exposure ?? external.get(id),
-      previousBinding, closed, attachment?.state === "closed" ? undefined : attachment?.state,
-      attachment?.state === "view-closed" && attachment.reconnect && attachment.attempt === selectionRevision.current);
+      attachment, exposure?.state === "closed", selectionRevision.current);
     return { id, mounted, previousBinding, attempt: attachment?.attempt ?? 0 };
   });
   const activePanel = panels.find(panel => panel.id === activeId);
@@ -112,22 +116,22 @@ export default function App() {
     if ((record?.binding ?? null) !== previous || (record?.attempt ?? 0) !== attempt) return { mode: "missing" };
     const exposure = store.exposure(id);
     return terminalPanel(store.current.views, id, inventoryRef.current, exposure ?? externalRef.current.get(id),
-      previous, exposure?.state === "closed" || record?.state === "closed", record?.state === "closed" ? undefined : record?.state,
-      record?.state === "view-closed" && record.reconnect && record.attempt === selectionRevision.current);
+      record, exposure?.state === "closed", selectionRevision.current);
   }, [store]);
   const reconnectClosedTerminal = useCallback((id: string, binding: BoundTerminal, attempt: number) => {
-    if (explicitClosedReconnect(currentAttachment(id, binding, attempt)) !== binding) return;
-    updateAttachment(id, { binding, state: "view-closed", attempt: ++selectionRevision.current, reconnect: true });
-  }, [currentAttachment, updateAttachment]);
-  const onBinding = useCallback((binding: BoundTerminal, state: TerminalBindingState, previous: BoundTerminal | null, attempt: number) => {
+    const next = beginTerminalReconnect(currentAttachment(id, binding, attempt), binding, selectionRevision.current + 1);
+    if (!next) return;
+    advanceSelection();
+    updateAttachment(id, next);
+  }, [advanceSelection, currentAttachment, updateAttachment]);
+  const onBinding = useCallback((binding: BoundTerminal, state: TerminalBindingState | "rendered", previous: BoundTerminal | null, attempt: number) => {
     const id = binding.terminal.target.runtime_id;
     const current = attachmentsRef.current.get(id);
-    if (!store.current.views.open.includes(id) || store.exposure(id)?.state === "closed" ||
-        current?.state === "closed" || current?.state === "changed" || current?.state === "ended" || current?.state === "completed" ||
-        (current?.binding ?? null) !== previous || (current?.attempt ?? 0) !== attempt) return false;
-    if (state === "bound" && (!currentAttachment(id, previous, attempt).intent ||
-        inventoryRef.current?.agent_pid !== binding.identity.agentPid)) return false;
-    updateAttachment(id, { binding, state, attempt });
+    if (!store.current.views.open.includes(id) || store.exposure(id)?.state === "closed") return false;
+    const next = updateTerminalRecord(current, currentAttachment(id, previous, attempt),
+      binding, state, previous, attempt, selectionRevision.current);
+    if (!next) return false;
+    updateAttachment(id, next);
     return true;
   }, [store, currentAttachment, updateAttachment]);
   useEffect(() => {
@@ -140,9 +144,8 @@ export default function App() {
         if (disposed) return;
         inventoryRef.current = inventory;
         for (const [id, record] of attachmentsRef.current) {
-          if (!record.binding) continue;
-          const state = inventoryBindingState(record.binding, record.state, inventory);
-          if (state !== record.state) updateAttachment(id, { ...record, state });
+          const next = refreshTerminalRecord(record, inventory);
+          if (next !== record) updateAttachment(id, next);
         }
         for (const runtime of inventory.runtimes) {
           const expected = store.exposure(runtime.runtime_id)?.operationId ?? remembered.current.get(runtime.runtime_id)?.operation_id;
@@ -152,6 +155,10 @@ export default function App() {
       } catch (error) {
         if (disposed) return;
         inventoryRef.current = null;
+        for (const [id, record] of attachmentsRef.current) {
+          const next = refreshTerminalRecord(record, null);
+          if (next !== record) updateAttachment(id, next);
+        }
         setOnline(false); setMessage(`Агент недоступний · повторюємо підключення. ${String(error)}`);
       }
       if (!disposed) timer = setTimeout(() => void refresh(), 1000);
@@ -344,7 +351,7 @@ export default function App() {
     };
   }
   async function openCreated(operation: LocalCreate) {
-    const selection = ++selectionRevision.current;
+    const selection = advanceSelection();
     const dialog = dialogRevision.current;
     const runtime = createdRuntime(operation);
     if (!runtime) return false;
@@ -363,7 +370,7 @@ export default function App() {
   }
   async function select(id: string) {
     cancelTerminalFocusRestore();
-    const selection = ++selectionRevision.current;
+    const selection = advanceSelection();
     const sampled = inventoryRef.current;
     const runtime = sampled?.runtimes.find(entry => entry.runtime_id === id);
     if (!runtime) return;
@@ -404,7 +411,7 @@ export default function App() {
   }
   function close(id: string) {
     cancelTerminalFocusRestore();
-    selectionRevision.current++;
+    advanceSelection();
     if (focusRuntime.current === id) focusRuntime.current = null;
     const result = store.close(id);
     updateAttachment(id, result === "pending" ? { binding: null, state: "closed", attempt: selectionRevision.current } : null);
@@ -419,7 +426,7 @@ export default function App() {
   }
   function activateTab(id: string) {
     cancelTerminalFocusRestore();
-    selectionRevision.current++;
+    advanceSelection();
     focusRuntime.current = null;
     if (id !== activeId) setViews(value => openView(value, id, value.open));
   }
@@ -492,7 +499,7 @@ export default function App() {
         <button className="back-button" onClick={() => {
           cancelTerminalFocusRestore();
           focusRuntime.current = null;
-          selectionRevision.current++;
+          advanceSelection();
           setViews(value => ({ ...value, active: null }));
           requestAnimationFrame(focusSidebar);
         }}>← Усі сесії</button>
