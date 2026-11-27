@@ -393,15 +393,24 @@ test("native status reads the existing view and decodes its exact target without
   ]);
 });
 
-test("native attach keeps the default command and forwards observer and restoration selectors", async t => {
+test("native attach and read stay separate from exact writer confirmation", async t => {
   const calls: unknown[] = [];
   const original = Object.getOwnPropertyDescriptor(globalThis, "window");
   const status = terminalStatus(freshId, 0);
   const payload = { view_id: freshId, cols: 100, rows: 30, status };
+  const observation = { data: [65], closed: false, writable: false, status, geometry: null };
+  let rejectConfirmation = false;
   Object.defineProperty(globalThis, "window", {
     configurable: true,
     value: { __TAURI_INTERNALS__: {
-      invoke(command: string, args: unknown) { calls.push([command, args]); return payload; },
+      invoke(command: string, args: unknown) {
+        calls.push([command, args]);
+        if (command === "terminal_attach") return payload;
+        if (command === "terminal_read") return observation;
+        assert.equal(command, "terminal_confirm_writer");
+        if (rejectConfirmation) throw Error("Terminal candidate is no longer current");
+        return null;
+      },
     } },
   });
   t.after(() => {
@@ -410,12 +419,21 @@ test("native attach keeps the default command and forwards observer and restorat
   });
   const restoration = { previous: terminalStatus(id, 0).terminal, agent_pid: 12, session_id: id, operation_id: id };
   assert.deepEqual(await localClient.attach(id), payload);
+  assert.deepEqual(await localClient.read(freshId), observation);
   assert.deepEqual(await localClient.attach(id, { observer: true }), payload);
   assert.deepEqual(await localClient.attach(id, { restoration }), payload);
+  const expected = { agent_pid: 12, session_id: id, operation_id: id, workspace_id: freshId };
+  assert.equal(await localClient.confirmWriter(status.terminal, expected), undefined);
+  rejectConfirmation = true;
+  const stale = { ...status.terminal, target: { ...status.terminal.target, process_start: status.terminal.target.process_start + 1 } };
+  await assert.rejects(localClient.confirmWriter(stale, expected), /candidate is no longer current/);
   assert.deepEqual(calls, [
     ["terminal_attach", { runtimeId: id }],
+    ["terminal_read", { viewId: freshId }],
     ["terminal_attach", { runtimeId: id, observer: true }],
     ["terminal_attach", { runtimeId: id, restoration }],
+    ["terminal_confirm_writer", { terminal: status.terminal, expected }],
+    ["terminal_confirm_writer", { terminal: stale, expected }],
   ]);
 });
 

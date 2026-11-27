@@ -393,7 +393,7 @@ fn controlled_view_with_master(
         observation: ObservationState::Unavailable,
     };
     let generation = bridge.generation.load(Ordering::SeqCst);
-    let allocation = bridge.reserve(generation).unwrap();
+    let allocation = bridge.reserve(generation, None).unwrap();
     let view = Arc::new(View {
         terminal,
         directory: bridge.directory.clone().unwrap_or_default(),
@@ -1139,6 +1139,14 @@ esac
 }
 
 async fn open_fixture(listener: &UnixListener, target: &TerminalTarget) -> TerminalStatus {
+    open_fixture_on_agent(listener, target, Uuid::new_v4()).await
+}
+
+async fn open_fixture_on_agent(
+    listener: &UnixListener,
+    target: &TerminalTarget,
+    agent_epoch: Uuid,
+) -> TerminalStatus {
     let (
         mut peer,
         Request::OpenTerminal {
@@ -1154,7 +1162,7 @@ async fn open_fixture(listener: &UnixListener, target: &TerminalTarget) -> Termi
         terminal: TerminalView {
             target: target.clone(),
             view_id,
-            agent_epoch: Uuid::new_v4(),
+            agent_epoch,
         },
         committed: CommittedGeometry {
             size: TerminalSize {
@@ -1184,6 +1192,587 @@ async fn attachment_status_peer(listener: &UnixListener, status: &TerminalStatus
     };
     assert_eq!(terminal, status.terminal);
     peer
+}
+
+struct WriterCandidateFixture {
+    bridge: Arc<DesktopBridge>,
+    listener: UnixListener,
+    target: TerminalTarget,
+    row: Runtime,
+    expected: TerminalInventoryBinding,
+    epoch: ResizeEpoch,
+    acquires: usize,
+    inputs: usize,
+    resizes: usize,
+    _directory: AgentFixture,
+}
+
+impl WriterCandidateFixture {
+    fn new() -> Self {
+        let directory = AgentFixture::new();
+        let target = target();
+        let tmux = attachment_tmux(&directory, target.generation, "ignore-size");
+        let listener = UnixListener::bind(directory.0.join("agent.sock")).unwrap();
+        let bridge = Arc::new(DesktopBridge::new(Some(directory.0.clone()), tmux));
+        let row = Runtime {
+            session_id: Uuid::new_v4(),
+            runtime_id: target.runtime_id,
+            tmux_name: "fixture".into(),
+            pane_id: target.pane.clone(),
+            command: "fixture".into(),
+            pane_pid: Some(target.pid),
+            exited: false,
+            width: 100,
+            height: 30,
+            origin: RuntimeOrigin::Managed,
+            workspace_id: Some(Uuid::new_v4()),
+            operation_id: Some(Uuid::new_v4()),
+        };
+        let expected = TerminalInventoryBinding {
+            agent_pid: 12,
+            session_id: row.session_id,
+            operation_id: row.operation_id,
+            workspace_id: row.workspace_id,
+        };
+        Self {
+            bridge,
+            listener,
+            target,
+            row,
+            expected,
+            epoch: ResizeEpoch {
+                agent: Uuid::new_v4(),
+                owner: Uuid::new_v4(),
+            },
+            acquires: 0,
+            inputs: 0,
+            resizes: 0,
+            _directory: directory,
+        }
+    }
+
+    fn restoration(&self, previous: TerminalView) -> AttachmentMode {
+        AttachmentMode::Restore(TerminalRestoration {
+            previous,
+            agent_pid: self.expected.agent_pid,
+            session_id: self.expected.session_id,
+            operation_id: self.expected.operation_id,
+        })
+    }
+
+    async fn park_proof(
+        &self,
+        mode: AttachmentMode,
+    ) -> (
+        tokio::task::JoinHandle<Result<Attachment>>,
+        TerminalStatus,
+        UnixStream,
+    ) {
+        let bridge = self.bridge.clone();
+        let runtime = self.target.runtime_id.to_string();
+        let attaching = tokio::spawn(async move {
+            match mode {
+                AttachmentMode::Candidate => bridge.prepare_attachment(&runtime).await,
+                AttachmentMode::Restore(restoration) => {
+                    bridge.restore_attachment(&runtime, restoration).await
+                }
+                AttachmentMode::Observer => bridge.attach_observer(&runtime).await,
+                AttachmentMode::Ordinary => unreachable!(),
+            }
+        });
+        let mut status =
+            open_fixture_on_agent(&self.listener, &self.target, self.epoch.agent).await;
+        let peer = attachment_status_peer(&self.listener, &status).await;
+        status.epoch = Some(self.epoch);
+        (attaching, status, peer)
+    }
+
+    async fn reply_inventory(&self, agent_pid: u32, row: Runtime) {
+        let (mut health, Request::Health {}) = receive(&self.listener).await else {
+            panic!("expected health for candidate inventory");
+        };
+        respond(
+            &mut health,
+            Response::Health {
+                agent_pid,
+                remote_execution_enabled: false,
+            },
+        )
+        .await;
+        let (mut list, Request::List {}) = receive(&self.listener).await else {
+            panic!("expected candidate inventory list");
+        };
+        respond(
+            &mut list,
+            Response::Runtimes {
+                runtimes: vec![row],
+            },
+        )
+        .await;
+    }
+
+    async fn prepare(&self, mode: AttachmentMode) -> Attachment {
+        let needs_inventory = mode.is_candidate();
+        let (attaching, status, mut peer) = self.park_proof(mode).await;
+        respond(&mut peer, Response::TerminalStatus { status }).await;
+        if needs_inventory {
+            self.reply_inventory(self.expected.agent_pid, self.row.clone())
+                .await;
+        }
+        attaching.await.unwrap().unwrap()
+    }
+
+    fn confirming(&self, terminal: TerminalView) -> tokio::task::JoinHandle<Result<()>> {
+        let bridge = self.bridge.clone();
+        let expected = self.expected;
+        tokio::spawn(async move { bridge.confirm_writer(terminal, expected).await })
+    }
+
+    async fn reject(&self, terminal: TerminalView, expected: TerminalInventoryBinding) {
+        tokio::select! {
+            result = self.bridge.confirm_writer(terminal, expected) => assert!(result.is_err()),
+            _ = self.listener.accept() => panic!("ineligible candidate entered host validation"),
+        }
+    }
+
+    async fn poll(&self, attachment: &Attachment) -> Chunk {
+        let view = self.bridge.view(&attachment.view_id).unwrap();
+        view.output.lock().await.refresh_at = Instant::now();
+        let mut status = attachment.status.clone();
+        status.epoch = Some(self.epoch);
+        let reply = async {
+            let mut peer = attachment_status_peer(&self.listener, &status).await;
+            respond(&mut peer, Response::TerminalStatus { status }).await;
+        };
+        let (chunk, ()) = tokio::join!(self.bridge.read(&attachment.view_id), reply);
+        let chunk = chunk.unwrap();
+        assert_eq!(chunk.status.as_ref().unwrap().epoch, Some(self.epoch));
+        chunk
+    }
+
+    async fn readonly(&self, attachment: &Attachment) {
+        let sample = self.poll(attachment).await;
+        assert!(!sample.writable && sample.paste_incarnation.is_none());
+        assert!(
+            self.bridge
+                .input(
+                    &attachment.view_id,
+                    vec![65],
+                    &Uuid::new_v4().to_string(),
+                    false
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            self.bridge
+                .resize(
+                    &attachment.view_id,
+                    attachment.status.committed.size,
+                    self.epoch
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    async fn acquire(&mut self, view: &View) -> UnixStream {
+        let peer = acquire_fixture_writer(&self.listener, view).await;
+        self.acquires += 1;
+        self.epoch.owner = Uuid::new_v4();
+        peer
+    }
+
+    async fn resize_as_writer(&mut self, view: &View, token: Uuid) {
+        let id = view.terminal.view_id.to_string();
+        let size = TerminalSize {
+            cols: 101,
+            rows: 31,
+        };
+        let admission = ResizeIntent {
+            epoch: self.epoch,
+            id: Uuid::new_v4(),
+        };
+        let reply = async {
+            let (
+                mut peer,
+                Request::ResizeTerminal {
+                    terminal,
+                    token: actual_token,
+                    sequence,
+                    size: actual_size,
+                },
+            ) = receive(&self.listener).await
+            else {
+                panic!("expected one scoped resize");
+            };
+            assert_eq!(
+                (terminal, actual_token, sequence, actual_size),
+                (view.terminal.clone(), token, 0, size)
+            );
+            respond(
+                &mut peer,
+                Response::Resize {
+                    resize: ResizeResult::Committed {
+                        admission,
+                        status: TerminalStatus {
+                            terminal: view.terminal.clone(),
+                            epoch: Some(self.epoch),
+                            committed: CommittedGeometry {
+                                size,
+                                revision: 1,
+                                intent: Some(admission),
+                            },
+                            provider: None,
+                            observation: ObservationState::Unavailable,
+                        },
+                    },
+                },
+            )
+            .await;
+        };
+        let (result, ()) = tokio::join!(self.bridge.resize(&id, size, self.epoch), reply);
+        assert!(
+            matches!(result.unwrap(), ResizeResult::Committed { admission: actual, .. } if actual == admission)
+        );
+        self.resizes += 1;
+    }
+
+    async fn no_effects(&self, epoch: ResizeEpoch) {
+        assert_no_fixture_request(&self.listener).await;
+        assert_eq!((self.acquires, self.inputs, self.resizes), (0, 0, 0));
+        assert_eq!(self.epoch, epoch);
+    }
+
+    async fn finish(&self) {
+        self.bridge.detach_all();
+        until(|| allocation_counts(&self.bridge) == (0, 0)).await;
+        assert_no_fixture_request(&self.listener).await;
+    }
+}
+
+#[tokio::test]
+async fn w1_terminal_current_candidate_confirms_once_and_sends_fresh_input() {
+    for restore in [false, true] {
+        let mut fixture = WriterCandidateFixture::new();
+        let original = fixture.epoch;
+        let mode = if restore {
+            let observer = fixture.prepare(AttachmentMode::Observer).await;
+            fixture
+                .reject(observer.status.terminal.clone(), fixture.expected)
+                .await;
+            fixture.bridge.detach(&observer.view_id);
+            fixture.restoration(observer.status.terminal)
+        } else {
+            AttachmentMode::Candidate
+        };
+        let candidate = fixture.prepare(mode).await;
+        fixture.readonly(&candidate).await;
+        fixture.no_effects(original).await;
+        let view = fixture.bridge.view(&candidate.view_id).unwrap();
+        let confirmation = fixture.confirming(view.terminal.clone());
+        fixture
+            .reply_inventory(fixture.expected.agent_pid, fixture.row.clone())
+            .await;
+        let mut status = attachment_status_peer(&fixture.listener, &candidate.status).await;
+        let duplicate = fixture.confirming(view.terminal.clone());
+        fixture
+            .reply_inventory(fixture.expected.agent_pid, fixture.row.clone())
+            .await;
+        let mut duplicate_status =
+            attachment_status_peer(&fixture.listener, &candidate.status).await;
+        fixture.no_effects(original).await;
+        respond(
+            &mut status,
+            Response::TerminalStatus {
+                status: candidate.status.clone(),
+            },
+        )
+        .await;
+        confirmation.await.unwrap().unwrap();
+        respond(
+            &mut duplicate_status,
+            Response::TerminalStatus {
+                status: candidate.status.clone(),
+            },
+        )
+        .await;
+        assert!(duplicate.await.unwrap().is_err());
+
+        let mut acquire = fixture.acquire(&view).await;
+        assert_ne!(fixture.epoch, original);
+        fixture
+            .reject(view.terminal.clone(), fixture.expected)
+            .await;
+        let token = Uuid::new_v4();
+        respond(
+            &mut acquire,
+            Response::TerminalControl {
+                token,
+                epoch: fixture.epoch,
+            },
+        )
+        .await;
+        assert_eq!(
+            view.control.lock().await.lease.as_ref().unwrap().token,
+            token
+        );
+        let grant = fixture.poll(&candidate).await;
+        assert!(grant.writable);
+        send_fixture_input(
+            &fixture.listener,
+            &fixture.bridge,
+            &view,
+            token,
+            grant.paste_incarnation.unwrap(),
+            0,
+            b"fresh",
+        )
+        .await;
+        fixture.inputs += 1;
+        assert!(
+            fixture
+                .bridge
+                .resize(
+                    &candidate.view_id,
+                    candidate.status.committed.size,
+                    original
+                )
+                .await
+                .is_err()
+        );
+        fixture.resize_as_writer(&view, token).await;
+        assert_eq!(
+            (fixture.acquires, fixture.inputs, fixture.resizes),
+            (1, 1, 1)
+        );
+        fixture.bridge.detach(&candidate.view_id);
+        release_fixture_writer(&fixture.listener, &view, token).await;
+        fixture.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn w1_terminal_restore_proof_canceled_before_reply_preserves_host_epoch() {
+    let fixture = WriterCandidateFixture::new();
+    let original = fixture.epoch;
+    let observer = fixture.prepare(AttachmentMode::Observer).await;
+    let (attached, starting) = tokio::sync::oneshot::channel();
+    let (resume, wait_reply) = tokio::sync::oneshot::channel();
+    *fixture.bridge.startup_gate.lock().unwrap() = Some(ViewGate {
+        attached,
+        resume: wait_reply,
+    });
+    let (restoring, status, mut proof) = fixture
+        .park_proof(fixture.restoration(observer.status.terminal))
+        .await;
+    let id = status.terminal.view_id;
+    assert!(!restoring.is_finished());
+    fixture.bridge.detach(&observer.view_id);
+    fixture
+        .reject(status.terminal.clone(), fixture.expected)
+        .await;
+    fixture.no_effects(original).await;
+    respond(&mut proof, Response::TerminalStatus { status }).await;
+    fixture
+        .reply_inventory(fixture.expected.agent_pid, fixture.row.clone())
+        .await;
+    assert_eq!(starting.await.unwrap(), id);
+    assert!(!restoring.is_finished());
+    fixture.no_effects(original).await;
+    resume.send(()).unwrap();
+    let stale = restoring.await.unwrap().unwrap();
+    assert_eq!(stale.view_id, id.to_string());
+    fixture.readonly(&stale).await;
+    fixture.no_effects(original).await;
+    fixture.bridge.detach(&stale.view_id);
+    fixture
+        .reject(stale.status.terminal, fixture.expected)
+        .await;
+    fixture.finish().await;
+    fixture.no_effects(original).await;
+}
+
+#[tokio::test]
+async fn w1_terminal_confirmation_rejects_inexact_and_superseded_candidates() {
+    let fixture = WriterCandidateFixture::new();
+    let original = fixture.epoch;
+    let candidate = fixture.prepare(AttachmentMode::Candidate).await;
+    let terminal = &candidate.status.terminal;
+    for wrong in [
+        TerminalInventoryBinding {
+            agent_pid: fixture.expected.agent_pid + 1,
+            ..fixture.expected
+        },
+        TerminalInventoryBinding {
+            session_id: Uuid::new_v4(),
+            ..fixture.expected
+        },
+        TerminalInventoryBinding {
+            operation_id: None,
+            ..fixture.expected
+        },
+        TerminalInventoryBinding {
+            workspace_id: None,
+            ..fixture.expected
+        },
+    ] {
+        fixture.reject(terminal.clone(), wrong).await;
+    }
+    for wrong in [
+        TerminalTarget {
+            runtime_id: Uuid::new_v4(),
+            ..fixture.target.clone()
+        },
+        TerminalTarget {
+            generation: Uuid::new_v4(),
+            ..fixture.target.clone()
+        },
+        TerminalTarget {
+            session: "$1".into(),
+            ..fixture.target.clone()
+        },
+        TerminalTarget {
+            window: "@1".into(),
+            ..fixture.target.clone()
+        },
+        TerminalTarget {
+            pane: "%1".into(),
+            ..fixture.target.clone()
+        },
+        TerminalTarget {
+            pid: fixture.target.pid + 1,
+            ..fixture.target.clone()
+        },
+        TerminalTarget {
+            process_start: fixture.target.process_start + 1,
+            ..fixture.target.clone()
+        },
+    ] {
+        fixture
+            .reject(
+                TerminalView {
+                    target: wrong,
+                    ..terminal.clone()
+                },
+                fixture.expected,
+            )
+            .await;
+    }
+    fixture
+        .reject(
+            TerminalView {
+                agent_epoch: Uuid::new_v4(),
+                ..terminal.clone()
+            },
+            fixture.expected,
+        )
+        .await;
+    fixture
+        .reject(
+            TerminalView {
+                view_id: Uuid::new_v4(),
+                ..terminal.clone()
+            },
+            fixture.expected,
+        )
+        .await;
+    fixture.no_effects(original).await;
+
+    let replacement = fixture.prepare(AttachmentMode::Candidate).await;
+    assert!(fixture.bridge.view(&candidate.view_id).is_ok());
+    fixture.reject(terminal.clone(), fixture.expected).await;
+    fixture.bridge.detach(&replacement.view_id);
+    fixture.reject(terminal.clone(), fixture.expected).await;
+    fixture
+        .reject(replacement.status.terminal, fixture.expected)
+        .await;
+    fixture.finish().await;
+    fixture.no_effects(original).await;
+}
+
+#[tokio::test]
+async fn w1_terminal_confirmation_rechecks_inventory_and_parked_native_validation() {
+    for boundary in [
+        "agent",
+        "runtime inventory",
+        "target",
+        "detach",
+        "replace",
+        "generation",
+        "expiry",
+    ] {
+        let fixture = WriterCandidateFixture::new();
+        let original = fixture.epoch;
+        let candidate = fixture.prepare(AttachmentMode::Candidate).await;
+        let terminal = &candidate.status.terminal;
+        let confirmation = fixture.confirming(terminal.clone());
+        let mut row = fixture.row.clone();
+        if boundary == "runtime inventory" {
+            row.exited = true;
+        }
+        let agent_pid = if boundary == "agent" {
+            fixture.expected.agent_pid + 1
+        } else {
+            fixture.expected.agent_pid
+        };
+        fixture.reply_inventory(agent_pid, row).await;
+        if !matches!(boundary, "agent" | "runtime inventory") {
+            let mut peer = attachment_status_peer(&fixture.listener, &candidate.status).await;
+            fixture.no_effects(original).await;
+            match boundary {
+                "target" => {
+                    let mut status = candidate.status.clone();
+                    status.terminal.target.process_start += 1;
+                    respond(&mut peer, Response::TerminalStatus { status }).await;
+                }
+                "detach" | "generation" => {
+                    peer.writable().await.unwrap();
+                    if boundary == "detach" {
+                        fixture.bridge.detach(&candidate.view_id);
+                    } else {
+                        fixture.bridge.detach_all();
+                    }
+                    let reply = Response::TerminalStatus {
+                        status: candidate.status.clone(),
+                    };
+                    let frame = encode_local_observation(&reply).unwrap() + "\n";
+                    assert_eq!(peer.try_write(frame.as_bytes()).unwrap(), frame.len());
+                }
+                "replace" => {
+                    let replacement = fixture.prepare(AttachmentMode::Candidate).await;
+                    respond(
+                        &mut peer,
+                        Response::TerminalStatus {
+                            status: candidate.status.clone(),
+                        },
+                    )
+                    .await;
+                    fixture.bridge.detach(&replacement.view_id);
+                }
+                "expiry" => {
+                    let mut views = fixture.bridge.views.lock().unwrap();
+                    views
+                        .writer_candidates
+                        .get_mut(&fixture.target.runtime_id)
+                        .unwrap()
+                        .proof = Some((fixture.expected, Instant::now()));
+                    drop(views);
+                    respond(
+                        &mut peer,
+                        Response::TerminalStatus {
+                            status: candidate.status.clone(),
+                        },
+                    )
+                    .await;
+                }
+                _ => unreachable!(),
+            }
+        }
+        assert!(confirmation.await.unwrap().is_err(), "{boundary}");
+        fixture.no_effects(original).await;
+        fixture.finish().await;
+    }
 }
 
 struct GeometryFixture {

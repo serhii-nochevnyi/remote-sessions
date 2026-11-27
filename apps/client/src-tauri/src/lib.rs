@@ -8,9 +8,9 @@ mod desktop {
     use remote_sessions_desktop_bridge::{
         Attachment, Chunk, CreateSubmission, DesktopBridge, GeometryEvent, GridAcknowledgement,
         Inventory, LocalCreateStatus, PasteAction, PasteResult, ProductIssue, ProviderProfile,
-        ResizeEpoch, ResizeResult, TerminalInputError, TerminalRestoration, TerminalSize,
-        TerminalStatus, WorkspaceReadiness, WorkspaceSelection, encode_local_observation,
-        encode_renderer_observation,
+        ResizeEpoch, ResizeResult, TerminalInputError, TerminalInventoryBinding,
+        TerminalRestoration, TerminalSize, TerminalStatus, TerminalView, WorkspaceReadiness,
+        WorkspaceSelection, encode_local_observation, encode_renderer_observation,
     };
     use tauri::{State, WebviewWindow, async_runtime};
     use tauri_plugin_dialog::{DialogExt, FilePath};
@@ -563,10 +563,21 @@ mod desktop {
         match (observer.unwrap_or(false), restoration) {
             (true, None) => bridge.attach_observer(&runtime_id).await,
             (false, Some(expected)) => bridge.restore_attachment(&runtime_id, expected).await,
-            (false, None) => bridge.attach(&runtime_id).await,
+            (false, None) => bridge.prepare_attachment(&runtime_id).await,
             (true, Some(_)) => return Err("Observer attachment cannot restore control".into()),
         }
         .map_err(|error| error.to_string())
+    }
+    #[tauri::command]
+    pub async fn terminal_confirm_writer(
+        terminal: TerminalView,
+        expected: TerminalInventoryBinding,
+        bridge: State<'_, DesktopBridge>,
+    ) -> Result<(), String> {
+        bridge
+            .confirm_writer(terminal, expected)
+            .await
+            .map_err(|error| error.to_string())
     }
     #[tauri::command]
     pub async fn terminal_read(
@@ -882,6 +893,7 @@ pub fn run() {
                 desktop::local_create_session,
                 desktop::local_create_status,
                 desktop::terminal_attach,
+                desktop::terminal_confirm_writer,
                 desktop::terminal_read,
                 desktop::terminal_status,
                 desktop::terminal_resize,

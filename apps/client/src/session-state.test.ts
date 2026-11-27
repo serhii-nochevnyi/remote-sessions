@@ -6,7 +6,7 @@ import xterm from "@xterm/xterm";
 import { localClient, TerminalDelivery, TerminalViewScope } from "./local-client.ts";
 import type { CreateStatus, Inventory, LocalCreate, RuntimeInfo, TerminalScope, TerminalStatus } from "./local-client.ts";
 import type { CreateExposure } from "./presentation-preferences.ts";
-import { attachCurrentTerminal, canRestoreTerminalFocus, closeView, demoSessions, desiredTerminalMode, focusAfterClose,
+import { adoptCurrentTerminal, attachCurrentTerminal, canRestoreTerminalFocus, closeView, demoSessions, desiredTerminalMode, focusAfterClose,
   explicitClosedReconnect, explicitTerminalOpen, inventoryBindingState, inventoryOpen, mountedTerminal, moveView, openView, parseScaffoldStatus,
   restoreFullscreenExitFocus, runMountedTerminalStream, tabKey, tabStop, terminalPanel, terminalStreamAccess,
   TerminalAttachmentIdentityError, updateMountedStream } from "./session-state.ts";
@@ -453,6 +453,7 @@ function mountedNativeFixture(t: TestContext, row = nativeRuntime) {
   let attempt = 0;
   let reopenAttempt: number | undefined;
   let disposeRetained: (() => void) | undefined;
+  let attemptScope: TerminalViewScope | undefined;
   const identity = { sessionId: row.session_id, operationId: row.operation_id ?? null };
   const calls: { command: string; args: unknown }[] = [];
   const steps = new Map<string, ((args: unknown) => Promise<unknown>)[]>();
@@ -468,7 +469,7 @@ function mountedNativeFixture(t: TestContext, row = nativeRuntime) {
         const step = steps.get(command)?.shift();
         if (step) return step(args);
         if (command === "local_inventory") return replyInventory;
-        if (command === "terminal_detach") return;
+        if (command === "terminal_detach" || command === "terminal_confirm_writer") return;
         assert.fail(`unexpected native invoke ${command}`);
       },
     } },
@@ -504,7 +505,7 @@ function mountedNativeFixture(t: TestContext, row = nativeRuntime) {
   async function connect(mode: AttachmentMode) {
     const previous = binding;
     const started = reopenAttempt === attempt ? attempt : ++attempt;
-    const current = (): MountedTerminal => started === attempt && (binding === previous || binding === accepted)
+    const current = (expected: BoundTerminal | null = accepted ?? previous): MountedTerminal => started === attempt && binding === expected
       ? selected() : { mode: "missing" };
     let accepted: BoundTerminal | undefined;
     const detachments: Promise<void>[] = [];
@@ -541,17 +542,23 @@ function mountedNativeFixture(t: TestContext, row = nativeRuntime) {
         if (eof === 0) dispose();
       },
     }, delivery);
+    attemptScope = scope;
     const protocol = bindTerminalProtocol(displayed, bytes => { void scope.send(bytes); });
-    scope.setInputEligible(mode === "ordinary");
     cleanup.push(async () => {
       scope.retire();
       dispose();
       await Promise.all(detachments);
     });
-    let candidate: Awaited<ReturnType<typeof attachCurrentTerminal>> = undefined;
+    let candidate: Awaited<ReturnType<typeof adoptCurrentTerminal>> = undefined;
     try {
-      candidate = await attachCurrentTerminal(runtimeId, previous, mode, () => current().intent,
-        () => delivery.mayRestore, () => scope.active, Promise.resolve(), localClient);
+      candidate = await adoptCurrentTerminal(runtimeId, previous, mode, current, () => delivery.mayRestore, scope, next => {
+        if (!current(previous).intent) return false;
+        accepted = next;
+        binding = next;
+        state = "bound";
+        reopenAttempt = undefined;
+        return true;
+      }, Promise.resolve(), localClient);
     } catch (error) {
       if (reopenAttempt === started && error instanceof TerminalAttachmentIdentityError && error.replacement) {
         state = "changed";
@@ -566,19 +573,13 @@ function mountedNativeFixture(t: TestContext, row = nativeRuntime) {
       scope.retire();
       return;
     }
-    assert.ok(candidate.isCurrent());
     const { attachment } = candidate;
     const view = attachment.view_id;
-    assert.ok(scope.bind(view));
     clearRetained();
-    accepted = candidate.binding;
-    binding = accepted;
-    state = "bound";
-    reopenAttempt = undefined;
     const routing = new OrderedGeometry(attachment.status);
     const eligibility = { scope, access, revokeMutations() { proposals.close(); protocol.pauseInput(); } };
     return {
-      binding: accepted, scope, displayed, frames, failures, proposals,
+      binding: candidate.binding, scope, displayed, frames, failures, proposals,
       update: () => updateMountedStream(eligibility),
       async run() {
         try {
@@ -622,7 +623,7 @@ function mountedNativeFixture(t: TestContext, row = nativeRuntime) {
   }
   return {
     calls, counts, park, publish, selected, connect, delivery,
-    binding: () => binding, state: () => state,
+    binding: () => binding, state: () => state, attemptScope: () => attemptScope,
     requestReconnect() {
       if (!explicitClosedReconnect(selected())) return false;
       reopenAttempt = ++attempt;
@@ -649,6 +650,171 @@ async function connectFixture(fixture: MountedFixture, mode: AttachmentMode, sam
 function mutatingCommands(fixture: MountedFixture) {
   return fixture.calls.filter(({ command }) => /input|paste|resize|acknowledge_grid|create_session|stop/.test(command));
 }
+
+function writerAssertions(view: string, row = nativeRuntime, agent = nativeAgent, agentPid = 12) {
+  return { terminal: nativeAttachment(view, agent).status.terminal, expected: {
+    agent_pid: agentPid, session_id: row.session_id, operation_id: row.operation_id, workspace_id: row.workspace_id,
+  } };
+}
+
+test("mounted ordinary attach binds before confirmation and waits for a scoped grant", async t => {
+  const fixture = mountedNativeFixture(t);
+  await fixture.publish(nativeRuntime);
+  const proof = fixture.park("terminal_attach");
+  const confirmation = fixture.park("terminal_confirm_writer");
+  const opening = fixture.connect("ordinary");
+  assert.deepEqual(await proof.entered, { runtimeId });
+  assert.equal(fixture.binding(), null);
+  assert.equal(fixture.counts("terminal_confirm_writer").length, 0);
+  proof.resolve(nativeAttachment(firstView));
+  assert.deepEqual(await confirmation.entered, writerAssertions(firstView));
+  assert.deepEqual(fixture.binding()?.terminal, writerAssertions(firstView).terminal);
+  const pendingScope = fixture.attemptScope();
+  assert.ok(pendingScope);
+  assert.ok(pendingScope.owns(firstView));
+  assert.equal(pendingScope.canWrite, false);
+  await pendingScope.send(Uint8Array.of(1));
+  await pendingScope.paste(Uint8Array.of(2));
+  assert.equal(fixture.counts("terminal_read").length, 0);
+  assert.deepEqual(mutatingCommands(fixture), []);
+  confirmation.resolve(undefined);
+  const mounted = await opening;
+  assert.ok(mounted);
+  assert.equal(mounted.scope.canWrite, false);
+
+  const observation = fixture.park("terminal_read");
+  const grant = fixture.park("terminal_read");
+  const ending = fixture.park("terminal_read");
+  const streaming = mounted.run();
+  await observation.entered;
+  observation.resolve(nativeData([65]));
+  await grant.entered;
+  assert.deepEqual(mounted.frames, [[65]]);
+  assert.equal(mounted.scope.canWrite, false);
+  grant.resolve(nativeData([66], nativeAttachment(firstView)));
+  await ending.entered;
+  assert.equal(mounted.scope.canWrite, true);
+  const input = fixture.park("terminal_input");
+  const fresh = mounted.scope.send(Uint8Array.of(3));
+  assert.deepEqual(await input.entered, { viewId: firstView, data: [3], incarnation: nativeIncarnation });
+  input.resolve(undefined);
+  await fresh;
+  ending.resolve(nativeClosure({ reason: "eof" }));
+  await streaming;
+  assert.deepEqual(fixture.counts("terminal_confirm_writer"), [writerAssertions(firstView)]);
+  assert.deepEqual(mutatingCommands(fixture).map(call => call.command), ["terminal_input"]);
+});
+
+test("mounted restore closes before proof returns and detaches without confirmation", async t => {
+  const fixture = mountedNativeFixture(t);
+  await fixture.publish(nativeRuntime);
+  const original = await connectFixture(fixture, "ordinary");
+  original.scope.retire();
+  const proof = fixture.park("terminal_attach");
+  const restoring = fixture.connect("ordinary");
+  assert.deepEqual(await proof.entered, { runtimeId, restoration: {
+    previous: original.binding.terminal, agent_pid: 12, session_id: nativeRuntime.session_id,
+    operation_id: nativeRuntime.operation_id,
+  } });
+  assert.deepEqual(fixture.counts("terminal_confirm_writer"), [writerAssertions(firstView)]);
+  fixture.close();
+  proof.resolve(nativeAttachment(observedView));
+  assert.equal(await restoring, undefined);
+  assert.equal(fixture.binding(), original.binding);
+  assert.equal(fixture.selected().mode, "missing");
+  assert.deepEqual(fixture.counts("terminal_detach"), [
+    { viewId: firstView, failure: undefined }, { viewId: observedView, failure: undefined },
+  ]);
+  assert.deepEqual(fixture.counts("terminal_confirm_writer"), [writerAssertions(firstView)]);
+  assert.equal(fixture.counts("terminal_read").length, 0);
+  assert.deepEqual(mutatingCommands(fixture), []);
+});
+
+for (const outcome of ["accepted", "rejected", "replaced", "closed"] as const) {
+  test(`mounted exact restore handles a ${outcome} confirmation without reviving stale views`, async t => {
+    const fixture = mountedNativeFixture(t);
+    await fixture.publish(nativeRuntime);
+    const original = await connectFixture(fixture, "ordinary");
+    original.scope.retire();
+    const proof = fixture.park("terminal_attach");
+    const confirmation = fixture.park("terminal_confirm_writer");
+    const restoring = fixture.connect("ordinary");
+    assert.ok(await proof.entered);
+    proof.resolve(nativeAttachment(observedView));
+    assert.deepEqual(await confirmation.entered, writerAssertions(observedView));
+    assert.equal(fixture.binding()?.terminal.view_id, observedView);
+    assert.equal(fixture.attemptScope()?.canWrite, false);
+    if (outcome === "closed") fixture.close();
+    if (outcome === "replaced") fixture.retireAttempt();
+    if (outcome === "rejected") {
+      confirmation.reject(Error("candidate rejected"));
+      await assert.rejects(restoring, /candidate rejected/);
+    } else {
+      confirmation.resolve(undefined);
+      const restored = await restoring;
+      assert.equal(Boolean(restored), outcome === "accepted");
+      assert.equal(fixture.attemptScope()?.active, outcome === "accepted");
+      assert.equal(fixture.attemptScope()?.canWrite, false);
+    }
+    const afterOriginal = fixture.calls.slice(fixture.calls.findIndex(call => call.command === "terminal_detach"));
+    assert.deepEqual(afterOriginal.map(call => call.command), [
+      "terminal_detach", "terminal_attach", "terminal_confirm_writer", ...(outcome === "accepted" ? [] : ["terminal_detach"]),
+    ]);
+    assert.deepEqual(mutatingCommands(fixture), []);
+  });
+}
+
+test("mounted restore does not confirm after a logical delivery hold appears during proof", async t => {
+  const fixture = mountedNativeFixture(t);
+  await fixture.publish(nativeRuntime);
+  const original = await connectFixture(fixture, "ordinary");
+  original.scope.retire();
+  const proof = fixture.park("terminal_attach");
+  const restoring = fixture.connect("ordinary");
+  await proof.entered;
+  fixture.delivery.holdInput(Error("delivery unknown"));
+  proof.resolve(nativeAttachment(observedView));
+  assert.equal(await restoring, undefined);
+  const observer = await connectFixture(fixture, "observer", nativeAttachment(finalView));
+  assert.equal(observer.scope.canWrite, false);
+  assert.deepEqual(fixture.counts("terminal_confirm_writer"), [writerAssertions(firstView)]);
+  assert.deepEqual(fixture.counts("terminal_detach"), [
+    { viewId: firstView, failure: undefined }, { viewId: observedView, failure: undefined },
+  ]);
+  assert.deepEqual(mutatingCommands(fixture), []);
+});
+
+test("a bound view that exits during confirmation drains read-only after the reply", async t => {
+  const fixture = mountedNativeFixture(t);
+  await fixture.publish(nativeRuntime);
+  const proof = fixture.park("terminal_attach");
+  const confirmation = fixture.park("terminal_confirm_writer");
+  const opening = fixture.connect("ordinary");
+  await proof.entered;
+  proof.resolve(nativeAttachment(firstView));
+  await confirmation.entered;
+  await fixture.publish({ ...nativeRuntime, exited: true, pane_pid: null });
+  assert.equal(fixture.selected().mode, "draining");
+  confirmation.reject(Error("Terminal has exited"));
+  const mounted = await opening;
+  assert.ok(mounted);
+  const final = fixture.park("terminal_read");
+  const eof = fixture.park("terminal_read");
+  const streaming = mounted.run();
+  await final.entered;
+  final.resolve(nativeData([65], nativeAttachment(firstView)));
+  await eof.entered;
+  assert.equal(mounted.scope.canWrite, false);
+  await mounted.scope.send(Uint8Array.of(2));
+  await mounted.scope.paste(Uint8Array.of(3));
+  eof.resolve(nativeClosure({ reason: "eof" }));
+  await streaming;
+  assert.deepEqual(mounted.frames, [[65]]);
+  assert.equal(mounted.completed(), 1);
+  assert.equal(mounted.disposed(), false);
+  assert.deepEqual(fixture.counts("terminal_confirm_writer"), [writerAssertions(firstView)]);
+  assert.deepEqual(mutatingCommands(fixture), []);
+});
 
 for (const unknown of [false, true]) {
   test(`inventory-first restart proves the original pane and ${unknown ? "keeps an unknown delivery held" : "restores fresh control without replay"}`, async t => {
@@ -683,6 +849,7 @@ for (const unknown of [false, true]) {
 
     const observer = await connectFixture(fixture, "observer", nativeAttachment(observedView, restartedAgent));
     assert.deepEqual(fixture.counts("terminal_attach"), [{ runtimeId }, { runtimeId, observer: true }]);
+    assert.deepEqual(fixture.counts("terminal_confirm_writer"), [writerAssertions(firstView)]);
     assert.deepEqual(fixture.calls.slice(-2).map(call => call.command), ["terminal_attach", "local_inventory"]);
     assert.notEqual(observer.binding.terminal.view_id, original.binding.terminal.view_id);
     assert.notEqual(observer.binding.terminal.agent_epoch, original.binding.terminal.agent_epoch);
@@ -723,6 +890,8 @@ for (const unknown of [false, true]) {
       previous: observer.binding.terminal, agent_pid: 13, session_id: nativeRuntime.session_id,
       operation_id: nativeRuntime.operation_id,
     } });
+    assert.deepEqual(fixture.counts("terminal_confirm_writer"), [writerAssertions(firstView),
+      writerAssertions(finalView, nativeRuntime, restartedAgent, 13)]);
     assert.equal(restored.scope.canWrite, false);
     const granted = fixture.park("terminal_read");
     const ended = fixture.park("terminal_read");
@@ -1077,6 +1246,7 @@ for (const boundary of ["close", "tab cancellation", "runtime exit", "stale fres
     assert.equal(fixture.counts("terminal_attach").length, 2);
     assert.equal(fixture.counts("terminal_read").length, 3);
     assert.deepEqual(fixture.counts("terminal_detach").map(args => (args as { viewId: string }).viewId), [firstView, observedView]);
+    assert.deepEqual(fixture.counts("terminal_confirm_writer"), [writerAssertions(firstView)]);
     assert.deepEqual(mutatingCommands(fixture), []);
   });
 }
@@ -1142,6 +1312,7 @@ test("unbound, retired or uncorroborated exited rows cannot drain or invoke atta
 test("the sidebar, saved restore and mounted renderer use the checked production paths", () => {
   const app = readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
   const view = readFileSync(new URL("./TerminalView.tsx", import.meta.url), "utf8");
+  const controller = readFileSync(new URL("./session-state.ts", import.meta.url), "utf8");
   const native = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
   const bridge = readFileSync(new URL("../../../crates/desktop-bridge/src/lib.rs", import.meta.url), "utf8");
   assert.match(app, /!requiresTerminalReopen\(record\?\.state\) && currentAttachment[\s\S]+explicitTerminalOpen\(status, latest, store.exposure\(id\)/);
@@ -1155,11 +1326,14 @@ test("the sidebar, saved restore and mounted renderer use the checked production
   assert.match(view, /inputEligible: \(\) => attachmentMode === "ordinary" && access\(\) === "attached"/);
   assert.match(view, /if \(view\) detached.current = detach\(view, failure\)/);
   assert.match(view, /const current = \(\) => currentAttachment\(runtimeId, binding \?\? previous, attempt\)[\s\S]+if \(currentIntent\(\)\) setRetry/);
-  assert.match(view, /attachCurrentTerminal\(runtimeId, previous, attachmentMode,[\s\S]+detached.current, localClient\)/);
-  assert.match(view, /if \(!candidate\)[\s\S]+scope.bind\(view\)[\s\S]+runMountedTerminalStream\(\{[\s\S]+localClient.read\(view\)[\s\S]+protocol.consume\(scope, view, chunk, render\)/);
-  assert.match(view, /if \(retained\) retainedRenderer.current = disposeRenderer[\s\S]+if \(!onBinding\(candidate.binding, "bound", previous, attempt\)\)[\s\S]+retainedRenderer.current\?\.\(\)[\s\S]+eof\(state\) \{\s+retained = onBinding\(candidate.binding, state/);
+  assert.match(view, /adoptCurrentTerminal\(runtimeId, previous, attachmentMode,[\s\S]+onBinding\(accepted, "bound", previous, attempt\)[\s\S]+detached.current, localClient\)/);
+  assert.match(view, /if \(!candidate\)[\s\S]+scope.owns\(attachment.view_id\)[\s\S]+runMountedTerminalStream\(\{[\s\S]+localClient.read\(view\)[\s\S]+protocol.consume\(scope, view, chunk, render\)/);
+  assert.match(view, /if \(retained\) retainedRenderer.current = disposeRenderer[\s\S]+onBinding\(accepted, "bound", previous, attempt\)[\s\S]+retainedRenderer.current\?\.\(\)[\s\S]+eof\(state\) \{\s+retained = onBinding\(candidate.binding, state/);
   assert.match(view, /mounted.mode === "completed" \? "Процес завершився · режим перегляду"[\s\S]+mounted.mode === "view-closed" \?[^\n]+"Потік термінала закрито · режим перегляду"/);
   assert.match(view, /disabled=\{intent\?\.reconnect === true \|\| \(!intent && !explicitClosedReconnect\(mounted\)\)\}[\s\S]+explicitClosedReconnect\(current\)[\s\S]+onReconnectClosed\(runtimeId, closedBinding, attempt\)/);
-  assert.match(native, /bridge.attach_observer\(&runtime_id\)[\s\S]+bridge.restore_attachment\(&runtime_id, expected\)/);
-  assert.match(bridge, /mode.check_opened\(&status.terminal\)[\s\S]+let status = prove_attachment\(&view, &status\).await\?[\s\S]+mode.prepare_control\(&view, &status\)[\s\S]+control.start\(&view\)/);
+  assert.match(controller, /await attachCurrentTerminal\([\s\S]+scope.bind\(terminal.view_id\)[\s\S]+accept\(binding\)[\s\S]+if \(mode === "observer"\) return candidate;[\s\S]+if \(!canConfirm\(\)\)[\s\S]+await client.confirmWriter\(terminal,[\s\S]+if \(!canConfirm\(\)\)[\s\S]+scope.setInputEligible\(true\)/);
+  assert.match(native, /#\[cfg\(target_os = "macos"\)\]\s*mod desktop[\s\S]+bridge.attach_observer\(&runtime_id\)[\s\S]+bridge.restore_attachment\(&runtime_id, expected\)[\s\S]+bridge.prepare_attachment\(&runtime_id\)[\s\S]+terminal_confirm_writer\([\s\S]+\.confirm_writer\(terminal, expected\)/);
+  assert.match(native, /#\[cfg\(target_os = "macos"\)\]\s*let builder = \{[\s\S]+desktop::terminal_attach,\s*desktop::terminal_confirm_writer,[\s\S]+#\[cfg\(not\(target_os = "macos"\)\)\]\s*let builder = builder.invoke_handler\(tauri::generate_handler!\[scaffold_status\]\)/);
+  assert.match(bridge, /mode.check_opened\(&status.terminal\)[\s\S]+prove_attachment\(&view, &status\).await\?[\s\S]+mode.prepare_control\(&view, &status\)[\s\S]+candidate.proof = Some[\s\S]+else if matches!\(mode, AttachmentMode::Ordinary\) \{\s*start_control\(&view\)/);
+  assert.match(bridge, /pub async fn confirm_writer\([\s\S]+let \(current, _\) = views.writer_candidate\(&terminal, expected\)\?[\s\S]+views.forget_writer_candidate\(&terminal\);\s*start_control\(&view\)/);
 });

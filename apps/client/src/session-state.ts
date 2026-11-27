@@ -348,10 +348,64 @@ export async function attachCurrentTerminal(
     if (latest && !proofMatches && stillCurrent()) throw new TerminalAttachmentIdentityError(!sameTarget);
     return;
   }
-  return { attachment, binding: { identity, terminal, mountKey: previous?.mountKey ?? `${runtimeId}:${identity.agentPid}` }, isCurrent: () => {
+  return { attachment, runtime: intent.runtime, binding: { identity, terminal, mountKey: previous?.mountKey ?? `${runtimeId}:${identity.agentPid}` }, isCurrent: () => {
     const latest = stillCurrent();
     return latest !== undefined && matchesPane(latest.runtime, terminal);
   } };
+}
+
+export async function adoptCurrentTerminal(
+  runtimeId: string,
+  previous: BoundTerminal | null,
+  mode: AttachmentMode,
+  current: (binding: BoundTerminal | null) => MountedTerminal,
+  mayRestore: () => boolean,
+  scope: TerminalViewScope,
+  accept: (binding: BoundTerminal) => boolean,
+  detached: Promise<void>,
+  client: Pick<typeof localClient, "attach" | "detach" | "inventory" | "confirmWriter">,
+) {
+  scope.setInputEligible(false);
+  const candidate = await attachCurrentTerminal(runtimeId, previous, mode, () => current(previous).intent,
+    mayRestore, () => scope.active, detached, client);
+  if (!candidate) return;
+  const { binding, runtime } = candidate;
+  const { terminal, identity } = binding;
+  if (!candidate.isCurrent() || !scope.bind(terminal.view_id)) {
+    await client.detach(terminal.view_id).catch(() => undefined);
+    return;
+  }
+  if (!accept(binding)) {
+    scope.retire();
+    return;
+  }
+  if (mode === "observer") return candidate;
+  const canConfirm = () => {
+    const intent = current(binding).intent;
+    return scope.owns(terminal.view_id) && mayRestore() && intent?.mode === "live" &&
+      sameInventoryIdentity(intent.identity, identity) && sameRuntime(intent.runtime, runtime) &&
+      matchesPane(intent.runtime, terminal);
+  };
+  if (!canConfirm()) {
+    scope.retire();
+    return;
+  }
+  try {
+    await client.confirmWriter(terminal, {
+      agent_pid: identity.agentPid, session_id: identity.sessionId,
+      operation_id: identity.operationId, workspace_id: identity.workspaceId,
+    });
+  } catch (error) {
+    if (canConfirm()) throw error;
+  }
+  if (!canConfirm()) {
+    const mounted = current(binding);
+    if (scope.owns(terminal.view_id) && mounted.mode === "draining" && mounted.outputOnly === binding) return candidate;
+    scope.retire();
+    return;
+  }
+  scope.setInputEligible(true);
+  return candidate;
 }
 
 export function terminalStreamAccess(
