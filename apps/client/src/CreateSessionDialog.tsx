@@ -1,7 +1,9 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
-import { CreateReadiness, localClient, mergeCreateOperations, workspaceIssueText } from "./local-client";
-import type { CreateDisposition, CreateIntent, LocalCreate, ProviderProfile, WorkspaceDisplay, WorkspaceReadiness } from "./local-client";
+import { CreateSession, initialCreateDraft } from "./create-session";
+import type { ReadinessStatus } from "./create-session";
+import { localClient, mergeCreateOperations, workspaceIssueText } from "./local-client";
+import type { CreateDisposition, CreateIntent, LocalCreate, ProviderProfile } from "./local-client";
 
 const profiles = [
   { value: "claude_code", label: "Claude Code" },
@@ -36,13 +38,12 @@ export function CreateSessionDialog({ onDismiss, onOpen, captureSubmission, retu
   const completed = useRef(false);
   const inAction = useRef(false);
   const refreshVersion = useRef(0);
-  const [workspace, setWorkspace] = useState<WorkspaceDisplay | null>(null);
-  const [profile, setProfile] = useState<ProviderProfile>("claude_code");
   const [operations, setOperations] = useState<readonly LocalCreate[]>([]);
   const [pending, setPending] = useState<"picker" | "submit" | "status" | null>(null);
-  const [readiness] = useState(() => new CreateReadiness());
-  const [readinessStatus, setReadinessStatus] = useState<WorkspaceReadiness | "pending" | "unavailable" | null>(null);
-  const [readinessRetry, setReadinessRetry] = useState(0);
+  const [readinessStatus, setReadinessStatus] = useState<ReadinessStatus>(null);
+  const [draft, setDraft] = useState(initialCreateDraft);
+  const [creation] = useState(() => new CreateSession(setDraft, setReadinessStatus));
+  const { workspace, profile } = draft;
   const [feedback, setFeedback] = useState("");
   const [storeIssue, setStoreIssue] = useState("");
   const [confirmSeparate, setConfirmSeparate] = useState<string | null>(null);
@@ -60,20 +61,10 @@ export function CreateSessionDialog({ onDismiss, onOpen, captureSubmission, retu
   }, [returnFocus]);
 
   const workspaceId = workspace?.workspace_id;
-  const picking = pending === "picker";
   useLayoutEffect(() => {
-    if (!workspaceId || picking) {
-      setReadinessStatus(null);
-      return;
-    }
-    const check = readiness.begin(workspaceId, profile);
-    setReadinessStatus("pending");
-    void localClient.workspaceReadiness(workspaceId, profile).then(
-      result => { if (readiness.finish(check, result)) setReadinessStatus(result); },
-      () => { if (readiness.finish(check, undefined)) setReadinessStatus("unavailable"); },
-    );
-    return () => readiness.invalidate();
-  }, [workspaceId, profile, picking, readiness, readinessRetry, connection]);
+    void creation.check(draft);
+    return () => creation.invalidate();
+  }, [creation, draft, connection]);
 
   useEffect(() => {
     let disposed = false;
@@ -91,9 +82,11 @@ export function CreateSessionDialog({ onDismiss, onOpen, captureSubmission, retu
   async function act(kind: NonNullable<typeof pending>, action: () => Promise<void>) {
     if (inAction.current) return;
     inAction.current = true;
-    if (kind !== "picker") refreshVersion.current += 1;
+    if (kind !== "picker") {
+      refreshVersion.current += 1;
+      setFeedback("");
+    }
     setPending(kind);
-    setFeedback("");
     try {
       await action();
     } catch {
@@ -106,50 +99,41 @@ export function CreateSessionDialog({ onDismiss, onOpen, captureSubmission, retu
 
   function chooseWorkspace() {
     return act("picker", async () => {
-      readiness.invalidate();
-      const choice = await localClient.pickWorkspace();
-      if (!mounted.current) return;
-      setReadinessRetry(value => value + 1);
-      if (choice.result === "selected") setWorkspace(choice.workspace);
-      if (choice.result === "blocked") {
-        setWorkspace(null);
-        setFeedback(workspaceIssueText[choice.issue]);
-      }
+      const choice = await creation.chooseWorkspace(() => mounted.current && dialogRef.current !== null);
+      if (!choice || !mounted.current) return;
+      setFeedback(choice.result === "blocked" ? workspaceIssueText[choice.issue] : "");
     });
   }
 
   function dismiss() {
-    readiness.invalidate();
+    creation.invalidate();
     mounted.current = false;
     onDismiss();
   }
 
   function selectProfile(next: ProviderProfile) {
-    if (next !== profile) readiness.invalidate();
-    setProfile(next);
+    creation.select(workspace, next);
     setFeedback("");
   }
 
   function submit(id: string, selectedProfile: ProviderProfile, intent?: CreateIntent) {
     if (!mounted.current || inAction.current) return;
-    if (!intent?.continueReference) {
-      if (workspaceId !== id || selectedProfile !== profile || !readiness.take(id, selectedProfile)) return;
-      setReadinessStatus(null);
-    }
-    const present = captureSubmission();
-    return act("submit", async () => {
-      const reply = await localClient.createSession(id, selectedProfile, intent);
-      if (mounted.current) setConfirmSeparate(null);
-      if (reply.result === "blocked") {
-        if (mounted.current) setFeedback(workspaceIssueText[reply.issue]);
-        return;
-      }
-      if (mounted.current) setOperations(current => mergeCreateOperations(current, [reply.operation]));
-      const disposition = reply.operation.disposition;
-      if (disposition.result === "launched" && disposition.current === "live") {
-        completed.current = present(reply.operation);
-        if (!completed.current && mounted.current) setFeedback("Відкрийте цей термінал із запису попередньої спроби.");
-      }
+    return creation.submit(id, selectedProfile, intent, send => {
+      const present = captureSubmission();
+      return act("submit", async () => {
+        const reply = await send();
+        if (mounted.current) setConfirmSeparate(null);
+        if (reply.result === "blocked") {
+          if (mounted.current) setFeedback(workspaceIssueText[reply.issue]);
+          return;
+        }
+        if (mounted.current) setOperations(current => mergeCreateOperations(current, [reply.operation]));
+        const disposition = reply.operation.disposition;
+        if (disposition.result === "launched" && disposition.current === "live") {
+          completed.current = present(reply.operation);
+          if (!completed.current && mounted.current) setFeedback("Відкрийте цей термінал із запису попередньої спроби.");
+        }
+      });
     });
   }
 
@@ -162,7 +146,7 @@ export function CreateSessionDialog({ onDismiss, onOpen, captureSubmission, retu
     });
   }
 
-  const ready = workspaceId !== undefined && readiness.allows(workspaceId, profile);
+  const ready = workspaceId !== undefined && creation.allows(workspaceId, profile);
   const readinessText = readinessStatus === "pending" ? "Перевіряємо папку та CLI в агенті Mac…" :
     readinessStatus === "unavailable" ? "Не вдалося перевірити папку та CLI. Повторіть перевірку." :
     readinessStatus?.result === "blocked" ? workspaceIssueText[readinessStatus.issue] : "";
@@ -194,7 +178,7 @@ export function CreateSessionDialog({ onDismiss, onOpen, captureSubmission, retu
     </p>
     {readinessText && <p role="status">{readinessText}</p>}
     {workspace && pending === null && !ready && readinessStatus !== "pending" &&
-      <button type="button" onClick={() => setReadinessRetry(value => value + 1)}>Перевірити знову</button>}
+      <button type="button" onClick={() => creation.retry()}>Перевірити знову</button>}
     {(operations.length > 0 || storeIssue) && <section aria-labelledby="create-recovery-title" style={{ maxHeight: "40vh", overflow: "auto" }}>
       <h3 id="create-recovery-title">Попередні спроби</h3>
       {storeIssue && <p role="status">{storeIssue}</p>}
@@ -219,9 +203,9 @@ export function CreateSessionDialog({ onDismiss, onOpen, captureSubmission, retu
                 <button type="button" disabled={pending !== null} onClick={() => void submit(operation.workspace_id, operation.profile, { continueReference: operation.reference })}>Продовжити</button>}
               {disposition.result !== "pending" && confirmSeparate !== operation.reference &&
                 <button type="button" disabled={pending !== null} onClick={() => {
-                  if (workspaceId !== operation.workspace_id) readiness.invalidate();
-                  setWorkspace(workspaceId === operation.workspace_id ? workspace : { workspace_id: operation.workspace_id, label: name ?? id });
-                  selectProfile(operation.profile);
+                  creation.select(workspaceId === operation.workspace_id ? workspace :
+                    { workspace_id: operation.workspace_id, label: name ?? id }, operation.profile);
+                  setFeedback("");
                   setConfirmSeparate(operation.reference);
                 }}>Створити окрему сесію…</button>}
             </div>
