@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { TestContext } from "node:test";
 import xterm from "@xterm/xterm";
-import { parseChunk, parseGeometryEvent, parseResizeResult, parseTerminalStatus } from "./local-client.ts";
-import type { GeometryEvent, TerminalSize } from "./local-client.ts";
-import { GeometryBoundaryError, OrderedGeometry, ResizeProposals } from "./terminal-geometry.ts";
+import { localClient, parseChunk, parseGeometryEvent, parseResizeResult, parseTerminalStatus, TerminalViewScope } from "./local-client.ts";
+import type { GeometryEvent, TerminalSize, TerminalStatus } from "./local-client.ts";
+import { GeometryBoundaryError, mountedResize, OrderedGeometry, ResizeProposals, sameTerminal } from "./terminal-geometry.ts";
+import { bindTerminalProtocol } from "./terminal-protocol.ts";
 
 const uuid = (id: number) => `11111111-1111-4111-8111-${String(id).padStart(12, "0")}`;
 const agent = uuid(1);
@@ -18,7 +20,7 @@ const fixtureStatus = (revision = 1, size: TerminalSize = sizes[0]) => ({
   terminal, epoch, committed: { revision, size, intent: { epoch, id: uuid(10 + revision) } },
   provider: { size: original, sampled_at_us: 101 },
   observation: "pending",
-});
+} satisfies TerminalStatus);
 const fixtureEvent = (revision = 1, size: TerminalSize = sizes[0]) => ({
   status: fixtureStatus(revision, size),
   bridge_pty: { size, sampled_at_us: 102 },
@@ -175,18 +177,299 @@ test("well-formed stale resize replies cannot complete the current scope or revi
   routing.offer(sizes[2]);
   routing.observe(newOwner, true, 0);
   assert.equal(routing.complete(old, parseResizeResult(reply)), false);
+  routing.offer(sizes[1]);
   assert.equal(routing.take(), undefined);
-  routing.offer(sizes[0]);
+  routing.observe(parseTerminalStatus({ ...fixtureStatus(), epoch: changedEpoch }), true, 1);
   const next = routing.take()!;
   routing.observe(parseTerminalStatus({ ...fixtureStatus(3, sizes[2]), epoch: changedEpoch }), true, 3);
-  const stale = fixtureStatus(2);
+  const stale = fixtureStatus(2, sizes[1]);
   assert.equal(routing.complete(next, parseResizeResult(committedReply({
     ...stale, epoch: changedEpoch, committed: { ...stale.committed, intent: { ...stale.committed.intent, epoch: changedEpoch } },
   }))), false);
+  routing.offer(original);
+  assert.equal(routing.take()?.revision, 3);
 });
 
 function bytes(data: readonly number[]) { return { data, writable: false, closed: false }; }
 function boundary(geometry = parseGeometryEvent(fixtureEvent())) { return { ...bytes([]), geometry }; }
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
+}
+
+function mountedResizeFixture(t: TestContext) {
+  const firstInput = deferred<unknown>();
+  const calls: { args: unknown; reply: ReturnType<typeof deferred<unknown>> }[] = [];
+  const acknowledgements: { args: unknown; reply: ReturnType<typeof deferred<GeometryEvent>> }[] = [];
+  const inputs: unknown[] = [];
+  const reports: boolean[] = [];
+  const grids: TerminalSize[] = [];
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: { __TAURI_INTERNALS__: {
+      invoke(command: string, args: unknown) {
+        switch (command) {
+          case "terminal_input":
+            inputs.push(args);
+            return firstInput.promise;
+          case "terminal_resize": {
+            const reply = deferred<unknown>();
+            calls.push({ args, reply });
+            return reply.promise;
+          }
+          case "terminal_acknowledge_grid": {
+            const reply = deferred<GeometryEvent>();
+            acknowledgements.push({ args, reply });
+            return reply.promise;
+          }
+          default:
+            return assert.fail(`unexpected native command ${command}`);
+        }
+      },
+    } },
+  });
+  const display = rendererFixture();
+  const ordered = new OrderedGeometry(initial());
+  let layoutQueued = false;
+  let bound = terminal;
+  let proposed = Promise.resolve();
+  const resize = mountedResize({
+    owns: target => sameTerminal(bound, target) && scope.owns(target.view_id),
+    canWrite: () => scope.canWrite,
+    ordered: () => ordered,
+    invoke: localClient.resize,
+    scheduleLayout() { layoutQueued = true; },
+    cancelLayout() { layoutQueued = false; },
+    settled(unavailable) { reports.push(unavailable); },
+  });
+  const scope = new TerminalViewScope({
+    input: (viewId, data, incarnation) => localClient.input({ viewId, data, incarnation }),
+    inputFailure: error => assert.fail(String(error)),
+    grantRejected() { if (resize.grantRejected()) protocol.pauseInput(); },
+    retire() { resize.close(); ordered.close(); protocol.dispose(); },
+    reconnect: error => assert.fail(String(error)),
+  });
+  const protocol = bindTerminalProtocol(display.xtermTerminal, data => { void scope.send(data); });
+  assert.ok(scope.bind(terminal.view_id));
+  t.after(() => {
+    scope.retire();
+    display.xtermTerminal.dispose();
+    if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow);
+    else Reflect.deleteProperty(globalThis, "window");
+  });
+  const sink = {
+    write: display.write,
+    resize(size: TerminalSize) {
+      grids.push(size);
+      display.xtermTerminal.resize(size.cols, size.rows);
+      return { cols: display.xtermTerminal.cols, rows: display.xtermTerminal.rows };
+    },
+    acknowledge: (event: GeometryEvent, size: TerminalSize) => localClient.acknowledgeGrid(terminal.view_id, {
+      renderer_id: uuid(30), epoch: event.status.epoch, revision: event.status.committed.revision, size, focused: false,
+    }),
+  };
+  return {
+    resize, scope, ordered, calls, acknowledgements, reports, grids,
+    pendingLayout: () => layoutQueued,
+    lastProposal: () => proposed,
+    replaceBinding() { bound = { ...terminal, target: { ...terminal.target, pane: "%3" } }; },
+    measure(size: TerminalSize) {
+      assert.equal(layoutQueued, true);
+      layoutQueued = false;
+      return resize.offer(size);
+    },
+    async sample(status: TerminalStatus | null, incarnation?: string, geometry: GeometryEvent | null = null) {
+      const chunk = parseChunk({ ...bytes([]), status, geometry, writable: incarnation !== undefined,
+        ...(incarnation ? { paste_incarnation: incarnation } : {}) });
+      assert.ok(await protocol.consume(scope, terminal.view_id, chunk, () => ordered.consume(chunk, sink)));
+      resize.observe(chunk);
+      proposed = resize.propose();
+    },
+    async rejectGrant(incarnation: string) {
+      const sending = scope.send(Uint8Array.of(65));
+      await Promise.resolve();
+      assert.deepEqual(inputs, [{ viewId: terminal.view_id, data: [65], incarnation }]);
+      firstInput.reject({ reason: "stale_input", view_id: terminal.view_id, rejection_id: uuid(31), event_time_us: 10 });
+      await sending;
+      assert.equal(scope.canWrite, false);
+      assert.equal(layoutQueued, false);
+    },
+  };
+}
+
+async function exerciseResizeGrantGap(t: TestContext, replyFirst: boolean, nextEpoch: typeof epoch, latest: TerminalSize) {
+  const fixture = mountedResizeFixture(t);
+  const oldGrant = uuid(32);
+  const freshGrant = uuid(33);
+  await fixture.sample(initial(), oldGrant);
+  const first = fixture.measure(sizes[0]);
+  const firstCall = { viewId: terminal.view_id, epoch, size: sizes[0] };
+  fixture.resize.scheduleLayout();
+  const oldLayout = fixture.measure(sizes[1]);
+  assert.deepEqual(fixture.calls.map(call => call.args), [firstCall]);
+  await oldLayout;
+  fixture.resize.scheduleLayout();
+  await fixture.rejectGrant(oldGrant);
+  await fixture.sample(initial());
+  assert.equal(fixture.scope.canWrite, false);
+  assert.equal(fixture.pendingLayout(), false);
+
+  async function settlePredecessor() {
+    fixture.calls[0]!.reply.resolve(committedReply());
+    await first;
+    assert.deepEqual(fixture.reports, []);
+    assert.equal(fixture.ordered.applied, 0);
+    assert.deepEqual(fixture.ordered.status.committed.size, original);
+    assert.deepEqual(fixture.grids, []);
+    assert.deepEqual(fixture.calls.map(call => call.args), [firstCall]);
+  }
+  if (replyFirst) await settlePredecessor();
+  await fixture.sample({ ...initial(), epoch: nextEpoch }, freshGrant);
+  assert.equal(fixture.scope.canWrite, true);
+  const intermediate = fixture.measure(sizes[1]);
+  assert.deepEqual(fixture.calls.map(call => call.args), [firstCall]);
+  await intermediate;
+  fixture.resize.scheduleLayout();
+  const latestLayout = fixture.measure(latest);
+  assert.deepEqual(fixture.calls.map(call => call.args), [firstCall]);
+  await latestLayout;
+  if (!replyFirst) await settlePredecessor();
+
+  const changed = { ...fixtureStatus(), epoch: nextEpoch };
+  await fixture.sample(changed, freshGrant);
+  assert.deepEqual(fixture.ordered.status, changed);
+  assert.equal(fixture.ordered.applied, 0);
+  assert.deepEqual(fixture.grids, []);
+  assert.deepEqual(fixture.calls.map(call => call.args), [firstCall]);
+  const event = parseGeometryEvent({ ...fixtureEvent(), status: changed });
+  const applying = fixture.sample(null, freshGrant, event);
+  assert.deepEqual(fixture.grids, [sizes[0]]);
+  assert.deepEqual(fixture.acknowledgements.map(ack => ack.args), [{ viewId: terminal.view_id, acknowledgement: {
+    renderer_id: uuid(30), epoch: nextEpoch, revision: 1, size: sizes[0], focused: false,
+  } }]);
+  assert.equal(fixture.ordered.applied, 0);
+  await fixture.resize.propose();
+  assert.deepEqual(fixture.calls.map(call => call.args), [firstCall]);
+  fixture.acknowledgements[0]!.reply.resolve(event);
+  await applying;
+  assert.equal(fixture.ordered.applied, 1);
+  const expected = [firstCall, { viewId: terminal.view_id, epoch: nextEpoch, size: latest }];
+  assert.deepEqual(fixture.calls.map(call => call.args), expected);
+  const final = {
+    terminal, epoch: nextEpoch, committed: { revision: 2, size: latest, intent: { epoch: nextEpoch, id: uuid(34) } },
+    provider: null, observation: "unavailable",
+  };
+  fixture.calls[1]!.reply.resolve({ result: "committed", admission: final.committed.intent, status: final });
+  await fixture.lastProposal();
+  assert.deepEqual(fixture.grids, [sizes[0]]);
+  assert.equal(fixture.ordered.applied, 1);
+  const followup = parseGeometryEvent({ ...fixtureEvent(2, latest), status: final });
+  const converging = fixture.sample(null, freshGrant, followup);
+  fixture.acknowledgements[1]!.reply.resolve(followup);
+  await converging;
+  assert.equal(fixture.ordered.applied, 2);
+  assert.deepEqual(fixture.ordered.status, final);
+  assert.deepEqual(fixture.grids, [sizes[0], latest]);
+  assert.deepEqual(fixture.calls.map(call => call.args), expected);
+}
+
+test("resize grant recovery keeps one physical invoke", { timeout: 2000 }, async t => {
+  await t.test("same owner", sub => exerciseResizeGrantGap(sub, false, epoch, sizes[2]));
+  await t.test("new owner", sub => exerciseResizeGrantGap(sub, false, { agent, owner: uuid(35) }, sizes[2]));
+});
+
+test("resize grant recovery waits for same-view ordered grid", { timeout: 2000 }, async t => {
+  await t.test("same owner returns to the previous grid", sub => exerciseResizeGrantGap(sub, true, epoch, original));
+  await t.test("new owner returns to the previous grid", sub => exerciseResizeGrantGap(sub, true, { agent, owner: uuid(35) }, original));
+});
+
+test("unknown resize drops old layout and requires reconciled geometry or a new grant", { timeout: 2000 }, async t => {
+  await t.test("same grant stays closed after transport failure", async sub => {
+    const fixture = mountedResizeFixture(sub);
+    const incarnation = uuid(36);
+    await fixture.sample(initial(), incarnation);
+    const pending = fixture.measure(sizes[0]);
+    fixture.resize.scheduleLayout();
+    await fixture.measure(sizes[1]);
+    fixture.calls[0]!.reply.reject(Error("resize result unknown"));
+    await pending;
+    assert.deepEqual(fixture.reports, [true]);
+    await fixture.sample(initial(), incarnation);
+    assert.equal(fixture.pendingLayout(), false);
+    fixture.resize.scheduleLayout();
+    await fixture.measure(sizes[0]);
+    assert.equal(fixture.calls.length, 1);
+
+    const event = parseGeometryEvent(fixtureEvent());
+    const applying = fixture.sample(null, incarnation, event);
+    assert.equal(fixture.calls.length, 1);
+    fixture.acknowledgements[0]!.reply.resolve(event);
+    await applying;
+    assert.equal(fixture.ordered.applied, 1);
+    assert.equal(fixture.pendingLayout(), true);
+    assert.equal(fixture.calls.length, 1);
+    const fresh = fixture.measure(sizes[2]);
+    assert.deepEqual(fixture.calls[1]?.args, { viewId: terminal.view_id, epoch, size: sizes[2] });
+    fixture.calls[1]!.reply.resolve(committedReply(fixtureStatus(2, sizes[2])));
+    await fresh;
+  });
+
+  for (const result of ["uncertain", "rejected"] as const) {
+    await t.test(`old ${result} reply preserves the newer grant`, async sub => {
+      const fixture = mountedResizeFixture(sub);
+      const oldGrant = uuid(36);
+      await fixture.sample(initial(), oldGrant);
+      const pending = fixture.measure(sizes[0]);
+      fixture.resize.scheduleLayout();
+      await fixture.measure(sizes[1]);
+      await fixture.rejectGrant(oldGrant);
+      await fixture.sample(initial(), uuid(37));
+      fixture.calls[0]!.reply.resolve({ result, terminal, intent: { epoch, id: uuid(38) } });
+      await pending;
+      assert.equal(fixture.scope.canWrite, true);
+      assert.equal(fixture.pendingLayout(), true);
+      assert.deepEqual(fixture.reports, []);
+      assert.deepEqual(fixture.grids, []);
+      assert.equal(fixture.calls.length, 1);
+      const fresh = fixture.measure(sizes[2]);
+      assert.deepEqual(fixture.calls[1]?.args, { viewId: terminal.view_id, epoch, size: sizes[2] });
+      fixture.calls[1]!.reply.resolve(committedReply(fixtureStatus(1, sizes[2])));
+      await fresh;
+    });
+  }
+});
+
+test("stale resize scope and disposal fence late outcomes", { timeout: 2000 }, async t => {
+  for (const stale of ["reply target", "mounted binding", "disposed view"] as const) {
+    await t.test(stale, async sub => {
+      const fixture = mountedResizeFixture(sub);
+      const incarnation = uuid(39);
+      await fixture.sample(initial(), incarnation);
+      const pending = fixture.measure(sizes[0]);
+      fixture.resize.scheduleLayout();
+      await fixture.measure(sizes[1]);
+      if (stale === "disposed view") fixture.scope.retire();
+      if (stale === "mounted binding") fixture.replaceBinding();
+      const status = fixtureStatus();
+      fixture.calls[0]!.reply.resolve(committedReply(stale === "reply target" ? {
+        ...status, terminal: { ...terminal, target: { ...terminal.target, pane: "%3" } },
+      } : status));
+      await pending;
+      if (stale === "reply target") await fixture.sample(initial(), incarnation);
+      await fixture.resize.propose();
+      assert.equal(fixture.calls.length, 1);
+      assert.deepEqual(fixture.reports, []);
+      assert.deepEqual(fixture.grids, []);
+      assert.deepEqual(fixture.acknowledgements, []);
+      assert.equal(fixture.ordered.applied, 0);
+      assert.deepEqual(fixture.ordered.status.committed.size, original);
+    });
+  }
+});
 
 test("each write callback precedes grid application and the matching ACK", async () => {
   const order: string[] = [];
