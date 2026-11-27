@@ -530,9 +530,10 @@ class ManifestTests(unittest.TestCase):
 
 class LossTests(unittest.TestCase):
     @staticmethod
-    def runtime(workspace_id=None):
-        session_id, runtime_id = uuid4(), uuid4()
-        return {'operation_id': str(uuid4()), 'runtime_id': str(runtime_id),
+    def runtime(workspace_id=None, *, runtime_id=None):
+        session_id = uuid4()
+        runtime_id = uuid4() if runtime_id is None else runtime_id
+        return {'operation_id': str(uuid4()) if workspace_id is not None else None, 'runtime_id': str(runtime_id),
                 'workspace_id': workspace_id, 'session_id': str(session_id),
                 'origin': 'managed' if workspace_id else 'legacy', 'pane_id': '%2', 'pane_pid': 42,
                 'exited': False, 'command': 'fixture', 'width': 80, 'height': 24,
@@ -649,6 +650,133 @@ class LossTests(unittest.TestCase):
             self.assertNotIn('error', result)
             self.assertEqual(result.get('request'), request_bytes)
         return received
+
+    def forward_inventory(self, upstream, path, rows, pid=42):
+        health = request_frame({'result': 'health', 'agent_pid': pid, 'remote_execution_enabled': False})
+        inventory = request_frame({'result': 'runtimes', 'runtimes': rows})
+        self.assertEqual(self.relay_exchange(upstream, path, {'op': 'health'}, health), health)
+        self.assertEqual(self.relay_exchange(upstream, path, {'op': 'list'}, inventory), inventory)
+
+    def assert_picker_hold_after_invalid_exchange(self, op, reply):
+        with self.relay_fixture() as (upstream, path, loss):
+            rows = [self.runtime()]
+            self.forward_inventory(upstream, path, rows)
+            decision = loss.cancel_snapshot()
+            self.assertEqual((decision['failures'], decision['active'], decision['forwarded_lists']), (0, 0, 1))
+            self.assertEqual(self.relay_exchange(upstream, path, {'op': op}, request_frame(reply)), b'')
+
+            for recovered in (False, True):
+                if recovered:
+                    self.forward_inventory(upstream, path, rows)
+                traffic = w1_recovery.picker_traffic(decision, loss.cancel_snapshot())
+                self.assertEqual(traffic['connected'], recovered)
+                self.assertFalse(traffic['intact'])
+                self.assertEqual(set(traffic['deltas'].values()), {0})
+                after = traffic['after']
+                self.assertEqual(after['forwarded_lists'] - decision['forwarded_lists'], int(recovered))
+                self.assertEqual((after['failures'] - decision['failures'], after['active']), (1, 0))
+
+    def test_handler_desktop_inventory_collection_bounds_hold_quiet_cancel(self):
+        print(self._testMethodName, flush=True)
+        rows = [self.runtime(runtime_id=UUID(int=index)) for index in range(1, 18)]
+        for name, invalid in (('exact duplicate', [rows[0], rows[0]]), ('over capacity', rows)):
+            with self.subTest(name=name):
+                self.assertTrue(all(w1_recovery.runtime_shape(row) for row in invalid))
+                self.assert_picker_hold_after_invalid_exchange('list', {'result': 'runtimes', 'runtimes': invalid})
+
+        with self.relay_fixture() as (upstream, path, loss):
+            self.forward_inventory(upstream, path, [])
+            before = loss.cancel_snapshot()
+            self.assertEqual(before['forwarded_lists'], 1)
+            self.forward_inventory(upstream, path, rows[:16])
+            traffic = w1_recovery.picker_traffic(before, loss.cancel_snapshot())
+            self.assertTrue(traffic['connected'] and traffic['intact'])
+            self.assertEqual(traffic['after']['forwarded_lists'], 2)
+            self.assertEqual(set(traffic['deltas'].values()), {0})
+
+    def test_handler_native_inventory_projection_holds_quiet_cancel(self):
+        print(self._testMethodName, flush=True)
+        runtime = self.runtime(runtime_id=UUID('abcdefab-cdef-abcd-efab-cdefabcdefab'))
+        managed = self.runtime(str(uuid4()))
+        no_origin = {key: value for key, value in managed.items() if key != 'origin'}
+        invalid_lists = (
+            ('canonical duplicate', [runtime, {**runtime, 'runtime_id': runtime['runtime_id'].upper()}]),
+            ('default legacy with IDs', [no_origin]),
+            ('explicit legacy with IDs', [{**managed, 'origin': 'legacy'}]),
+            ('only workspace ID', [{**managed, 'operation_id': None}]),
+            ('only operation ID', [{**managed, 'workspace_id': None}]),
+            ('nil workspace ID', [{**managed, 'workspace_id': UUID(int=0).hex}]),
+            ('nil operation ID', [{**managed, 'operation_id': f'{{{UUID(int=0)}}}'}]),
+            ('zero pane PID', [{**runtime, 'pane_pid': 0}]),
+            ('large pane PID', [{**runtime, 'pane_pid': 2**31 + 1}]),
+            ('zero width', [{**runtime, 'width': 0}]),
+            ('large width', [{**runtime, 'width': 10_001}]),
+            ('zero height', [{**runtime, 'height': 0}]),
+            ('large height', [{**runtime, 'height': 10_001}]),
+            ('overlong UTF-16 command', [{**runtime, 'command': '😀' * 128 + 'a'}]),
+        )
+        for name, rows in invalid_lists:
+            with self.subTest(name=name):
+                self.assertTrue(all(w1_recovery.runtime_shape(row) for row in rows))
+                self.assert_picker_hold_after_invalid_exchange('list', {'result': 'runtimes', 'runtimes': rows})
+
+        for field, invalid in (
+            ('width', True), ('height', 24.0), ('pane_pid', '42'), ('exited', 0), ('command', 1),
+            ('pane_id', '%01'), ('pane_id', '%4294967296'), ('pane_id', '$2'),
+            ('tmux_name', runtime['tmux_name'] + '0'),
+            ('runtime_id', f"{{{UUID(runtime['runtime_id']).hex}}}"),
+            ('runtime_id', 'urn:uuid:' + UUID(runtime['runtime_id']).hex),
+            ('runtime_id', runtime['runtime_id'] + '\n'),
+        ):
+            with self.subTest(field=field, invalid=invalid):
+                reply = {'result': 'runtimes', 'runtimes': [{**runtime, field: invalid}]}
+                self.assert_picker_hold_after_invalid_exchange('list', reply)
+
+        omitted = {'pane_pid', 'workspace_id', 'operation_id'}
+        legacy = {key: value for key, value in self.runtime().items() if key not in omitted | {'origin'}}
+        unverified = {**self.runtime(), 'origin': 'managed', 'pane_pid': 1, 'pane_id': '%0',
+                      'width': 10_000, 'height': 1}
+        unverified_omitted = {key: value for key, value in self.runtime().items() if key not in omitted}
+        unverified_omitted['origin'] = 'managed'
+        alternate = {**self.runtime(str(uuid4())), 'pane_pid': 2**31, 'pane_id': '%4294967295',
+                     'width': 1, 'height': 10_000, 'command': '😀' * 128, 'exited': True}
+        alternate.update(
+            runtime_id=UUID(alternate['runtime_id']).hex,
+            session_id=f"{{{alternate['session_id']}}}",
+            workspace_id='UrN:UuId:' + alternate['workspace_id'].upper(),
+            operation_id=alternate['operation_id'].upper(),
+        )
+        with self.relay_fixture() as (upstream, path, loss):
+            self.forward_inventory(upstream, path, [runtime, legacy, managed])
+            before = loss.cancel_snapshot()
+            self.forward_inventory(upstream, path, [unverified, unverified_omitted, alternate])
+            traffic = w1_recovery.picker_traffic(before, loss.cancel_snapshot())
+            self.assertTrue(traffic['connected'] and traffic['intact'])
+            self.assertEqual(traffic['after']['forwarded_lists'], 2)
+
+            request = {'op': 'create', 'session_id': runtime['session_id'], 'runtime_id': runtime['runtime_id'],
+                       'cwd': '/fixture', 'argv': ['fixture']}
+            created = request_frame({'result': 'created', 'runtime': {**runtime, 'width': 0}})
+            self.assertEqual(self.relay_exchange(upstream, path, request, created), created)
+            self.assertEqual(loss.cancel_snapshot(), traffic['after'])
+
+    def test_handler_desktop_health_pid_bounds_hold_quiet_cancel(self):
+        print(self._testMethodName, flush=True)
+        for pid in (0, 2**31 + 1):
+            with self.subTest(pid=pid):
+                self.assertTrue(w1_recovery.U32(pid))
+                self.assert_picker_hold_after_invalid_exchange(
+                    'health', {'result': 'health', 'agent_pid': pid, 'remote_execution_enabled': False},
+                )
+        with self.relay_fixture() as (upstream, path, loss):
+            rows = [self.runtime()]
+            self.forward_inventory(upstream, path, rows, pid=1)
+            before = loss.cancel_snapshot()
+            self.assertEqual(before['forwarded_lists'], 1)
+            self.forward_inventory(upstream, path, rows, pid=2**31)
+            traffic = w1_recovery.picker_traffic(before, loss.cancel_snapshot())
+            self.assertTrue(traffic['connected'] and traffic['intact'])
+            self.assertEqual(traffic['after']['forwarded_lists'], 2)
 
     def test_handler_malformed_list_holds_quiet_cancel(self):
         print(self._testMethodName, flush=True)
