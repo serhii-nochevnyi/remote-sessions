@@ -29,7 +29,6 @@ export class CreateSession {
   }
 
   private replaceDraft(workspace: WorkspaceDisplay | null, profile: ProviderProfile) {
-    // Each replacement is an effect key, even when the selected pair is identical.
     this.invalidate();
     this.currentDraft = { workspace, profile };
     this.publishDraft(this.currentDraft);
