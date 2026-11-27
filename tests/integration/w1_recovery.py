@@ -176,18 +176,52 @@ def wire_uuid(value):
     return re.fullmatch(rf'(?:{simple}|{hyphenated}|urn:uuid:{hyphenated}|\{{{hyphenated}\}})', value) is not None
 
 
-def runtime_shape(value):
-    wire_object(value, {'session_id': wire_uuid, 'runtime_id': wire_uuid, 'tmux_name': string,
+def inventory_uuid(value):
+    return isinstance(value, str) and value.isascii() and wire_uuid(value.lower())
+
+
+def runtime_shape(value, uuid_check=wire_uuid):
+    wire_object(value, {'session_id': uuid_check, 'runtime_id': uuid_check, 'tmux_name': string,
                         'pane_id': string, 'command': string, 'exited': boolean,
                         'width': U16, 'height': U16},
                 {'pane_pid': nullable(U32), 'origin': choices('managed', 'legacy'),
-                 'workspace_id': nullable(wire_uuid), 'operation_id': nullable(wire_uuid)})
-    if (not valid_id(value['session_id']) or not valid_id(value['runtime_id'])
+                 'workspace_id': nullable(uuid_check), 'operation_id': nullable(uuid_check)})
+    session_id = UUID(value['session_id'].lower())
+    runtime_id = UUID(value['runtime_id'].lower())
+    if (not session_id.int or not runtime_id.int
             or not value['tmux_name'].startswith('rs_')
-            or value['tmux_name'][3:].lower() != f"{UUID(value['session_id']).hex}_{UUID(value['runtime_id']).hex}"
+            or value['tmux_name'][3:].lower() != f'{session_id.hex}_{runtime_id.hex}'
             or not re.fullmatch(r'%(?:0|[1-9][0-9]{0,9})', value['pane_id'])
             or not U32(int(value['pane_id'][1:]))):
         raise ValueError('Invalid IPC runtime identity')
+    return True
+
+
+def desktop_pid(value):
+    return U32(value) and 1 <= value <= 2**31
+
+
+def inventory_shape(rows):
+    if not isinstance(rows, list) or len(rows) > 16:
+        return False
+    runtime_ids = set()
+    for row in rows:
+        runtime_shape(row, inventory_uuid)
+        runtime_id = str(UUID(row['runtime_id'].lower()))
+        if runtime_id in runtime_ids:
+            return False
+        runtime_ids.add(runtime_id)
+
+        workspace_id, operation_id = row.get('workspace_id'), row.get('operation_id')
+        if workspace_id is not None or operation_id is not None:
+            if (row.get('origin', 'legacy') != 'managed'
+                    or not all(value is not None and valid_id(value.lower())
+                               for value in (workspace_id, operation_id))):
+                return False
+        if (not nullable(desktop_pid)(row.get('pane_pid'))
+                or not 1 <= row['width'] <= 10_000 or not 1 <= row['height'] <= 10_000
+                or len(row['command'].encode('utf-16-le')) > 512):
+            return False
     return True
 
 
@@ -261,7 +295,7 @@ PRODUCT_REQUESTS = {
 }
 REPLIES = {
     'health': {'agent_pid': U32, 'remote_execution_enabled': boolean},
-    'runtimes': {'runtimes': array(runtime_shape)},
+    'runtimes': {'runtimes': inventory_shape},
     'created': {'runtime': runtime_shape},
     'snapshot': {'text': string},
     'attachment': {'tmux_name': string},
@@ -342,6 +376,8 @@ def validate_reply(message, reply):
     if op == 'input' and message.get('paste') is True:
         names = ('paste_unavailable',)
     result = variant(reply, 'result', {name: REPLIES[name] for name in (*names, 'error')})
+    if result == 'health' and not desktop_pid(reply['agent_pid']):
+        raise ValueError('Invalid desktop inventory agent PID')
     if result == 'paste':
         variant(reply['paste'], 'result', PASTE_REPLIES[op])
     return result
