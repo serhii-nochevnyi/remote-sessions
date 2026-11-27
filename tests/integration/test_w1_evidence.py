@@ -108,6 +108,10 @@ FALSE_OUTCOME_CLAIM = re.compile(
     r"|\b(?:submitted\s+)?model prompts?\s*[:*]+\s*(?:0|zero|\d+)\b",
     re.IGNORECASE,
 )
+COUNT_FIRST_PROMPT_CLAIM = re.compile(
+    r"\b(?:zero|\d+)\s+(?:submitted\s+)?(?:model\s+)?prompts?\s+(?:was|were)\s+observed\b",
+    re.IGNORECASE,
+)
 
 
 def require(condition, message):
@@ -275,7 +279,8 @@ def validate_evidence(root, data, markdown):
         else:
             prose.append(line)
     markdown_cases = index_cases(markdown_rows, REPORT)
-    false_claim = FALSE_OUTCOME_CLAIM.search("\n".join(prose))
+    narrative = "\n".join(prose)
+    false_claim = FALSE_OUTCOME_CLAIM.search(narrative) or COUNT_FIRST_PROMPT_CLAIM.search(narrative)
     require(not false_claim, f"{REPORT}: contradictory acceptance claim: {false_claim and false_claim[0]}")
 
     for case_id, status in CASE_STATUS.items():
@@ -463,15 +468,42 @@ class W1EvidenceTest(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, "expected exactly one Follow-up"):
                 validate_evidence(ROOT, self.data, markdown)
 
+    def report_fixture(self):
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        (root / REPORT).parent.mkdir()
+        shutil.copyfile(ROOT / EVIDENCE, root / EVIDENCE)
+        return root
+
     def test_rejects_markdown_native_pass_and_observed_zero_prompts(self):
+        root = self.report_fixture()
         for claim in ("Native acceptance passed.", "Observed zero submitted model prompts."):
-            with self.subTest(claim=claim), TemporaryDirectory() as directory:
-                root = Path(directory)
-                (root / REPORT).parent.mkdir()
-                shutil.copyfile(ROOT / EVIDENCE, root / EVIDENCE)
+            with self.subTest(claim=claim):
                 (root / REPORT).write_text(self.markdown + "\n" + claim + "\n", encoding="utf-8")
                 with self.assertRaisesRegex(AssertionError, "contradictory acceptance claim"):
                     validate_evidence(root, *load_report(root))
+
+    def test_rejects_markdown_prose_count_first_prompt_claim(self):
+        root = self.report_fixture()
+        case_lines = [line for line in self.markdown.splitlines() if line.startswith("| `R")]
+        self.assertEqual(len(case_lines), 105)
+        for count in ("Zero", "0"):
+            claim = f"{count} submitted model prompts were observed"
+            with self.subTest(claim=claim):
+                changed_markdown = f"{self.markdown}\n{claim}.\n"
+                (root / REPORT).write_text(changed_markdown, encoding="utf-8")
+                data, markdown = load_report(root)
+                self.assertEqual((root / EVIDENCE).read_bytes(), (ROOT / EVIDENCE).read_bytes())
+                self.assertEqual(data, self.data)
+                fixture_case_lines = [line for line in markdown.splitlines() if line.startswith("| `R")]
+                self.assertEqual(fixture_case_lines, case_lines)
+                for field in ("Native outcome", "Submitted model prompts"):
+                    require_markdown_field(markdown, field, "Unknown")
+                diagnostic = rf"{re.escape(REPORT)}: contradictory acceptance claim: {re.escape(claim)}"
+                with self.assertRaisesRegex(AssertionError, diagnostic):
+                    validate_evidence(root, data, markdown)
+        print(self.id(), flush=True)
 
     def test_rejects_markdown_case_status_and_prompt_changes(self):
         for new_value in ("PASS | changed | Unknown", "UNRUN | changed | 0"):
