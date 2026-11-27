@@ -1751,13 +1751,14 @@ async fn w1_terminal_confirmation_rechecks_inventory_and_parked_native_validatio
                     fixture.bridge.detach(&replacement.view_id);
                 }
                 "expiry" => {
-                    let mut views = fixture.bridge.views.lock().unwrap();
-                    views
-                        .writer_candidates
-                        .get_mut(&fixture.target.runtime_id)
-                        .unwrap()
-                        .proof = Some((fixture.expected, Instant::now()));
-                    drop(views);
+                    {
+                        let mut views = fixture.bridge.views.lock().unwrap();
+                        views
+                            .writer_candidates
+                            .get_mut(&fixture.target.runtime_id)
+                            .unwrap()
+                            .proof = Some((fixture.expected, Instant::now()));
+                    }
                     respond(
                         &mut peer,
                         Response::TerminalStatus {
