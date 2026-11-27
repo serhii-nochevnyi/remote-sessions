@@ -465,6 +465,7 @@ class Trace:
         self._file_identity = None
         self._size = 0
         self._modified_ns = None
+        self._caught_up = None
 
     def provider_samples(self):
         for first, latest in self._providers.values():
@@ -487,8 +488,8 @@ class Trace:
             elif sampled_at > latest['provider']['sampled_at_us']:
                 self._providers[identity] = (first, item)
 
-    def _open(self):
-        if self.stream is not None:
+    def _open(self, independent=False):
+        if self.stream is not None and not independent:
             return nullcontext(self.stream)
         descriptor = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         return os.fdopen(descriptor, 'rb')
@@ -533,24 +534,12 @@ class Trace:
                 need(self.offset <= boundary <= end, 'native log boundary unavailable')
                 end = boundary
             stream.seek(self.offset)
-            batch_start = self.offset
-            for _ in range(8192):
-                start = stream.tell()
-                if start >= end or start - batch_start >= 4 * 1024 * 1024:
-                    break
-                line = stream.readline(min(MAX_RECORD + 1, end - start))
-                if not line or not line.endswith(b'\n'):
-                    need(len(line) < MAX_RECORD, 'oversized native diagnostic record')
-                    break
-                need(len(line) <= MAX_RECORD, 'oversized native diagnostic record')
+            for start, line in self._lines(stream, end):
                 self.offset = stream.tell()
-                if not line.startswith(PREFIX):
-                    continue
-                kind, _, payload = line[len(PREFIX):].partition(b' ')
+                kind, payload = self._record(line)
                 if kind not in (b'PRESSURE', b'GRID', b'PROVIDER', b'FAILURE', b'REJECTION'):
                     continue
-                item = json.loads(payload, object_pairs_hook=unique_evidence_fields)
-                need(isinstance(item, dict), 'invalid diagnostic payload')
+                item = self._payload(payload)
                 if kind == b'PRESSURE':
                     fields = 'event view_id pid at_us'
                     event = item.get('event')
@@ -579,6 +568,70 @@ class Trace:
             self._check_stream(stream)
         return self
 
+    @staticmethod
+    def _lines(stream, end):
+        batch_start = stream.tell()
+        for _ in range(8192):
+            start = stream.tell()
+            if start >= end or start - batch_start >= 4 * 1024 * 1024:
+                break
+            line = stream.readline(min(MAX_RECORD + 1, end - start))
+            if not line or not line.endswith(b'\n'):
+                need(len(line) < MAX_RECORD, 'oversized native diagnostic record')
+                break
+            need(len(line) <= MAX_RECORD, 'oversized native diagnostic record')
+            yield start, line
+
+    @staticmethod
+    def _record(line):
+        if not line.startswith(PREFIX):
+            return None, None
+        kind, _, payload = line[len(PREFIX):].partition(b' ')
+        return kind, payload
+
+    @staticmethod
+    def _payload(payload):
+        item = json.loads(payload, object_pairs_hook=unique_evidence_fields)
+        need(isinstance(item, dict), 'invalid diagnostic payload')
+        return item
+
+    def staged_provider(self, observed, sampled_at):
+        def matches(sample):
+            return (sample['provider'] is not None and sample['provider']['sampled_at_us'] == sampled_at
+                    and sample['terminal'] == observed['terminal']
+                    and committed_key(sample) == committed_key(observed))
+
+        need(self._caught_up is not None, 'native log capture boundary unavailable')
+        boundary, deadline = self._caught_up
+        try:
+            with self._open() as original:
+                need(boundary <= self._check_stream(original), 'native log capture boundary unavailable')
+                if self.offset == boundary:
+                    cached = next((sample for sample in self.provider_samples() if matches(sample)), None)
+                    if cached is not None:
+                        return cached
+
+            deadline = min(deadline, time.monotonic() + 2)
+            with self._open(independent=True) as stream:
+                need(boundary <= self._check_stream(stream), 'native log capture boundary unavailable')
+                while stream.tell() < boundary:
+                    need(time.monotonic() < deadline, 'native log provider lookup deadline expired')
+                    previous = stream.tell()
+                    for _, line in self._lines(stream, boundary):
+                        kind, payload = self._record(line)
+                        if kind == b'PROVIDER':
+                            candidate = status(self._payload(payload))
+                            if matches(candidate):
+                                self._check_stream(stream)
+                                need(time.monotonic() < deadline, 'native log provider lookup deadline expired')
+                                return candidate
+                    need(stream.tell() > previous, 'native log provider lookup made no progress')
+                self._check_stream(stream)
+                need(time.monotonic() < deadline, 'native log provider lookup deadline expired')
+        except (OSError, ValueError) as error:
+            raise ProofError('native log stream unavailable or malformed') from error
+        return None
+
 
 def catch_up_role_logs(traces, deadline):
     need(time.monotonic() < deadline, 'native log catch-up deadline expired')
@@ -587,6 +640,8 @@ def catch_up_role_logs(traces, deadline):
         need(time.monotonic() < deadline, 'native log catch-up deadline expired')
         pending = [(trace, end) for trace, end in zip(traces, boundaries) if trace.offset < end]
         if not pending:
+            for trace, end in zip(traces, boundaries):
+                trace._caught_up = end, deadline
             return
         for trace, end in pending:
             need(time.monotonic() < deadline, 'native log catch-up deadline expired')
@@ -1379,6 +1434,7 @@ def validate_capture(record, run_id, role, app, trace, expected, anchor, opened,
     exact(record, 'run_id capture_id inspector_target inspector_window window app captured_ns view_id renderer_id target epoch '
                   'read_sample_us writable grant_sha256 acknowledgement')
     need(record['run_id'] == run_id and record['app'] == app and app['role'] == role
+         and trace.path == Path(app['stderr'])
          and uuid_text(record['capture_id']) and uuid_text(record['inspector_target']) and record['window'] == 'main'
          and positive(record['inspector_window'])
          and positive(record['captured_ns']) and opened < record['captured_ns'] <= received
@@ -1401,10 +1457,8 @@ def validate_capture(record, run_id, role, app, trace, expected, anchor, opened,
          'Inspector capture disagrees with the live authority interval')
     read_at = mono(record['read_sample_us'], anchor)
     need(mono(attached['at_us'], anchor) < read_at <= at
-         and any(committed_key(sample) == committed_key(observed) and sample['terminal'] == observed['terminal']
-                 and sample['provider'] is not None
-                 and sample['provider']['sampled_at_us'] == record['read_sample_us']
-                 for sample in trace.provider_samples()), 'capture lacks its role-owned live read status')
+         and trace.staged_provider(observed, record['read_sample_us']) is not None,
+         'capture lacks its role-owned live read status')
     if role == 'victim':
         need(record['writable'] is False and record['grant_sha256'] is None
              and record['acknowledgement'] == grid['renderer'],

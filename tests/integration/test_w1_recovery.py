@@ -1097,10 +1097,7 @@ class PressureNativeTests(unittest.TestCase):
         writer = role == 'owner'
         view, renderer = self.pause[role + '_view'], self.pause[role + '_renderer']
         trace = pressure.Trace(Path(self.original[role]['stderr']))
-        trace.pressure[view] = {'attached': {'pid': 501, 'at_us': 105}}
         grid = self.grid_record(view, renderer, 1, 110)
-        trace.grids.append(grid)
-        trace._retain_provider(grid['event']['status'])
         capture = {'run_id': self.run_id, 'capture_id': self.uid(40 if writer else 41),
                    'inspector_target': self.uid(42 if writer else 43),
                    'inspector_window': 114 if writer else 115, 'window': 'main',
@@ -1122,10 +1119,18 @@ class PressureNativeTests(unittest.TestCase):
         gate = {'run_id': self.run_id, 'capture_id': capture['capture_id'],
                 'inspector_target': capture['inspector_target'],
                 'inspector_window': capture['inspector_window'], 'issued_ns': 120_000_000, 'log_cursor': 0}
+        trace.path.write_bytes(self.capture_log(capture, grid, [grid['event']['status']]))
+        pressure.catch_up_role_logs((trace,), time.monotonic() + 2)
         return trace, capture, gate, invocation, grid
 
     def trace_line(self, kind, value):
         return self.pressure.PREFIX + kind + b' ' + json.dumps(value).encode() + b'\n'
+
+    def capture_log(self, capture, grid, samples):
+        return (self.trace_line(b'PRESSURE', {'event': 'attached', 'view_id': capture['view_id'],
+                                              'pid': 501, 'at_us': 105})
+                + self.trace_line(b'GRID', grid)
+                + b''.join(self.trace_line(b'PROVIDER', sample) for sample in samples))
 
     def invocation_anchor(self):
         return {'wall_ns': 100_000_000, 'before_ns': 99_999_750, 'after_ns': 100_000_250}
@@ -1163,12 +1168,6 @@ class PressureNativeTests(unittest.TestCase):
             args = (self.run_id, role, self.original[role], trace, self.args_target, self.anchor, 100_000, 120_000,
                     (capture['view_id'], capture['renderer_id']))
             self.assertEqual(pressure.validate_capture(capture, *args), grid)
-            rejections = [call['rejection'] for call in invocation['calls']]
-            with patch.object(pressure, 'ns', return_value=200_000_000):
-                logged = self.record_rejections(trace, rejections)
-            matched = pressure.validate_invocation(invocation, capture, gate, logged, 180_000_000,
-                                                   self.invocation_anchor(), used, role)
-            self.assertEqual([item['rejection'] for item in matched], rejections)
             for variant in ({**capture, 'view_id': self.replacement},
                             {key: value for key, value in capture.items() if key != 'grant_sha256'},
                             {**capture, 'grant_sha256': 'b' * 64 if role == 'victim' else None}):
@@ -1177,6 +1176,12 @@ class PressureNativeTests(unittest.TestCase):
             trace.pressure[capture['view_id']]['detached'] = {'at_us': 114, 'pid': 501}
             with self.assertRaises(pressure.ProofError):
                 pressure.validate_capture(capture, *args)
+            rejections = [call['rejection'] for call in invocation['calls']]
+            with patch.object(pressure, 'ns', return_value=200_000_000):
+                logged = self.record_rejections(trace, rejections)
+            matched = pressure.validate_invocation(invocation, capture, gate, logged, 180_000_000,
+                                                   self.invocation_anchor(), used, role)
+            self.assertEqual([item['rejection'] for item in matched], rejections)
         self.assertEqual(len(used), 4)
         ledger = self.state / 'pressure-input.bin'
         expected = pressure.BRIDGE_INPUT + pressure.NATIVE_INPUT
@@ -1255,13 +1260,14 @@ class PressureNativeTests(unittest.TestCase):
         traces, captures = [], []
         for role in ('owner', 'victim'):
             trace, capture, _, _, grid = self.captured(role)
+            sample = grid['event']['status']
+            samples = [{**sample, 'provider': {**sample['provider'], 'sampled_at_us': at}}
+                       for at in (108, 110, 112)]
             trace.path.write_bytes(
-                b'ordinary stderr\n' * 8200
-                + self.trace_line(b'PRESSURE', {'event': 'attached', 'view_id': capture['view_id'],
-                                                 'pid': 501, 'at_us': 105})
-                + self.trace_line(b'GRID', grid)
-                + self.trace_line(b'PROVIDER', grid['event']['status']))
-            traces.append(pressure.Trace(trace.path))
+                b'ordinary stderr\n' * 8200 + self.capture_log(capture, grid, samples))
+            original = trace.path.open('rb')
+            self.addCleanup(original.close)
+            traces.append(pressure.Trace(trace.path, original))
             captures.append(capture)
 
         def stage_record():
@@ -1273,9 +1279,15 @@ class PressureNativeTests(unittest.TestCase):
         captured, received = pressure.wait_native_record(stage_record, traces, 2, 'missing stage')
         for trace, capture in zip(traces, captures):
             role = capture['app']['role']
+            boundary = trace.offset
+            cursor = trace.stream.tell()
+            self.assertEqual({sample['provider']['sampled_at_us'] for sample in trace.provider_samples()},
+                             {108, 112})
             result = pressure.validate_capture(capture, self.run_id, role, capture['app'], trace,
                                                self.args_target, self.anchor, 100_000, received)
             self.assertEqual(result['renderer']['renderer_id'], capture['renderer_id'])
+            self.assertEqual(trace.offset, boundary)
+            self.assertEqual(trace.stream.tell(), cursor)
         self.assertEqual(captured, captures[0])
 
         records = {}
@@ -1313,7 +1325,67 @@ class PressureNativeTests(unittest.TestCase):
         for trace in traces:
             self.assertEqual(trace.offset, trace.path.stat().st_size)
             self.assertEqual({sample['provider']['sampled_at_us'] for sample in trace.provider_samples()},
-                             {110, 221, 222})
+                             {108, 112, 221, 222})
+
+    def test_pressure_staged_provider_sample_requires_exact_role_scope_epoch_and_time(self):
+        print(self._testMethodName, flush=True)
+        pressure = self.pressure
+        original, capture, _, _, grid = self.captured('owner')
+        sample = grid['event']['status']
+        variants = {name: deepcopy(sample) for name in ('view', 'target', 'epoch', 'intent', 'timestamp')}
+        variants['view']['terminal']['view_id'] = self.replacement
+        variants['target']['terminal']['target']['pid'] += 1
+        variants['epoch']['epoch']['owner'] = self.uid(93)
+        variants['intent']['committed']['intent']['id'] = self.uid(94)
+        variants['timestamp']['provider']['sampled_at_us'] = 111
+
+        def stage(path, samples):
+            path.write_bytes(b'ordinary stderr\n' * 8200 + self.capture_log(capture, grid, samples))
+            trace = pressure.Trace(path)
+            pressure.wait_native_record(lambda: capture, (trace,), 2, 'missing stage')
+            return trace
+
+        def validate(trace, record=capture):
+            return pressure.validate_capture(record, self.run_id, 'owner', capture['app'], trace,
+                                             self.args_target, self.anchor, 100_000, 120_000)
+
+        earlier = {**sample, 'provider': {**sample['provider'], 'sampled_at_us': 108}}
+        later = {**sample, 'provider': {**sample['provider'], 'sampled_at_us': 112}}
+        for name, middle in {'missing': [], **{key: [item] for key, item in variants.items()}}.items():
+            with self.subTest(name=name):
+                trace = stage(original.path, [earlier, *middle, later])
+                with self.assertRaisesRegex(pressure.ProofError, 'role-owned live read status'):
+                    validate(trace)
+
+        wrong_role = stage(Path(self.original['victim']['stderr']), [earlier, sample, later])
+        with self.assertRaisesRegex(pressure.ProofError, 'wrong app'):
+            validate(wrong_role)
+
+        trace = stage(original.path, [earlier])
+        boundary = trace.offset
+        with trace.path.open('ab') as stream:
+            stream.write(self.trace_line(b'PROVIDER', sample))
+        with self.assertRaisesRegex(pressure.ProofError, 'role-owned live read status'):
+            validate(trace)
+        self.assertEqual(trace.offset, boundary)
+        trace.read()
+        self.assertGreater(trace.offset, boundary)
+        self.assertIn(sample, trace.provider_samples())
+        with self.assertRaisesRegex(pressure.ProofError, 'role-owned live read status'):
+            validate(trace)
+
+        trace = stage(original.path, [earlier, sample, later])
+        self.assertEqual(validate(trace), grid)
+        for at in (105, 116):
+            with self.subTest(at=at), self.assertRaisesRegex(pressure.ProofError, 'role-owned live read status'):
+                validate(trace, {**capture, 'read_sample_us': at})
+        with patch.object(pressure.time, 'monotonic', side_effect=(0, 3)):
+            with self.assertRaisesRegex(pressure.ProofError, 'provider lookup deadline'):
+                validate(trace)
+
+        original.path.write_bytes(b'rewritten\n')
+        with self.assertRaisesRegex(pressure.ProofError, 'stream changed'):
+            validate(trace)
 
     def test_pressure_catch_up_holds_incomplete_or_unavailable_boundaries(self):
         print(self._testMethodName, flush=True)
