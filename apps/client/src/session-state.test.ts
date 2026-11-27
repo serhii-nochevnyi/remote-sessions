@@ -7,9 +7,9 @@ import { localClient, TerminalDelivery, TerminalViewScope } from "./local-client
 import type { CreateStatus, Inventory, LocalCreate, RuntimeInfo, TerminalScope, TerminalStatus } from "./local-client.ts";
 import type { CreateExposure } from "./presentation-preferences.ts";
 import { attachCurrentTerminal, canRestoreTerminalFocus, closeView, demoSessions, desiredTerminalMode, focusAfterClose,
-  explicitTerminalOpen, inventoryBindingState, inventoryOpen, mountedTerminal, moveView, openView, parseScaffoldStatus,
+  explicitClosedReconnect, explicitTerminalOpen, inventoryBindingState, inventoryOpen, mountedTerminal, moveView, openView, parseScaffoldStatus,
   restoreFullscreenExitFocus, runMountedTerminalStream, tabKey, tabStop, terminalPanel, terminalStreamAccess,
-  updateMountedStream } from "./session-state.ts";
+  TerminalAttachmentIdentityError, updateMountedStream } from "./session-state.ts";
 import type { AttachmentMode, BoundTerminal, MountedTerminal, SessionViews, TerminalBindingState } from "./session-state.ts";
 import { OrderedGeometry, ResizeProposals } from "./terminal-geometry.ts";
 import { bindTerminalProtocol } from "./terminal-protocol.ts";
@@ -451,6 +451,8 @@ function mountedNativeFixture(t: TestContext, row = nativeRuntime) {
   let binding: BoundTerminal | null = null;
   let state: TerminalBindingState | undefined;
   let attempt = 0;
+  let reopenAttempt: number | undefined;
+  let disposeRetained: (() => void) | undefined;
   const identity = { sessionId: row.session_id, operationId: row.operation_id ?? null };
   const calls: { command: string; args: unknown }[] = [];
   const steps = new Map<string, ((args: unknown) => Promise<unknown>)[]>();
@@ -487,16 +489,21 @@ function mountedNativeFixture(t: TestContext, row = nativeRuntime) {
     steps.set(command, queue);
     return { entered: entered.promise, resolve: reply.resolve, reject: reply.reject };
   }
-  const selected = () => terminalPanel(views, runtimeId, latest, identity, binding, false, state);
+  const selected = () => terminalPanel(views, runtimeId, latest, identity, binding, false, state, reopenAttempt === attempt);
+  function clearRetained() {
+    disposeRetained?.();
+    disposeRetained = undefined;
+  }
   async function publish(row: RuntimeInfo, pid = 12) {
     replyInventory = inventory(row, pid);
     latest = await localClient.inventory();
     if (binding && state) state = inventoryBindingState(binding, state, latest);
+    if (state === "changed") clearRetained();
     return selected();
   }
   async function connect(mode: AttachmentMode) {
     const previous = binding;
-    const started = ++attempt;
+    const started = reopenAttempt === attempt ? attempt : ++attempt;
     const current = (): MountedTerminal => started === attempt && (binding === previous || binding === accepted)
       ? selected() : { mode: "missing" };
     let accepted: BoundTerminal | undefined;
@@ -506,7 +513,7 @@ function mountedNativeFixture(t: TestContext, row = nativeRuntime) {
     const frames: number[][] = [];
     const failures: unknown[] = [];
     let closed = 0;
-    let completed = 0;
+    let eof = 0;
     let disposed = false;
     let detachmentFailure: "stream_closed" | undefined;
     let beforeRender: (() => Promise<void>) | undefined;
@@ -528,10 +535,10 @@ function mountedNativeFixture(t: TestContext, row = nativeRuntime) {
         proposals.close();
         protocol.pauseInput();
         if (view) detachments.push(localClient.detach(view, detachmentFailure));
-        if (binding === accepted && started === attempt && state !== "completed" && state !== "changed") {
+        if (binding === accepted && started === attempt && state !== "view-closed" && state !== "completed" && state !== "changed") {
           state = state === "draining" ? "ended" : "retired";
         }
-        if (completed === 0) dispose();
+        if (eof === 0) dispose();
       },
     }, delivery);
     const protocol = bindTerminalProtocol(displayed, bytes => { void scope.send(bytes); });
@@ -541,8 +548,20 @@ function mountedNativeFixture(t: TestContext, row = nativeRuntime) {
       dispose();
       await Promise.all(detachments);
     });
-    const candidate = await attachCurrentTerminal(runtimeId, previous, mode, () => current().intent,
-      () => delivery.mayRestore, () => scope.active, Promise.resolve(), localClient);
+    let candidate: Awaited<ReturnType<typeof attachCurrentTerminal>> = undefined;
+    try {
+      candidate = await attachCurrentTerminal(runtimeId, previous, mode, () => current().intent,
+        () => delivery.mayRestore, () => scope.active, Promise.resolve(), localClient);
+    } catch (error) {
+      if (reopenAttempt === started && error instanceof TerminalAttachmentIdentityError && error.replacement) {
+        state = "changed";
+        clearRetained();
+      }
+      scope.retire();
+      throw error;
+    } finally {
+      if (!candidate && reopenAttempt === started) reopenAttempt = undefined;
+    }
     if (!candidate) {
       scope.retire();
       return;
@@ -551,9 +570,11 @@ function mountedNativeFixture(t: TestContext, row = nativeRuntime) {
     const { attachment } = candidate;
     const view = attachment.view_id;
     assert.ok(scope.bind(view));
+    clearRetained();
     accepted = candidate.binding;
     binding = accepted;
     state = "bound";
+    reopenAttempt = undefined;
     const routing = new OrderedGeometry(attachment.status);
     const eligibility = { scope, access, revokeMutations() { proposals.close(); protocol.pauseInput(); } };
     return {
@@ -580,7 +601,7 @@ function mountedNativeFixture(t: TestContext, row = nativeRuntime) {
             rendered: () => {
               if (access() === "attached") proposals.observe(routing.status, scope.canWrite, routing.applied);
             },
-            completed() { completed++; state = "completed"; },
+            eof(next) { eof++; state = next; disposeRetained = dispose; },
             closed() { closed++; detachmentFailure = "stream_closed"; },
             identityChanged() { state = "changed"; },
           });
@@ -594,7 +615,7 @@ function mountedNativeFixture(t: TestContext, row = nativeRuntime) {
         if (proposal) await localClient.resize(proposal.terminal.view_id, proposal.epoch, proposal.size);
       },
       beforeRender(callback: () => Promise<void>) { beforeRender = callback; },
-      completed: () => completed,
+      completed: () => eof,
       closed: () => closed,
       disposed: () => disposed,
     };
@@ -602,8 +623,13 @@ function mountedNativeFixture(t: TestContext, row = nativeRuntime) {
   return {
     calls, counts, park, publish, selected, connect, delivery,
     binding: () => binding, state: () => state,
-    select(id: string) { views = openView(views, id, views.open); },
-    close() { views = closeView(views, runtimeId); },
+    requestReconnect() {
+      if (!explicitClosedReconnect(selected())) return false;
+      reopenAttempt = ++attempt;
+      return true;
+    },
+    select(id: string) { views = openView(views, id, views.open); reopenAttempt = undefined; },
+    close() { views = closeView(views, runtimeId); reopenAttempt = undefined; clearRetained(); },
     retireAttempt() { attempt++; },
     nextInventory(row: RuntimeInfo, pid: number) { replyInventory = inventory(row, pid); },
   };
@@ -880,22 +906,180 @@ test("parked read after inventory exit renders the final FIFO and one EOF on the
   assert.deepEqual(mutatingCommands(fixture).map(call => call.command), ["terminal_input"]);
 });
 
-test("typed EOF before inventory exit keeps the screen and cannot reopen the stream", async t => {
+async function closeLiveTerminalView(fixture: MountedFixture, holdDelivery = false) {
+  const mounted = await connectFixture(fixture, "ordinary");
+  const first = fixture.park("terminal_read");
+  const final = fixture.park("terminal_read");
+  const eof = fixture.park("terminal_read");
+  const streaming = mounted.run();
+  await first.entered;
+  first.resolve(nativeData([65], nativeAttachment(firstView)));
+  await final.entered;
+  let finishInput: (() => Promise<unknown>) | undefined;
+  if (holdDelivery) {
+    const input = fixture.park("terminal_input");
+    const sent = mounted.scope.send(Uint8Array.of(1));
+    await input.entered;
+    const queued = mounted.scope.send(Uint8Array.of(2));
+    const paste = mounted.scope.paste(Uint8Array.of(3));
+    finishInput = () => {
+      input.reject(Error("delivery unknown"));
+      return Promise.all([sent, queued, paste]);
+    };
+  }
+  final.resolve(nativeData([66, 27, 91, 54, 110]));
+  await eof.entered;
+  eof.resolve(nativeClosure({ reason: "eof" }));
+  await streaming;
+  await finishInput?.();
+  assert.equal(mounted.completed(), 1);
+  assert.equal(mounted.closed(), 0);
+  assert.equal(mounted.disposed(), false);
+  assert.equal(mounted.scope.canWrite, false);
+  assert.equal(mounted.displayed.options.disableStdin, true);
+  assert.deepEqual(mounted.frames, [[65], [66, 27, 91, 54, 110]]);
+  assert.equal(mounted.displayed.buffer.active.getLine(0)?.translateToString(true), "AB");
+  assert.deepEqual(fixture.counts("terminal_detach"), [{ viewId: firstView, failure: undefined }]);
+  assert.equal(fixture.counts("terminal_read").length, 3);
+  return mounted;
+}
+
+for (const route of ["Reconnect button", "same sidebar row with create status", "same sidebar row with inventory origin"] as const) {
+  test(`native view EOF with live inventory retains the FIFO and reconnects explicitly from the ${route}`, async t => {
+    const row: RuntimeInfo = route === "same sidebar row with inventory origin"
+      ? { ...nativeRuntime, origin: "legacy", operation_id: null, workspace_id: null } : nativeRuntime;
+    const fixture = mountedNativeFixture(t, row);
+    await fixture.publish(row);
+    const mounted = await closeLiveTerminalView(fixture);
+    assert.equal(fixture.selected().mode, "view-closed");
+    assert.equal(fixture.selected().intent, undefined);
+    assert.equal(await fixture.connect("ordinary"), undefined);
+    assert.equal(fixture.counts("terminal_attach").length, 1);
+    fixture.select(secondTab);
+    assert.equal(fixture.selected().outputOnly, mounted.binding);
+    assert.equal(explicitClosedReconnect(fixture.selected()), undefined);
+    assert.equal(fixture.requestReconnect(), false);
+    fixture.select(runtimeId);
+    assert.equal((await fixture.publish(row)).key, mounted.binding.mountKey);
+    assert.equal(fixture.selected().intent, undefined);
+
+    if (route === "Reconnect button") {
+      assert.equal(explicitClosedReconnect(fixture.selected()), mounted.binding);
+    } else {
+      const operation: LocalCreate = {
+        reference: createdRef, workspace_id: fixtureId(3), presented: true, profile: "codex",
+        disposition: { result: "launched", current: "live", readiness: "unobserved", runtime: row },
+      };
+      const exposure: CreateExposure | undefined = row.origin === "managed" ? {
+        runtimeId, sessionId: row.session_id, operationId: fixtureId(4), reference: createdRef, state: "presented",
+      } : undefined;
+      assert.deepEqual(explicitTerminalOpen(exposure ? { operations: [operation], issue: null } : null,
+        row, exposure, fixture.binding(), fixture.state()), { decision: exposure ? operation : "inventory", retry: true });
+    }
+    assert.equal(fixture.counts("terminal_attach").length, 1);
+    assert.equal(fixture.requestReconnect(), true);
+    const proof = fixture.park("terminal_attach");
+    const fresh = fixture.park("local_inventory");
+    const reconnecting = fixture.connect("ordinary");
+    assert.deepEqual(await proof.entered, { runtimeId, restoration: {
+      previous: mounted.binding.terminal, agent_pid: 12, session_id: row.session_id, operation_id: row.operation_id,
+    } });
+    proof.resolve(nativeAttachment(observedView));
+    await fresh.entered;
+    assert.equal(fixture.selected().outputOnly, mounted.binding);
+    assert.equal(mounted.displayed.buffer.active.getLine(0)?.translateToString(true), "AB");
+    fresh.resolve(inventory(row));
+    const reopened = await reconnecting;
+    assert.ok(reopened);
+    assert.equal(mounted.disposed(), true);
+    assert.equal(fixture.selected().mode, "live");
+    assert.equal(fixture.binding(), reopened.binding);
+    assert.deepEqual(reopened.binding.terminal.target, mounted.binding.terminal.target);
+    assert.equal(reopened.binding.terminal.view_id, observedView);
+    assert.equal(reopened.scope.canWrite, false);
+    assert.deepEqual(mutatingCommands(fixture), []);
+  });
+}
+
+test("native view EOF before confirmed runtime exit retains the final screen without a fresh attach", async t => {
   const fixture = mountedNativeFixture(t);
   await fixture.publish(nativeRuntime);
-  const mounted = await connectFixture(fixture, "ordinary");
-  const read = fixture.park("terminal_read");
-  const streaming = mounted.run();
-  await read.entered;
-  read.resolve(nativeClosure({ reason: "eof" }));
-  await streaming;
-  assert.equal(fixture.selected().mode, "completed");
-  assert.equal(mounted.disposed(), false);
-  assert.equal((await fixture.publish({ ...nativeRuntime, exited: true, pane_pid: null })).key, mounted.binding.mountKey);
+  const mounted = await closeLiveTerminalView(fixture);
+  assert.equal(fixture.selected().mode, "view-closed");
+  assert.equal((await fixture.publish({ ...nativeRuntime, workspace_id: null, operation_id: null })).mode, "view-closed");
+  assert.equal(fixture.requestReconnect(), false);
+  const exited = { ...nativeRuntime, exited: true, pane_pid: null };
+  assert.equal((await fixture.publish(exited)).mode, "completed");
+  assert.equal(fixture.requestReconnect(), false);
   assert.equal(await fixture.connect("ordinary"), undefined);
-  assert.equal(fixture.selected().mode, "completed");
+  assert.equal(fixture.selected().outputOnly, mounted.binding);
+  assert.equal(mounted.displayed.buffer.active.getLine(0)?.translateToString(true), "AB");
+  assert.equal(fixture.counts("terminal_attach").length, 1);
   assert.deepEqual(mutatingCommands(fixture), []);
 });
+
+test("explicit reconnect after native view EOF uses a read-only candidate when input delivery is unknown", async t => {
+  const fixture = mountedNativeFixture(t);
+  await fixture.publish(nativeRuntime);
+  const mounted = await closeLiveTerminalView(fixture, true);
+  assert.equal(fixture.delivery.held, true);
+  assert.equal(fixture.requestReconnect(), true);
+  assert.equal(desiredTerminalMode(fixture.selected().intent, "ordinary", fixture.delivery.mayRestore), "observer");
+  const reopened = await connectFixture(fixture, "observer", nativeAttachment(observedView));
+  assert.deepEqual(fixture.counts("terminal_attach")[1], { runtimeId, observer: true });
+  assert.deepEqual(reopened.binding.terminal.target, mounted.binding.terminal.target);
+  const read = fixture.park("terminal_read");
+  const end = fixture.park("terminal_read");
+  const reading = reopened.run();
+  await read.entered;
+  read.resolve(nativeData([67], nativeAttachment(observedView), newIncarnation));
+  await end.entered;
+  await reopened.scope.send(Uint8Array.of(2));
+  await reopened.scope.paste(Uint8Array.of(3));
+  await reopened.flushResize();
+  end.resolve(nativeClosure({ reason: "eof" }));
+  await reading;
+  assert.equal(fixture.delivery.held, true);
+  assert.deepEqual(mutatingCommands(fixture).map(call => call.command), ["terminal_input"]);
+});
+
+for (const boundary of ["close", "tab cancellation", "runtime exit", "stale fresh inventory", "inventory replacement", "replacement proof"] as const) {
+  test(`explicit reconnect after native view EOF drops the candidate on ${boundary}`, async t => {
+    const fixture = mountedNativeFixture(t);
+    await fixture.publish(nativeRuntime);
+    const mounted = await closeLiveTerminalView(fixture);
+    assert.equal(fixture.requestReconnect(), true);
+    const proof = fixture.park("terminal_attach");
+    const reconnecting = fixture.connect("ordinary");
+    await proof.entered;
+    if (boundary === "replacement proof") {
+      proof.resolve(nativeAttachment(observedView, nativeAgent, { ...nativeTarget, process_start: 124 }));
+      await assert.rejects(reconnecting, /Terminal attachment identity changed/);
+    } else {
+      const fresh = fixture.park("local_inventory");
+      proof.resolve(nativeAttachment(observedView));
+      await fresh.entered;
+      if (boundary === "close") fixture.close();
+      if (boundary === "tab cancellation") {
+        fixture.select(secondTab);
+        fixture.select(runtimeId);
+      }
+      if (boundary === "runtime exit") await fixture.publish({ ...nativeRuntime, exited: true, pane_pid: null });
+      if (boundary === "inventory replacement") await fixture.publish({ ...nativeRuntime, pane_id: "%3", pane_pid: 43 });
+      fresh.resolve(inventory(nativeRuntime, boundary === "stale fresh inventory" ? 13 : 12));
+      assert.equal(await reconnecting, undefined);
+    }
+    assert.equal(fixture.binding(), mounted.binding);
+    const removeScreen = boundary === "close" || boundary === "inventory replacement" || boundary === "replacement proof";
+    assert.equal(fixture.selected().key, removeScreen ? undefined : mounted.binding.mountKey);
+    assert.equal(mounted.disposed(), removeScreen);
+    assert.equal(fixture.selected().intent, undefined);
+    assert.equal(fixture.counts("terminal_attach").length, 2);
+    assert.equal(fixture.counts("terminal_read").length, 3);
+    assert.deepEqual(fixture.counts("terminal_detach").map(args => (args as { viewId: string }).viewId), [firstView, observedView]);
+    assert.deepEqual(mutatingCommands(fixture), []);
+  });
+}
 
 for (const boundary of ["close", "replacement", "runtime identity", "detached", "overflow", "geometry timeout", "geometry event"] as const) {
   test(`parked final read honors ${boundary} without completion or a fresh attach`, async t => {
@@ -960,8 +1144,9 @@ test("the sidebar, saved restore and mounted renderer use the checked production
   const view = readFileSync(new URL("./TerminalView.tsx", import.meta.url), "utf8");
   const native = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
   const bridge = readFileSync(new URL("../../../crates/desktop-bridge/src/lib.rs", import.meta.url), "utf8");
-  assert.match(app, /record\?\.state !== "retired" && currentAttachment[\s\S]+explicitTerminalOpen\(status, latest, store.exposure\(id\)/);
-  assert.match(app, /showCreated\(decision, "user"\)[\s\S]+approveExternal\(latest\)[\s\S]+if \(retry && latestRecord\?\.state === "retired"\)/);
+  assert.match(app, /!requiresTerminalReopen\(record\?\.state\) && currentAttachment[\s\S]+explicitTerminalOpen\(status, latest, store.exposure\(id\)/);
+  assert.match(app, /showCreated\(decision, "user"\)[\s\S]+approveExternal\(latest\)[\s\S]+if \(retry && latestRecord\?\.state === "view-closed"\) reconnectClosedTerminal\(id, latestRecord.binding, latestRecord.attempt\)[\s\S]+if \(retry && latestRecord\?\.state === "retired"\)/);
+  assert.match(app, /explicitClosedReconnect\(currentAttachment\(id, binding, attempt\)\) !== binding[\s\S]+state: "view-closed", attempt: \+\+selectionRevision.current, reconnect: true[\s\S]+onReconnectClosed=\{reconnectClosedTerminal\}/);
   assert.match(app, /inventoryOpen\(status, observed, exposure, "saved"\)/);
   assert.match(app, /restoreSaved\(null\);\s*void localClient.createStatus\(\)/);
   assert.match(app, /terminalPanel\(views, id, inventory,[\s\S]+terminalPanel\(store.current.views, id, inventoryRef.current/);
@@ -972,7 +1157,9 @@ test("the sidebar, saved restore and mounted renderer use the checked production
   assert.match(view, /const current = \(\) => currentAttachment\(runtimeId, binding \?\? previous, attempt\)[\s\S]+if \(currentIntent\(\)\) setRetry/);
   assert.match(view, /attachCurrentTerminal\(runtimeId, previous, attachmentMode,[\s\S]+detached.current, localClient\)/);
   assert.match(view, /if \(!candidate\)[\s\S]+scope.bind\(view\)[\s\S]+runMountedTerminalStream\(\{[\s\S]+localClient.read\(view\)[\s\S]+protocol.consume\(scope, view, chunk, render\)/);
-  assert.match(view, /if \(!completed\) disposeRenderer\(\)[\s\S]+completed = onBinding\(candidate.binding, "completed"/);
+  assert.match(view, /if \(retained\) retainedRenderer.current = disposeRenderer[\s\S]+if \(!onBinding\(candidate.binding, "bound", previous, attempt\)\)[\s\S]+retainedRenderer.current\?\.\(\)[\s\S]+eof\(state\) \{\s+retained = onBinding\(candidate.binding, state/);
+  assert.match(view, /mounted.mode === "completed" \? "Процес завершився · режим перегляду"[\s\S]+mounted.mode === "view-closed" \?[^\n]+"Потік термінала закрито · режим перегляду"/);
+  assert.match(view, /disabled=\{intent\?\.reconnect === true \|\| \(!intent && !explicitClosedReconnect\(mounted\)\)\}[\s\S]+explicitClosedReconnect\(current\)[\s\S]+onReconnectClosed\(runtimeId, closedBinding, attempt\)/);
   assert.match(native, /bridge.attach_observer\(&runtime_id\)[\s\S]+bridge.restore_attachment\(&runtime_id, expected\)/);
   assert.match(bridge, /mode.check_opened\(&status.terminal\)[\s\S]+let status = prove_attachment\(&view, &status\).await\?[\s\S]+mode.prepare_control\(&view, &status\)[\s\S]+control.start\(&view\)/);
 });

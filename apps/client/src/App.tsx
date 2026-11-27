@@ -6,8 +6,8 @@ import { TerminalToolbar } from "./TerminalToolbar";
 import type { FullscreenExitFocus } from "./TerminalToolbar";
 import { CreateSessionDialog } from "./CreateSessionDialog";
 import { SessionTabs } from "./SessionTabs";
-import { canRestoreTerminalFocus, explicitTerminalOpen, inventoryBindingState, inventoryOpen, moveView, openView,
-  restoreFullscreenExitFocus, sameRuntime, terminalPanel, viewAvailability } from "./session-state.ts";
+import { canRestoreTerminalFocus, explicitClosedReconnect, explicitTerminalOpen, inventoryBindingState, inventoryOpen, moveView, openView,
+  requiresTerminalReopen, restoreFullscreenExitFocus, sameRuntime, terminalPanel, viewAvailability } from "./session-state.ts";
 import type { BoundTerminal, MountedTerminal, SessionViews, TerminalBindingState, TerminalFocusTarget } from "./session-state.ts";
 import { createdRuntime, PresentationStore, zoomFont, zoomShortcut } from "./presentation-preferences.ts";
 import type { ZoomAction } from "./presentation-preferences.ts";
@@ -22,7 +22,7 @@ interface FullscreenFocusIntent {
   target: HTMLElement | null;
 }
 
-type AttachmentState = { binding: BoundTerminal; state: TerminalBindingState; attempt: number }
+type AttachmentState = { binding: BoundTerminal; state: TerminalBindingState; attempt: number; reconnect?: true }
   | { binding: null; state: "closed"; attempt: number };
 
 function PanelTerminal(props: Omit<ComponentProps<typeof TerminalView>, "delivery" | "detached">) {
@@ -76,7 +76,8 @@ export default function App() {
     const previousBinding = attachment?.binding ?? null;
     const closed = exposure?.state === "closed" || attachment?.state === "closed";
     const mounted = terminalPanel(views, id, inventory, exposure ?? external.get(id),
-      previousBinding, closed, attachment?.state === "closed" ? undefined : attachment?.state);
+      previousBinding, closed, attachment?.state === "closed" ? undefined : attachment?.state,
+      attachment?.state === "view-closed" && attachment.reconnect && attachment.attempt === selectionRevision.current);
     return { id, mounted, previousBinding, attempt: attachment?.attempt ?? 0 };
   });
   const activePanel = panels.find(panel => panel.id === activeId);
@@ -111,13 +112,18 @@ export default function App() {
     if ((record?.binding ?? null) !== previous || (record?.attempt ?? 0) !== attempt) return { mode: "missing" };
     const exposure = store.exposure(id);
     return terminalPanel(store.current.views, id, inventoryRef.current, exposure ?? externalRef.current.get(id),
-      previous, exposure?.state === "closed" || record?.state === "closed", record?.state === "closed" ? undefined : record?.state);
+      previous, exposure?.state === "closed" || record?.state === "closed", record?.state === "closed" ? undefined : record?.state,
+      record?.state === "view-closed" && record.reconnect && record.attempt === selectionRevision.current);
   }, [store]);
+  const reconnectClosedTerminal = useCallback((id: string, binding: BoundTerminal, attempt: number) => {
+    if (explicitClosedReconnect(currentAttachment(id, binding, attempt)) !== binding) return;
+    updateAttachment(id, { binding, state: "view-closed", attempt: ++selectionRevision.current, reconnect: true });
+  }, [currentAttachment, updateAttachment]);
   const onBinding = useCallback((binding: BoundTerminal, state: TerminalBindingState, previous: BoundTerminal | null, attempt: number) => {
     const id = binding.terminal.target.runtime_id;
     const current = attachmentsRef.current.get(id);
     if (!store.current.views.open.includes(id) || store.exposure(id)?.state === "closed" ||
-        current?.state === "closed" || current?.state === "changed" || current?.state === "ended" ||
+        current?.state === "closed" || current?.state === "changed" || current?.state === "ended" || current?.state === "completed" ||
         (current?.binding ?? null) !== previous || (current?.attempt ?? 0) !== attempt) return false;
     if (state === "bound" && (!currentAttachment(id, previous, attempt).intent ||
         inventoryRef.current?.agent_pid !== binding.identity.agentPid)) return false;
@@ -364,7 +370,7 @@ export default function App() {
     const exposure = store.exposure(id);
     const record = attachmentsRef.current.get(id);
     if (store.current.views.active === id && (exposure || externalRef.current.has(id)) &&
-        record?.state !== "retired" && currentAttachment(id, record?.binding ?? null, record?.attempt ?? 0).mode !== "missing") {
+        !requiresTerminalReopen(record?.state) && currentAttachment(id, record?.binding ?? null, record?.attempt ?? 0).mode !== "missing") {
       focusTerminal();
       return;
     }
@@ -393,6 +399,7 @@ export default function App() {
       focusRuntime.current = id;
       setViews(value => openView(value, id, [id]));
     }
+    if (retry && latestRecord?.state === "view-closed") reconnectClosedTerminal(id, latestRecord.binding, latestRecord.attempt);
     if (retry && latestRecord?.state === "retired") updateAttachment(id, { ...latestRecord, attempt: selection });
   }
   function close(id: string) {
@@ -500,7 +507,7 @@ export default function App() {
             role="tabpanel" aria-labelledby={`tab-${id}`}>
             <PanelTerminal runtimeId={id} label={`Термінал ${title(id)}`}
               fontSize={fontSize} mounted={mounted} previousBinding={previousBinding} attempt={attempt}
-              currentAttachment={currentAttachment} onBinding={onBinding} />
+              currentAttachment={currentAttachment} onBinding={onBinding} onReconnectClosed={reconnectClosedTerminal} />
             {!mounted.key && id === activeId && <div className="empty-state">
                 <h2>{mounted.mode === "offline" ? "Агент недоступний" : mounted.mode === "exited" ? "Сесія завершена"
                   : mounted.mode === "pending" ? "Перевіряємо запис сесії" : "Сесію не підтверджено"}</h2>

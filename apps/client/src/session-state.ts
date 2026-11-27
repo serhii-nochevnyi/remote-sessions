@@ -111,19 +111,21 @@ export function inventoryOpen(
     ? "inventory" : "blocked";
 }
 
-type MountMode = "live" | "observe" | "rollover" | "draining" | "completed" | "pending" | "offline" | "missing" | "exited" | "inactive";
-export type TerminalBindingState = "bound" | "retired" | "changed" | "draining" | "completed" | "ended";
+type MountMode = "live" | "observe" | "rollover" | "draining" | "view-closed" | "completed" | "pending" | "offline" | "missing" | "exited" | "inactive";
+export type TerminalBindingState = "bound" | "retired" | "changed" | "draining" | "view-closed" | "completed" | "ended";
 export type AttachmentMode = "ordinary" | "observer";
 export interface TerminalAttachmentIntent {
   readonly mode: "live" | "observe" | "rollover";
   readonly identity: InventoryIdentity;
   readonly runtime: RuntimeInfo;
+  readonly reconnect?: true;
 }
 
 export interface MountedTerminal {
   readonly mode: MountMode;
   readonly key?: string;
   readonly intent?: TerminalAttachmentIntent;
+  readonly reconnectIntent?: TerminalAttachmentIntent;
   readonly outputOnly?: BoundTerminal;
 }
 
@@ -165,12 +167,27 @@ export function mountedTerminal(
   bound: BoundTerminal | null,
   closed: boolean,
   state: TerminalBindingState = "bound",
+  reconnect = false,
 ): MountedTerminal {
   if (closed || state === "changed") return { mode: "missing" };
   if (bound && expected && !sameSessionIdentity(bound.identity, expected)) return { mode: "missing" };
   const runtime = inventory?.runtimes.find(entry => entry.runtime_id === id);
   const priorIdentity = expected ?? bound?.identity;
   if (priorIdentity && runtime && inventoryConflicts(runtime, priorIdentity, bound)) return { mode: "missing" };
+  if (bound && state === "view-closed") {
+    const retained = { key: bound.mountKey, outputOnly: bound };
+    if (inventory && runtime && inventoryMatches(runtime, bound.identity) && runtime.pane_id === bound.terminal.target.pane) {
+      if (runtime.exited && inventory.agent_pid === bound.identity.agentPid) return { ...retained, mode: "completed" };
+      if (expected && matchesPane(runtime, bound.terminal)) {
+        const reconnectIntent: TerminalAttachmentIntent = {
+          mode: inventory.agent_pid === bound.identity.agentPid ? "live" : "rollover",
+          identity: { ...bound.identity, agentPid: inventory.agent_pid }, runtime, reconnect: true,
+        };
+        return { ...retained, mode: "view-closed", reconnectIntent, ...(reconnect ? { intent: reconnectIntent } : {}) };
+      }
+    }
+    return { ...retained, mode: "view-closed" };
+  }
   if (bound && state === "completed") return { mode: "completed", key: bound.mountKey, outputOnly: bound };
   if (state === "ended") return { mode: "exited" };
   if (bound && (state === "draining" || (state === "bound" && runtime?.exited))) {
@@ -209,10 +226,13 @@ export function terminalPanel(
   bound: BoundTerminal | null,
   closed: boolean,
   state?: TerminalBindingState,
+  reconnect = false,
 ): MountedTerminal {
   if (closed || !views.open.includes(id)) return { mode: "missing" };
-  const mounted = mountedTerminal(id, inventory, expected, bound, false, state);
-  return views.active === id || mounted.outputOnly ? mounted : { mode: "inactive" };
+  const mounted = mountedTerminal(id, inventory, expected, bound, false, state, reconnect);
+  if (views.active === id) return mounted;
+  return mounted.outputOnly
+    ? { mode: mounted.mode, key: mounted.outputOnly.mountKey, outputOnly: mounted.outputOnly } : { mode: "inactive" };
 }
 
 export function inventoryBindingState(
@@ -223,9 +243,22 @@ export function inventoryBindingState(
   const id = previous.terminal.target.runtime_id;
   const next = mountedTerminal(id, inventory, previous.identity, previous, false, state);
   if (next.mode === "draining") return "draining";
+  if (state === "view-closed") {
+    if (next.mode === "completed") return "completed";
+    if (next.mode === "missing") return "changed";
+    return state;
+  }
   if (state !== "draining" && state !== "completed") return state;
   if (next.mode === "completed") return state;
   return next.mode === "missing" && inventory.runtimes.some(entry => entry.runtime_id === id) ? "changed" : "ended";
+}
+
+export function requiresTerminalReopen(state: TerminalBindingState | "closed" | undefined) {
+  return state === "retired" || state === "view-closed";
+}
+
+export function explicitClosedReconnect(mounted: MountedTerminal) {
+  return mounted.reconnectIntent && !mounted.intent ? mounted.outputOnly : undefined;
 }
 
 export function explicitTerminalOpen(
@@ -238,7 +271,7 @@ export function explicitTerminalOpen(
   const decision = state === "changed" || (bound && (inventoryConflicts(runtime, bound.identity, bound) ||
     (!runtime.exited && !matchesPane(runtime, bound.terminal))))
     ? "blocked" : inventoryOpen(status, runtime, exposure, "user");
-  return { decision, retry: decision !== "blocked" && state === "retired" && !runtime.exited };
+  return { decision, retry: decision !== "blocked" && requiresTerminalReopen(state) && !runtime.exited };
 }
 
 export function desiredTerminalMode(
@@ -247,7 +280,7 @@ export function desiredTerminalMode(
   mayRestore: boolean,
 ): AttachmentMode | undefined {
   if (!intent) return;
-  return intent.mode === "live" && (active === "ordinary" || mayRestore) ? "ordinary" : "observer";
+  return intent.mode === "live" && (mayRestore || (active === "ordinary" && !intent.reconnect)) ? "ordinary" : "observer";
 }
 
 export class TerminalAttachmentIdentityError extends Error {
@@ -288,7 +321,7 @@ export async function attachCurrentTerminal(
   const { identity } = intent;
   const stillCurrent = () => {
     const latest = admissible();
-    return latest && latest.mode === intent.mode && sameInventoryIdentity(identity, latest.identity) &&
+    return latest && latest.mode === intent.mode && latest.reconnect === intent.reconnect && sameInventoryIdentity(identity, latest.identity) &&
       sameRuntime(latest.runtime, intent.runtime) ? latest : undefined;
   };
   const options = mode === "observer" ? { observer: true as const }
@@ -305,8 +338,9 @@ export async function attachCurrentTerminal(
   const matchesAttempt = attachment.view_id === terminal.view_id && (!previous ||
     (terminal.view_id !== previous.terminal.view_id && rollover === (terminal.agent_epoch !== previous.terminal.agent_epoch)));
   const proofMatches = matchesPane(intent.runtime, terminal) && sameTarget && matchesAttempt;
-  const fresh = rollover && proofMatches && stillCurrent() ? await client.inventory().catch(() => null) : null;
-  const corroborated = !rollover || (fresh !== null && fresh.agent_pid === identity.agentPid &&
+  const needsFreshInventory = rollover || intent.reconnect;
+  const fresh = needsFreshInventory && proofMatches && stillCurrent() ? await client.inventory().catch(() => null) : null;
+  const corroborated = !needsFreshInventory || (fresh !== null && fresh.agent_pid === identity.agentPid &&
     fresh.runtimes.some(runtime => sameRuntime(runtime, intent.runtime)));
   const latest = stillCurrent();
   if (!latest || !proofMatches || !corroborated) {
@@ -327,7 +361,7 @@ export function terminalStreamAccess(
   mayRestore: boolean,
 ): "attached" | "draining" | "stale" {
   if (mounted.mode === "draining" && mounted.outputOnly === binding) return "draining";
-  if (mounted.intent && sameInventoryIdentity(mounted.intent.identity, binding.identity) &&
+  if (!mounted.outputOnly && mounted.intent && sameInventoryIdentity(mounted.intent.identity, binding.identity) &&
       matchesPane(mounted.intent.runtime, binding.terminal) &&
       desiredTerminalMode(mounted.intent, attached, mayRestore) === attached) return "attached";
   return "stale";
@@ -343,7 +377,7 @@ interface MountedStream {
   read(view: string): Promise<Chunk>;
   consume(view: string, chunk: Chunk, render: () => Promise<void>): Promise<boolean>;
   rendered(chunk: Chunk): void;
-  completed(): void;
+  eof(state: "view-closed" | "completed"): void;
   closed(): void;
   identityChanged(): void;
 }
@@ -372,7 +406,7 @@ export async function runMountedTerminalStream(stream: MountedStream) {
       if (chunk.closure.reason === "eof") {
         scope.setInputEligible(false);
         stream.revokeMutations();
-        stream.completed();
+        stream.eof(access === "draining" ? "completed" : "view-closed");
         scope.retire();
       } else {
         stream.closed();
