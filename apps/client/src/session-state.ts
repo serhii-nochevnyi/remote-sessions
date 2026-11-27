@@ -1,3 +1,7 @@
+import type { CreateStatus, Inventory, LocalCreate, RuntimeInfo, TerminalScope, TerminalViewScope, localClient } from "./local-client.ts";
+import type { CreateExposure } from "./presentation-preferences.ts";
+import { sameTerminal } from "./terminal-geometry.ts";
+
 export interface DemoSession {
   readonly id: string;
   readonly name: string;
@@ -60,38 +64,159 @@ export function viewAvailability(
 }
 
 export interface BoundTerminal {
-  readonly agentPid: number;
+  readonly identity: InventoryIdentity;
   readonly terminal: TerminalScope;
+}
+
+export interface InventoryIdentity {
+  readonly agentPid: number;
+  readonly sessionId: string;
+  readonly operationId: string | null;
+}
+
+export function sameRuntime(current: RuntimeInfo, expected: RuntimeInfo): boolean {
+  return current.origin === expected.origin && current.runtime_id === expected.runtime_id &&
+    current.session_id === expected.session_id && current.pane_pid === expected.pane_pid &&
+    current.pane_id === expected.pane_id && current.operation_id === expected.operation_id &&
+    current.workspace_id === expected.workspace_id && current.exited === expected.exited;
+}
+
+export function inventoryOpen(
+  status: CreateStatus | null,
+  runtime: RuntimeInfo,
+  exposure: CreateExposure | undefined,
+  source: "saved" | "user",
+): "blocked" | "inventory" | LocalCreate {
+  if (source === "saved" && exposure && exposure.state !== "presented") return "blocked";
+  if (runtime.origin !== "legacy" && runtime.origin !== "managed") return "blocked";
+  for (const operation of status?.operations ?? []) {
+    const result = operation.disposition;
+    if (result.result !== "launched" && result.result !== "exited") continue;
+    const known = result.runtime;
+    if (known.runtime_id === runtime.runtime_id || (runtime.operation_id && known.operation_id === runtime.operation_id)) {
+      return !status?.issue && sameRuntime(runtime, known) ? operation : "blocked";
+    }
+  }
+  if (exposure) return "blocked";
+  if (runtime.origin === "legacy") return "inventory";
+  return status && !status.issue && runtime.operation_id && runtime.workspace_id &&
+    !status.operations.some(operation => operation.workspace_id === runtime.workspace_id &&
+      (operation.disposition.result === "unknown" || operation.disposition.result === "pending"))
+    ? "inventory" : "blocked";
+}
+
+type MountMode = "live" | "observe" | "pending" | "offline" | "missing" | "exited";
+export type AttachmentMode = "ordinary" | "observer";
+export interface TerminalAttachmentIntent {
+  readonly mode: "live" | "observe";
+  readonly identity: InventoryIdentity;
+  readonly runtime: RuntimeInfo;
+}
+
+function inventoryMatches(runtime: RuntimeInfo, expected: Pick<InventoryIdentity, "sessionId" | "operationId">) {
+  return runtime.session_id === expected.sessionId && (expected.operationId === null
+    ? runtime.origin === "legacy"
+    : runtime.origin === "managed" && runtime.operation_id === expected.operationId && Boolean(runtime.workspace_id));
+}
+
+function sameInventoryIdentity(left: InventoryIdentity, right: InventoryIdentity) {
+  return left.agentPid === right.agentPid && left.sessionId === right.sessionId && left.operationId === right.operationId;
+}
+
+function matchesPane(runtime: RuntimeInfo, terminal: TerminalScope) {
+  return runtime.runtime_id === terminal.target.runtime_id && runtime.pane_id === terminal.target.pane &&
+    runtime.pane_pid === terminal.target.pid && !runtime.exited;
 }
 
 export function mountedTerminal(
   id: string,
   inventory: Inventory | null,
-  expected: { operationId: string | null; sessionId: string } | undefined,
+  expected: Pick<InventoryIdentity, "operationId" | "sessionId"> | undefined,
   bound: BoundTerminal | null,
-  verified: TerminalScope | null | undefined,
-  checking: boolean,
-): { mode: "live" | "observe" | "pending" | "offline" | "missing" | "exited"; key?: string } {
+  closed: boolean,
+): { mode: MountMode; key?: string; intent?: TerminalAttachmentIntent } {
+  if (closed) return { mode: "missing" };
   const runtime = inventory?.runtimes.find(entry => entry.runtime_id === id);
   if (inventory && !runtime) return { mode: "missing" };
-  if (runtime && expected && (runtime.session_id !== expected.sessionId ||
-      (runtime.operation_id && runtime.operation_id !== expected.operationId))) return { mode: "missing" };
   if (runtime?.exited) return { mode: "exited" };
-  const enriched = runtime && (!expected || (runtime.operation_id ?? null) === expected.operationId);
+  if (!expected) return { mode: inventory ? "pending" : "offline" };
+  if (!inventory || !runtime) return bound ? { mode: "pending", key: `${id}:${bound.identity.agentPid}` } : { mode: "offline" };
+  if (runtime.session_id !== expected.sessionId ||
+      (runtime.operation_id && runtime.operation_id !== expected.operationId) ||
+      (runtime.origin === "legacy" && expected.operationId !== null) ||
+      !runtime.pane_id || !runtime.pane_pid) return { mode: "missing" };
+  const identity = {
+    agentPid: inventory.agent_pid,
+    sessionId: expected.sessionId,
+    operationId: expected.operationId,
+  };
+  if (bound && (!sameInventoryIdentity(bound.identity, identity) || !matchesPane(runtime, bound.terminal))) return { mode: "missing" };
+  const mode = inventoryMatches(runtime, expected) ? "live" : bound ? "observe" : "pending";
+  if (mode === "pending") return { mode };
+  return { mode, key: `${id}:${identity.agentPid}`, intent: { mode, identity, runtime } };
+}
 
-  if (!bound || bound.terminal.target.runtime_id !== id) {
-    if (!inventory) return { mode: "offline" };
-    return enriched ? { mode: "live", key: `${id}:${inventory.agent_pid}` } : { mode: "missing" };
+export function desiredTerminalMode(
+  intent: TerminalAttachmentIntent | undefined,
+  active: AttachmentMode | undefined,
+  mayRestore: boolean,
+): AttachmentMode | undefined {
+  if (!intent) return;
+  return intent.mode === "live" && (active === "ordinary" || mayRestore) ? "ordinary" : "observer";
+}
+
+export function updateTerminalEligibility(
+  scope: Pick<TerminalViewScope, "setInputEligible" | "retire">,
+  attached: AttachmentMode,
+  desired: AttachmentMode | undefined,
+) {
+  if (desired === attached) return;
+  scope.setInputEligible(false);
+  scope.retire();
+}
+
+export async function attachCurrentTerminal(
+  runtimeId: string,
+  previous: BoundTerminal | null,
+  mode: AttachmentMode,
+  current: () => TerminalAttachmentIntent | undefined,
+  mayRestore: () => boolean,
+  active: () => boolean,
+  detached: Promise<void>,
+  client: Pick<typeof localClient, "attach" | "detach">,
+) {
+  const admissible = () => {
+    const intent = current();
+    if (!active() || !intent || desiredTerminalMode(intent, undefined, mayRestore()) !== mode ||
+        intent.runtime.runtime_id !== runtimeId || (mode === "observer" && !previous) ||
+        (previous && (!sameInventoryIdentity(previous.identity, intent.identity) || !matchesPane(intent.runtime, previous.terminal)))) return;
+    return intent;
+  };
+  await detached;
+  const intent = admissible();
+  if (!intent) return;
+  const { identity } = intent;
+  const attachment = await client.attach(runtimeId, mode === "observer" ? { observer: true }
+    : previous ? { restoration: { previous: previous.terminal, agent_pid: identity.agentPid,
+      session_id: identity.sessionId, operation_id: identity.operationId } } : undefined);
+  const terminal = attachment.status.terminal;
+  const sameTarget = matchesPane(intent.runtime, terminal) && (!previous ||
+    (terminal.view_id !== previous.terminal.view_id &&
+      sameTerminal({ ...previous.terminal, view_id: terminal.view_id }, terminal)));
+  const stillCurrent = () => {
+    const latest = admissible();
+    return latest && sameInventoryIdentity(identity, latest.identity) ? latest : undefined;
+  };
+  const latest = stillCurrent();
+  if (!latest || !matchesPane(latest.runtime, terminal) || !sameTarget) {
+    await client.detach(attachment.view_id).catch(() => undefined);
+    if (latest && stillCurrent()) throw Error("Terminal attachment identity changed");
+    return;
   }
-
-  const { terminal, agentPid } = bound;
-  if ((inventory && inventory.agent_pid !== agentPid) ||
-      (runtime && (runtime.pane_pid !== terminal.target.pid || (runtime.pane_id && runtime.pane_id !== terminal.target.pane))) ||
-      verified === null || (verified && !sameTerminal(terminal, verified))) return { mode: "missing" };
-
-  const key = `${id}:${agentPid}`;
-  if (!verified && (checking || !enriched)) return { mode: "pending", key };
-  return { mode: enriched ? "live" : "observe", key };
+  return { attachment, binding: { identity, terminal }, isCurrent: () => {
+    const latest = stillCurrent();
+    return latest !== undefined && matchesPane(latest.runtime, terminal);
+  } };
 }
 
 export function tabStop(state: SessionViews, focused: string | null): string | null {
@@ -156,5 +281,3 @@ export function parseScaffoldStatus(value: unknown): ScaffoldStatus {
   }
   return { protocolVersion: 1, appVersion: value.appVersion, stage: "scaffold", capabilities: [] };
 }
-import type { Inventory, TerminalScope } from "./local-client.ts";
-import { sameTerminal } from "./terminal-geometry.ts";

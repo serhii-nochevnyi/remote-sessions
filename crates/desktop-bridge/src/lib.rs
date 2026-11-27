@@ -17,7 +17,7 @@ use remote_sessions_host::{
     engine::set_local_pty_nonblocking,
     model::{
         INPUT_CHUNK_LIMIT, INPUT_LEASE_TTL, PasteAdmission, PasteBinding, ProductRequest,
-        ProductResponse, Request, Response, Runtime, TerminalView,
+        ProductResponse, Request, Response, Runtime, RuntimeOrigin, TerminalView,
     },
     product_launch::workspace_locator,
     product_request, request,
@@ -52,6 +52,97 @@ pub struct Attachment {
     pub cols: u16,
     pub rows: u16,
     pub status: TerminalStatus,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalRestoration {
+    previous: TerminalView,
+    agent_pid: u32,
+    session_id: Uuid,
+    operation_id: Option<Uuid>,
+}
+
+impl TerminalRestoration {
+    fn check_target(&self, terminal: &TerminalView) -> Result<()> {
+        ensure!(
+            self.previous.agent_epoch == terminal.agent_epoch
+                && self.previous.target == terminal.target
+                && !self.previous.view_id.is_nil()
+                && self.previous.view_id != terminal.view_id,
+            "Terminal attachment identity changed"
+        );
+        Ok(())
+    }
+
+    fn check_inventory(&self, terminal: &TerminalView, inventory: &Inventory) -> Result<()> {
+        ensure!(
+            inventory.agent_pid == self.agent_pid
+                && inventory.runtimes.iter().any(|runtime| {
+                    runtime.runtime_id == terminal.target.runtime_id
+                        && runtime.session_id == self.session_id
+                        && runtime.pane_id == terminal.target.pane
+                        && runtime.pane_pid == Some(terminal.target.pid)
+                        && !runtime.exited
+                        && match (runtime.origin, self.operation_id) {
+                            (RuntimeOrigin::Legacy, None) => {
+                                runtime.workspace_id.is_none() && runtime.operation_id.is_none()
+                            }
+                            (RuntimeOrigin::Managed, Some(operation_id)) => {
+                                !operation_id.is_nil()
+                                    && runtime.workspace_id.is_some_and(|id| !id.is_nil())
+                                    && runtime.operation_id == Some(operation_id)
+                            }
+                            _ => false,
+                        }
+                }),
+            "Terminal restoration is not corroborated by inventory"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum NativeRejection {
+    StaleInput {
+        view_id: Uuid,
+        rejection_id: Uuid,
+        event_time_us: u64,
+    },
+}
+
+#[derive(Debug)]
+struct StaleInput(NativeRejection);
+
+impl std::fmt::Display for StaleInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Керування змінилося")
+    }
+}
+
+impl std::error::Error for StaleInput {}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum TerminalInputError {
+    Rejected(NativeRejection),
+    Message(String),
+}
+
+impl From<&str> for TerminalInputError {
+    fn from(message: &str) -> Self {
+        Self::Message(message.into())
+    }
+}
+
+impl From<anyhow::Error> for TerminalInputError {
+    fn from(error: anyhow::Error) -> Self {
+        match error.downcast_ref::<StaleInput>() {
+            Some(cause) => Self::Rejected(cause.0.clone()),
+            None => Self::Message(error.to_string()),
+        }
+    }
 }
 #[derive(Serialize)]
 pub struct Chunk {
@@ -136,6 +227,31 @@ struct Views {
 struct PasteFixtureFrame {
     request: String,
     reply: tokio::sync::oneshot::Sender<String>,
+}
+
+async fn agent_request(
+    _views: &Weak<Mutex<Views>>,
+    directory: &Path,
+    message: &Request,
+) -> Result<Response> {
+    #[cfg(test)]
+    {
+        let fixture = _views
+            .upgrade()
+            .and_then(|views| views.lock().unwrap().paste_fixture.clone());
+        if let Some(fixture) = fixture {
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            fixture
+                .send(PasteFixtureFrame {
+                    request: encode_local_observation(message)? + "\n",
+                    reply,
+                })
+                .map_err(|_| anyhow::anyhow!("Fixture disconnected"))?;
+            let frame = tokio::time::timeout(Duration::from_secs(5), receive).await??;
+            return remote_sessions_host::decode_local_fixture(frame.as_bytes());
+        }
+    }
+    request(directory, message).await
 }
 
 struct ClosureNotice {
@@ -572,25 +688,7 @@ struct View {
 }
 impl View {
     async fn agent_request(&self, message: &Request) -> Result<Response> {
-        #[cfg(test)]
-        {
-            let fixture = self
-                .views
-                .upgrade()
-                .and_then(|views| views.lock().unwrap().paste_fixture.clone());
-            if let Some(fixture) = fixture {
-                let (reply, receive) = tokio::sync::oneshot::channel();
-                fixture
-                    .send(PasteFixtureFrame {
-                        request: encode_local_observation(message)? + "\n",
-                        reply,
-                    })
-                    .map_err(|_| anyhow::anyhow!("Fixture disconnected"))?;
-                let frame = tokio::time::timeout(Duration::from_secs(5), receive).await??;
-                return remote_sessions_host::decode_local_fixture(frame.as_bytes());
-            }
-        }
-        request(&self.directory, message).await
+        agent_request(&self.views, &self.directory, message).await
     }
 
     fn hold_paste(&self, hold: PasteAdmission) {
@@ -1025,7 +1123,10 @@ async fn refresh_control(view: &View) {
             {
                 let views = view.views.upgrade();
                 let mut registry = views.as_ref().map(|views| views.lock().unwrap());
-                if !view.closed() && epoch.agent == view.terminal.agent_epoch {
+                if !view.closed()
+                    && Instant::now() < deadline
+                    && epoch.agent == view.terminal.agent_epoch
+                {
                     if let Some(lease) = control
                         .lease
                         .as_mut()
@@ -1053,7 +1154,9 @@ async fn refresh_control(view: &View) {
             drop(control);
             view.release(token).await;
         }
-        Ok(Response::Accepted {}) if !view.closed() && control.lease.is_some() => {
+        Ok(Response::Accepted {})
+            if !view.closed() && Instant::now() < deadline && control.lease.is_some() =>
+        {
             control.lease.as_mut().unwrap().deadline = deadline;
             view.publish_control(&control);
         }
@@ -1067,6 +1170,83 @@ async fn refresh_control(view: &View) {
             if let Some(token) = token {
                 view.release(token).await;
             }
+        }
+    }
+}
+
+fn start_control(view: &Arc<View>) {
+    let active = Arc::downgrade(view);
+    tokio::spawn(async move {
+        while let Some(view) = active.upgrade() {
+            if view.closed() {
+                break;
+            }
+            refresh_control(&view).await;
+            tokio::select! {
+                _ = view.retired() => break,
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+        }
+    });
+}
+
+async fn inventory(views: &Weak<Mutex<Views>>, directory: &Path) -> Result<Inventory> {
+    let Response::Health { agent_pid, .. } =
+        agent_request(views, directory, &Request::Health {}).await?
+    else {
+        bail!("Agent health unavailable");
+    };
+    match agent_request(views, directory, &Request::List {}).await? {
+        Response::Runtimes { runtimes } => Ok(Inventory {
+            agent_pid,
+            runtimes,
+        }),
+        Response::Error { message } => bail!("{message}"),
+        _ => bail!("Unexpected inventory response"),
+    }
+}
+
+enum AttachmentMode {
+    Ordinary,
+    Observer,
+    Restore(TerminalRestoration),
+}
+
+enum ControlStart {
+    Writer,
+    Observer,
+}
+
+impl AttachmentMode {
+    fn check_opened(&self, opened: &TerminalView) -> Result<()> {
+        if let Self::Restore(expected) = self {
+            expected.check_target(opened)?;
+        }
+        Ok(())
+    }
+
+    async fn prepare_control(&self, view: &View, proof: &TerminalStatus) -> Result<ControlStart> {
+        match self {
+            Self::Ordinary => Ok(ControlStart::Writer),
+            Self::Observer => Ok(ControlStart::Observer),
+            Self::Restore(expected) => {
+                expected.check_target(&proof.terminal)?;
+                ensure!(
+                    view.terminal == proof.terminal,
+                    "Terminal attachment identity changed"
+                );
+                let current = inventory(&view.views, &view.directory).await?;
+                expected.check_inventory(&proof.terminal, &current)?;
+                Ok(ControlStart::Writer)
+            }
+        }
+    }
+}
+
+impl ControlStart {
+    fn start(self, view: &Arc<View>) {
+        if matches!(self, Self::Writer) {
+            start_control(view);
         }
     }
 }
@@ -1542,29 +1722,26 @@ impl DesktopBridge {
         }
     }
     pub async fn inventory(&self) -> Result<Inventory> {
-        let directory = self.directory()?;
-        let Response::Health { agent_pid, .. } = request(directory, &Request::Health {}).await?
-        else {
-            bail!("Agent health unavailable")
-        };
-        match request(directory, &Request::List {}).await? {
-            Response::Runtimes { runtimes } => Ok(Inventory {
-                agent_pid,
-                runtimes,
-            }),
-            Response::Error { message } => bail!("{message}"),
-            _ => bail!("Unexpected inventory response"),
-        }
+        inventory(&Arc::downgrade(&self.views), self.directory()?).await
     }
     pub async fn attach(&self, runtime_id: &str) -> Result<Attachment> {
-        self.attach_view(runtime_id, true).await
+        self.attach_view(runtime_id, AttachmentMode::Ordinary).await
     }
 
     pub async fn attach_observer(&self, runtime_id: &str) -> Result<Attachment> {
-        self.attach_view(runtime_id, false).await
+        self.attach_view(runtime_id, AttachmentMode::Observer).await
     }
 
-    async fn attach_view(&self, runtime_id: &str, request_control: bool) -> Result<Attachment> {
+    pub async fn restore_attachment(
+        &self,
+        runtime_id: &str,
+        restoration: TerminalRestoration,
+    ) -> Result<Attachment> {
+        self.attach_view(runtime_id, AttachmentMode::Restore(restoration))
+            .await
+    }
+
+    async fn attach_view(&self, runtime_id: &str, mode: AttachmentMode) -> Result<Attachment> {
         let generation = self.generation.load(Ordering::SeqCst);
         let runtime_id = Uuid::parse_str(runtime_id)?;
         let directory = self.directory()?;
@@ -1587,6 +1764,7 @@ impl DesktopBridge {
                 && status.committed.size.supported(),
             "Unexpected terminal attachment"
         );
+        mode.check_opened(&status.terminal)?;
         let size = status.committed.size;
         let pair = native_pty_system().openpty(pty_size(size))?;
         ensure!(
@@ -1651,6 +1829,7 @@ impl DesktopBridge {
             cleanup_confirmations: AtomicU64::new(0),
         };
         let status = prove_attachment(&view, &status).await?;
+        let control = mode.prepare_control(&view, &status).await?;
         let output = view.output.get_mut();
         output.status = status.clone();
         output.refresh_at = Instant::now() + STATUS_REFRESH_INTERVAL;
@@ -1664,21 +1843,7 @@ impl DesktopBridge {
                 gate.park(view_id).await;
             }
         }
-        if request_control {
-            let active = Arc::downgrade(&view);
-            tokio::spawn(async move {
-                while let Some(view) = active.upgrade() {
-                    if view.closed() {
-                        break;
-                    }
-                    refresh_control(&view).await;
-                    tokio::select! {
-                        _ = view.retired() => break,
-                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                    }
-                }
-            });
-        }
+        control.start(&view);
         Ok(Attachment {
             view_id: view_id.to_string(),
             cols: size.cols,
@@ -2021,7 +2186,17 @@ impl DesktopBridge {
         ensure!(!view.closed(), "View detached");
         let lease = control.lease.as_mut().context("Керування ще не отримано")?;
         ensure!(lease.writable(Instant::now()), "Керування втрачено");
-        ensure!(lease.incarnation == incarnation, "Керування змінилося");
+        if lease.incarnation != incarnation {
+            if let Ok(event_time_us) = sample_clock() {
+                return Err(StaleInput(NativeRejection::StaleInput {
+                    view_id: view.terminal.view_id,
+                    rejection_id: Uuid::new_v4(),
+                    event_time_us,
+                })
+                .into());
+            }
+            bail!("Керування змінилося");
+        }
         let token = lease.token;
         let sequence = lease.input_sequence;
         lease.input_sequence = sequence
@@ -2475,6 +2650,307 @@ mod tests {
                 .is_err()
             );
         }
+
+        fn input(
+            &self,
+            view: &View,
+            incarnation: Uuid,
+            byte: u8,
+        ) -> tokio::task::JoinHandle<Result<()>> {
+            let bridge = self.bridge.clone();
+            let id = view.terminal.view_id.to_string();
+            tokio::spawn(async move {
+                bridge
+                    .input(&id, vec![byte], &incarnation.to_string(), false)
+                    .await
+            })
+        }
+
+        async fn reply_inventory(&self, agent_pid: u32, runtimes: Vec<Runtime>) {
+            let (peer, request) = self.receive().await;
+            assert!(matches!(request, Request::Health {}));
+            Self::reply(
+                peer,
+                Response::Health {
+                    agent_pid,
+                    remote_execution_enabled: false,
+                },
+            );
+            let (peer, request) = self.receive().await;
+            assert!(matches!(request, Request::List {}));
+            Self::reply(peer, Response::Runtimes { runtimes });
+        }
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_native_rejection_metadata() {
+        let ipc = PasteIpc::new();
+        let (view, _output) = ipc.attach();
+        let (token, _, predecessor) = ipc.grant(&view).await;
+        ipc.lose(&view, token).await;
+        let (token, _, successor) = ipc.grant(&view).await;
+        let before = sample_clock().unwrap();
+        let stale = ipc
+            .input(&view, predecessor, b'a')
+            .await
+            .unwrap()
+            .unwrap_err();
+        let after = sample_clock().unwrap();
+        assert_eq!(stale.to_string(), "Керування змінилося");
+        let rejection = stale.downcast_ref::<StaleInput>().unwrap().0.clone();
+        let rejection_frame = encode_local_observation(&rejection).unwrap();
+        let NativeRejection::StaleInput {
+            view_id,
+            rejection_id,
+            event_time_us,
+        } = rejection;
+        assert_eq!(view_id, view.terminal.view_id);
+        assert!(!rejection_id.is_nil());
+        assert!((before..=after).contains(&event_time_us));
+        assert_eq!(
+            encode_local_observation(&TerminalInputError::from(stale)).unwrap(),
+            rejection_frame
+        );
+        assert_eq!(
+            rejection_frame,
+            format!(
+                r#"{{"reason":"stale_input","view_id":"{view_id}","rejection_id":"{rejection_id}","event_time_us":{event_time_us}}}"#
+            )
+        );
+        let control = view.control.lock().await;
+        let lease = control.lease.as_ref().unwrap();
+        assert_eq!(
+            (lease.token, lease.incarnation, lease.input_sequence),
+            (token, successor, 0)
+        );
+        drop(control);
+        ipc.no_request().await;
+
+        let send = ipc.input(&view, successor, b'b');
+        let (peer, request) = ipc.receive().await;
+        assert!(
+            matches!(request, Request::Input { token: current, sequence: 0, data, paste: false, .. }
+            if current == token && data == b"b")
+        );
+        PasteIpc::reply(peer, Response::Accepted {});
+        send.await.unwrap().unwrap();
+        ipc.no_request().await;
+
+        for lost in [false, true] {
+            let (token, _, incarnation) = if lost {
+                ipc.grant(&view).await
+            } else {
+                (
+                    token,
+                    view.control.lock().await.lease.as_ref().unwrap().epoch,
+                    successor,
+                )
+            };
+            let send = ipc.input(&view, incarnation, b'c');
+            let (peer, request) = ipc.receive().await;
+            assert!(matches!(request, Request::Input { .. }));
+            if lost {
+                drop(peer);
+            } else {
+                PasteIpc::reply(
+                    peer,
+                    Response::Error {
+                        message: "Керування змінилося".into(),
+                    },
+                );
+            }
+            ipc.release(token).await;
+            let failure = TerminalInputError::from(send.await.unwrap().unwrap_err());
+            assert!(matches!(failure, TerminalInputError::Message(message) if
+                message == if lost { "Input outcome unknown; input was not retried" } else { "Керування змінилося" }
+            ));
+        }
+        ipc.no_request().await;
+    }
+
+    #[tokio::test]
+    async fn w1_terminal_observer_restore_control() {
+        let ipc = PasteIpc::new();
+        let (observer, _output) = ipc.attach();
+        let status = observer.output.lock().await.status.clone();
+        AttachmentMode::Observer
+            .prepare_control(&observer, &status)
+            .await
+            .unwrap()
+            .start(&observer);
+        let observer_id = observer.terminal.view_id.to_string();
+        let operation_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let agent_pid = 12;
+        let mode = AttachmentMode::Restore(TerminalRestoration {
+            previous: observer.terminal.clone(),
+            agent_pid,
+            session_id,
+            operation_id: Some(operation_id),
+        });
+        let runtime = Runtime {
+            session_id,
+            runtime_id: ipc.target.runtime_id,
+            tmux_name: "fixture".into(),
+            pane_id: ipc.target.pane.clone(),
+            command: "fixture".into(),
+            pane_pid: Some(ipc.target.pid),
+            exited: false,
+            width: 100,
+            height: 30,
+            origin: RuntimeOrigin::Managed,
+            workspace_id: Some(Uuid::new_v4()),
+            operation_id: Some(operation_id),
+        };
+        let previous_incarnation = Uuid::new_v4();
+        let epoch = ResizeEpoch {
+            agent: ipc.agent,
+            owner: Uuid::new_v4(),
+        };
+        assert!(
+            ipc.input(&observer, previous_incarnation, b'x')
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            ipc.bridge
+                .resize(&observer_id, status.committed.size, epoch)
+                .await
+                .is_err()
+        );
+        ipc.no_request().await;
+        ipc.bridge.detach(&observer_id);
+
+        let (view, _output) = ipc.attach();
+        let id = view.terminal.view_id.to_string();
+        let proof = view.output.lock().await.status.clone();
+        mode.check_opened(&proof.terminal).unwrap();
+        for replacement in [
+            TerminalView {
+                agent_epoch: Uuid::new_v4(),
+                ..proof.terminal.clone()
+            },
+            TerminalView {
+                target: remote_sessions_host::model::TerminalTarget {
+                    process_start: ipc.target.process_start + 1,
+                    ..ipc.target.clone()
+                },
+                ..proof.terminal.clone()
+            },
+        ] {
+            assert!(mode.check_opened(&replacement).is_err());
+            assert!(
+                mode.prepare_control(
+                    &view,
+                    &TerminalStatus {
+                        terminal: replacement,
+                        ..proof.clone()
+                    }
+                )
+                .await
+                .is_err()
+            );
+        }
+        for (pid, rows) in [
+            (agent_pid, vec![]),
+            (
+                agent_pid,
+                vec![Runtime {
+                    workspace_id: None,
+                    operation_id: None,
+                    ..runtime.clone()
+                }],
+            ),
+            (agent_pid + 1, vec![runtime.clone()]),
+            (
+                agent_pid,
+                vec![Runtime {
+                    pane_id: "%1".into(),
+                    ..runtime.clone()
+                }],
+            ),
+        ] {
+            let (admission, ()) = tokio::join!(
+                mode.prepare_control(&view, &proof),
+                ipc.reply_inventory(pid, rows)
+            );
+            assert!(admission.is_err());
+            assert!(
+                ipc.input(&view, previous_incarnation, b'x')
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            assert!(
+                ipc.bridge
+                    .resize(&id, proof.committed.size, epoch)
+                    .await
+                    .is_err()
+            );
+            ipc.no_request().await;
+        }
+
+        let (admission, ()) = tokio::join!(
+            mode.prepare_control(&view, &proof),
+            ipc.reply_inventory(agent_pid, vec![runtime])
+        );
+        admission.unwrap().start(&view);
+        let (peer, request) = ipc.receive().await;
+        assert!(
+            matches!(request, Request::AcquireTerminal { terminal } if terminal == view.terminal)
+        );
+        PasteIpc::reply(
+            peer,
+            Response::Error {
+                message: "catalog unavailable".into(),
+            },
+        );
+        assert!(
+            ipc.input(&view, previous_incarnation, b'x')
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            ipc.bridge
+                .resize(&id, proof.committed.size, epoch)
+                .await
+                .is_err()
+        );
+        assert!(!ipc.bridge.read(&id).await.unwrap().writable);
+        let (peer, request) = ipc.receive().await;
+        assert!(
+            matches!(request, Request::AcquireTerminal { terminal } if terminal == view.terminal)
+        );
+        let token = Uuid::new_v4();
+        PasteIpc::reply(peer, Response::TerminalControl { token, epoch });
+        assert!(view.control.lock().await.lease.is_some());
+        view.output.lock().await.status.epoch = Some(epoch);
+        let current = ipc
+            .bridge
+            .read(&id)
+            .await
+            .unwrap()
+            .paste_incarnation
+            .unwrap();
+        assert_ne!(current, previous_incarnation);
+        assert!(
+            ipc.input(&view, previous_incarnation, b'x')
+                .await
+                .unwrap()
+                .is_err()
+        );
+        let send = ipc.input(&view, current, b'n');
+        let (peer, request) = ipc.receive().await;
+        assert!(
+            matches!(request, Request::Input { token: current, sequence: 0, data, paste: false, .. }
+            if current == token && data == b"n")
+        );
+        PasteIpc::reply(peer, Response::Accepted {});
+        send.await.unwrap().unwrap();
+        ipc.bridge.detach(&id);
+        ipc.no_request().await;
     }
 
     #[tokio::test]

@@ -38,6 +38,25 @@ case "$4" in
       for name in $(cat names); do
         IFS='|' read -r session window pane pid < "$name.pane"
         if test "$pane" != "$7"; then continue; fi
+        if test "$#" = 24; then
+          format='#{pid}|#{start_time}|#{@rs_create_generation}|#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}|#{session_name}|#{pane_dead}|#{@rs_create_nonce}'
+          test "$8" = "$format" && test "${24}" = "$format"
+          test "$9 ${10} ${11} ${12} ${13} ${14} ${15} ${16} ${17} ${18} ${19} ${20} ${21} ${22} ${23}" = "; show-environment -s -t =$name ; show-options -p -t $pane ; display-message -p -t $pane"
+          nonce=$(option_value "$name.nonce")
+          stamp=$(option_value "$name.stamp")
+          marker=""
+          if test -n "$stamp"; then marker="$nonce:$stamp"; fi
+          row="$(cat "$name.pane")|$name|$(cat "$name.dead")|$marker"
+          printf '42|100|%s|%s\n' "$token" "$row"
+          test ! -f "$name.inventory-fault" || exit 1
+          if test -f "$name.nonce"; then printf "RS_CREATE_NONCE='%s'; export RS_CREATE_NONCE;\n" "$nonce"; fi
+          if test -f "$name.stamp"; then printf "@rs_create_nonce '%s'\n" "$marker"; fi
+          if test -f "$name.inventory-replacement"; then row=$(cat "$name.inventory-replacement"); fi
+          next_token=$token
+          if test -f "$name.inventory-generation"; then next_token=$(cat "$name.inventory-generation"); fi
+          printf '42|100|%s|%s\n' "$next_token" "$row"
+          exit 0
+        fi
         nonce=$(cat "$name.nonce")
         stamp=$(cat "$name.stamp")
         epoch=$(cat epoch 2>/dev/null || :)
@@ -189,7 +208,11 @@ case "$4" in
   list-panes)
     for name in $(cat names); do
       IFS='|' read -r session window pane pid < "$name.pane"
-      printf '%s\t%s\t%s\t%s\t100\t30\tfixture\n' "$name" "$pane" "$pid" "$(cat "$name.dead")"
+      printf '%s\t%s\t%s\t%s\t100\t30\tfixture' "$name" "$pane" "$pid" "$(cat "$name.dead")"
+      case "${7-}" in
+        *'#{session_id}|#{window_id}') printf '\t42|100|%s|%s|%s' "$token" "$session" "$window" ;;
+      esac
+      printf '\n'
     done ;;
   list-commands)
     printf 'paste-buffer [-dprS]\nload-buffer path\n' ;;
@@ -640,6 +663,125 @@ async fn w1_create_guarded_paste_probe() {
         fs::read(fixture.root.join("buffer-loads")).unwrap(),
         b"load\nload\n"
     );
+    stop(job).await;
+}
+
+#[tokio::test]
+async fn w1_create_inventory_corroborates_origin() {
+    let fixture = Fixture::new();
+    let lane = fixture.lane();
+    let job = fixture.serve(lane).await;
+    let workspace = fixture.register().await;
+    let legacy = tmux_name(Uuid::new_v4(), Uuid::new_v4());
+    fixture.set("names", format!("{legacy}\n"));
+    fixture.set(&format!("{legacy}.pane"), "$9|@9|%9|309\n");
+    fixture.set(&format!("{legacy}.dead"), "0\n");
+    let Response::Runtimes { runtimes } = request(&fixture.root, &Request::List {}).await.unwrap()
+    else {
+        panic!("expected surviving legacy pane");
+    };
+    assert_eq!(runtimes.len(), 1);
+    assert_eq!(runtimes[0].origin, RuntimeOrigin::Legacy);
+    assert!(!fixture.root.join("generation").exists());
+
+    let key = Uuid::new_v4();
+    fixture.set("mode", "effect-lost");
+    assert!(matches!(
+        fixture.call(&create(key, workspace, None)).await,
+        CreateState::Unknown { .. }
+    ));
+    let names = fs::read_to_string(fixture.root.join("names")).unwrap();
+    let managed = names.lines().find(|name| *name != legacy).unwrap();
+    let stamp_file = format!("{managed}.stamp");
+    let nonce_file = format!("{managed}.nonce");
+    let stamp = fs::read(fixture.root.join(&stamp_file)).unwrap();
+    let nonce = fs::read(fixture.root.join(&nonce_file)).unwrap();
+    fs::remove_file(fixture.root.join(&stamp_file)).unwrap();
+
+    let inventory = async || {
+        let Response::Runtimes { runtimes } =
+            request(&fixture.root, &Request::List {}).await.unwrap()
+        else {
+            panic!("expected inventory for both surviving panes");
+        };
+        assert_eq!(runtimes.len(), 2);
+        let legacy = runtimes
+            .iter()
+            .find(|runtime| runtime.tmux_name == legacy)
+            .unwrap()
+            .clone();
+        let managed = runtimes
+            .into_iter()
+            .find(|runtime| runtime.tmux_name == managed)
+            .unwrap();
+        (legacy, managed)
+    };
+    let verify = async || {
+        let (legacy, managed) = inventory().await;
+        assert_eq!(
+            (legacy.origin, legacy.workspace_id, legacy.operation_id),
+            (RuntimeOrigin::Legacy, None, None)
+        );
+        assert_eq!(
+            (managed.origin, managed.workspace_id, managed.operation_id),
+            (RuntimeOrigin::Managed, None, None)
+        );
+    };
+    verify().await;
+
+    let catalog_path = fixture.catalog.join("catalog.sqlite3");
+    let retained = fixture.catalog.join("retained.sqlite3");
+    fs::rename(&catalog_path, &retained).unwrap();
+    verify().await;
+    assert!(matches!(
+        fixture.status(key).await,
+        CreateState::Unknown {
+            issue: Some(ProductIssue::CatalogMissing)
+        }
+    ));
+
+    fs::remove_file(fixture.root.join(&nonce_file)).unwrap();
+    for invalid_stamp in ["", "malformed"] {
+        fixture.set(&stamp_file, invalid_stamp);
+        verify().await;
+    }
+
+    let fault = format!("{legacy}.inventory-fault");
+    fixture.set(&fault, "");
+    assert_eq!(inventory().await.0.origin, RuntimeOrigin::Managed);
+    fs::remove_file(fixture.root.join(fault)).unwrap();
+    for replacement in [
+        format!("$9|@9|%9|999|{legacy}|0|"),
+        format!("$1|@1|%9|309|{legacy}|0|"),
+    ] {
+        fixture.set(&format!("{legacy}.inventory-replacement"), replacement);
+        assert_eq!(inventory().await.0.origin, RuntimeOrigin::Managed);
+    }
+    fs::remove_file(fixture.root.join(format!("{legacy}.inventory-replacement"))).unwrap();
+    let replaced_server = format!("{legacy}.inventory-generation");
+    fixture.set(&replaced_server, Uuid::new_v4().to_string());
+    assert_eq!(inventory().await.0.origin, RuntimeOrigin::Managed);
+    fs::remove_file(fixture.root.join(replaced_server)).unwrap();
+
+    fixture.set(&nonce_file, nonce);
+    fixture.set(&stamp_file, stamp);
+    fs::rename(&retained, &catalog_path).unwrap();
+    let job = fixture.restart(job).await;
+    let CreateState::Confirmed {
+        outcome,
+        current: PaneLiveness::Live,
+        ..
+    } = fixture.status(key).await
+    else {
+        panic!("expected the original managed launch after catalog recovery");
+    };
+    let (legacy, managed) = inventory().await;
+    assert_eq!(legacy.origin, RuntimeOrigin::Legacy);
+    assert_eq!(managed.origin, RuntimeOrigin::Managed);
+    assert_eq!(managed.workspace_id, Some(workspace));
+    assert!(managed.operation_id.is_some());
+    assert_eq!(managed, outcome.runtime);
+    assert_eq!(fixture.dispatches(), 1);
     stop(job).await;
 }
 
