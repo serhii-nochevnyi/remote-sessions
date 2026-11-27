@@ -19,6 +19,17 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
+#[cfg(any(test, debug_assertions))]
+use std::time::Instant;
+#[cfg(test)]
+use std::{
+    cell::RefCell,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
+
 const APPLICATION_ID: i32 = 0x5253_4341;
 const SCHEMA_VERSION: i32 = 2;
 const BUSY_TIMEOUT_MS: u32 = 100;
@@ -65,6 +76,34 @@ const OPERATION_SCHEMA: &str = "CREATE TABLE create_operations (
 
 type CatalogResult<T> = Result<T, ProductIssue>;
 type Identity = (u64, u64);
+
+#[cfg(test)]
+thread_local! {
+    static OPEN_ATTEMPTS: RefCell<Option<OpenAttemptTap>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct OpenAttemptTap {
+    path: PathBuf,
+    count: Arc<AtomicUsize>,
+}
+
+#[cfg(test)]
+struct OpenAttemptScope(Option<OpenAttemptTap>);
+
+#[cfg(test)]
+impl OpenAttemptScope {
+    fn install(tap: OpenAttemptTap) -> Self {
+        Self(OPEN_ATTEMPTS.replace(Some(tap)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for OpenAttemptScope {
+    fn drop(&mut self) {
+        OPEN_ATTEMPTS.set(self.0.take());
+    }
+}
 
 fn storage_error(error: io::Error) -> ProductIssue {
     match error.kind() {
@@ -572,6 +611,14 @@ impl Catalog {
     }
 
     fn open(dir: &Path) -> CatalogResult<Self> {
+        #[cfg(test)]
+        OPEN_ATTEMPTS.with_borrow(|tap| {
+            if let Some(tap) = tap
+                && tap.path == dir
+            {
+                tap.count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
         let lock = CatalogLock::acquire(dir, false)?;
         let files = CatalogFiles::inspect(dir)?;
         let provision_id = files.provision_id(dir)?;
@@ -866,6 +913,32 @@ impl Catalog {
 
 type Job = Box<dyn FnOnce(&mut CatalogResult<Catalog>, &ServiceProfiles) + Send>;
 
+#[cfg(any(test, debug_assertions))]
+fn open_fixture_with_wait(
+    dir: &Path,
+    budget: Duration,
+    mut on_contention: impl FnMut(),
+) -> CatalogResult<Catalog> {
+    let deadline = Instant::now() + budget;
+    loop {
+        let result = Catalog::open(dir);
+        if !matches!(result, Err(ProductIssue::CatalogBusy)) {
+            return result;
+        }
+        on_contention();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            std::thread::sleep(remaining.min(Duration::from_millis(5)));
+        }
+        if Instant::now() >= deadline {
+            return result;
+        }
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+pub(super) type FixtureBusyObserver = (PathBuf, mpsc::Sender<()>);
+
 #[derive(Clone)]
 pub(crate) struct CatalogLane {
     jobs: mpsc::Sender<Job>,
@@ -876,6 +949,45 @@ impl CatalogLane {
         directory: impl FnOnce() -> AnyResult<PathBuf> + Send + 'static,
         profiles: ServiceProfiles,
     ) -> Self {
+        Self::start_with(directory, profiles, Catalog::open, || {})
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    pub(super) async fn start_fixture(
+        directory: impl FnOnce() -> AnyResult<PathBuf> + Send + 'static,
+        profiles: ServiceProfiles,
+        mut busy: Option<FixtureBusyObserver>,
+    ) -> AnyResult<Self> {
+        let (started, startup) = oneshot::channel();
+        let lane = Self::start_with(
+            directory,
+            profiles,
+            move |dir| {
+                open_fixture_with_wait(dir, Duration::from_secs(1), || {
+                    if busy.as_ref().is_some_and(|(path, _)| path == dir)
+                        && let Some((_, observed)) = busy.take()
+                    {
+                        let _ = observed.try_send(());
+                    }
+                })
+            },
+            move || {
+                let _ = started.send(());
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(2), startup)
+            .await
+            .context("fixture catalog worker startup timed out")?
+            .context("fixture catalog worker stopped during startup")?;
+        Ok(lane)
+    }
+
+    fn start_with(
+        directory: impl FnOnce() -> AnyResult<PathBuf> + Send + 'static,
+        profiles: ServiceProfiles,
+        open: impl FnOnce(&Path) -> CatalogResult<Catalog> + Send + 'static,
+        on_started: impl FnOnce() + Send + 'static,
+    ) -> Self {
         let (jobs, mut queue) = mpsc::channel::<Job>(4);
         if let Err(error) = std::thread::Builder::new()
             .name("host-catalog".into())
@@ -885,7 +997,7 @@ impl CatalogLane {
                         eprintln!("local catalog configuration: {error:#}");
                         ProductIssue::CatalogUnsafe
                     })
-                    .and_then(|directory| Catalog::open(&directory));
+                    .and_then(|directory| open(&directory));
                 match &catalog {
                     Ok(catalog) => eprintln!(
                         "local catalog ready (SQLite {}, schema {}, DELETE, EXTRA, foreign keys on, fullfsync {}, busy timeout {} ms, device {}, owner {})",
@@ -894,6 +1006,7 @@ impl CatalogLane {
                     ),
                     Err(issue) => eprintln!("local catalog unavailable ({issue:?})"),
                 }
+                on_started();
                 while let Some(job) = queue.blocking_recv() {
                     job(&mut catalog, &profiles);
                 }
@@ -977,7 +1090,8 @@ impl CatalogLane {
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
-    use std::time::Instant;
+
+    const DIRECT_FIXTURE_BUDGET: Duration = Duration::from_secs(3);
 
     fn fixture() -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir_in("/tmp").unwrap();
@@ -992,7 +1106,7 @@ mod tests {
         let path = temp.path().canonicalize().unwrap().join("Project Folder");
         fs::create_dir(&path).unwrap();
         let locator = path.to_str().unwrap().to_owned();
-        let mut opened = Catalog::open(&dir).unwrap();
+        let mut opened = open_fixture(&dir).unwrap();
         assert_eq!(Catalog::open(&dir).err(), Some(ProductIssue::CatalogBusy));
         let connection = &opened.connection;
         assert_eq!(
@@ -1023,7 +1137,18 @@ mod tests {
         let first = opened.register(locator.clone(), identity).unwrap();
         drop(opened);
 
-        let mut reopened = Catalog::open(&dir).unwrap();
+        let mut owner = Some(open_fixture(&dir).unwrap());
+        let mut reopened = open_fixture_with_wait(&dir, DIRECT_FIXTURE_BUDGET, || {
+            let held = owner
+                .take()
+                .expect("catalog was still busy after the test released it");
+            release_fixture_owner(held);
+        })
+        .unwrap();
+        assert!(
+            owner.is_none(),
+            "reopen did not observe real catalog contention"
+        );
         let (saved_locator, saved_identity) = reopened.workspace(first.workspace_id).unwrap();
         assert_eq!(saved_locator, locator);
         assert_eq!(saved_identity, resolve_workspace(&path).unwrap());
@@ -1052,7 +1177,7 @@ mod tests {
     #[test]
     fn w1_readiness_expired_registration_does_not_write() {
         let (temp, dir) = fixture();
-        let mut catalog = Catalog::open(&dir).unwrap();
+        let mut catalog = open_fixture(&dir).unwrap();
         let (reply, response) = oneshot::channel::<()>();
         drop(response);
         let request = ProductRequest::RegisterWorkspace {
@@ -1075,30 +1200,97 @@ mod tests {
         assert_eq!(count, 0);
     }
 
-    fn open_fault_fixture(dir: &Path) -> CatalogResult<Catalog> {
-        open_fault_fixture_with_wait(dir, Duration::from_secs(3), || {})
+    fn open_fixture(dir: &Path) -> CatalogResult<Catalog> {
+        open_fixture_with_wait(dir, DIRECT_FIXTURE_BUDGET, || {})
     }
 
-    fn open_fault_fixture_with_wait(
-        dir: &Path,
-        budget: Duration,
-        mut on_contention: impl FnMut(),
-    ) -> CatalogResult<Catalog> {
-        let deadline = Instant::now() + budget;
-        loop {
-            let result = Catalog::open(dir);
-            if !matches!(result, Err(ProductIssue::CatalogBusy)) {
-                return result;
-            }
-            on_contention();
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if !remaining.is_zero() {
-                std::thread::sleep(remaining.min(Duration::from_millis(5)));
-            }
-            if Instant::now() >= deadline {
-                return result;
-            }
-        }
+    fn release_fixture_owner(owner: Catalog) {
+        let Catalog {
+            connection, lock, ..
+        } = owner;
+        drop(connection);
+        lock.file.unlock().unwrap();
+    }
+
+    #[test]
+    fn w1_readiness_catalog_fixture_does_not_retry_missing_storage() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let dir = temp.path().canonicalize().unwrap().join("catalog");
+        DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let lock = dir.join(LOCK);
+        drop(
+            file_options()
+                .write(true)
+                .create_new(true)
+                .open(&lock)
+                .unwrap(),
+        );
+
+        let metadata = fs::symlink_metadata(&dir).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.uid(), geteuid().as_raw());
+        assert_eq!(metadata.mode() & 0o7777, 0o700);
+        private_file(&fs::symlink_metadata(&lock).unwrap()).unwrap();
+        assert!(absent(&dir.join(DB)).unwrap() && absent(&dir.join(RECORD)).unwrap());
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut contentions = 0;
+        let result = {
+            let _tap = OpenAttemptScope::install(OpenAttemptTap {
+                path: dir.clone(),
+                count: Arc::clone(&count),
+            });
+            open_fixture_with_wait(&dir, DIRECT_FIXTURE_BUDGET, || contentions += 1)
+        };
+        assert_eq!(result.err(), Some(ProductIssue::CatalogMissing));
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+        assert_eq!(contentions, 0);
+        assert!(absent(&dir.join(DB)).unwrap() && absent(&dir.join(RECORD)).unwrap());
+    }
+
+    #[tokio::test]
+    async fn w1_readiness_production_catalog_lane_opens_once_under_contention() {
+        let (temp, dir) = fixture();
+        let holder = open_fixture(&dir).unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let worker_count = Arc::clone(&count);
+        let worker_dir = dir.clone();
+        let lane = CatalogLane::start(
+            move || {
+                OPEN_ATTEMPTS.set(Some(OpenAttemptTap {
+                    path: worker_dir.clone(),
+                    count: worker_count,
+                }));
+                Ok(worker_dir)
+            },
+            ServiceProfiles::new(None),
+        );
+        let locator = temp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let register = || ProductRequest::RegisterWorkspace {
+            locator: locator.clone(),
+        };
+        let busy = ProductResponse::Blocked {
+            issue: ProductIssue::CatalogBusy,
+        };
+        assert_eq!(lane.call(register()).await, busy);
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+        release_fixture_owner(holder);
+        assert_eq!(lane.call(register()).await, busy);
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+
+        let fixture = CatalogLane::start_fixture(move || Ok(dir), ServiceProfiles::new(None), None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            fixture.call(register()).await,
+            ProductResponse::WorkspaceRegistered { .. }
+        ));
     }
 
     fn empty_locked_fixture() -> (tempfile::TempDir, PathBuf, CatalogLock) {
@@ -1114,7 +1306,7 @@ mod tests {
         let (_temp, dir, owner) = empty_locked_fixture();
         assert_eq!(Catalog::open(&dir).err(), Some(ProductIssue::CatalogBusy));
         let mut observed = false;
-        let result = open_fault_fixture_with_wait(&dir, Duration::from_secs(3), || {
+        let result = open_fixture_with_wait(&dir, DIRECT_FIXTURE_BUDGET, || {
             assert!(!observed);
             observed = true;
             owner.file.unlock().unwrap();
@@ -1127,9 +1319,11 @@ mod tests {
         let budget = Duration::from_millis(30);
         let start = Instant::now();
         let mut observed = false;
-        let result = open_fault_fixture_with_wait(&held_dir, budget, || observed = true);
+        let result = open_fixture_with_wait(&held_dir, budget, || observed = true);
+        let elapsed = start.elapsed();
         assert!(observed);
-        assert!(start.elapsed() >= budget);
+        assert!(elapsed >= budget);
+        assert!(elapsed < Duration::from_secs(2));
         assert_eq!(result.err(), Some(ProductIssue::CatalogBusy));
         assert_eq!(
             Catalog::open(&held_dir).err(),
@@ -1153,33 +1347,21 @@ mod tests {
         assert!(!is_private_file(&metadata, metadata.uid().wrapping_add(1)));
         let backup = dir.join("backup");
         fs::rename(&db, &backup).unwrap();
-        assert_eq!(
-            open_fault_fixture(&dir).err(),
-            Some(ProductIssue::CatalogMissing)
-        );
+        assert_eq!(open_fixture(&dir).err(), Some(ProductIssue::CatalogMissing));
         assert_eq!(provision(&dir), Err(ProductIssue::CatalogUnsafe));
         assert!(!db.exists());
         symlink(&backup, &db).unwrap();
-        assert_eq!(
-            open_fault_fixture(&dir).err(),
-            Some(ProductIssue::CatalogUnsafe)
-        );
+        assert_eq!(open_fixture(&dir).err(), Some(ProductIssue::CatalogUnsafe));
         fs::remove_file(&db).unwrap();
         fs::rename(&backup, &db).unwrap();
         fs::set_permissions(&db, fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(
-            open_fault_fixture(&dir).err(),
-            Some(ProductIssue::CatalogUnsafe)
-        );
+        assert_eq!(open_fixture(&dir).err(), Some(ProductIssue::CatalogUnsafe));
         fs::set_permissions(&db, fs::Permissions::from_mode(0o600)).unwrap();
 
         let record = dir.join(RECORD);
         let saved = fs::read(&record).unwrap();
         fs::remove_file(&record).unwrap();
-        assert_eq!(
-            open_fault_fixture(&dir).err(),
-            Some(ProductIssue::CatalogMissing)
-        );
+        assert_eq!(open_fixture(&dir).err(), Some(ProductIssue::CatalogMissing));
         let mut file = file_options()
             .create_new(true)
             .write(true)
@@ -1187,17 +1369,14 @@ mod tests {
             .unwrap();
         file.write_all(Uuid::new_v4().to_string().as_bytes())
             .unwrap();
-        assert_eq!(
-            open_fault_fixture(&dir).err(),
-            Some(ProductIssue::CatalogUnsafe)
-        );
+        assert_eq!(open_fixture(&dir).err(), Some(ProductIssue::CatalogUnsafe));
         fs::write(&record, saved).unwrap();
 
         let journal = dir.join(SIDECARS[0]);
         fs::write(&journal, "retain rollback evidence").unwrap();
         let before = fs::read(&db).unwrap();
         assert_eq!(
-            open_fault_fixture(&dir).err(),
+            open_fixture(&dir).err(),
             Some(ProductIssue::CatalogUnavailable)
         );
         assert_eq!(
@@ -1214,16 +1393,13 @@ mod tests {
         drop(connection);
         let before = fs::read(&db).unwrap();
         assert_eq!(
-            open_fault_fixture(&dir).err(),
+            open_fixture(&dir).err(),
             Some(ProductIssue::CatalogUnsupported)
         );
         assert_eq!(fs::read(&db).unwrap(), before);
         fs::rename(&db, &backup).unwrap();
         fs::remove_file(&record).unwrap();
-        assert_eq!(
-            open_fault_fixture(&dir).err(),
-            Some(ProductIssue::CatalogMissing)
-        );
+        assert_eq!(open_fixture(&dir).err(), Some(ProductIssue::CatalogMissing));
         assert_eq!(provision(&dir), Err(ProductIssue::CatalogUnsafe));
         assert!(!db.exists() && !record.exists());
     }
@@ -1233,7 +1409,7 @@ mod tests {
         let (_temp, dir) = fixture();
         let workspace = dir.parent().unwrap();
         let locator = workspace.to_str().unwrap().to_owned();
-        let mut opened = Catalog::open(&dir).unwrap();
+        let mut opened = open_fixture(&dir).unwrap();
         let original = opened
             .register(locator.clone(), resolve_workspace(workspace).unwrap())
             .unwrap();
@@ -1254,7 +1430,7 @@ mod tests {
         assert_eq!(fs::read(dir.join(DB)).unwrap(), before);
         validate_schema(&reader, 1).unwrap();
         drop(reader);
-        let reopened = Catalog::open(&dir).unwrap();
+        let reopened = open_fixture(&dir).unwrap();
         assert_eq!(
             reopened.workspace(original.workspace_id).unwrap().0,
             locator
