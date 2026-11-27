@@ -351,6 +351,7 @@ impl Fixture {
     }
 
     async fn wait_restart_released(&self) {
+        self.wait_catalog_released().await;
         let timeout = Duration::from_secs(3);
         wait_lock_release(&self.root.join("agent.lock"), timeout, || {})
             .await
