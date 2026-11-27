@@ -247,6 +247,31 @@ test("ordinary input sends the captured grant with each native invoke", async t 
   ]);
 });
 
+test("resize forwards the captured incarnation and rejects a missing capture before invoke", async t => {
+  const calls: unknown[] = [];
+  const status = terminalStatus(id, 1);
+  const size = status.committed.size;
+  const nativeReply = { result: "committed", admission: status.committed.intent, status };
+  const original = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: { __TAURI_INTERNALS__: {
+      invoke(command: string, args: unknown) {
+        calls.push([command, args]);
+        return Promise.resolve(nativeReply);
+      },
+    } },
+  });
+  t.after(() => {
+    if (original) Object.defineProperty(globalThis, "window", original);
+    else Reflect.deleteProperty(globalThis, "window");
+  });
+  await assert.rejects(localClient.resize(id, owner, size), { message: "Керування ще не отримано" });
+  assert.deepEqual(calls, []);
+  assert.deepEqual(await localClient.resize(id, owner, size, freshId), nativeReply);
+  assert.deepEqual(calls, [["terminal_resize", { viewId: id, epoch: owner, size, incarnation: freshId }]]);
+});
+
 test("a typed rejection from another scoped invoke cannot retire this grant", async t => {
   const original = Object.getOwnPropertyDescriptor(globalThis, "window");
   Object.defineProperty(globalThis, "window", {

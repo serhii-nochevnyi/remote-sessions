@@ -1115,20 +1115,23 @@ async fn wait_provider(directory: &Path, committed: &TerminalStatus) -> Result<T
     .context("Provider did not reach the committed size")?
 }
 
-async fn await_owner(bridge: &DesktopBridge, view: &Attachment) -> Result<ResizeEpoch> {
+async fn await_owner(bridge: &DesktopBridge, view: &Attachment) -> Result<(ResizeEpoch, Uuid)> {
     tokio::time::timeout(Duration::from_secs(5), async {
+        let mut epoch = view.status.epoch;
         loop {
             let chunk = bridge.read(&view.view_id).await?;
             ensure!(
                 !chunk.closed && chunk.geometry.is_none(),
                 "View changed before owner acquisition"
             );
+            if let Some(status) = chunk.status {
+                epoch = status.epoch;
+            }
             if chunk.writable {
-                return bridge
-                    .status(&view.view_id)
-                    .await?
-                    .epoch
-                    .context("Missing active epoch");
+                return Ok((
+                    epoch.context("Missing active epoch")?,
+                    chunk.paste_incarnation.context("Missing native grant")?,
+                ));
             }
         }
     })
@@ -1227,10 +1230,10 @@ async fn positive(lab: &Lab, report: &mut Report) -> Result<()> {
     report.witnessed.push("all_observers_passive");
     bridge.detach(&observer.view_id);
     let owner = bridge.attach(&lab.runtime.to_string()).await?;
-    let epoch = await_owner(&bridge, &owner).await?;
+    let (epoch, incarnation) = await_owner(&bridge, &owner).await?;
     ensure!(
         browser
-            .resize(&spectator.view_id, NARROW, epoch)
+            .resize(&spectator.view_id, NARROW, epoch, incarnation)
             .await
             .is_err(),
         "Spectator admitted a resize"
@@ -1241,8 +1244,9 @@ async fn positive(lab: &Lab, report: &mut Report) -> Result<()> {
         [NARROW, NORMAL]
     };
     for size in targets {
-        let ResizeResult::Committed { status, .. } =
-            bridge.resize(&owner.view_id, size, epoch).await?
+        let ResizeResult::Committed { status, .. } = bridge
+            .resize(&owner.view_id, size, epoch, incarnation)
+            .await?
         else {
             bail!("Bridge owner resize was unconfirmed");
         };
@@ -1260,7 +1264,10 @@ async fn positive(lab: &Lab, report: &mut Report) -> Result<()> {
     bridge.detach(&owner.view_id);
     browser.detach(&spectator.view_id);
     ensure!(
-        bridge.resize(&owner.view_id, NARROW, epoch).await.is_err(),
+        bridge
+            .resize(&owner.view_id, NARROW, epoch, incarnation)
+            .await
+            .is_err(),
         "Detached view admitted resize"
     );
     report.witnessed.push("owner_and_spectator_two_targets");
@@ -2699,7 +2706,7 @@ async fn pressure_probe(args: Vec<String>) -> Result<()> {
     let started_at_us = wall_us()?;
     let owner = bridge.attach(&runtime_id).await?;
     let owner_process = PressureView::observe(&bridge, &owner).await?;
-    let epoch = await_owner(&bridge, &owner).await?;
+    let (epoch, incarnation) = await_owner(&bridge, &owner).await?;
     let victim = bridge.attach_observer(&runtime_id).await?;
     let victim_process = PressureView::observe(&bridge, &victim).await?;
     let committed = async {
@@ -2709,8 +2716,9 @@ async fn pressure_probe(args: Vec<String>) -> Result<()> {
         } else {
             NORMAL
         };
-        let ResizeResult::Committed { status, .. } =
-            bridge.resize(&owner.view_id, size, epoch).await?
+        let ResizeResult::Committed { status, .. } = bridge
+            .resize(&owner.view_id, size, epoch, incarnation)
+            .await?
         else {
             bail!("Pressure geometry commit was unconfirmed");
         };

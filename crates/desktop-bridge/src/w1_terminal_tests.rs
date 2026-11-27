@@ -1369,7 +1369,8 @@ impl WriterCandidateFixture {
                 .resize(
                     &attachment.view_id,
                     attachment.status.committed.size,
-                    self.epoch
+                    self.epoch,
+                    Uuid::new_v4(),
                 )
                 .await
                 .is_err()
@@ -1393,6 +1394,14 @@ impl WriterCandidateFixture {
             epoch: self.epoch,
             id: Uuid::new_v4(),
         };
+        let incarnation = view
+            .control
+            .lock()
+            .await
+            .lease
+            .as_ref()
+            .unwrap()
+            .incarnation;
         let reply = async {
             let (
                 mut peer,
@@ -1431,7 +1440,10 @@ impl WriterCandidateFixture {
             )
             .await;
         };
-        let (result, ()) = tokio::join!(self.bridge.resize(&id, size, self.epoch), reply);
+        let (result, ()) = tokio::join!(
+            self.bridge.resize(&id, size, self.epoch, incarnation),
+            reply
+        );
         assert!(
             matches!(result.unwrap(), ResizeResult::Committed { admission: actual, .. } if actual == admission)
         );
@@ -1536,7 +1548,8 @@ async fn w1_terminal_current_candidate_confirms_once_and_sends_fresh_input() {
                 .resize(
                     &candidate.view_id,
                     candidate.status.committed.size,
-                    original
+                    original,
+                    grant.paste_incarnation.unwrap(),
                 )
                 .await
                 .is_err()
@@ -1841,7 +1854,8 @@ async fn w1_terminal_candidate_drains_eof_during_confirmation() {
                 .resize(
                     &candidate.view_id,
                     candidate.status.committed.size,
-                    original
+                    original,
+                    Uuid::new_v4(),
                 )
                 .await
                 .is_err()
@@ -2043,6 +2057,15 @@ esac
     async fn commit(&mut self, size: TerminalSize) {
         let owner = self.owner.terminal.view_id.to_string();
         let epoch = self.status.epoch.unwrap();
+        let incarnation = self
+            .owner
+            .control
+            .lock()
+            .await
+            .lease
+            .as_ref()
+            .unwrap()
+            .incarnation;
         let sequence = self.status.committed.revision;
         let admission = ResizeIntent {
             id: Uuid::new_v4(),
@@ -2078,7 +2101,7 @@ esac
             )
             .await;
         };
-        let (reply, ()) = tokio::join!(self.bridge.resize(&owner, size, epoch), agent);
+        let (reply, ()) = tokio::join!(self.bridge.resize(&owner, size, epoch, incarnation), agent);
         assert_eq!(
             reply.unwrap(),
             ResizeResult::Committed {
@@ -2091,6 +2114,32 @@ esac
     async fn reply_status(&self, status: TerminalStatus) {
         let mut peer = attachment_status_peer(&self.listener, &self.status).await;
         respond(&mut peer, Response::TerminalStatus { status }).await;
+    }
+
+    async fn handoff_to_view(&mut self) -> (Uuid, Uuid) {
+        self.bridge.detach(&self.owner.terminal.view_id.to_string());
+        release_fixture_writer(&self.listener, &self.owner, self.token).await;
+        let epoch = ResizeEpoch {
+            owner: Uuid::new_v4(),
+            ..self.status.epoch.unwrap()
+        };
+        let token = Uuid::new_v4();
+        let grant = async {
+            let mut peer = acquire_fixture_writer(&self.listener, &self.view).await;
+            respond(&mut peer, Response::TerminalControl { token, epoch }).await;
+        };
+        tokio::join!(refresh_control(&self.view), grant);
+        self.status.epoch = Some(epoch);
+        let incarnation = self
+            .view
+            .control
+            .lock()
+            .await
+            .lease
+            .as_ref()
+            .unwrap()
+            .incarnation;
+        (token, incarnation)
     }
 
     fn key(&self) -> String {
@@ -2261,13 +2310,184 @@ async fn w1_resize_superseding_ack() {
 }
 
 #[tokio::test]
+async fn w1_resize_handoff_orders_issued_ack_and_queued_successor_before_writable() {
+    for queued in [false, true] {
+        let mut fixture = GeometryFixture::new().await;
+        let key = fixture.key();
+        fixture.commit(GRID_A).await;
+        let mut event = fixture.issue_first().await;
+        if queued {
+            fixture.commit(GRID_B).await;
+            let (reply, ()) = tokio::join!(
+                fixture
+                    .bridge
+                    .acknowledge_grid(&key, fixture.acknowledgement(&event)),
+                fixture.reply_status(fixture.status.clone()),
+            );
+            assert_eq!(reply.unwrap().status, event.status);
+            fixture.assert_paused(1).await;
+        }
+        let predecessor = fixture.status.clone();
+        let (token, incarnation) = fixture.handoff_to_view().await;
+        assert_ne!(fixture.status.epoch, predecessor.epoch);
+        assert_eq!(fixture.status.committed, predecessor.committed);
+        assert_eq!(fixture.view.output.lock().await.status, event.status);
+        assert_eq!(fixture.redraws(), 0);
+        fixture.writer.data(b"after handoff");
+        if queued {
+            event = fixture.read_successor().await;
+            assert_eq!(event.status.committed, predecessor.committed);
+            assert_eq!(event.status.epoch, fixture.status.epoch);
+        }
+        let ack = fixture.acknowledgement(&event);
+        let wrong_epoch = if queued {
+            predecessor.epoch
+        } else {
+            fixture.status.epoch
+        };
+        let wrong = GridAcknowledgement {
+            epoch: wrong_epoch,
+            ..ack
+        };
+        assert_eq!(
+            fixture
+                .bridge
+                .acknowledge_grid(&key, wrong)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "Terminal renderer acknowledgement is stale or mismatched"
+        );
+        fixture.assert_paused(ack.revision - 1).await;
+        assert_eq!(fixture.redraws(), 0);
+        let (reply, ()) = tokio::join!(
+            fixture.bridge.acknowledge_grid(&key, ack),
+            fixture.reply_status(fixture.status.clone()),
+        );
+        let reply = reply.unwrap();
+        assert_eq!(reply.status, event.status);
+        assert_eq!(
+            (reply.bridge_pty.size, reply.client.size),
+            (ack.size, ack.size)
+        );
+        assert_eq!(fixture.view.reader_state.load(Ordering::Acquire), RESUME);
+        assert_eq!(fixture.redraws(), 1);
+        if !queued {
+            let authority = fixture.bridge.read(&key).await.unwrap();
+            assert_eq!(authority.status.as_ref(), Some(&fixture.status));
+            assert!(authority.geometry.is_none() && authority.data.is_empty());
+            assert!(
+                !authority.closed && !authority.writable && authority.paste_incarnation.is_none()
+            );
+        }
+        let data = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let chunk = fixture.bridge.read(&key).await.unwrap();
+                assert!(!chunk.closed && chunk.geometry.is_none() && chunk.status.is_none());
+                assert!(chunk.writable);
+                assert_eq!(chunk.paste_incarnation, Some(incarnation));
+                if !chunk.data.is_empty() {
+                    break chunk.data;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(data, b"after handoff");
+        let output = fixture.view.output.lock().await;
+        assert_eq!(output.status, fixture.status);
+        assert_eq!(output.applied_revision, ack.revision);
+        assert!(output.drain_started.is_none());
+        drop(output);
+        fixture.bridge.detach(&key);
+        release_fixture_writer(&fixture.listener, &fixture.view, token).await;
+        fixture.writer.finish();
+    }
+}
+
+#[tokio::test]
+async fn w1_resize_handoff_rejects_replacement_and_inconsistent_equal_commit() {
+    for queued in [false, true] {
+        for mismatch in ["target", "size", "intent", "intent epoch", "revision"] {
+            let mut fixture = GeometryFixture::new().await;
+            let key = fixture.key();
+            fixture.commit(GRID_A).await;
+            let event = fixture.issue_first().await;
+            let ack = fixture.acknowledgement(&event);
+            if queued {
+                fixture.commit(GRID_B).await;
+                let (reply, ()) = tokio::join!(
+                    fixture.bridge.acknowledge_grid(&key, ack),
+                    fixture.reply_status(fixture.status.clone()),
+                );
+                assert_eq!(reply.unwrap().status, event.status);
+            }
+            let mut changed = fixture.status.clone();
+            changed.epoch.as_mut().unwrap().owner = Uuid::new_v4();
+            match mismatch {
+                "target" => changed.terminal.target.process_start += 1,
+                "size" => {
+                    changed.committed.size.cols += 1;
+                    changed.provider.as_mut().unwrap().size = changed.committed.size;
+                }
+                "intent" => changed.committed.intent.as_mut().unwrap().id = Uuid::new_v4(),
+                "intent epoch" => {
+                    changed.committed.intent.as_mut().unwrap().epoch.owner = Uuid::new_v4()
+                }
+                "revision" => {
+                    changed.committed.revision -= 1;
+                    if changed.committed.revision == 0 {
+                        changed.committed.intent = None;
+                    }
+                }
+                _ => unreachable!(),
+            }
+            fixture.writer.data(b"must remain paused");
+            fixture.assert_paused(if queued { 1 } else { 0 }).await;
+            let reject = async {
+                if queued {
+                    fixture
+                        .bridge
+                        .read(&key)
+                        .await
+                        .err()
+                        .expect("queued successor must fail")
+                } else {
+                    fixture
+                        .bridge
+                        .acknowledge_grid(&key, ack)
+                        .await
+                        .unwrap_err()
+                }
+            };
+            let (error, ()) = tokio::join!(reject, fixture.reply_status(changed));
+            assert_eq!(
+                error.to_string(),
+                if mismatch == "target" {
+                    "Terminal attachment identity changed"
+                } else {
+                    "Terminal geometry boundary was superseded"
+                }
+            );
+            assert_eq!(fixture.view.reader_state.load(Ordering::Acquire), CLOSE);
+            assert_eq!(fixture.redraws(), 0);
+            assert!(fixture.bridge.read(&key).await.is_err());
+        }
+    }
+}
+
+#[tokio::test]
 async fn w1_resize_w1_terminal_original_drain_deadline() {
     let tick = Duration::from_nanos(1);
-    for (elapsed, resumes, superseded) in [
-        (DRAIN_TIMEOUT - tick, true, false),
-        (DRAIN_TIMEOUT, false, false),
-        (DRAIN_TIMEOUT + tick, false, false),
-        (DRAIN_TIMEOUT, false, true),
+    for (elapsed, resumes, superseded, handoff) in [
+        (DRAIN_TIMEOUT - tick, true, false, false),
+        (DRAIN_TIMEOUT, false, false, false),
+        (DRAIN_TIMEOUT + tick, false, false, false),
+        (DRAIN_TIMEOUT, false, true, false),
+        (DRAIN_TIMEOUT - tick, true, false, true),
+        (DRAIN_TIMEOUT, false, false, true),
+        (DRAIN_TIMEOUT - tick, true, true, true),
+        (DRAIN_TIMEOUT, false, true, true),
     ] {
         let mut fixture = GeometryFixture::new().await;
         let key = fixture.key();
@@ -2284,6 +2504,11 @@ async fn w1_resize_w1_terminal_original_drain_deadline() {
                 fixture.reply_status(fixture.status.clone()),
             );
             assert_eq!(reply.unwrap().status, event.status);
+        }
+        if handoff {
+            fixture.status.epoch.as_mut().unwrap().owner = Uuid::new_v4();
+        }
+        if superseded {
             event = fixture.read_successor().await;
         }
         let applied = event.status.committed.revision - 1;
@@ -3451,6 +3676,145 @@ async fn w1_terminal_expired_input_recovers_through_accepted_renewal() {
         RenewalTiming::Live,
     ] {
         check_same_token_renewal(timing, false).await;
+    }
+}
+
+#[tokio::test]
+async fn w1_terminal_resize_admission_and_historical_settlement_across_renewal() {
+    use std::{future::Future, task::Poll};
+
+    for already_admitted in [false, true] {
+        let fixture = AgentFixture::new();
+        let listener = UnixListener::bind(fixture.0.join("agent.sock")).unwrap();
+        let bridge = DesktopBridge::new(Some(fixture.0.clone()), "/unused/tmux".into());
+        let (view, reader, _) = controlled_view(&bridge, &target(), Uuid::new_v4(), 0);
+        let id = view.terminal.view_id.to_string();
+        let (token, epoch, captured) = grant_fixture_writer(&listener, &bridge, &view).await;
+        let started = Instant::now() + Duration::from_secs(30);
+        let old_deadline = started + INPUT_LEASE_TTL / 2;
+        {
+            let mut control = view.control.lock().await;
+            control.lease.as_mut().unwrap().deadline = old_deadline;
+            view.publish_control(&control);
+        }
+        let now = Cell::new(started);
+        let mut old = std::pin::pin!(bridge.resize(&id, GRID_A, epoch, captured));
+        let pending = if already_admitted {
+            Some(tokio::select! {
+                result = old.as_mut() => panic!("historical resize finished early: {result:?}"),
+                request = receive(&listener) => request,
+            })
+        } else {
+            None
+        };
+        let drive_renewal = async {
+            let (
+                mut peer,
+                Request::Renew {
+                    runtime_id,
+                    token: actual,
+                },
+            ) = receive(&listener).await
+            else {
+                panic!("expected same-token renewal");
+            };
+            assert_eq!(
+                (runtime_id, actual),
+                (view.terminal.target.runtime_id, token)
+            );
+            assert!(view.control.try_lock().is_err());
+            if !already_admitted {
+                std::future::poll_fn(|cx| {
+                    assert!(old.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                assert!(view.resize.try_lock().is_err());
+            }
+            now.set(old_deadline + Duration::from_nanos(1));
+            respond(&mut peer, Response::TerminalControl { token, epoch }).await;
+        };
+        tokio::join!(
+            refresh_control_with_clock(&view, || now.get()),
+            drive_renewal
+        );
+        if pending.is_none() {
+            tokio::select! {
+                result = old.as_mut() => assert_eq!(result.unwrap_err().to_string(), "Resize authority changed"),
+                _ = receive(&listener) => panic!("old capture reached the host after renewal"),
+            }
+        }
+        let fresh = bridge.read(&id).await.unwrap().paste_incarnation.unwrap();
+        assert_ne!(fresh, captured);
+        {
+            let control = view.control.try_lock().unwrap();
+            let lease = control.lease.as_ref().unwrap();
+            assert_eq!(
+                (lease.token, lease.epoch, lease.resize_sequence),
+                (token, epoch, 0)
+            );
+        }
+        let settle = async |(mut peer, request): (UnixStream, Request),
+                            sequence: u64,
+                            size: TerminalSize| {
+            assert!(matches!(request, Request::ResizeTerminal {
+                terminal, token: actual, sequence: sent, size: proposed,
+            } if terminal == view.terminal && actual == token && sent == sequence && proposed == size));
+            let admission = ResizeIntent {
+                id: Uuid::new_v4(),
+                epoch,
+            };
+            let mut status = view.output.lock().await.status.clone();
+            status.committed = CommittedGeometry {
+                size,
+                revision: sequence + 1,
+                intent: Some(admission),
+            };
+            let result = ResizeResult::Committed { admission, status };
+            respond(
+                &mut peer,
+                Response::Resize {
+                    resize: result.clone(),
+                },
+            )
+            .await;
+            result
+        };
+        if let Some(request) = pending {
+            let (result, expected) = tokio::join!(old, settle(request, 0, GRID_A));
+            assert_eq!(result.unwrap(), expected);
+        }
+        assert_no_fixture_request(&listener).await;
+
+        let sequence = if already_admitted { 1 } else { 0 };
+        assert_eq!(
+            view.control
+                .lock()
+                .await
+                .lease
+                .as_ref()
+                .unwrap()
+                .resize_sequence,
+            sequence
+        );
+        let reply = async { settle(receive(&listener).await, sequence, GRID_B).await };
+        let (result, expected) = tokio::join!(bridge.resize(&id, GRID_B, epoch, fresh), reply);
+        assert_eq!(result.unwrap(), expected);
+        assert_eq!(
+            view.control
+                .lock()
+                .await
+                .lease
+                .as_ref()
+                .unwrap()
+                .resize_sequence,
+            sequence + 1
+        );
+        assert_no_fixture_request(&listener).await;
+        bridge.detach(&id);
+        release_fixture_writer(&listener, &view, token).await;
+        reader.finish();
+        until(|| allocation_counts(&bridge) == (0, 0)).await;
     }
 }
 
