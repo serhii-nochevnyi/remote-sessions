@@ -1,6 +1,7 @@
 """File-only guard for the deferred W1 handoff."""
 
 import copy
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -20,6 +21,7 @@ ADR = "docs/decisions/ADR-13-local-desktop-workflow.md"
 FOLLOW_UP = "https://github.com/serhii-nochevnyi/remote-sessions/issues/10"
 INSPECTED_REVISION = "086365f61368678fb780cfa1e7f4befa9d606276"
 SCOPED_ARGV = "python3 -m unittest discover -s tests/integration -p test_w1_evidence.py".split()
+REVIEWED_CASE_TEXT_SHA256 = "57455de156e47e9eeecab18de079801947213a10c06af3971a93790155eb08df"
 
 PARENT_GATES = frozenset("R1 R2 R3 R4 R5 R6 R7".split())
 PREPARATION_CASES = frozenset("""
@@ -196,6 +198,14 @@ def require_held_case_text(report, case_id, reason, owed_witness):
         require(not claim, f"{report}: {case_id}: contradictory {field} claim: {claim and claim[0]}")
 
 
+def require_reviewed_case_text(report, triples):
+    canonical = json.dumps(sorted(triples), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    require(
+        hashlib.sha256(canonical).hexdigest() == REVIEWED_CASE_TEXT_SHA256,
+        f"{report}: held case text differs from the reviewed baseline; baseline review required",
+    )
+
+
 def validate_evidence(root, data, markdown):
     require(isinstance(data, dict) and data.keys() == {
         "schema", "installed_acceptance", "completion", "follow_up", "source_handoff",
@@ -288,6 +298,13 @@ def validate_evidence(root, data, markdown):
             markdown_case == [status, row["reason"], "Unknown", row["owed_witness"]],
             f"{REPORT}: {case_id} status, reason, prompt observation or owed witness differs from {EVIDENCE}",
         )
+
+    require_reviewed_case_text(EVIDENCE, (
+        (case_id, row["reason"], row["owed_witness"]) for case_id, row in json_cases.items()
+    ))
+    require_reviewed_case_text(REPORT, (
+        (case_id, reason, witness) for case_id, (_, reason, _, witness) in markdown_cases.items()
+    ))
 
 
 def validate_public_docs(root):
@@ -497,6 +514,32 @@ class W1EvidenceTest(unittest.TestCase):
                 ):
                     validate_evidence(ROOT, self.data, markdown)
         print("W1EvidenceTest.test_rejects_paired_installed_outcome_claim", flush=True)
+
+    def assert_paired_edit_requires_baseline_review(self, text):
+        for field in ("reason", "owed_witness"):
+            with self.subTest(field=field):
+                _, data, markdown = self.case_text_claim_fixture(field, text)
+                with self.assertRaisesRegex(AssertionError, "baseline review required"):
+                    validate_evidence(ROOT, data, markdown)
+        print(self.id(), flush=True)
+
+    def test_rejects_paired_count_first_prompt_claim(self):
+        self.assert_paired_edit_requires_baseline_review("Zero submitted model prompts were observed.")
+
+    def test_rejects_paired_numeral_prompt_claim(self):
+        self.assert_paired_edit_requires_baseline_review("0 submitted model prompts were observed.")
+
+    def test_rejects_paired_synonymous_prompt_claim(self):
+        self.assert_paired_edit_requires_baseline_review("No requests were sent to the model.")
+
+    def test_rejects_paired_localized_prompt_claim(self):
+        self.assert_paired_edit_requires_baseline_review("Не зафіксовано жодного надісланого запиту до моделі.")
+
+    def test_rejects_paired_innocuous_wording_edit(self):
+        self.assert_paired_edit_requires_baseline_review("Record the corresponding details in the follow-up.")
+
+    def test_rejects_paired_future_witness_append(self):
+        self.assert_paired_edit_requires_baseline_review("The installed run must verify zero submitted model prompts.")
 
     def test_rejects_missing_json_link(self):
         markdown = self.markdown.replace("(W1-EVIDENCE.json)", "(unrelated.json)")
