@@ -1,5 +1,6 @@
-import type { CreateStatus, Inventory, LocalCreate, RuntimeInfo, TerminalScope, TerminalViewScope, localClient } from "./local-client.ts";
+import type { Chunk, CreateStatus, Inventory, LocalCreate, RuntimeInfo, TerminalScope, TerminalViewScope, localClient } from "./local-client.ts";
 import type { CreateExposure } from "./presentation-preferences.ts";
+import type { OrderedGeometry } from "./terminal-geometry.ts";
 import { sameTerminal } from "./terminal-geometry.ts";
 
 export interface DemoSession {
@@ -66,12 +67,17 @@ export function viewAvailability(
 export interface BoundTerminal {
   readonly identity: InventoryIdentity;
   readonly terminal: TerminalScope;
+  readonly mountKey: string;
 }
 
-export interface InventoryIdentity {
-  readonly agentPid: number;
+interface SessionIdentity {
   readonly sessionId: string;
   readonly operationId: string | null;
+}
+
+export interface InventoryIdentity extends SessionIdentity {
+  readonly agentPid: number;
+  readonly workspaceId: string | null;
 }
 
 export function sameRuntime(current: RuntimeInfo, expected: RuntimeInfo): boolean {
@@ -105,22 +111,48 @@ export function inventoryOpen(
     ? "inventory" : "blocked";
 }
 
-type MountMode = "live" | "observe" | "pending" | "offline" | "missing" | "exited";
+type MountMode = "live" | "observe" | "rollover" | "draining" | "view-closed" | "completed" | "pending" | "offline" | "missing" | "exited" | "inactive";
+export type TerminalBindingState = "bound" | "retired" | "changed" | "draining" | "view-closed" | "completed" | "ended";
 export type AttachmentMode = "ordinary" | "observer";
 export interface TerminalAttachmentIntent {
-  readonly mode: "live" | "observe";
+  readonly mode: "live" | "observe" | "rollover";
   readonly identity: InventoryIdentity;
   readonly runtime: RuntimeInfo;
+  readonly reconnect?: true;
 }
 
-function inventoryMatches(runtime: RuntimeInfo, expected: Pick<InventoryIdentity, "sessionId" | "operationId">) {
+export interface MountedTerminal {
+  readonly mode: MountMode;
+  readonly key?: string;
+  readonly intent?: TerminalAttachmentIntent;
+  readonly reconnectIntent?: TerminalAttachmentIntent;
+  readonly outputOnly?: BoundTerminal;
+}
+
+function inventoryMatches(runtime: RuntimeInfo, expected: SessionIdentity) {
   return runtime.session_id === expected.sessionId && (expected.operationId === null
     ? runtime.origin === "legacy"
     : runtime.origin === "managed" && runtime.operation_id === expected.operationId && Boolean(runtime.workspace_id));
 }
 
 function sameInventoryIdentity(left: InventoryIdentity, right: InventoryIdentity) {
-  return left.agentPid === right.agentPid && left.sessionId === right.sessionId && left.operationId === right.operationId;
+  return left.agentPid === right.agentPid && sameSessionIdentity(left, right) && left.workspaceId === right.workspaceId;
+}
+
+function sameSessionIdentity(left: SessionIdentity, right: SessionIdentity) {
+  return left.sessionId === right.sessionId && left.operationId === right.operationId;
+}
+
+function inventoryConflicts(runtime: RuntimeInfo, expected: SessionIdentity, bound: BoundTerminal | null) {
+  return runtime.session_id !== expected.sessionId ||
+    (runtime.operation_id != null && runtime.operation_id !== expected.operationId) ||
+    (runtime.origin === "legacy" && expected.operationId !== null) ||
+    (runtime.origin === "managed" && expected.operationId === null) ||
+    (bound !== null && (!sameSessionIdentity(bound.identity, expected) ||
+      runtime.runtime_id !== bound.terminal.target.runtime_id ||
+      (runtime.pane_id !== undefined && runtime.pane_id !== bound.terminal.target.pane) ||
+      (runtime.pane_pid !== null && runtime.pane_pid !== bound.terminal.target.pid) ||
+      (runtime.workspace_id != null && runtime.workspace_id !== bound.identity.workspaceId)));
 }
 
 function matchesPane(runtime: RuntimeInfo, terminal: TerminalScope) {
@@ -131,29 +163,115 @@ function matchesPane(runtime: RuntimeInfo, terminal: TerminalScope) {
 export function mountedTerminal(
   id: string,
   inventory: Inventory | null,
-  expected: Pick<InventoryIdentity, "operationId" | "sessionId"> | undefined,
+  expected: SessionIdentity | undefined,
   bound: BoundTerminal | null,
   closed: boolean,
-): { mode: MountMode; key?: string; intent?: TerminalAttachmentIntent } {
-  if (closed) return { mode: "missing" };
+  state: TerminalBindingState = "bound",
+  reconnect = false,
+): MountedTerminal {
+  if (closed || state === "changed") return { mode: "missing" };
+  if (bound && expected && !sameSessionIdentity(bound.identity, expected)) return { mode: "missing" };
   const runtime = inventory?.runtimes.find(entry => entry.runtime_id === id);
+  const priorIdentity = expected ?? bound?.identity;
+  if (priorIdentity && runtime && inventoryConflicts(runtime, priorIdentity, bound)) return { mode: "missing" };
+  if (bound && state === "view-closed") {
+    const retained = { key: bound.mountKey, outputOnly: bound };
+    if (inventory && runtime && inventoryMatches(runtime, bound.identity) && runtime.pane_id === bound.terminal.target.pane) {
+      if (runtime.exited && inventory.agent_pid === bound.identity.agentPid) return { ...retained, mode: "completed" };
+      if (expected && matchesPane(runtime, bound.terminal)) {
+        const reconnectIntent: TerminalAttachmentIntent = {
+          mode: inventory.agent_pid === bound.identity.agentPid ? "live" : "rollover",
+          identity: { ...bound.identity, agentPid: inventory.agent_pid }, runtime, reconnect: true,
+        };
+        return { ...retained, mode: "view-closed", reconnectIntent, ...(reconnect ? { intent: reconnectIntent } : {}) };
+      }
+    }
+    return { ...retained, mode: "view-closed" };
+  }
+  if (bound && state === "completed") return { mode: "completed", key: bound.mountKey, outputOnly: bound };
+  if (state === "ended") return { mode: "exited" };
+  if (bound && (state === "draining" || (state === "bound" && runtime?.exited))) {
+    if (!inventory || (inventory.agent_pid === bound.identity.agentPid && (runtime
+      ? inventoryMatches(runtime, bound.identity) && runtime.pane_id === bound.terminal.target.pane &&
+        (runtime.pane_pid === bound.terminal.target.pid || runtime.exited)
+      : state === "draining"))) {
+      return { mode: "draining", key: bound.mountKey, outputOnly: bound };
+    }
+    return { mode: "exited" };
+  }
   if (inventory && !runtime) return { mode: "missing" };
   if (runtime?.exited) return { mode: "exited" };
   if (!expected) return { mode: inventory ? "pending" : "offline" };
-  if (!inventory || !runtime) return bound ? { mode: "pending", key: `${id}:${bound.identity.agentPid}` } : { mode: "offline" };
-  if (runtime.session_id !== expected.sessionId ||
-      (runtime.operation_id && runtime.operation_id !== expected.operationId) ||
-      (runtime.origin === "legacy" && expected.operationId !== null) ||
-      !runtime.pane_id || !runtime.pane_pid) return { mode: "missing" };
+  if (!inventory || !runtime) return bound ? { mode: "pending", key: bound.mountKey } : { mode: "offline" };
+  if (!runtime.pane_id || !runtime.pane_pid) return { mode: "missing" };
+  const verified = inventoryMatches(runtime, expected);
+  const rollover = bound !== null && bound.identity.agentPid !== inventory.agent_pid;
+  if (rollover && !verified) return { mode: "pending", key: bound.mountKey };
   const identity = {
     agentPid: inventory.agent_pid,
     sessionId: expected.sessionId,
     operationId: expected.operationId,
+    workspaceId: runtime.workspace_id ?? bound?.identity.workspaceId ?? null,
   };
-  if (bound && (!sameInventoryIdentity(bound.identity, identity) || !matchesPane(runtime, bound.terminal))) return { mode: "missing" };
-  const mode = inventoryMatches(runtime, expected) ? "live" : bound ? "observe" : "pending";
+  const mode = rollover ? "rollover" : verified ? "live" : bound ? "observe" : "pending";
   if (mode === "pending") return { mode };
-  return { mode, key: `${id}:${identity.agentPid}`, intent: { mode, identity, runtime } };
+  return { mode, key: bound?.mountKey ?? `${id}:${identity.agentPid}`, intent: { mode, identity, runtime } };
+}
+
+export function terminalPanel(
+  views: SessionViews,
+  id: string,
+  inventory: Inventory | null,
+  expected: SessionIdentity | undefined,
+  bound: BoundTerminal | null,
+  closed: boolean,
+  state?: TerminalBindingState,
+  reconnect = false,
+): MountedTerminal {
+  if (closed || !views.open.includes(id)) return { mode: "missing" };
+  const mounted = mountedTerminal(id, inventory, expected, bound, false, state, reconnect);
+  if (views.active === id) return mounted;
+  return mounted.outputOnly
+    ? { mode: mounted.mode, key: mounted.outputOnly.mountKey, outputOnly: mounted.outputOnly } : { mode: "inactive" };
+}
+
+export function inventoryBindingState(
+  previous: BoundTerminal,
+  state: TerminalBindingState,
+  inventory: Inventory,
+): TerminalBindingState {
+  const id = previous.terminal.target.runtime_id;
+  const next = mountedTerminal(id, inventory, previous.identity, previous, false, state);
+  if (next.mode === "draining") return "draining";
+  if (state === "view-closed") {
+    if (next.mode === "completed") return "completed";
+    if (next.mode === "missing") return "changed";
+    return state;
+  }
+  if (state !== "draining" && state !== "completed") return state;
+  if (next.mode === "completed") return state;
+  return next.mode === "missing" && inventory.runtimes.some(entry => entry.runtime_id === id) ? "changed" : "ended";
+}
+
+export function requiresTerminalReopen(state: TerminalBindingState | "closed" | undefined) {
+  return state === "retired" || state === "view-closed";
+}
+
+export function explicitClosedReconnect(mounted: MountedTerminal) {
+  return mounted.reconnectIntent && !mounted.intent ? mounted.outputOnly : undefined;
+}
+
+export function explicitTerminalOpen(
+  status: CreateStatus | null,
+  runtime: RuntimeInfo,
+  exposure: CreateExposure | undefined,
+  bound: BoundTerminal | null,
+  state: TerminalBindingState | undefined,
+) {
+  const decision = state === "changed" || (bound && (inventoryConflicts(runtime, bound.identity, bound) ||
+    (!runtime.exited && !matchesPane(runtime, bound.terminal))))
+    ? "blocked" : inventoryOpen(status, runtime, exposure, "user");
+  return { decision, retry: decision !== "blocked" && requiresTerminalReopen(state) && !runtime.exited };
 }
 
 export function desiredTerminalMode(
@@ -162,17 +280,16 @@ export function desiredTerminalMode(
   mayRestore: boolean,
 ): AttachmentMode | undefined {
   if (!intent) return;
-  return intent.mode === "live" && (active === "ordinary" || mayRestore) ? "ordinary" : "observer";
+  return intent.mode === "live" && (mayRestore || (active === "ordinary" && !intent.reconnect)) ? "ordinary" : "observer";
 }
 
-export function updateTerminalEligibility(
-  scope: Pick<TerminalViewScope, "setInputEligible" | "retire">,
-  attached: AttachmentMode,
-  desired: AttachmentMode | undefined,
-) {
-  if (desired === attached) return;
-  scope.setInputEligible(false);
-  scope.retire();
+export class TerminalAttachmentIdentityError extends Error {
+  readonly replacement: boolean;
+
+  constructor(replacement: boolean) {
+    super("Terminal attachment identity changed");
+    this.replacement = replacement;
+  }
 }
 
 export async function attachCurrentTerminal(
@@ -183,40 +300,136 @@ export async function attachCurrentTerminal(
   mayRestore: () => boolean,
   active: () => boolean,
   detached: Promise<void>,
-  client: Pick<typeof localClient, "attach" | "detach">,
+  client: Pick<typeof localClient, "attach" | "detach" | "inventory">,
 ) {
   const admissible = () => {
     const intent = current();
     if (!active() || !intent || desiredTerminalMode(intent, undefined, mayRestore()) !== mode ||
         intent.runtime.runtime_id !== runtimeId || (mode === "observer" && !previous) ||
-        (previous && (!sameInventoryIdentity(previous.identity, intent.identity) || !matchesPane(intent.runtime, previous.terminal)))) return;
+        (previous && (!sameSessionIdentity(previous.identity, intent.identity) ||
+          previous.identity.workspaceId !== intent.identity.workspaceId ||
+          !matchesPane(intent.runtime, previous.terminal) ||
+          (intent.mode === "rollover"
+            ? mode !== "observer" || previous.identity.agentPid === intent.identity.agentPid ||
+              !inventoryMatches(intent.runtime, previous.identity)
+            : !sameInventoryIdentity(previous.identity, intent.identity))))) return;
     return intent;
   };
   await detached;
   const intent = admissible();
   if (!intent) return;
   const { identity } = intent;
-  const attachment = await client.attach(runtimeId, mode === "observer" ? { observer: true }
-    : previous ? { restoration: { previous: previous.terminal, agent_pid: identity.agentPid,
-      session_id: identity.sessionId, operation_id: identity.operationId } } : undefined);
-  const terminal = attachment.status.terminal;
-  const sameTarget = matchesPane(intent.runtime, terminal) && (!previous ||
-    (terminal.view_id !== previous.terminal.view_id &&
-      sameTerminal({ ...previous.terminal, view_id: terminal.view_id }, terminal)));
   const stillCurrent = () => {
     const latest = admissible();
-    return latest && sameInventoryIdentity(identity, latest.identity) ? latest : undefined;
+    return latest && latest.mode === intent.mode && latest.reconnect === intent.reconnect && sameInventoryIdentity(identity, latest.identity) &&
+      sameRuntime(latest.runtime, intent.runtime) ? latest : undefined;
   };
+  const options = mode === "observer" ? { observer: true as const }
+    : previous ? { restoration: { previous: previous.terminal, agent_pid: identity.agentPid,
+      session_id: identity.sessionId, operation_id: identity.operationId } } : undefined;
+  const attachment = await client.attach(runtimeId, options).catch((error: unknown) => {
+    if (stillCurrent()) throw error;
+  });
+  if (!attachment) return;
+  const terminal = attachment.status.terminal;
+  const rollover = intent.mode === "rollover";
+  const sameTarget = !previous || sameTerminal({ ...previous.terminal, view_id: terminal.view_id,
+    agent_epoch: terminal.agent_epoch }, terminal);
+  const matchesAttempt = attachment.view_id === terminal.view_id && (!previous ||
+    (terminal.view_id !== previous.terminal.view_id && rollover === (terminal.agent_epoch !== previous.terminal.agent_epoch)));
+  const proofMatches = matchesPane(intent.runtime, terminal) && sameTarget && matchesAttempt;
+  const needsFreshInventory = rollover || intent.reconnect;
+  const fresh = needsFreshInventory && proofMatches && stillCurrent() ? await client.inventory().catch(() => null) : null;
+  const corroborated = !needsFreshInventory || (fresh !== null && fresh.agent_pid === identity.agentPid &&
+    fresh.runtimes.some(runtime => sameRuntime(runtime, intent.runtime)));
   const latest = stillCurrent();
-  if (!latest || !matchesPane(latest.runtime, terminal) || !sameTarget) {
-    await client.detach(attachment.view_id).catch(() => undefined);
-    if (latest && stillCurrent()) throw Error("Terminal attachment identity changed");
+  if (!latest || !proofMatches || !corroborated) {
+    if (attachment.view_id !== previous?.terminal.view_id) await client.detach(attachment.view_id).catch(() => undefined);
+    if (latest && !proofMatches && stillCurrent()) throw new TerminalAttachmentIdentityError(!sameTarget);
     return;
   }
-  return { attachment, binding: { identity, terminal }, isCurrent: () => {
+  return { attachment, binding: { identity, terminal, mountKey: previous?.mountKey ?? `${runtimeId}:${identity.agentPid}` }, isCurrent: () => {
     const latest = stillCurrent();
     return latest !== undefined && matchesPane(latest.runtime, terminal);
   } };
+}
+
+export function terminalStreamAccess(
+  mounted: MountedTerminal,
+  binding: BoundTerminal,
+  attached: AttachmentMode,
+  mayRestore: boolean,
+): "attached" | "draining" | "stale" {
+  if (mounted.mode === "draining" && mounted.outputOnly === binding) return "draining";
+  if (!mounted.outputOnly && mounted.intent && sameInventoryIdentity(mounted.intent.identity, binding.identity) &&
+      matchesPane(mounted.intent.runtime, binding.terminal) &&
+      desiredTerminalMode(mounted.intent, attached, mayRestore) === attached) return "attached";
+  return "stale";
+}
+
+interface MountedStream {
+  readonly binding: BoundTerminal;
+  readonly scope: TerminalViewScope;
+  readonly routing: OrderedGeometry;
+  readonly sink: Parameters<OrderedGeometry["consume"]>[1];
+  access(): ReturnType<typeof terminalStreamAccess>;
+  revokeMutations(): void;
+  read(view: string): Promise<Chunk>;
+  consume(view: string, chunk: Chunk, render: () => Promise<void>): Promise<boolean>;
+  rendered(chunk: Chunk): void;
+  eof(state: "view-closed" | "completed"): void;
+  closed(): void;
+  identityChanged(): void;
+}
+
+export function updateMountedStream(stream: Pick<MountedStream, "scope" | "access" | "revokeMutations">) {
+  const access = stream.access();
+  if (access !== "attached") {
+    stream.scope.setInputEligible(false);
+    stream.revokeMutations();
+    if (access === "stale") stream.scope.retire();
+  }
+  return access;
+}
+
+export async function runMountedTerminalStream(stream: MountedStream) {
+  const { scope, routing, sink, binding } = stream;
+  const terminal = binding.terminal;
+  const view = terminal.view_id;
+  while (scope.owns(view) && updateMountedStream(stream) !== "stale") {
+    const checkEligibility = scope.captureReadEligibility();
+    const chunk = await stream.read(view);
+    if (!scope.owns(view)) return;
+    const access = updateMountedStream(stream);
+    if (access === "stale") return;
+    if (chunk.closure) {
+      if (chunk.closure.reason === "eof") {
+        scope.setInputEligible(false);
+        stream.revokeMutations();
+        stream.eof(access === "draining" ? "completed" : "view-closed");
+        scope.retire();
+      } else {
+        stream.closed();
+        scope.acceptClosure(view, chunk.closure);
+      }
+      return;
+    }
+    if ((chunk.status && !sameTerminal(terminal, chunk.status.terminal)) ||
+        (chunk.geometry && !sameTerminal(terminal, chunk.geometry.status.terminal))) {
+      stream.identityChanged();
+      throw Error("Стан термінала змінився");
+    }
+    const { paste_incarnation, paste_completion, ...readOnly } = chunk;
+    const sample = access === "draining" ? { ...readOnly, writable: false } : checkEligibility(chunk);
+    const rendered = await stream.consume(view, sample, async () => {
+      const current = updateMountedStream(stream);
+      if (current === "stale") return;
+      if (current === "draining" && chunk.geometry) throw Error("Потік перервано");
+      await routing.consume(sample, sink);
+    });
+    if (!rendered || updateMountedStream(stream) === "stale") return;
+    stream.rendered(sample);
+  }
 }
 
 export function tabStop(state: SessionViews, focused: string | null): string | null {

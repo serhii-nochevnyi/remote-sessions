@@ -1,13 +1,14 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { KeyboardEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import type { ComponentProps, KeyboardEvent } from "react";
 import { isTauri } from "@tauri-apps/api/core";
 import { TerminalView } from "./TerminalView";
 import { TerminalToolbar } from "./TerminalToolbar";
 import type { FullscreenExitFocus } from "./TerminalToolbar";
 import { CreateSessionDialog } from "./CreateSessionDialog";
 import { SessionTabs } from "./SessionTabs";
-import { canRestoreTerminalFocus, inventoryOpen, mountedTerminal, moveView, openView, restoreFullscreenExitFocus, sameRuntime, viewAvailability } from "./session-state.ts";
-import type { BoundTerminal, SessionViews, TerminalFocusTarget } from "./session-state.ts";
+import { canRestoreTerminalFocus, explicitClosedReconnect, explicitTerminalOpen, inventoryBindingState, inventoryOpen, moveView, openView,
+  requiresTerminalReopen, restoreFullscreenExitFocus, sameRuntime, terminalPanel, viewAvailability } from "./session-state.ts";
+import type { BoundTerminal, MountedTerminal, SessionViews, TerminalBindingState, TerminalFocusTarget } from "./session-state.ts";
 import { createdRuntime, PresentationStore, zoomFont, zoomShortcut } from "./presentation-preferences.ts";
 import type { ZoomAction } from "./presentation-preferences.ts";
 import { localClient, runtimeTitle, TerminalDelivery } from "./local-client";
@@ -21,7 +22,14 @@ interface FullscreenFocusIntent {
   target: HTMLElement | null;
 }
 
-type AttachmentState = { binding: BoundTerminal; state: "bound" | "retired" | "changed" };
+type AttachmentState = { binding: BoundTerminal; state: TerminalBindingState; attempt: number; reconnect?: true }
+  | { binding: null; state: "closed"; attempt: number };
+
+function PanelTerminal(props: Omit<ComponentProps<typeof TerminalView>, "delivery" | "detached">) {
+  const [delivery] = useState(() => new TerminalDelivery());
+  const detached = useRef(Promise.resolve());
+  return props.mounted.key ? <TerminalView key={props.mounted.key} {...props} delivery={delivery} detached={detached} /> : null;
+}
 
 export default function App() {
   const [createOpen, setCreateOpen] = useState(false);
@@ -39,11 +47,14 @@ export default function App() {
   const inventoryRef = useRef<Inventory | null>(null);
   const [external, setExternal] = useState<ReadonlyMap<string, { operationId: string | null; sessionId: string }>>(() => new Map());
   const externalRef = useRef(external);
-  const [attachment, setAttachment] = useState<AttachmentState | null>(null);
-  const attachmentRef = useRef<AttachmentState | null>(null);
-  const updateAttachment = useCallback((next: AttachmentState | null) => {
-    attachmentRef.current = next;
-    setAttachment(next);
+  const [attachments, setAttachments] = useState<ReadonlyMap<string, AttachmentState>>(() => new Map());
+  const attachmentsRef = useRef(attachments);
+  const updateAttachment = useCallback((id: string, value: AttachmentState | null) => {
+    const next = new Map(attachmentsRef.current);
+    if (value) next.set(id, value);
+    else next.delete(id);
+    attachmentsRef.current = next;
+    setAttachments(next);
   }, []);
   const focusRuntime = useRef<string | null>(null);
   const app = useRef<HTMLDivElement>(null);
@@ -56,17 +67,22 @@ export default function App() {
   const [notice, setNotice] = useState("Локальні сесії · процеси працюють незалежно від вкладок.");
   const [closeFault, setCloseFault] = useState<{ runtimeId: string; message: string } | null>(null);
   const activeId = views.active;
-  const delivery = useMemo(() => new TerminalDelivery(), [activeId]);
   const activeRuntime = online ? runtimes.find(runtime => runtime.runtime_id === activeId) : undefined;
   const expected = activeId ? preferences.exposures?.find(record => record.runtimeId === activeId) ?? external.get(activeId) : undefined;
   const inventory = online ? { agent_pid: agentPid, runtimes } : null;
-  const previousBinding = attachment && attachment.binding.terminal.target.runtime_id === activeId ? attachment.binding : null;
-  const mounted = activeId ? mountedTerminal(activeId, inventory, expected, previousBinding,
-    (previousBinding !== null && attachment?.state === "changed") ||
-      preferences.exposures?.some(record => record.runtimeId === activeId && record.state === "closed") === true) : undefined;
-  const terminalKey = mounted?.key;
-  const terminalEpoch = previousBinding?.identity.agentPid ?? agentPid;
-  const activeStatus = mounted?.mode;
+  const panels = views.open.map(id => {
+    const exposure = preferences.exposures?.find(record => record.runtimeId === id);
+    const attachment = attachments.get(id);
+    const previousBinding = attachment?.binding ?? null;
+    const closed = exposure?.state === "closed" || attachment?.state === "closed";
+    const mounted = terminalPanel(views, id, inventory, exposure ?? external.get(id),
+      previousBinding, closed, attachment?.state === "closed" ? undefined : attachment?.state,
+      attachment?.state === "view-closed" && attachment.reconnect && attachment.attempt === selectionRevision.current);
+    return { id, mounted, previousBinding, attempt: attachment?.attempt ?? 0 };
+  });
+  const activePanel = panels.find(panel => panel.id === activeId);
+  const terminalKey = activePanel?.mounted.key;
+  const terminalEpoch = activePanel?.previousBinding?.identity.agentPid ?? agentPid;
 
   function availability(id: string) {
     return viewAvailability(online ? runtimes : null, id,
@@ -91,27 +107,29 @@ export default function App() {
       return next === value.views ? value : { ...value, views: next };
     });
   }, [updatePreferences]);
-  const onBinding = useCallback((binding: BoundTerminal, state: "bound" | "retired" | "changed") => {
-    const id = binding.terminal.target.runtime_id;
-    const current = attachmentRef.current;
-    if (store.current.views.active !== id || !store.current.views.open.includes(id)) return;
-    if (state === "retired") {
-      if (current?.binding === binding && current.state !== "changed") updateAttachment({ binding, state });
-      return;
-    }
-    if (inventoryRef.current?.agent_pid === binding.identity.agentPid) updateAttachment({ binding, state });
-  }, [store, updateAttachment]);
-  const currentAttachment = useCallback((id: string, previous: BoundTerminal | null) => {
-    const { views } = store.current;
+  const currentAttachment = useCallback((id: string, previous: BoundTerminal | null, attempt: number): MountedTerminal => {
+    const record = attachmentsRef.current.get(id);
+    if ((record?.binding ?? null) !== previous || (record?.attempt ?? 0) !== attempt) return { mode: "missing" };
     const exposure = store.exposure(id);
-    if (views.active !== id || !views.open.includes(id) ||
-        (attachmentRef.current?.binding === previous && attachmentRef.current?.state === "changed")) return;
-    return mountedTerminal(id, inventoryRef.current, exposure ?? externalRef.current.get(id),
-      previous, exposure?.state === "closed").intent;
+    return terminalPanel(store.current.views, id, inventoryRef.current, exposure ?? externalRef.current.get(id),
+      previous, exposure?.state === "closed" || record?.state === "closed", record?.state === "closed" ? undefined : record?.state,
+      record?.state === "view-closed" && record.reconnect && record.attempt === selectionRevision.current);
   }, [store]);
-  useLayoutEffect(() => {
-    if (attachmentRef.current && attachmentRef.current.binding.terminal.target.runtime_id !== activeId) updateAttachment(null);
-  }, [activeId, updateAttachment]);
+  const reconnectClosedTerminal = useCallback((id: string, binding: BoundTerminal, attempt: number) => {
+    if (explicitClosedReconnect(currentAttachment(id, binding, attempt)) !== binding) return;
+    updateAttachment(id, { binding, state: "view-closed", attempt: ++selectionRevision.current, reconnect: true });
+  }, [currentAttachment, updateAttachment]);
+  const onBinding = useCallback((binding: BoundTerminal, state: TerminalBindingState, previous: BoundTerminal | null, attempt: number) => {
+    const id = binding.terminal.target.runtime_id;
+    const current = attachmentsRef.current.get(id);
+    if (!store.current.views.open.includes(id) || store.exposure(id)?.state === "closed" ||
+        current?.state === "closed" || current?.state === "changed" || current?.state === "ended" || current?.state === "completed" ||
+        (current?.binding ?? null) !== previous || (current?.attempt ?? 0) !== attempt) return false;
+    if (state === "bound" && (!currentAttachment(id, previous, attempt).intent ||
+        inventoryRef.current?.agent_pid !== binding.identity.agentPid)) return false;
+    updateAttachment(id, { binding, state, attempt });
+    return true;
+  }, [store, currentAttachment, updateAttachment]);
   useEffect(() => {
     if (!isTauri()) return;
     let disposed = false;
@@ -121,6 +139,11 @@ export default function App() {
         const inventory = await localClient.inventory();
         if (disposed) return;
         inventoryRef.current = inventory;
+        for (const [id, record] of attachmentsRef.current) {
+          if (!record.binding) continue;
+          const state = inventoryBindingState(record.binding, record.state, inventory);
+          if (state !== record.state) updateAttachment(id, { ...record, state });
+        }
         for (const runtime of inventory.runtimes) {
           const expected = store.exposure(runtime.runtime_id)?.operationId ?? remembered.current.get(runtime.runtime_id)?.operation_id;
           if (!expected || expected === runtime.operation_id) remembered.current.set(runtime.runtime_id, runtime);
@@ -135,7 +158,7 @@ export default function App() {
     }
     void refresh();
     return () => { disposed = true; clearTimeout(timer); };
-  }, [store]);
+  }, [store, updateAttachment]);
   const focusTerminal = useCallback(() => {
     cancelTerminalFocusRestore();
     (panel.current?.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea") ?? panel.current)?.focus();
@@ -214,7 +237,7 @@ export default function App() {
     }
     remembered.current.set(runtime.runtime_id, runtime);
     if (source === "user") {
-      if (attachmentRef.current?.state === "changed") updateAttachment(null);
+      if (attachmentsRef.current.get(runtime.runtime_id)?.state === "closed") updateAttachment(runtime.runtime_id, null);
       setCloseFault(current => current?.runtimeId === runtime.runtime_id ? null : current);
     }
     if ((source === "submit" || source === "user") && !preserveActive) focusRuntime.current = runtime.runtime_id;
@@ -345,8 +368,9 @@ export default function App() {
     const runtime = sampled?.runtimes.find(entry => entry.runtime_id === id);
     if (!runtime) return;
     const exposure = store.exposure(id);
-    if (store.current.views.active === id && (exposure || external.has(id)) &&
-        mounted?.mode !== "missing" && attachment?.state !== "changed") {
+    const record = attachmentsRef.current.get(id);
+    if (store.current.views.active === id && (exposure || externalRef.current.has(id)) &&
+        !requiresTerminalReopen(record?.state) && currentAttachment(id, record?.binding ?? null, record?.attempt ?? 0).mode !== "missing") {
       focusTerminal();
       return;
     }
@@ -360,28 +384,32 @@ export default function App() {
       setNotice("Не вдалося прочитати збережені вкладки. Повторіть відкриття.");
       return;
     }
-    const decision = inventoryOpen(status, latest, store.exposure(id), "user");
+    const latestRecord = attachmentsRef.current.get(id);
+    const { decision, retry } = explicitTerminalOpen(status, latest, store.exposure(id), latestRecord?.binding ?? null,
+      latestRecord?.state === "closed" ? undefined : latestRecord?.state);
     if (decision === "blocked") {
       setNotice("Не вдалося підтвердити цей термінал. Оновіть запис створення.");
       return;
     }
     if (decision !== "inventory") {
-      showCreated(decision, "user");
-      return;
+      if (!showCreated(decision, "user")) return;
+    } else {
+      approveExternal(latest);
+      if (latestRecord?.state === "closed") updateAttachment(id, null);
+      focusRuntime.current = id;
+      setViews(value => openView(value, id, [id]));
     }
-    approveExternal(latest);
-    if (attachmentRef.current?.state === "changed") updateAttachment(null);
-    focusRuntime.current = id;
-    setViews(value => openView(value, id, [id]));
+    if (retry && latestRecord?.state === "view-closed") reconnectClosedTerminal(id, latestRecord.binding, latestRecord.attempt);
+    if (retry && latestRecord?.state === "retired") updateAttachment(id, { ...latestRecord, attempt: selection });
   }
   function close(id: string) {
     cancelTerminalFocusRestore();
     selectionRevision.current++;
     if (focusRuntime.current === id) focusRuntime.current = null;
     const result = store.close(id);
+    updateAttachment(id, result === "pending" ? { binding: null, state: "closed", attempt: selectionRevision.current } : null);
     setPreferences(store.current);
     if (result === "closed") {
-      if (attachmentRef.current?.binding.terminal.target.runtime_id === id) updateAttachment(null);
       setCloseFault(current => current?.runtimeId === id ? null : current);
       setNotice("Вкладку закрито. Доступні сесії можна відкрити знову зі списку.");
     } else {
@@ -474,22 +502,21 @@ export default function App() {
               updatePreferences(value => ({ ...value, expanded: !value.expanded }));
               focusTerminal();
             }} onReturnFocus={activeId ? focusTerminal : focusSidebar} onFullscreenExit={captureFullscreenFocus} />
-          {views.open.filter(id => id !== activeId).map(id =>
-            <section key={id} id={`panel-${id}`} hidden role="tabpanel" aria-labelledby={`tab-${id}`} />)}
-          {activeId ? <section key={activeId} ref={panel} id={`panel-${activeId}`} tabIndex={-1} className="session-panel"
-            role="tabpanel" aria-labelledby={`tab-${activeId}`}>
-            {terminalKey
-              ? <TerminalView key={terminalKey} runtimeId={activeId} label={`Термінал ${title(activeId)}`}
-                fontSize={fontSize} intent={mounted?.intent} previousBinding={previousBinding} delivery={delivery}
-                currentAttachment={currentAttachment} onBinding={onBinding} />
-              : <div className="empty-state">
-                <h2>{activeStatus === "offline" ? "Агент недоступний" : activeStatus === "exited" ? "Сесія завершена"
-                  : activeStatus === "pending" ? "Перевіряємо запис сесії" : "Сесію не підтверджено"}</h2>
-                <p>{activeStatus === "offline" ? "Вкладка збережена. Оновимо стан після підключення."
-                  : activeStatus === "exited" ? "Процес завершився. Створіть нову сесію для нового запуску."
+          {panels.map(({ id, mounted, previousBinding, attempt }) => <section key={id} ref={id === activeId ? panel : undefined}
+            id={`panel-${id}`} tabIndex={-1} hidden={id !== activeId} className={id === activeId ? "session-panel" : undefined}
+            role="tabpanel" aria-labelledby={`tab-${id}`}>
+            <PanelTerminal runtimeId={id} label={`Термінал ${title(id)}`}
+              fontSize={fontSize} mounted={mounted} previousBinding={previousBinding} attempt={attempt}
+              currentAttachment={currentAttachment} onBinding={onBinding} onReconnectClosed={reconnectClosedTerminal} />
+            {!mounted.key && id === activeId && <div className="empty-state">
+                <h2>{mounted.mode === "offline" ? "Агент недоступний" : mounted.mode === "exited" ? "Сесія завершена"
+                  : mounted.mode === "pending" ? "Перевіряємо запис сесії" : "Сесію не підтверджено"}</h2>
+                <p>{mounted.mode === "offline" ? "Вкладка збережена. Оновимо стан після підключення."
+                  : mounted.mode === "exited" ? "Процес завершився. Створіть нову сесію для нового запуску."
                   : "Вкладка збережена. Стан сесії оновиться, якщо вона з’явиться у списку."}</p>
-              </div>}
-          </section> : <div className="empty-state"><h2>Відкрий сесію зі списку</h2><p>{isTauri() ? "Наявні сесії можна переглядати у вкладках." : "Браузерний перегляд не має доступу до локальних процесів."}</p></div>}
+            </div>}
+          </section>)}
+          {!activeId && <div className="empty-state"><h2>Відкрий сесію зі списку</h2><p>{isTauri() ? "Наявні сесії можна переглядати у вкладках." : "Браузерний перегляд не має доступу до локальних процесів."}</p></div>}
         </div>
         <footer><span>{message}</span></footer>
       </main>
