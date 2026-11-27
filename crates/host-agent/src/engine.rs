@@ -78,8 +78,7 @@ impl PasteBuffer {
     }
 
     fn from_marker(read: &GeometryReadback) -> Option<Self> {
-        if !read.sender_supported || read.epoch.is_none() || parse_uuid(&read.paste_launch).is_err()
-        {
+        if read.epoch.is_none() || parse_uuid(&read.paste_launch).is_err() {
             return None;
         }
         let marker = read
@@ -167,7 +166,10 @@ impl ResizeLane {
             .iter_mut()
             .find(|previous| previous.original.same_pane(&scope.original))
         {
-            if previous.buffer.is_none() {
+            if previous.buffer.is_none()
+                && previous.original.epoch == scope.original.epoch
+                && previous.original.paste_marker == scope.original.paste_marker
+            {
                 previous.buffer = scope.buffer;
             }
         } else {
@@ -201,6 +203,7 @@ struct PasteTest {
     admission: Mutex<Option<Arc<PasteBarrier>>>,
     sender_fixture: bool,
     provider_sample: Option<ProviderSample>,
+    geometry_watchdog: Option<Duration>,
     send_watchdog: Option<Duration>,
 }
 
@@ -854,8 +857,12 @@ impl Engine {
 
     fn terminal_command_watchdog(&self) -> Duration {
         #[cfg(test)]
-        if self.paste_test.sender_fixture {
-            return Duration::from_secs(3);
+        if let Some(watchdog) = self.paste_test.geometry_watchdog.or_else(|| {
+            self.paste_test
+                .sender_fixture
+                .then_some(Duration::from_secs(3))
+        }) {
+            return watchdog;
         }
         PASTE_WATCHDOG
     }
@@ -2319,6 +2326,11 @@ impl Engine {
             let allow_absent = !buffer.requires_deletion(original);
             self.delete_paste(current, &buffer.name, allow_absent)
                 .await?;
+        } else {
+            ensure!(
+                original.paste_ready(),
+                "Original paste custody is unconfirmed"
+            );
         }
         Ok(())
     }
@@ -2963,6 +2975,10 @@ impl Engine {
             return Ok(read);
         };
         lane.retain_paste(PasteScope::sampled(&read));
+        ensure!(
+            read.sender_supported && self.private_sender_socket(),
+            "Paste cleanup unavailable"
+        );
         let requires_deletion = buffer.requires_deletion(&read);
         let fenced = buffer.marker(&read, if requires_deletion { 'f' } else { 'q' });
         if read.paste_marker != fenced {
@@ -3625,6 +3641,28 @@ mod tests {
                 assert!(!text(&f, "last-effect-command").contains("Україна"));
                 let held = text(&f, "marker");
                 for stale in [
+                    PasteBinding {
+                        token: Uuid::new_v4(),
+                        ..b.clone()
+                    },
+                    PasteBinding {
+                        epoch: ResizeEpoch {
+                            owner: Uuid::new_v4(),
+                            ..b.epoch
+                        },
+                        ..b.clone()
+                    },
+                    PasteBinding {
+                        terminal: TerminalView {
+                            view_id: Uuid::new_v4(),
+                            ..b.terminal.clone()
+                        },
+                        ..b.clone()
+                    },
+                    PasteBinding {
+                        sequence: b.sequence + 1,
+                        ..b.clone()
+                    },
                     PasteBinding {
                         incarnation: Uuid::new_v4(),
                         ..b.clone()

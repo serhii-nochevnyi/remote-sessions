@@ -2562,6 +2562,14 @@ set -eu
 cd "$(dirname "$3")"
 token=$(cat generation)
 pid=$(cat pane-pid)
+sender=0
+if test -f paste-tmux; then
+  test "$1" = -N && test "$2" = -S && test "$3" = "$PWD/tmux.sock" && test -S "$3"
+  sender=1
+fi
+read_option() {
+  if test -f "$1"; then cat "$1"; fi
+}
 case "$4" in
   display-message)
     if test "$#" = 8 && test "$6" = -t; then
@@ -2576,8 +2584,9 @@ case "$4" in
         if test -f missing-device && test "$sample" = 1; then device=/dev/pts/999999999; fi
       fi
       nonce=$(cat "$name.nonce")
-      printf '52|101|%s|$0|@0|%%0|%s|%s|0|0|%s:$0:@0:%%0:%s|0|1|1|manual|%s|100|30|100|30|||||0|0\n' \
-        "$token" "$pid" "$name" "$nonce" "$pid" "$device"
+      printf '52|101|%s|$0|@0|%%0|%s|%s|0|0|%s:$0:@0:%%0:%s|0|1|1|manual|%s|100|30|100|30|%s||%s|%s|0|%s\n' \
+        "$token" "$pid" "$name" "$nonce" "$pid" "$device" \
+        "$(read_option epoch)" "$(read_option launch)" "$(read_option marker)" "$sender"
     else
       printf '52|101|%s\n' "$token"
       if test "$#" -gt 6 && test -f names; then cat names; fi
@@ -2591,9 +2600,15 @@ case "$4" in
         test -n "$name" && test -n "$nonce"
         printf '%s\n' "$nonce" > "$name.nonce"
         printf '%s\n' "$name" >> names
+        if test "$sender" = 1; then printf '%s\n' "$name" > active; fi
         printf '$0|@0|%%0|%s\n' "$pid" ;;
-      *) printf '%s\n' "$*" >> unexpected; exit 1 ;;
+      *)
+        if test "$sender" = 1; then exec ./paste-tmux "$@"; fi
+        printf '%s\n' "$*" >> unexpected; exit 1 ;;
     esac ;;
+  list-commands|save-buffer)
+    test "$sender" = 1
+    exec ./paste-tmux "$@" ;;
   show-environment)
     name=${6#=}
     test "$#" = 14 && test "$7" = RS_CREATE_NONCE
@@ -2609,6 +2624,88 @@ case "$4" in
   *) printf '%s\n' "$*" >> unexpected; exit 1 ;;
 esac
 "#;
+
+#[cfg(debug_assertions)]
+const PASTE_HOST_MUTATIONS: &str = r##"#!/usr/bin/env python3
+from pathlib import Path
+import re
+import sys
+
+def read(name):
+    path = Path(name)
+    return path.read_text().strip() if path.exists() else ""
+
+def buffer_path(name):
+    assert re.fullmatch(r"rs-paste-(?:probe-)?[0-9a-f]{32}", name), name
+    return Path(name)
+
+command, *args = sys.argv[4:]
+if command == "list-commands":
+    assert not args
+    print("load-buffer (loadb) [-w] [-b buffer-name] path")
+    print("paste-buffer (pasteb) [-dprS] [-b buffer-name] [-t target-pane]")
+elif command == "save-buffer":
+    flag, buffer, output = args
+    assert (flag, output) == ("-b", "-") and buffer.startswith("rs-paste-probe-")
+    sys.stdout.buffer.write(buffer_path(buffer).read_bytes())
+else:
+    assert command == "if-shell"
+    flag, target, pane, guard, branch, *otherwise = args
+    assert (flag, target, pane) == ("-F", "-t", "%0")
+    pid, name = read("pane-pid"), read("active")
+    nonce = read(name + ".nonce")
+    actual = {
+        "pid": "52", "start_time": "101", "@rs_create_generation": read("generation"),
+        "session_name": name, "session_id": "$0", "window_id": "@0", "pane_id": pane,
+        "window_index": "0", "pane_index": "0", "pane_pid": pid, "pane_tty": read("tty"),
+        "@rs_create_nonce": f"{nonce}:$0:@0:%0:{pid}", "session_windows": "1",
+        "window_panes": "1", "pane_dead": "0", "window-size": "manual",
+        "@rs_resize_epoch": read("epoch"), "version": "3.8", "socket_path": sys.argv[3],
+        "@rs_paste_launch": read("launch"), "@rs_paste_admission": read("marker"),
+        "pane_input_off": "0", "command-error": "",
+    }
+    for hook in ("load-buffer", "save-buffer", "paste-buffer", "delete-buffer",
+                 "send-keys", "set-option", "display-message", "resize-window", "list-buffers"):
+        actual["after-" + hook] = ""
+    guard = re.sub(r"#\{==:#\{([^}]+)\},([^}]*)\}",
+                   lambda match: str(int(actual[match[1]] == match[2])), guard)
+    while "#{" in guard:
+        reduced = re.sub(r"#\{&&:([01]),([01])\}",
+                         lambda match: str(int(match[1] == match[2] == "1")), guard)
+        assert reduced != guard, guard
+        guard = reduced
+    assert guard == "1", (guard, branch, otherwise)
+    for node in branch.split(" ; "):
+        action, *words = node.split()
+        if action == "set-option":
+            option, value = words[-2:]
+            assert words[:-2] in (["-p", "-t", pane], ["-p", "-o", "-t", pane])
+            path = {"@rs_resize_epoch": "epoch", "@rs_paste_launch": "launch",
+                    "@rs_paste_admission": "marker"}[option]
+            if "-o" in words:
+                assert not Path(path).exists()
+            Path(path).write_text(value)
+        elif action == "load-buffer":
+            flag, buffer, source = words
+            assert (flag, source) == ("-b", "-")
+            buffer_path(buffer).write_bytes(sys.stdin.buffer.read())
+        elif action == "delete-buffer":
+            flag, buffer = words
+            assert flag == "-b"
+            buffer_path(buffer).unlink()
+        elif action == "paste-buffer":
+            assert words[:5] == ["-p", "-r", "-S", "-d", "-b"] and words[6:] == ["-t", pane]
+            buffer = buffer_path(words[5])
+            assert read("marker").split("~")[-4] == "s" and read("marker").endswith("~" + buffer.name)
+            with Path("pane-bytes").open("ab") as terminal:
+                terminal.write(buffer.read_bytes())
+            buffer.unlink()
+            with Path("paste-effects").open("ab") as effects:
+                effects.write(b"1")
+        else:
+            assert action == "display-message" and words[:-1] == ["-p", "-l", "-t", pane]
+            print(words[-1])
+"##;
 
 #[cfg(debug_assertions)]
 #[derive(Clone, Copy)]
@@ -2635,20 +2732,13 @@ async fn w1_terminal_eof_real_host_replacement_discards_fifo() {
 }
 
 #[cfg(debug_assertions)]
-async fn check_real_eof_status(outcome: RealEofStatus, standalone: bool) {
-    use remote_sessions_host::{
-        model::{CreateState, PaneLiveness},
-        serve_catalog_fixture,
-    };
+async fn start_catalog_terminal_fixture(
+    host: &AgentFixture,
+    generation: Uuid,
+    tty: &Path,
+) -> (tokio::task::JoinHandle<Result<()>>, Uuid) {
+    use remote_sessions_host::serve_catalog_fixture;
 
-    let host = AgentFixture::new();
-    let attachment = AgentFixture::new();
-    let generation = Uuid::new_v4();
-    let initial = TerminalSize {
-        cols: 100,
-        rows: 30,
-    };
-    let provider = native_pty_system().openpty(pty_size(initial)).unwrap();
     let tmux = host.0.join("tmux");
     fs::write(&tmux, STATUS_HOST_TMUX).unwrap();
     fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
@@ -2657,11 +2747,7 @@ async fn check_real_eof_status(outcome: RealEofStatus, standalone: bool) {
     fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(host.0.join("generation"), generation.to_string()).unwrap();
     fs::write(host.0.join("pane-pid"), std::process::id().to_string()).unwrap();
-    fs::write(
-        host.0.join("tty"),
-        provider.master.tty_name().unwrap().to_str().unwrap(),
-    )
-    .unwrap();
+    fs::write(host.0.join("tty"), tty.to_str().unwrap()).unwrap();
     let project = host.0.join("project");
     fs::create_dir(&project).unwrap();
     let server = tokio::spawn({
@@ -2689,32 +2775,51 @@ async fn check_real_eof_status(outcome: RealEofStatus, standalone: bool) {
     let ProductResponse::WorkspaceRegistered { workspace } = workspace else {
         panic!("expected a registered fixture workspace");
     };
-    let launch = async || {
-        let reply = product_request(
-            &host.0,
-            &ProductRequest::CreateManaged {
-                key: Uuid::new_v4(),
-                workspace_id: workspace.workspace_id,
-                profile: ProviderProfile::Codex,
-                reservation: None,
+    (server, workspace.workspace_id)
+}
+
+#[cfg(debug_assertions)]
+async fn launch_catalog_terminal(host: &AgentFixture, workspace_id: Uuid) -> Runtime {
+    use remote_sessions_host::model::{CreateState, PaneLiveness};
+
+    let reply = product_request(
+        &host.0,
+        &ProductRequest::CreateManaged {
+            key: Uuid::new_v4(),
+            workspace_id,
+            profile: ProviderProfile::Codex,
+            reservation: None,
+        },
+    )
+    .await
+    .unwrap();
+    let ProductResponse::Create {
+        state:
+            CreateState::Confirmed {
+                outcome,
+                current: PaneLiveness::Live,
+                ..
             },
-        )
-        .await
-        .unwrap();
-        let ProductResponse::Create {
-            state:
-                CreateState::Confirmed {
-                    outcome,
-                    current: PaneLiveness::Live,
-                    ..
-                },
-        } = reply
-        else {
-            panic!("expected a catalog-corroborated live pane: {reply:?}");
-        };
-        outcome.runtime
+    } = reply
+    else {
+        panic!("expected a catalog-corroborated live pane: {reply:?}");
     };
-    let original = launch().await;
+    outcome.runtime
+}
+
+#[cfg(debug_assertions)]
+async fn check_real_eof_status(outcome: RealEofStatus, standalone: bool) {
+    let host = AgentFixture::new();
+    let attachment = AgentFixture::new();
+    let generation = Uuid::new_v4();
+    let initial = TerminalSize {
+        cols: 100,
+        rows: 30,
+    };
+    let provider = native_pty_system().openpty(pty_size(initial)).unwrap();
+    let tty = provider.master.tty_name().unwrap();
+    let (server, workspace_id) = start_catalog_terminal_fixture(&host, generation, &tty).await;
+    let original = launch_catalog_terminal(&host, workspace_id).await;
     fs::write(host.0.join("active"), &original.tmux_name).unwrap();
     let runtime_id = original.runtime_id;
     let runtime = runtime_id.to_string();
@@ -2759,7 +2864,7 @@ async fn check_real_eof_status(outcome: RealEofStatus, standalone: bool) {
         read_until_bytes(&bridge, &id, b"buffered attachment output").await,
         b"buffered attachment output"
     );
-    let replacement = launch().await;
+    let replacement = launch_catalog_terminal(&host, workspace_id).await;
     assert_eq!(replacement.pane_id, original.pane_id);
     assert_ne!(replacement.runtime_id, original.runtime_id);
 
@@ -3355,6 +3460,318 @@ async fn w1_terminal_same_token_control_reply_fences_expired_incarnation() {
     check_same_token_renewal(RenewalTiming::Live, true).await;
 }
 
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn w1_terminal_paste_same_token_renewal_accepts_fresh_grant() {
+    let host = AgentFixture::new();
+    let attachment = AgentFixture::new();
+    let generation = Uuid::new_v4();
+    let provider = native_pty_system()
+        .openpty(pty_size(TerminalSize {
+            cols: 100,
+            rows: 30,
+        }))
+        .unwrap();
+    let tty = provider.master.tty_name().unwrap();
+    let _tmux_socket = UnixListener::bind(host.0.join("tmux.sock")).unwrap();
+    let mutations = host.0.join("paste-tmux");
+    fs::write(&mutations, PASTE_HOST_MUTATIONS).unwrap();
+    fs::set_permissions(&mutations, fs::Permissions::from_mode(0o700)).unwrap();
+    let (server, workspace_id) = start_catalog_terminal_fixture(&host, generation, &tty).await;
+    let runtime = launch_catalog_terminal(&host, workspace_id).await;
+    assert!(
+        fs::read_to_string(host.0.join("marker"))
+            .unwrap()
+            .contains("~r~")
+    );
+
+    let tmux = attachment_tmux(&attachment, generation, "ignore-size");
+    let listener = UnixListener::bind(attachment.0.join("agent.sock")).unwrap();
+    let bridge = DesktopBridge::new(Some(attachment.0.clone()), tmux);
+    let park = async || {
+        let (peer, query) = receive(&listener).await;
+        let reply = request(&host.0, &query).await.unwrap();
+        (peer, query, reply)
+    };
+    let forward = async || {
+        let (mut peer, query, reply) = park().await;
+        respond(&mut peer, reply).await;
+        query
+    };
+    let runtime_id = runtime.runtime_id;
+    let runtime = runtime_id.to_string();
+    let attaching = bridge.attach_observer(&runtime);
+    let prove = async {
+        assert!(
+            matches!(forward().await, Request::OpenTerminal { runtime_id: id, .. } if id == runtime_id)
+        );
+        assert!(matches!(forward().await, Request::TerminalStatus { .. }));
+    };
+    let (attached, ()) = tokio::join!(attaching, prove);
+    let id = attached.unwrap().view_id;
+    let view = bridge.view(&id).unwrap();
+
+    let acquiring = refresh_fixture_control(&view);
+    let (mut peer, query, reply) = park().await;
+    assert!(matches!(query, Request::AcquireTerminal { terminal } if terminal == view.terminal));
+    let Response::TerminalControl { token, epoch } = reply else {
+        panic!("expected a real writer grant: {reply:?}");
+    };
+    respond(&mut peer, reply).await;
+    acquiring.await.unwrap();
+
+    let read = async || {
+        view.output.lock().await.refresh_at = Instant::now();
+        let (chunk, query) = tokio::join!(bridge.read(&id), forward());
+        assert!(matches!(query, Request::TerminalStatus { terminal } if terminal == view.terminal));
+        chunk.unwrap()
+    };
+    let paste = async |incarnation: Uuid, operation, action| {
+        bridge
+            .paste(&id, &incarnation.to_string(), operation, action)
+            .await
+    };
+    let send = async |incarnation, operation, action| {
+        tokio::join!(paste(incarnation, operation, action), forward())
+    };
+    let stage = |data: &[u8]| PasteAction::Stage {
+        offset: 0,
+        data: data.into(),
+    };
+    let ack = |receipt: Uuid| PasteAction::Ack {
+        receipt: receipt.to_string(),
+    };
+    let effects = || fs::read(host.0.join("paste-effects")).unwrap_or_default();
+    let first = read().await;
+    assert!(first.writable);
+    assert_eq!(first.paste_admission, None);
+    let old_grant = first.paste_incarnation.unwrap();
+    let first_draft = "first draft ☃".as_bytes();
+    let (staged, request) = send(old_grant, 1, stage(first_draft)).await;
+    assert_eq!(staged, PasteResult::Staged {});
+    let Request::PasteStage {
+        binding: first_binding,
+        offset: 0,
+        data,
+    } = request
+    else {
+        panic!("expected a real paste stage");
+    };
+    assert_eq!(data, first_draft);
+    assert_eq!(first_binding.terminal, view.terminal);
+    assert_eq!((first_binding.token, first_binding.epoch), (token, epoch));
+    assert_eq!((first_binding.sequence, first_binding.operation), (0, 1));
+    assert_ne!(first_binding.incarnation, old_grant);
+    let (committed, request) = send(
+        old_grant,
+        1,
+        PasteAction::Commit {
+            bytes: first_draft.len(),
+        },
+    )
+    .await;
+    assert!(matches!(request, Request::PasteCommit { binding, bytes }
+        if binding == first_binding && bytes == first_draft.len()));
+    let PasteResult::Committed {
+        receipt: first_receipt,
+    } = committed
+    else {
+        panic!("expected the first host receipt: {committed:?}");
+    };
+    let (acknowledged, request) = send(old_grant, 1, ack(first_receipt)).await;
+    assert_eq!(acknowledged, PasteResult::Acknowledged { writable: true });
+    assert!(matches!(request, Request::PasteAck { binding, receipt }
+        if binding == first_binding && receipt == first_receipt));
+    assert_eq!(effects(), b"1");
+    assert_eq!(fs::read(host.0.join("pane-bytes")).unwrap(), first_draft);
+
+    let obsolete = b"old staged draft".as_slice();
+    let (staged, request) = send(old_grant, 2, stage(obsolete)).await;
+    assert_eq!(staged, PasteResult::Staged {});
+    assert!(
+        matches!(request, Request::PasteStage { binding, offset: 0, data }
+        if binding == (PasteBinding { operation: 2, sequence: 1, ..first_binding.clone() })
+            && data == obsolete)
+    );
+    let old_deadline = {
+        let mut control = view.control.lock().await;
+        let lease = control.lease.as_mut().unwrap();
+        lease.deadline = Instant::now();
+        let deadline = lease.deadline;
+        view.publish_control(&control);
+        deadline
+    };
+    let native_clock = Cell::new(old_deadline - Duration::from_secs(1));
+    let mut renewing = std::pin::pin!(refresh_control_with_clock(&view, || native_clock.get()));
+    let (mut peer, query, reply) = tokio::select! {
+        parked = park() => parked,
+        () = &mut renewing => panic!("renewal settled before the accepted reply was parked"),
+    };
+    assert!(
+        matches!(query, Request::Renew { runtime_id: id, token: current }
+        if id == runtime_id && current == token)
+    );
+    assert!(matches!(reply, Response::Accepted {}));
+    native_clock.set(old_deadline);
+    let expired = read().await;
+    assert!(!expired.writable && expired.paste_incarnation.is_none());
+    respond(&mut peer, reply).await;
+    renewing.await;
+    let renewed = read().await;
+    assert!(renewed.writable && renewed.paste_admission.is_none());
+    let fresh_grant = renewed.paste_incarnation.unwrap();
+    assert_ne!(fresh_grant, old_grant);
+    assert_ne!(fresh_grant, first_binding.incarnation);
+
+    let fresh_draft = "fresh draft ї".as_bytes();
+    for (capture, operation, action) in [
+        (old_grant, 3, stage(fresh_draft)),
+        (
+            old_grant,
+            2,
+            PasteAction::Commit {
+                bytes: obsolete.len(),
+            },
+        ),
+        (
+            fresh_grant,
+            2,
+            PasteAction::Commit {
+                bytes: obsolete.len(),
+            },
+        ),
+        (
+            fresh_grant,
+            2,
+            PasteAction::Stage {
+                offset: obsolete.len(),
+                data: b"x".into(),
+            },
+        ),
+        (fresh_grant, 2, stage(obsolete)),
+        (
+            fresh_grant,
+            3,
+            PasteAction::Commit {
+                bytes: fresh_draft.len(),
+            },
+        ),
+    ] {
+        assert_eq!(
+            paste(capture, operation, action).await,
+            PasteResult::Stale {}
+        );
+    }
+    assert_no_fixture_request(&listener).await;
+    assert_eq!(effects(), b"1");
+
+    let (staged, request) = send(fresh_grant, 3, stage(fresh_draft)).await;
+    assert_eq!(staged, PasteResult::Staged {});
+    let expected_binding = PasteBinding {
+        operation: 3,
+        sequence: 1,
+        ..first_binding
+    };
+    assert!(
+        matches!(request, Request::PasteStage { binding, offset: 0, data }
+        if binding == expected_binding && data == fresh_draft)
+    );
+    let mut committing = std::pin::pin!(paste(
+        fresh_grant,
+        3,
+        PasteAction::Commit {
+            bytes: fresh_draft.len()
+        }
+    ));
+    let (mut peer, query, reply) = tokio::select! {
+        parked = park() => parked,
+        result = &mut committing => panic!("fresh Commit settled before the host reply was parked: {result:?}"),
+    };
+    let Request::PasteCommit {
+        binding: fresh_binding,
+        bytes,
+    } = query
+    else {
+        panic!("expected the real fresh Commit");
+    };
+    assert_eq!(
+        (fresh_binding.clone(), bytes),
+        (expected_binding, fresh_draft.len())
+    );
+    let Response::Paste {
+        paste: PasteResult::Committed {
+            receipt: fresh_receipt,
+        },
+    } = reply
+    else {
+        panic!("expected the fresh host receipt: {reply:?}");
+    };
+    assert_ne!(fresh_receipt, first_receipt);
+    let pending = tokio::time::timeout(Duration::from_secs(2), read())
+        .await
+        .unwrap();
+    let fresh_gesture = PasteCompletion {
+        incarnation: fresh_grant,
+        operation: 3,
+    };
+    assert_eq!(pending.paste_completion, Some(fresh_gesture));
+    assert!(!pending.writable && pending.paste_incarnation.is_none());
+    assert_eq!(pending.paste_admission, None);
+    assert_eq!(effects(), b"11");
+    respond(&mut peer, reply).await;
+    assert_eq!(
+        committing.await,
+        PasteResult::Committed {
+            receipt: fresh_receipt
+        }
+    );
+
+    refresh_control(&view).await;
+    for (capture, operation, receipt) in [
+        (old_grant, 3, fresh_receipt),
+        (fresh_binding.incarnation, 3, fresh_receipt),
+        (fresh_grant, 2, fresh_receipt),
+        (fresh_grant, 3, first_receipt),
+    ] {
+        assert_eq!(
+            paste(capture, operation, ack(receipt)).await,
+            PasteResult::Stale {}
+        );
+    }
+    assert_no_fixture_request(&listener).await;
+    let pending = read().await;
+    assert_eq!(pending.paste_completion, Some(fresh_gesture));
+    assert_eq!(pending.paste_admission, None);
+    let (acknowledged, request) = send(fresh_grant, 3, ack(fresh_receipt)).await;
+    assert_eq!(acknowledged, PasteResult::Acknowledged { writable: true });
+    assert!(matches!(request, Request::PasteAck { binding, receipt }
+        if binding == fresh_binding && receipt == fresh_receipt));
+    assert_eq!(
+        paste(fresh_grant, 3, ack(fresh_receipt)).await,
+        PasteResult::Stale {}
+    );
+    assert_no_fixture_request(&listener).await;
+    let settled = read().await;
+    assert!(settled.writable && settled.paste_completion.is_none());
+    assert_eq!(settled.paste_incarnation, Some(fresh_grant));
+    assert_eq!(settled.paste_admission, None);
+    assert_eq!(effects(), b"11");
+    assert_eq!(
+        fs::read(host.0.join("pane-bytes")).unwrap(),
+        [first_draft, fresh_draft].concat()
+    );
+
+    bridge.detach(&id);
+    assert!(
+        matches!(forward().await, Request::Release { runtime_id: id, token: current }
+        if id == runtime_id && current == token)
+    );
+    until(|| allocation_counts(&bridge) == (0, 0)).await;
+    assert!(!host.0.join("unexpected").exists());
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}
+
 async fn check_same_token_renewal(timing: RenewalTiming, terminal_control_reply: bool) {
     use std::{future::Future, task::Poll};
 
@@ -3473,13 +3890,17 @@ async fn w1_terminal_pending_paste_denies_ordinary_input_and_keeps_its_receipt()
     let (view, reader, _) = controlled_view(&bridge, &target(), Uuid::new_v4(), 0);
     let id = view.terminal.view_id.to_string();
     let (token, epoch, incarnation) = grant_fixture_writer(&listener, &bridge, &view).await;
+    let wire_incarnation = {
+        let control = view.control.lock().await;
+        control.lease.as_ref().unwrap().paste_wire_incarnation
+    };
     let incarnation_id = incarnation.to_string();
     let operation = 1;
     let binding = PasteBinding {
         terminal: view.terminal.clone(),
         token,
         epoch,
-        incarnation,
+        incarnation: wire_incarnation,
         operation,
         sequence: 0,
     };
