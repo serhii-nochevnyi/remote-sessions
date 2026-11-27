@@ -105,11 +105,100 @@ impl TerminalRestoration {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum NativeRejection {
+    ViewDetached {
+        view_id: Uuid,
+        rejection_id: Uuid,
+        event_time_us: u64,
+        command: TerminalCommand,
+        stage: TerminalStage,
+    },
     StaleInput {
         view_id: Uuid,
         rejection_id: Uuid,
         event_time_us: u64,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalCommand {
+    TerminalInput,
+    TerminalRead,
+    TerminalAcknowledgeGrid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalStage {
+    Input,
+    Read,
+    Acknowledge,
+}
+
+#[derive(Debug)]
+struct Detached(NativeRejection);
+
+impl std::fmt::Display for Detached {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("View detached")
+    }
+}
+
+impl std::error::Error for Detached {}
+
+impl TerminalCommand {
+    fn stage(self) -> TerminalStage {
+        match self {
+            Self::TerminalInput => TerminalStage::Input,
+            Self::TerminalRead => TerminalStage::Read,
+            Self::TerminalAcknowledgeGrid => TerminalStage::Acknowledge,
+        }
+    }
+}
+
+fn detached(view_id: Uuid, command: TerminalCommand) -> anyhow::Error {
+    match sample_clock() {
+        Ok(event_time_us) if event_time_us > 0 && !view_id.is_nil() => {
+            Detached(NativeRejection::ViewDetached {
+                view_id,
+                rejection_id: Uuid::new_v4(),
+                event_time_us,
+                command,
+                stage: command.stage(),
+            })
+            .into()
+        }
+        _ => anyhow::anyhow!("View detached"),
+    }
+}
+
+pub fn terminal_rejection(
+    error: anyhow::Error,
+    diagnostic: Option<bool>,
+    trace: bool,
+) -> (TerminalInputError, Option<String>) {
+    if diagnostic == Some(true)
+        && trace
+        && let Some(cause) = error.downcast_ref::<Detached>()
+        && let NativeRejection::ViewDetached {
+            view_id,
+            rejection_id,
+            event_time_us,
+            command,
+            stage,
+        } = &cause.0
+        && !view_id.is_nil()
+        && !rejection_id.is_nil()
+        && *event_time_us > 0
+        && command.stage() == *stage
+        && let Ok(observation) = encode_local_observation(&cause.0)
+    {
+        return (
+            TerminalInputError::Rejected(cause.0.clone()),
+            Some(observation),
+        );
+    }
+    (TerminalInputError::from(error), None)
 }
 
 #[derive(Debug)]
@@ -888,7 +977,10 @@ impl PendingRead<'_> {
                     ..Chunk::empty()
                 })
             }
-            Some(_) if result.is_ok() => bail!("View detached"),
+            Some(_) if result.is_ok() => Err(detached(
+                self.view.terminal.view_id,
+                TerminalCommand::TerminalRead,
+            )),
             _ => result,
         }
     }
@@ -1930,6 +2022,17 @@ impl DesktopBridge {
             .context("View detached")
     }
 
+    fn command_view(&self, view_id: &str, command: TerminalCommand) -> Result<Arc<View>> {
+        let id = Uuid::parse_str(view_id).context("View detached")?;
+        self.views
+            .lock()
+            .unwrap()
+            .live
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| detached(id, command))
+    }
+
     pub fn attachment_pid(&self, view_id: &str) -> Result<u32> {
         Ok(self.view(view_id)?.client_pid)
     }
@@ -1962,7 +2065,7 @@ impl DesktopBridge {
                     .notices
                     .iter()
                     .position(|notice| notice.view == id)
-                    .context("View detached")?;
+                    .ok_or_else(|| detached(id, TerminalCommand::TerminalRead))?;
                 return Ok(Chunk::closed(views.notices.remove(index).unwrap().closure));
             };
             ensure!(
@@ -1984,7 +2087,7 @@ impl DesktopBridge {
             };
             tokio::select! {
                 biased;
-                _ = view.discarded() => Err(anyhow::anyhow!("View detached")),
+                _ = view.discarded() => Err(detached(id, TerminalCommand::TerminalRead)),
                 result = read_chunk(&view, &mut output, now) => result,
             }
         };
@@ -2108,7 +2211,16 @@ impl DesktopBridge {
         acknowledgement: GridAcknowledgement,
         now: impl Fn() -> Instant,
     ) -> Result<GeometryEvent> {
-        let view = self.view(view_id)?;
+        let command = TerminalCommand::TerminalAcknowledgeGrid;
+        let view = self.command_view(view_id, command)?;
+        let detached = || detached(view.terminal.view_id, command);
+        let boundary_unavailable = || {
+            if view.closed() {
+                detached()
+            } else {
+                anyhow::anyhow!("View detached")
+            }
+        };
         let mut output = view
             .output
             .try_lock()
@@ -2136,7 +2248,7 @@ impl DesktopBridge {
         };
         let result = tokio::select! {
             biased;
-            _ = view.retired() => Err(anyhow::anyhow!("View detached")),
+            _ = view.retired() => Err(detached()),
             result = redraw => result,
         };
         let (event, successor) = match result {
@@ -2159,10 +2271,9 @@ impl DesktopBridge {
             }
         }
         let mut views = self.views.lock().unwrap();
-        ensure!(
-            view.reader_state.load(Ordering::Acquire) == PAUSE,
-            "View detached"
-        );
+        if view.reader_state.load(Ordering::Acquire) != PAUSE {
+            return Err(boundary_unavailable());
+        }
         if let Err(error) = drain_budget(output.drain_started, now()) {
             view.retire_locked(
                 &mut views,
@@ -2173,7 +2284,7 @@ impl DesktopBridge {
         if successor.is_none() {
             view.reader_state
                 .compare_exchange(PAUSE, RESUME, Ordering::AcqRel, Ordering::Acquire)
-                .map_err(|_| anyhow::anyhow!("View detached"))?;
+                .map_err(|_| boundary_unavailable())?;
             output.drain_started = None;
             view.drain_revision.store(0, Ordering::Relaxed);
         }
@@ -2196,9 +2307,12 @@ impl DesktopBridge {
             "Input must contain 1..4096 bytes"
         );
         let incarnation = Uuid::parse_str(incarnation).context("Некоректна прив’язка вводу")?;
-        let view = self.view(view_id)?;
+        let command = TerminalCommand::TerminalInput;
+        let view = self.command_view(view_id, command)?;
         let mut control = view.control.lock().await;
-        ensure!(!view.closed(), "View detached");
+        if view.closed() {
+            return Err(detached(view.terminal.view_id, command));
+        }
         let lease = control.lease.as_mut().context("Керування ще не отримано")?;
         ensure!(lease.writable(Instant::now()), "Керування втрачено");
         if lease.incarnation != incarnation {
@@ -2698,6 +2812,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn w1_terminal_native_detached_trace_identity() {
+        let ipc = PasteIpc::new();
+        let (view, _output) = ipc.attach();
+        let view_id = view.terminal.view_id;
+        let id = view_id.to_string();
+        ipc.bridge.detach(&id);
+        let acknowledgement = GridAcknowledgement {
+            renderer_id: Uuid::new_v4(),
+            epoch: None,
+            revision: 0,
+            size: TerminalSize {
+                cols: 100,
+                rows: 30,
+            },
+            focused: false,
+        };
+        let mut identities = std::collections::HashSet::new();
+        for (diagnostic, trace) in [
+            (None, true),
+            (Some(false), true),
+            (Some(true), false),
+            (Some(true), true),
+        ] {
+            let before = sample_clock().unwrap();
+            let errors = [
+                (
+                    ipc.bridge
+                        .input(&id, vec![b'x'], &Uuid::new_v4().to_string(), false)
+                        .await
+                        .err()
+                        .unwrap(),
+                    "terminal_input",
+                    "input",
+                ),
+                (
+                    ipc.bridge.read(&id).await.err().unwrap(),
+                    "terminal_read",
+                    "read",
+                ),
+                (
+                    ipc.bridge
+                        .acknowledge_grid(&id, acknowledgement)
+                        .await
+                        .err()
+                        .unwrap(),
+                    "terminal_acknowledge_grid",
+                    "acknowledge",
+                ),
+            ];
+            let after = sample_clock().unwrap();
+            for (error, command, stage) in errors {
+                assert_eq!(error.to_string(), "View detached");
+                let (value, observation) = terminal_rejection(error, diagnostic, trace);
+                let frame = encode_local_observation(&value).unwrap();
+                if diagnostic == Some(true) && trace {
+                    let TerminalInputError::Rejected(NativeRejection::ViewDetached {
+                        view_id: observed_view,
+                        rejection_id,
+                        event_time_us,
+                        ..
+                    }) = value
+                    else {
+                        panic!("expected detached rejection");
+                    };
+                    assert_eq!(observed_view, view_id);
+                    assert!(!rejection_id.is_nil() && identities.insert(rejection_id));
+                    assert!((before..=after).contains(&event_time_us));
+                    assert_eq!(observation.as_deref(), Some(frame.as_str()));
+                    assert_eq!(
+                        frame,
+                        format!(
+                            r#"{{"reason":"view_detached","view_id":"{view_id}","rejection_id":"{rejection_id}","event_time_us":{event_time_us},"command":"{command}","stage":"{stage}"}}"#
+                        )
+                    );
+                } else {
+                    assert_eq!(frame, r#""View detached""#);
+                    assert_eq!(observation, None);
+                }
+            }
+        }
+        for error in [
+            anyhow::anyhow!("View detached"),
+            anyhow::anyhow!("Unrelated error"),
+            Detached(NativeRejection::ViewDetached {
+                view_id,
+                rejection_id: Uuid::nil(),
+                event_time_us: 0,
+                command: TerminalCommand::TerminalRead,
+                stage: TerminalStage::Read,
+            })
+            .into(),
+            ipc.bridge.read("invalid view").await.err().unwrap(),
+        ] {
+            let (value, observation) = terminal_rejection(error, Some(true), true);
+            assert!(matches!(value, TerminalInputError::Message(_)));
+            assert_eq!(observation, None);
+        }
+    }
+
+    #[tokio::test]
     async fn w1_terminal_native_rejection_metadata() {
         let ipc = PasteIpc::new();
         let (view, _output) = ipc.attach();
@@ -2718,14 +2932,16 @@ mod tests {
             view_id,
             rejection_id,
             event_time_us,
-        } = rejection;
+        } = rejection
+        else {
+            panic!("expected stale input rejection");
+        };
         assert_eq!(view_id, view.terminal.view_id);
         assert!(!rejection_id.is_nil());
         assert!((before..=after).contains(&event_time_us));
-        assert_eq!(
-            encode_local_observation(&TerminalInputError::from(stale)).unwrap(),
-            rejection_frame
-        );
+        let (value, observation) = terminal_rejection(stale, None, true);
+        assert_eq!(encode_local_observation(&value).unwrap(), rejection_frame);
+        assert_eq!(observation, None);
         assert_eq!(
             rejection_frame,
             format!(

@@ -49,7 +49,12 @@ NATIVE_FINAL_RECORD_SECONDS = 7200
 NATIVE_FIXTURE_GRACE_SECONDS = 60
 CLEANUP_NS = 2_000_000_000
 STALE_INPUT = {'victim': b'RS-SPECTATOR-STALE\r', 'owner': b'RS-WRITER-STALE\r'}
-TRACE_STAGE = {'victim': 'acknowledge', 'owner': 'read'}
+RETIRED_CALLS = {
+    'victim': (('terminal_input', 'input'), ('terminal_acknowledge_grid', 'acknowledge')),
+    'owner': (('terminal_input', 'input'), ('terminal_read', 'read')),
+}
+REJECTION_FIELDS = 'reason view_id rejection_id event_time_us command stage'
+INSPECTOR_TICK_NS = 1_000_000
 SYNTHETIC_INCARNATION = '00000000-0000-4000-8000-000000000001'
 PS_START = re.compile(r'[A-Z][a-z]{2} [A-Z][a-z]{2}\s[ 0-9][0-9] \d\d:\d\d:\d\d \d{4}')
 
@@ -165,12 +170,13 @@ def capture_json(path, expected_sha256=None):
     if expected_sha256 is not None and hashlib.sha256(data).hexdigest() != expected_sha256:
         raise ProvenanceHold('build record differs from the independently retained producer digest')
 
-    def unique(pairs):
-        fields = dict(pairs)
-        need(len(fields) == len(pairs), 'duplicate evidence key')
-        return fields
+    return json.loads(data, object_pairs_hook=unique_evidence_fields)
 
-    return json.loads(data, object_pairs_hook=unique)
+
+def unique_evidence_fields(pairs):
+    fields = dict(pairs)
+    need(len(fields) == len(pairs), 'duplicate evidence key')
+    return fields
 
 
 def write_json(path, record, replace=False):
@@ -313,14 +319,44 @@ def versions(build, tmux):
 
 def sample_clock():
     before = ns()
-    wall_us = time.time_ns() // 1000
+    wall_ns = time.time_ns()
     after = ns()
-    return {'mono_ns': (before + after) // 2, 'wall_us': wall_us}
+    return {'mono_ns': (before + after) // 2, 'wall_us': wall_ns // 1000,
+            'wall_ns': wall_ns, 'before_ns': before, 'after_ns': after}
 
 
 def mono(at_us, anchor):
     need(positive(at_us), 'invalid observation timestamp')
     return anchor['mono_ns'] + (at_us - anchor['wall_us']) * 1000
+
+
+def wall_interval(wall_ns, width_ns, anchor):
+    need(all(positive(anchor.get(field)) for field in ('before_ns', 'after_ns', 'wall_ns')),
+         'native clock anchor is incomplete')
+    lower = anchor['before_ns'] - anchor['wall_ns']
+    upper = anchor['after_ns'] - anchor['wall_ns']
+    need(0 <= upper - lower <= INSPECTOR_TICK_NS, 'native clock anchor is imprecise')
+    return wall_ns + lower, wall_ns + width_ns + upper
+
+
+def corroborate_clock(anchor, later):
+    lower = min(anchor['before_ns'] - anchor['wall_ns'], later['before_ns'] - later['wall_ns'])
+    upper = max(anchor['after_ns'] - anchor['wall_ns'], later['after_ns'] - later['wall_ns'])
+    need(0 <= upper - lower <= INSPECTOR_TICK_NS, 'wall and monotonic clocks drifted during invocation')
+    return {**anchor, 'before_ns': anchor['wall_ns'] + lower, 'after_ns': anchor['wall_ns'] + upper}
+
+
+def inspector_interval(ms, anchor):
+    return wall_interval((ms - 1) * INSPECTOR_TICK_NS, 2 * INSPECTOR_TICK_NS, anchor)
+
+
+def detached_rejection(value):
+    item = exact(value, REJECTION_FIELDS)
+    need(item['reason'] == 'view_detached' and uuid_text(item['view_id'])
+         and uuid_text(item['rejection_id']) and positive(item['event_time_us'])
+         and any((item['command'], item['stage']) in calls for calls in RETIRED_CALLS.values()),
+         'invalid native rejection metadata')
+    return item
 
 
 def fixture(state):
@@ -425,8 +461,10 @@ class Trace:
         self.grids = []
         self._providers = {}
         self.failures = []
-        self.retired_witness = None
-        self.detached_failure = None
+        self.rejections = []
+        self._file_identity = None
+        self._size = 0
+        self._modified_ns = None
 
     def provider_samples(self):
         for first, latest in self._providers.values():
@@ -449,12 +487,58 @@ class Trace:
             elif sampled_at > latest['provider']['sampled_at_us']:
                 self._providers[identity] = (first, item)
 
-    def read(self):
-        with (nullcontext(self.stream) if self.stream is not None else self.path.open('rb')) as stream:
+    def _open(self):
+        if self.stream is not None:
+            return nullcontext(self.stream)
+        descriptor = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        return os.fdopen(descriptor, 'rb')
+
+    def _check_stream(self, stream):
+        info = os.fstat(stream.fileno())
+        named = self.path.lstat()
+        identity = info.st_dev, info.st_ino
+        need(stat.S_ISREG(info.st_mode) and os.path.samestat(info, named)
+             and (self._file_identity is None or self._file_identity == identity)
+             and (info.st_size > self._size or info.st_size == self._size
+                  and self._modified_ns in (None, info.st_mtime_ns)), 'native log stream changed')
+        self._file_identity = identity
+        self._size = info.st_size
+        self._modified_ns = info.st_mtime_ns
+        return info.st_size
+
+    def boundary(self):
+        try:
+            with self._open() as stream:
+                end = self._check_stream(stream)
+                start = max(self.offset, end - MAX_RECORD)
+                stream.seek(start)
+                suffix = stream.read(end - start)
+                need(len(suffix) == end - start, 'native log boundary unavailable')
+                newline = suffix.rfind(b'\n')
+                need(newline >= 0 or len(suffix) < MAX_RECORD, 'oversized native diagnostic record')
+                return start + newline + 1 if newline >= 0 else self.offset
+        except (OSError, ValueError) as error:
+            raise ProofError('native log boundary unavailable') from error
+
+    def read(self, boundary=None):
+        try:
+            return self._read_batch(boundary)
+        except (OSError, ValueError) as error:
+            raise ProofError('native log stream unavailable or malformed') from error
+
+    def _read_batch(self, boundary):
+        with self._open() as stream:
+            end = self._check_stream(stream)
+            if boundary is not None:
+                need(self.offset <= boundary <= end, 'native log boundary unavailable')
+                end = boundary
             stream.seek(self.offset)
+            batch_start = self.offset
             for _ in range(8192):
                 start = stream.tell()
-                line = stream.readline(MAX_RECORD + 1)
+                if start >= end or start - batch_start >= 4 * 1024 * 1024:
+                    break
+                line = stream.readline(min(MAX_RECORD + 1, end - start))
                 if not line or not line.endswith(b'\n'):
                     need(len(line) < MAX_RECORD, 'oversized native diagnostic record')
                     break
@@ -463,9 +547,9 @@ class Trace:
                 if not line.startswith(PREFIX):
                     continue
                 kind, _, payload = line[len(PREFIX):].partition(b' ')
-                if kind not in (b'PRESSURE', b'GRID', b'PROVIDER', b'FAILURE'):
+                if kind not in (b'PRESSURE', b'GRID', b'PROVIDER', b'FAILURE', b'REJECTION'):
                     continue
-                item = json.loads(payload)
+                item = json.loads(payload, object_pairs_hook=unique_evidence_fields)
                 need(isinstance(item, dict), 'invalid diagnostic payload')
                 if kind == b'PRESSURE':
                     fields = 'event view_id pid at_us'
@@ -483,19 +567,48 @@ class Trace:
                     self.grids.append(grid_observation(item))
                 elif kind == b'PROVIDER':
                     self._retain_provider(status(item))
+                elif kind == b'REJECTION':
+                    self.rejections.append((detached_rejection(item), start, self.offset))
                 else:
                     exact(item, 'view_id stage reason')
                     if item['reason'] == 'stream_closed' and item['stage'] in ('read', 'renderer_detach'):
                         need(uuid_text(item['view_id']), 'invalid stream closure identity')
                         self.failures.append(item)
-                    if (item['reason'] == 'view_detached'
-                            and (item['view_id'], item['stage']) == self.retired_witness
-                            and self.detached_failure is None):
-                        self.detached_failure = {**item, 'offset': start, 'end_offset': self.offset,
-                                                 'observed_ns': ns()}
-        need(len(self.pressure) <= 128 and len(self.grids) <= 256
-             and len(self.failures) <= 256, 'too many debug observations')
+                need(len(self.pressure) <= 128 and len(self.grids) <= 256
+                     and len(self.failures) <= 256 and len(self.rejections) <= 256, 'too many debug observations')
+            self._check_stream(stream)
         return self
+
+
+def catch_up_role_logs(traces, deadline):
+    need(time.monotonic() < deadline, 'native log catch-up deadline expired')
+    boundaries = [trace.boundary() for trace in traces]
+    while True:
+        need(time.monotonic() < deadline, 'native log catch-up deadline expired')
+        pending = [(trace, end) for trace, end in zip(traces, boundaries) if trace.offset < end]
+        if not pending:
+            return
+        for trace, end in pending:
+            need(time.monotonic() < deadline, 'native log catch-up deadline expired')
+            previous = trace.offset
+            trace.read(end)
+            need(trace.offset > previous, 'native log boundary made no progress')
+
+
+def wait_native_record(read_record, traces, budget, message):
+    deadline = time.monotonic() + budget
+
+    def poll():
+        for trace in traces:
+            trace.read()
+        record = read_record()
+        if record is None:
+            return None
+        received = ns()
+        catch_up_role_logs(traces, deadline)
+        return record, received
+
+    return wait(poll, deadline - time.monotonic(), message)
 
 
 def grid_observation(item):
@@ -1107,8 +1220,8 @@ def committed_key(record):
     return record['terminal']['target'], record['terminal']['agent_epoch'], record['epoch'], record['committed']
 
 
-def native_preflight(lab, path, anchor, run_id, expected, owner, victim, opened):
-    pause = exact(capture_json(path), 'run_id paused_at_ns owner_view victim_view owner_renderer victim_renderer '
+def native_preflight(lab, record, anchor, run_id, expected, owner, victim, opened):
+    pause = exact(record, 'run_id paused_at_ns owner_view victim_view owner_renderer victim_renderer '
                   'inspector continue_enabled step_enabled no_pending_boundary')
     need(pause['run_id'] == run_id and pause['inspector'] == 'immediate_pause_requested'
          and all(pause[key] is True for key in ('continue_enabled', 'step_enabled', 'no_pending_boundary'))
@@ -1116,8 +1229,8 @@ def native_preflight(lab, path, anchor, run_id, expected, owner, victim, opened)
     for suffix in ('view', 'renderer'):
         need(uuid_text(pause[f'owner_{suffix}']) and uuid_text(pause[f'victim_{suffix}'])
              and pause[f'owner_{suffix}'] != pause[f'victim_{suffix}'], 'pre-pressure view scopes must be distinct')
-    owner_grid = raw_grid(owner.read(), expected, pause['owner_view'], pause['owner_renderer'])
-    victim_grid = raw_grid(victim.read(), expected, pause['victim_view'], pause['victim_renderer'])
+    owner_grid = raw_grid(owner, expected, pause['owner_view'], pause['owner_renderer'])
+    victim_grid = raw_grid(victim, expected, pause['victim_view'], pause['victim_renderer'])
     for right in reversed(victim_grid):
         right_status = right['event']['status']
         for left in reversed(owner_grid):
@@ -1305,26 +1418,60 @@ def validate_capture(record, run_id, role, app, trace, expected, anchor, opened,
     return grid
 
 
-def validate_invocation(record, capture, gate, trace, received):
+def validate_invocation(record, capture, gate, trace, received, anchor, used_ids, role):
     fields = ('run_id capture_id inspector_target inspector_window window app view_id renderer_id target epoch '
               'read_sample_us grant_sha256')
-    exact(record, fields + ' invoked_ns finished_ns input_result traced_result traced_stage')
+    exact(record, fields + ' calls clock_ticks')
     need(all(record[key] == capture[key] for key in fields.split())
-         and gate['capture_id'] == capture['capture_id']
-         and gate['inspector_target'] == capture['inspector_target']
-         and gate['inspector_window'] == capture['inspector_window'],
+         and capture['app']['role'] == role and trace.path == Path(capture['app']['stderr'])
+         and all(gate[key] == capture[key] for key in
+                 ('run_id', 'capture_id', 'inspector_target', 'inspector_window')),
          'retired input did not use the original capture and Inspector page')
-    first, last = record['invoked_ns'], record['finished_ns']
-    need(positive(first) and positive(last) and gate['issued_ns'] < first <= last <= received
-         and last - first <= 10_000_000_000 and record['input_result'] == record['traced_result'] == 'View detached'
-         and record['traced_stage'] == TRACE_STAGE[capture['app']['role']], 'retired native input was not rejected')
-    failure = trace.detached_failure
-    need(failure is not None and failure['view_id'] == capture['view_id']
-         and failure['stage'] == record['traced_stage'] and failure['reason'] == 'view_detached'
-         and gate['log_cursor'] <= failure['offset'] < failure['end_offset'] <= trace.offset
-         and first <= failure['observed_ns'] <= received,
-         'retired input lacks its original native command trace')
-    return failure
+    ticks = record['clock_ticks']
+    need(isinstance(ticks, list) and len(ticks) == 3 and all(positive(tick) for tick in ticks)
+         and ticks[1] == ticks[0] + 1 and ticks[2] == ticks[1] + 1,
+         'Inspector wall clock precision was not observed')
+    calibration = inspector_interval(ticks[0], anchor)
+    need(gate['issued_ns'] < calibration[0], 'Inspector clock calibration predates the invocation gate')
+    calls = record['calls']
+    expected = RETIRED_CALLS[role]
+    need(isinstance(calls, list) and len(calls) == len(expected), 'missing retired native calls')
+    role_rejections = [(item, start, end) for item, start, end in trace.rejections
+                       if item['view_id'] == capture['view_id'] and start >= gate['log_cursor']]
+    need(len(role_rejections) == len(expected), 'unexpected number of role-owned native rejections')
+    previous_end = gate['issued_ns']
+    previous_offset = gate['log_cursor']
+    identities = set()
+    witnesses = []
+    for call, (command, stage) in zip(calls, expected):
+        exact(call, 'command before_ms after_ms rejection')
+        need(call['command'] == command and positive(call['before_ms']) and positive(call['after_ms'])
+             and ticks[-1] <= call['before_ms'] <= call['after_ms'], 'invalid retired native call')
+        before = inspector_interval(call['before_ms'], anchor)
+        after = inspector_interval(call['after_ms'], anchor)
+        need(previous_end < before[0] <= before[1] < after[0] <= after[1] <= received
+             and after[1] - before[0] <= 10_000_000_000, 'ambiguous retired native call window')
+        rejection = detached_rejection(call['rejection'])
+        identity = rejection['rejection_id']
+        event = wall_interval(rejection['event_time_us'] * 1000, 1000, anchor)
+        need(identity not in used_ids and identity not in identities
+             and rejection['view_id'] == capture['view_id']
+             and (rejection['command'], rejection['stage']) == (command, stage)
+             and before[1] <= event[0] <= event[1] <= after[0],
+             'native rejection falls outside its own retired call')
+        matches = [(item, start, end) for item, start, end in trace.rejections
+                   if item['rejection_id'] == identity]
+        need(len(matches) == 1, 'retired native call lacks a unique role-owned rejection')
+        item, start, end = matches[0]
+        need(item == rejection and previous_offset <= start < end <= trace.offset,
+             'retired native rejection does not match the gated call')
+        identities.add(identity)
+        witnesses.append({'rejection': item, 'offset': start, 'end_offset': end,
+                          'before_ns': list(before), 'after_ns': list(after), 'event_ns': list(event)})
+        previous_end = after[1]
+        previous_offset = end
+    used_ids.update(identities)
+    return witnesses
 
 
 def validate_handoff(handoff, owner, victim, capture, capture_ack_ns, replacement, expected, anchor):
@@ -1473,17 +1620,19 @@ def native_leg(lab, options, report, expected, anchor, original_process, build):
             'final_record': str(options.native_evidence),
         })
         samples = {}
+        traces = (owner, victim)
+
+        def operator_record(path, budget, message):
+            def read_record():
+                need(all(child.poll() is None for child, _, _ in apps.values()), 'original native app exited')
+                return read_if_present(path)
+
+            return wait_native_record(read_record, traces, budget, message)
 
         def stage(name, budget):
-            def read_stage():
-                need(all(child.poll() is None for child, _, _ in apps.values()), 'original native app exited')
-                return read_if_present(paths[name])
-
-            record = wait(read_stage, budget, f'operator stage {name} was not supplied')
+            record, received = operator_record(paths[name], budget, f'operator stage {name} was not supplied')
             samples[name] = sample_native_apps(apps, artifacts)
-            owner.read()
-            victim.read()
-            return record, ns()
+            return record, received
 
         def acknowledge_capture(role, budget, scope=None):
             record, received = stage(f'{role}-capture', budget)
@@ -1509,9 +1658,9 @@ def native_leg(lab, options, report, expected, anchor, original_process, build):
             inspector_ids[role] = opened_windows.pop()
         publish_operator(paths['inspectors'], {'run_id': run_id, 'windows': inspector_ids})
         spectator, spectator_grid, spectator_ack = acknowledge_capture('victim', setup_deadline - time.monotonic())
-        stage('pause', setup_deadline - time.monotonic())
+        pause_record, _ = stage('pause', setup_deadline - time.monotonic())
         pause, pre_owner, pre_victim, clients = native_preflight(
-            lab, paths['pause'], anchor, run_id, expected, owner, victim, opened)
+            lab, pause_record, anchor, run_id, expected, owner, victim, opened)
         need(spectator_ack < pause['paused_at_ns'] and spectator['view_id'] == pause['victim_view']
              and spectator['renderer_id'] == pause['victim_renderer'] and pre_victim == spectator_grid,
              'pause did not follow the acknowledged spectator capture on the same view')
@@ -1545,6 +1694,8 @@ def native_leg(lab, options, report, expected, anchor, original_process, build):
         grid_status = replacement_grid['event']['status']
         committed = grid_status['committed']
 
+        used_rejection_ids = set()
+
         def invoke_retired(role, capture, authority):
             _, _, trace = apps[role]
             need(tmux_target(lab, expected) == committed['size'], 'replacement grid changed before stale input')
@@ -1552,24 +1703,27 @@ def native_leg(lab, options, report, expected, anchor, original_process, build):
             before = ns()
             wait(lambda: replacement_status(victim, expected, redraw_id, authority, committed, anchor, before),
                  6, 'replacement authority and grid were not observed before stale input')
-            trace.read()
+            catch_up_role_logs(traces, final_deadline)
             need(capture['inspector_window'] in inspector_windows(capture['app']['pid']),
                  'original Inspector window closed before invocation')
+            gate_clock = corroborate_clock(anchor, sample_clock())
             gate = {'run_id': run_id, 'capture_id': capture['capture_id'],
                     'inspector_target': capture['inspector_target'], 'inspector_window': capture['inspector_window'],
                     'log_cursor': trace.offset, 'issued_ns': ns()}
-            trace.retired_witness = capture['view_id'], TRACE_STAGE[role]
             publish_operator(paths[f'{role}-gate'], gate)
             record, received = stage(f'{role}-invoked', remaining())
             need(capture['inspector_window'] in inspector_windows(capture['app']['pid']),
                  'original Inspector window closed during invocation')
-            failure = validate_invocation(record, capture, gate, trace, received)
+            invocation_clock = corroborate_clock(gate_clock, sample_clock())
+            failures = validate_invocation(record, capture, gate, trace, received, invocation_clock,
+                                           used_rejection_ids, role)
+            finished = failures[-1]['after_ns'][1]
             wait(lambda: replacement_status(victim, expected, redraw_id, authority, committed, anchor,
-                                            record['finished_ns']),
+                                            finished),
                  6, 'replacement authority and grid were not observed after stale input')
             need(tmux_target(lab, expected) == committed['size'], 'stale input changed the runtime grid')
             ledger(state, BRIDGE_INPUT)
-            return {'capture': capture, 'gate': gate, 'invocation': record, 'trace': failure}
+            return {'capture': capture, 'gate': gate, 'invocation': record, 'trace': failures}
 
         detached_spectator = invoke_retired('victim', spectator, grid_status['epoch'])
         writer, writer_grid, writer_ack = acknowledge_capture(
@@ -1578,7 +1732,7 @@ def native_leg(lab, options, report, expected, anchor, original_process, build):
              and writer['capture_id'] != spectator['capture_id']
              and writer['inspector_target'] != spectator['inspector_target']
              and committed_key(writer_grid['event']['status']) == committed_key(grid_status)
-             and detached_spectator['invocation']['finished_ns'] < writer['captured_ns'],
+             and detached_spectator['trace'][-1]['after_ns'][1] < writer['captured_ns'],
              'writer capture did not bind the original owner and committed replacement grid')
         handoff, _ = stage('handoff', remaining())
         validate_handoff(handoff, owner, victim, writer, writer_ack, redraw_id, expected, anchor)
@@ -1589,13 +1743,13 @@ def native_leg(lab, options, report, expected, anchor, original_process, build):
         publish_operator(paths['fresh'], {'run_id': run_id, 'view_id': redraw_id,
                                          'epoch': handoff['successor_epoch'], 'issued_ns': fresh_gate})
 
-        evidence = wait(lambda: read_if_present(options.native_evidence), remaining(),
-                        'final native evidence was not supplied')
+        evidence, _ = operator_record(options.native_evidence, remaining(), 'final native evidence was not supplied')
         samples['final'] = sample_native_apps(apps, artifacts)
         need(all(record['inspector_window'] in inspector_windows(record['app']['pid'])
                  for record in (spectator, writer)), 'original Inspector window closed before final evidence')
-        owner.read()
-        victim.read()
+        all_logged_ids = [item['rejection_id'] for trace in traces for item, _, _ in trace.rejections]
+        need(len(used_rejection_ids) == 4 and all(all_logged_ids.count(identity) == 1 for identity in used_rejection_ids),
+             'native rejection identities were reused across role logs')
         exact(evidence, 'run_id source tree builds pause raw providers')
         need(evidence['run_id'] == run_id and all(evidence[key] == source[key] for key in source)
              and evidence['builds'] == builds and evidence['pause'] == pause,
@@ -1734,9 +1888,32 @@ use null. Wait for a matching chunk with a status and provider sample.
       return [a, b, c, d, e, f, g, h]
         .map((word, i) => ((word + initial[i]) >>> 0).toString(16).padStart(8, "0")).join("");
     };
+    const nextTick = previous => {
+      const limit = performance.now() + 50;
+      for (let i = 0; i < 100000 && performance.now() < limit; i++) {
+        const current = Date.now();
+        if (current > previous) return current;
+      }
+      throw Error("Inspector wall clock precision unavailable");
+    };
     const rejected = async (command, args) => {
-      try { await invoke(command, args); return "unexpected success"; }
-      catch (error) { return error === "View detached" ? error : "unexpected rejection"; }
+      const before_ms = Date.now();
+      nextTick(nextTick(nextTick(before_ms)));
+      let rejection = null;
+      try { await invoke(command, { ...args, diagnostic: true }); }
+      catch (error) {
+        const uuidText = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+        const stages = { terminal_input: "input", terminal_read: "read",
+                         terminal_acknowledge_grid: "acknowledge" };
+        if (error?.reason === "view_detached" && Object.keys(error).length === 6 &&
+            error.view_id === viewId && error.command === command && error.stage === stages[command] &&
+            typeof error.rejection_id === "string" && uuidText.test(error.rejection_id) &&
+            Number.isSafeInteger(error.event_time_us) && error.event_time_us > 0) {
+          rejection = error;
+        }
+      }
+      const after_ms = nextTick(nextTick(nextTick(Date.now())));
+      return { command, before_ms, after_ms, rejection };
     };
     let used = false;
     page.w1Capture = Object.freeze({
@@ -1749,15 +1926,17 @@ use null. Wait for a matching chunk with a status and provider sample.
             gate.inspector_target !== inspector_target ||
             gate.inspector_window !== bound.inspector_window) throw Error("Wrong capture gate");
         used = true;
-        const invoked_ns = now();
+        const clock_ticks = [nextTick(Date.now())];
+        clock_ticks.push(nextTick(clock_ticks[0]));
+        clock_ticks.push(nextTick(clock_ticks[1]));
         const marker = writer ? "RS-WRITER-STALE" : "RS-SPECTATOR-STALE";
         const data = [...new TextEncoder().encode(marker), 13];
-        const input_result = await rejected("terminal_input", { viewId, incarnation, data, paste: false });
-        const traced_result = writer
+        const input = await rejected("terminal_input", { viewId, incarnation, data, paste: false });
+        nextTick(nextTick(nextTick(input.after_ms)));
+        const followup = writer
           ? await rejected("terminal_read", { viewId })
           : await rejected("terminal_acknowledge_grid", { viewId, acknowledgement });
-        return { ...structuredClone(bound), invoked_ns, finished_ns: now(), input_result,
-                 traced_result, traced_stage: writer ? "read" : "acknowledge",
+        return { ...structuredClone(bound), clock_ticks, calls: [input, followup],
                  grant_sha256: digestGrant() };
       }
     });
@@ -1805,8 +1984,12 @@ owner-gate invoke once from the retained closure and send owner-invoked.
            captured_ns view_id renderer_id target epoch read_sample_us writable
            grant_sha256 acknowledgement
   invocation: run_id capture_id inspector_target inspector_window window app
-              view_id renderer_id target epoch read_sample_us grant_sha256 invoked_ns
-              finished_ns input_result traced_result traced_stage
+              view_id renderer_id target epoch read_sample_us grant_sha256 clock_ticks calls
+  clock_ticks: three consecutive observed wall milliseconds
+  calls: two ordered entries with command before_ms after_ms rejection
+  Keep the clock tick spacing in the closure so the uncertainty bounds for
+  the four calls remain distinguishable even when a rejection is immediate.
+  rejection: reason view_id rejection_id event_time_us command stage
   handoff: owner_detached_ns authorized_ns successor_epoch
 
 Wait for fresh. Type RS-NATIVE-FRESH and press Enter once in the successor

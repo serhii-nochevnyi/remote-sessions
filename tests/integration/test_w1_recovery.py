@@ -1,6 +1,6 @@
 """Stdlib checks for lab scoping and the native recovery evidence contract."""
 import argparse
-from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
+from contextlib import closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from copy import deepcopy
 import io
 import json
@@ -8,11 +8,14 @@ import os
 from pathlib import Path
 import plistlib
 import shutil
+import socket
 import sqlite3
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -526,17 +529,21 @@ class ManifestTests(unittest.TestCase):
 
 
 class LossTests(unittest.TestCase):
+    @staticmethod
+    def runtime(workspace_id=None):
+        session_id, runtime_id = uuid4(), uuid4()
+        return {'operation_id': str(uuid4()), 'runtime_id': str(runtime_id),
+                'workspace_id': workspace_id, 'session_id': str(session_id),
+                'origin': 'managed' if workspace_id else 'legacy', 'pane_id': '%2', 'pane_pid': 42,
+                'exited': False, 'command': 'fixture', 'width': 80, 'height': 24,
+                'tmux_name': f'rs_{session_id.hex}_{runtime_id.hex}'}
+
     def test_drop_only_one_complete_confirmed_create_and_forward_status_inventory(self):
         key = str(uuid4())
         workspace_id = str(uuid4())
         create = {'product': {'op': 'create_managed', 'key': key, 'workspace_id': workspace_id,
                               'profile': 'codex'}}
-        runtime = {'operation_id': str(uuid4()), 'runtime_id': str(uuid4()),
-                   'workspace_id': workspace_id, 'session_id': str(uuid4()),
-                   'origin': 'managed', 'pane_id': '%2', 'pane_pid': 42,
-                   'exited': False}
-        runtime['tmux_name'] = 'rs_{}_{}'.format(runtime['session_id'].replace('-', ''),
-                                                runtime['runtime_id'].replace('-', ''))
+        runtime = self.runtime(workspace_id)
         reply = request_frame({'product': {'result': 'create', 'state': {
             'state': 'confirmed', 'current': 'live', 'outcome': {'runtime': runtime}}}})
         failure = request_frame({'product': {'result': 'create', 'state': {
@@ -544,21 +551,22 @@ class LossTests(unittest.TestCase):
         status = {'product': {'op': 'create_status', 'key': key}}
         inventory = request_frame({'result': 'runtimes', 'runtimes': [runtime]})
         loss = ResponseLoss()
-        self.assertEqual(loss.response(create, reply), reply)
+        self.assertEqual(loss.response(create, reply)[0], reply)
         loss.arm('codex')
-        self.assertEqual(loss.response(create, failure), failure)
+        self.assertEqual(loss.response(create, failure)[0], failure)
         wrong_target = json.loads(reply)
-        wrong_target['product']['state']['outcome']['runtime']['tmux_name'] = 'foreign'
+        wrong_target['product']['state']['outcome']['runtime']['workspace_id'] = str(uuid4())
         wrong_target = request_frame(wrong_target)
-        self.assertEqual(loss.response(create, wrong_target), wrong_target)
-        self.assertEqual(loss.response(status, reply), reply)
+        self.assertEqual(loss.response(create, wrong_target)[0], wrong_target)
+        self.assertEqual(loss.response(status, reply)[0], reply)
         with self.assertRaises(ValueError):
             loss.response(create, reply[:-1])
-        self.assertIsNone(loss.response(create, reply))
-        self.assertEqual(loss.response(status, reply), reply)
-        self.assertEqual(loss.response({'op': 'list'}, inventory), inventory)
-        self.assertEqual(loss.response(create, reply), reply)
+        self.assertIsNone(loss.response(create, reply)[0])
+        self.assertEqual(loss.response(status, reply)[0], reply)
+        self.assertEqual(loss.response({'op': 'list'}, inventory)[0], inventory)
+        self.assertEqual(loss.response(create, reply)[0], reply)
         self.assertEqual(loss.drops, [{'key': key, 'runtime': runtime}])
+        self.assertEqual(loss.forwarded('list'), 0)
         self.assertEqual(response_state(json.loads(failure))['state'], 'failed')
 
     def test_bounded_newline_frames(self):
@@ -583,6 +591,170 @@ class LossTests(unittest.TestCase):
         self.assertEqual(loss.count('create_managed', key), 1)
 
 
+    @contextmanager
+    def relay_fixture(self):
+        with tempfile.TemporaryDirectory(dir=Path('/tmp').resolve()) as directory:
+            state = Path(directory)
+            client = state / 'c'
+            client.mkdir(mode=0o700)
+            path = state / 'agent.sock'
+            loss = ResponseLoss()
+            with closing(socket.socket(socket.AF_UNIX)) as upstream:
+                upstream.bind(str(path))
+                path.chmod(0o600)
+                upstream.listen()
+                upstream.settimeout(2)
+                with w1_recovery.agent_proxy(SimpleNamespace(state=state), client, loss):
+                    yield upstream, client / 'agent.sock', loss
+
+    def relay_exchange(self, upstream, path, request, response=None, write_failure=False):
+        request_bytes = request_frame(request) if isinstance(request, dict) else request
+        result = {}
+
+        def serve():
+            try:
+                with closing(upstream.accept()[0]) as peer:
+                    peer.settimeout(2)
+                    with peer.makefile('rb') as incoming:
+                        result['request'] = read_frame(incoming, w1_recovery.REQUEST_LIMIT)
+                    peer.sendall(response)
+            except (OSError, ValueError) as error:
+                result['error'] = error
+
+        worker = None
+        if response is not None:
+            worker = threading.Thread(target=serve)
+            worker.start()
+        sendall = socket.socket.sendall
+
+        def write(peer, data):
+            if peer.getsockname() == str(path):
+                raise BrokenPipeError
+            return sendall(peer, data)
+
+        write_scope = patch.object(socket.socket, 'sendall', write) if write_failure else nullcontext()
+        try:
+            with write_scope, closing(socket.socket(socket.AF_UNIX)) as peer:
+                peer.settimeout(3)
+                peer.connect(str(path))
+                peer.sendall(request_bytes)
+                peer.shutdown(socket.SHUT_WR)
+                with peer.makefile('rb') as incoming:
+                    received = incoming.read()
+        finally:
+            if worker is not None:
+                worker.join(3)
+                self.assertFalse(worker.is_alive())
+        if worker is not None:
+            self.assertNotIn('error', result)
+            self.assertEqual(result.get('request'), request_bytes)
+        return received
+
+    def test_handler_malformed_list_holds_quiet_cancel(self):
+        print(self._testMethodName, flush=True)
+        runtime = self.runtime()
+        inventory = request_frame({'result': 'runtimes', 'runtimes': [runtime]})
+        request = {'op': 'list'}
+        bad_replies = (
+            {'result': 'health', 'agent_pid': 42, 'remote_execution_enabled': False},
+            {'result': 'runtimes'},
+            {'result': 'runtimes', 'runtimes': {}},
+            {'result': 'runtimes', 'runtimes': [None]},
+            {'result': 'runtimes', 'runtimes': [{**runtime, 'pane_pid': True}]},
+            {'result': 'runtimes', 'runtimes': [{**runtime, 'runtime_id': 'invalid'}]},
+            {'product': []},
+            {'product': {'result': 'blocked', 'issue': 'invalid_request'}},
+            {'result': 'error', 'message': None},
+            [],
+        )
+        for reply in (*map(request_frame, bad_replies), b'{"result":', b'{invalid}\n', b'\xff\n'):
+            with self.subTest(reply=reply), self.relay_fixture() as (upstream, path, loss):
+                self.assertEqual(self.relay_exchange(upstream, path, request, inventory), inventory)
+                before = loss.cancel_snapshot()
+                self.assertEqual(self.relay_exchange(upstream, path, request, reply), b'')
+                middle = loss.cancel_snapshot()
+                self.assertEqual((middle['failures'], middle['active'], middle['forwarded_lists']), (1, 0, 1))
+                self.assertEqual(self.relay_exchange(upstream, path, request, inventory), inventory)
+                traffic = w1_recovery.picker_traffic(before, loss.cancel_snapshot())
+                self.assertTrue(traffic['connected'])
+                self.assertFalse(traffic['intact'])
+                self.assertEqual(set(traffic['deltas'].values()), {0})
+                self.assertEqual(traffic['after']['failures'], 1)
+
+        with self.relay_fixture() as (upstream, path, loss):
+            self.assertEqual(self.relay_exchange(upstream, path, request, inventory), inventory)
+            before = loss.cancel_snapshot()
+            error = request_frame({'result': 'error', 'message': 'fixture unavailable'})
+            self.assertEqual(self.relay_exchange(upstream, path, request, error), error)
+            self.assertEqual(loss.forwarded('list'), 1)
+            self.assertEqual(self.relay_exchange(upstream, path, request, inventory), inventory)
+            traffic = w1_recovery.picker_traffic(before, loss.cancel_snapshot())
+            self.assertTrue(traffic['connected'] and traffic['intact'])
+
+    def test_handler_validates_product_fields_and_accounts_for_write_failure(self):
+        print(self._testMethodName, flush=True)
+        workspace, key = str(uuid4()), str(uuid4())
+        create = {'product': {'op': 'create_managed', 'key': key, 'workspace_id': workspace, 'profile': 'codex'}}
+        status = {'product': {'op': 'create_status', 'key': key}}
+        register = {'product': {'op': 'register_workspace', 'locator': '/fixture'}}
+        readiness = {'product': {'op': 'workspace_readiness', 'workspace_id': workspace, 'profile': 'codex'}}
+        runtime = self.runtime(workspace)
+        outcome = {'runtime': runtime, 'setup_issue': None}
+        confirmed = {'state': 'confirmed', 'outcome': outcome, 'current': 'live', 'setup_issue': None}
+        reply = lambda state: {'product': {'result': 'create', 'state': state}}
+        error = {'result': 'error', 'message': 'fixture unavailable'}
+        blocked = {'product': {'result': 'blocked', 'issue': 'catalog_unconfigured'}}
+        for request, value, valid in (
+            (create, error, True), (status, blocked, True),
+            (readiness, {'product': {'result': 'ready'}}, True),
+            (register, {'product': {'result': 'workspace_registered',
+                                     'workspace': {'workspace_id': workspace, 'label': 'fixture'}}}, True),
+            (register, {'product': {'result': 'workspace_registered',
+                                     'workspace': {'workspace_id': workspace}}}, False),
+            (readiness, {'product': {'result': 'blocked', 'issue': 'invented'}}, False),
+            (status, {'result': 'error', 'message': []}, False),
+            (status, {'result': 'runtimes', 'runtimes': []}, False),
+            (create, reply({'state': 'pending', 'reservation': 4}), False),
+            (create, reply({**confirmed, 'current': 'running'}), False),
+            (create, reply({**confirmed, 'outcome': {**outcome, 'runtime': {**runtime, 'width': '80'}}}), False),
+            (create, reply({**confirmed, 'current': 'exited'}), True),
+        ):
+            with self.subTest(value=value), self.relay_fixture() as (upstream, path, loss):
+                loss.arm('codex')
+                frame = request_frame(value)
+                self.assertEqual(self.relay_exchange(upstream, path, request, frame), frame if valid else b'')
+                self.assertEqual((loss.failures, loss.active, loss.profile, loss.drops),
+                                 (int(not valid), 0, 'codex', []))
+
+        with self.relay_fixture() as (upstream, path, loss):
+            for expected, request in enumerate((
+                b'{"op":"list"', b'{invalid}\n', b'[]\n', {'op': 'list', 'extra': True},
+                {'product': {'op': 'register_workspace'}},
+                {'product': {**readiness['product'], 'profile': 'shell'}},
+                {'product': {**status['product'], 'reservation': key}},
+                {'product': {**create['product'], 'workspace_id': 1}},
+                {'op': 'input', 'runtime_id': workspace, 'token': key, 'sequence': True, 'data': [1]},
+            ), 1):
+                self.assertEqual(self.relay_exchange(upstream, path, request), b'')
+                self.assertEqual((loss.failures, loss.active, loss.forwarded('list')), (expected, 0, 0))
+            upstream.setblocking(False)
+            with self.assertRaises(BlockingIOError):
+                upstream.accept()
+            upstream.settimeout(2)
+
+            before = loss.failures
+            frame = request_frame({'result': 'runtimes', 'runtimes': []})
+            self.assertEqual(self.relay_exchange(upstream, path, {'op': 'list'}, frame, write_failure=True), b'')
+            self.assertEqual((loss.failures, loss.active, loss.forwarded('list')), (before + 1, 0, 0))
+
+            loss.arm('codex')
+            self.assertEqual(self.relay_exchange(upstream, path, create, request_frame(reply(confirmed))), b'')
+            self.assertEqual((loss.failures, loss.active, loss.drops), (before + 1, 0, [{'key': key, 'runtime': runtime}]))
+            frame = request_frame(reply(confirmed))
+            self.assertEqual(self.relay_exchange(upstream, path, status, frame), frame)
+            self.assertEqual(loss.forwarded('create_status', key), 1)
+
+
 class EvidenceTests(unittest.TestCase):
     def picker_case(self, request=None, recorder_failed=False, connected=True):
         recovery = w1_recovery
@@ -595,20 +767,19 @@ class EvidenceTests(unittest.TestCase):
             nonlocal recorder
             recorder = loss
             if connected:
-                loss.response({'op': 'list'}, request_frame({'result': 'runtimes'}))
+                loss.replies['list', None] += 1
             yield
 
         def cancel(case, name, prompt):
             case['checks'][name] = True
             if request:
-                with patch.object(recovery, 'exchange', return_value=request_frame({'result': 'error'})):
-                    recorder.relay(io.BytesIO(request_frame({'product': {'op': request}})), Path('/unused'))
+                recorder.request({'product': {'op': request}})
             if recorder_failed:
                 recorder.failures += 1
 
         def wait_for_poll(check, timeout):
             if not check() and connected:
-                recorder.response({'op': 'list'}, request_frame({'result': 'runtimes'}))
+                recorder.replies['list', None] += 1
             ready = check()
             if not ready:
                 raise TimeoutError
@@ -811,14 +982,29 @@ class PressureNativeTests(unittest.TestCase):
                    'acknowledgement': None if writer else grid['renderer']}
         invocation = {key: value for key, value in capture.items()
                       if key not in {'captured_ns', 'writable', 'acknowledgement'}}
-        invocation.update({'invoked_ns': 130_000, 'finished_ns': 140_000, 'input_result': 'View detached',
-                           'traced_result': 'View detached', 'traced_stage': pressure.TRACE_STAGE[role]})
-        gate = {'capture_id': capture['capture_id'], 'inspector_target': capture['inspector_target'],
-                'inspector_window': capture['inspector_window'], 'issued_ns': 125_000, 'log_cursor': 50}
-        trace.offset = 100
-        trace.detached_failure = {'view_id': view, 'stage': pressure.TRACE_STAGE[role],
-                                  'reason': 'view_detached', 'offset': 55, 'end_offset': 100, 'observed_ns': 135_000}
+        invocation['clock_ticks'] = [125, 126, 127]
+        invocation['calls'] = []
+        for index, (command, stage) in enumerate(pressure.RETIRED_CALLS[role]):
+            before = 130 + 20 * index
+            rejection = {'view_id': view, 'stage': stage, 'command': command, 'reason': 'view_detached',
+                         'rejection_id': self.uid((50 if writer else 60) + index),
+                         'event_time_us': before * 1000 + 5000}
+            invocation['calls'].append({'command': command, 'before_ms': before,
+                                        'after_ms': before + 10, 'rejection': rejection})
+        gate = {'run_id': self.run_id, 'capture_id': capture['capture_id'],
+                'inspector_target': capture['inspector_target'],
+                'inspector_window': capture['inspector_window'], 'issued_ns': 120_000_000, 'log_cursor': 0}
         return trace, capture, gate, invocation, grid
+
+    def trace_line(self, kind, value):
+        return self.pressure.PREFIX + kind + b' ' + json.dumps(value).encode() + b'\n'
+
+    def invocation_anchor(self):
+        return {'wall_ns': 100_000_000, 'before_ns': 99_999_750, 'after_ns': 100_000_250}
+
+    def record_rejections(self, trace, items):
+        trace.path.write_bytes(b''.join(self.trace_line(b'REJECTION', item) for item in items))
+        return self.pressure.Trace(trace.path).read()
 
     def test_pressure_operator_native_input_capture(self):
         print(self._testMethodName, flush=True)
@@ -828,27 +1014,42 @@ class PressureNativeTests(unittest.TestCase):
                         '"terminal_input", { viewId, incarnation, data, paste: false }',
                         '"terminal_read", { viewId }',
                         '"terminal_acknowledge_grid", { viewId, acknowledgement }',
+                        'await invoke(command, { ...args, diagnostic: true })',
+                        'calls: [input, followup]', 'const before_ms = Date.now()',
                         'victim-captured before pausing', 'owner-captured before closing',
                         'RS-SPECTATOR-STALE', 'RS-WRITER-STALE', pressure.SYNTHETIC_INCARNATION):
             self.assertIn(literal, guide)
+        tauri = (ROOT / 'apps/client/src-tauri/src/lib.rs').read_text()
+        for command in ('terminal_input', 'terminal_read', 'terminal_acknowledge_grid'):
+            body = tauri.split(f'pub async fn {command}(', 1)[1].split('#[tauri::command]', 1)[0]
+            self.assertIn('diagnostic: Option<bool>', body)
+            self.assertIn('Result<', body)
+            self.assertIn('TerminalInputError>', body)
+            self.assertRegex(body, r'terminal_rejection\(\s*error,\s*diagnostic,')
+            self.assertIn('RS_W1_RESIZE_REJECTION', body)
+        self.assertIn('cfg!(debug_assertions) && std::env::var("RS_W1_RESIZE_TRACE")', tauri)
+
+        used = set()
         for role in ('victim', 'owner'):
             trace, capture, gate, invocation, grid = self.captured(role)
             args = (self.run_id, role, self.original[role], trace, self.args_target, self.anchor, 100_000, 120_000,
                     (capture['view_id'], capture['renderer_id']))
             self.assertEqual(pressure.validate_capture(capture, *args), grid)
-            self.assertEqual(pressure.validate_invocation(invocation, capture, gate, trace, 150_000),
-                             trace.detached_failure)
+            rejections = [call['rejection'] for call in invocation['calls']]
+            with patch.object(pressure, 'ns', return_value=200_000_000):
+                logged = self.record_rejections(trace, rejections)
+            matched = pressure.validate_invocation(invocation, capture, gate, logged, 180_000_000,
+                                                   self.invocation_anchor(), used, role)
+            self.assertEqual([item['rejection'] for item in matched], rejections)
             for variant in ({**capture, 'view_id': self.replacement},
                             {key: value for key, value in capture.items() if key != 'grant_sha256'},
                             {**capture, 'grant_sha256': 'b' * 64 if role == 'victim' else None}):
                 with self.assertRaises(pressure.ProofError):
                     pressure.validate_capture(variant, *args)
-            with self.assertRaises(pressure.ProofError):
-                pressure.validate_invocation({**invocation, 'input_result': 'invalid args'}, capture, gate, trace,
-                                             150_000)
             trace.pressure[capture['view_id']]['detached'] = {'at_us': 114, 'pid': 501}
             with self.assertRaises(pressure.ProofError):
                 pressure.validate_capture(capture, *args)
+        self.assertEqual(len(used), 4)
         ledger = self.state / 'pressure-input.bin'
         expected = pressure.BRIDGE_INPUT + pressure.NATIVE_INPUT
         ledger.write_bytes(expected)
@@ -858,46 +1059,168 @@ class PressureNativeTests(unittest.TestCase):
             with self.assertRaisesRegex(pressure.ProofError, 'input mismatch or replay'):
                 pressure.ledger(self.state, expected)
 
-    def test_pressure_rejects_wrong_input_process(self):
+    def test_pressure_rejects_cross_call_and_unprovable_native_rejections(self):
         print(self._testMethodName, flush=True)
         pressure = self.pressure
         owner, capture, gate, invocation, _ = self.captured('owner')
         victim, _, _, _, _ = self.captured('victim')
+        native = [call['rejection'] for call in invocation['calls']]
+        anchor = self.invocation_anchor()
 
-        def line(view, stage):
-            item = {'view_id': view, 'stage': stage, 'reason': 'view_detached'}
-            return pressure.PREFIX + b'FAILURE ' + json.dumps(item).encode() + b'\n'
+        def validate(record, trace=None, used=None, scope=gate, clock=anchor):
+            return pressure.validate_invocation(record, capture, scope, trace or owner, 180_000_000,
+                                                clock, set() if used is None else used, 'owner')
 
-        owner.offset = 0
-        owner.detached_failure = None
-        owner.path.write_bytes(line(capture['view_id'], 'read'))
-        owner.read()
-        gate['log_cursor'] = owner.offset
-        owner.retired_witness = capture['view_id'], 'read'
-        with owner.path.open('ab') as stream:
-            stream.write(line(capture['view_id'], 'acknowledge'))
-            stream.write(line(self.pause['victim_view'], 'read'))
-            stream.write(line(capture['view_id'], 'read'))
-        with patch.object(pressure, 'ns', return_value=135_000):
-            owner.read()
-        self.assertTrue(pressure.validate_invocation(invocation, capture, gate, owner, 150_000))
-        victim_pid = {**capture['app'], 'pid': self.original['victim']['pid'],
-                      'started': self.original['victim']['started']}
-        for change in ({'app': victim_pid},
+        for event_us in (123500, 130999, 141000, 155000):
+            with self.subTest(event_us=event_us), self.assertRaises(pressure.ProofError):
+                changed = deepcopy(invocation)
+                changed['calls'][0]['rejection']['event_time_us'] = event_us
+                validate(changed, self.record_rejections(owner, [c['rejection'] for c in changed['calls']]))
+
+        owner = self.record_rejections(owner, native)
+        other_app = self.record_rejections(victim, native)
+        for change in ({'app': self.original['victim']},
                        {'app': {**capture['app'], 'started': 'Thu Nov 26 13:57:47 2026'}},
                        {'inspector_target': self.uid(21)}, {'inspector_window': 999},
-                       {'view_id': self.pause['victim_view']},
-                       {'grant_sha256': 'b' * 64}):
+                       {'capture_id': self.uid(22)}, {'view_id': self.pause['victim_view']},
+                       {'grant_sha256': 'b' * 64}, {'clock_ticks': [125, 127, 129]},
+                       {'calls': list(reversed(invocation['calls']))},
+                       {'calls': [invocation['calls'][0], {**invocation['calls'][1], 'before_ms': 141}]}):
             with self.subTest(change=change), self.assertRaises(pressure.ProofError):
-                pressure.validate_invocation({**invocation, **change}, capture, gate, owner, 150_000)
+                validate({**invocation, **change})
+        for field, value in (('rejection_id', native[1]['rejection_id']), ('stage', 'read'),
+                             ('command', 'terminal_read'), ('reason', 'stale_input'),
+                             ('event_time_us', native[0]['event_time_us'] + 1)):
+            changed = deepcopy(invocation)
+            changed['calls'][0]['rejection'][field] = value
+            with self.subTest(field=field), self.assertRaises(pressure.ProofError):
+                validate(changed)
+        for rejection in ('View detached', {}, {**native[0], 'token': 'unexpected'}):
+            changed = deepcopy(invocation)
+            changed['calls'][0]['rejection'] = rejection
+            with self.subTest(rejection=rejection), self.assertRaises(pressure.ProofError):
+                validate(changed)
+        swapped = deepcopy(invocation)
+        for call, item in zip(swapped['calls'], reversed(native)):
+            call['rejection']['rejection_id'] = item['rejection_id']
         with self.assertRaises(pressure.ProofError):
-            pressure.validate_capture({**capture, 'app': self.original['victim']}, self.run_id, 'owner',
-                                      self.original['owner'], owner, self.args_target, self.anchor, 100_000, 120_000)
+            validate(swapped)
         with self.assertRaises(pressure.ProofError):
-            pressure.validate_invocation(invocation, capture, gate, victim, 150_000)
-        owner.detached_failure = None
+            validate(invocation, other_app)
         with self.assertRaises(pressure.ProofError):
-            pressure.validate_invocation(invocation, capture, gate, owner, 150_000)
+            validate(invocation, used={native[0]['rejection_id']})
+        with self.assertRaises(pressure.ProofError):
+            validate(invocation, scope={**gate, 'log_cursor': owner.rejections[0][2]})
+        with self.assertRaises(pressure.ProofError):
+            validate(invocation, clock={**anchor, 'after_ns': 102_000_000})
+        with self.assertRaises(pressure.ProofError):
+            pressure.corroborate_clock(anchor, {**anchor, 'wall_ns': 102_000_000})
+
+        unrelated = {**native[0], 'rejection_id': self.uid(99), 'event_time_us': 128000}
+        for bad in ([native[1]], [native[0], native[0], native[1]], [unrelated, *native], list(reversed(native))):
+            with self.subTest(bad=bad), self.assertRaises(pressure.ProofError):
+                validate(invocation, self.record_rejections(owner, bad))
+
+    def test_pressure_stage_and_final_records_catch_up_both_real_traces(self):
+        print(self._testMethodName, flush=True)
+        pressure = self.pressure
+        traces, captures = [], []
+        for role in ('owner', 'victim'):
+            trace, capture, _, _, grid = self.captured(role)
+            trace.path.write_bytes(
+                b'ordinary stderr\n' * 8200
+                + self.trace_line(b'PRESSURE', {'event': 'attached', 'view_id': capture['view_id'],
+                                                 'pid': 501, 'at_us': 105})
+                + self.trace_line(b'GRID', grid)
+                + self.trace_line(b'PROVIDER', grid['event']['status']))
+            traces.append(pressure.Trace(trace.path))
+            captures.append(capture)
+
+        def stage_record():
+            for trace in traces:
+                self.assertFalse(trace.grids)
+                self.assertGreater(trace.offset, 0)
+            return captures[0]
+
+        captured, received = pressure.wait_native_record(stage_record, traces, 2, 'missing stage')
+        for trace, capture in zip(traces, captures):
+            role = capture['app']['role']
+            result = pressure.validate_capture(capture, self.run_id, role, capture['app'], trace,
+                                               self.args_target, self.anchor, 100_000, received)
+            self.assertEqual(result['renderer']['renderer_id'], capture['renderer_id'])
+        self.assertEqual(captured, captures[0])
+
+        records = {}
+        inventory = []
+        for index, profile in enumerate(('claude_code', 'codex'), 1):
+            target = {**self.args_target, 'runtime_id': self.uid(70 + index), 'pid': 600 + index}
+            inventory.append({'runtime_id': target['runtime_id'], 'pane_pid': target['pid'],
+                              'exited': False, 'origin': 'managed'})
+            record = {'target': target, 'paused_ns': 240_000, 'startup_ns': 250_000, 'edit_ns': 260_000,
+                      'resumed_ns': 270_000, 'prompts_submitted': 0, 'inspector': 'immediate_pause_requested',
+                      'continued': True, 'trust_auth_unchanged': True, 'startup_visible': True,
+                      'unsent_edit_visible': True}
+            for role, trace, offset in zip(('owner', 'victim'), traces, (0, 10)):
+                view, renderer = self.uid(80 + offset + index), self.uid(100 + offset + index)
+                grid = self.grid_record(view, renderer, 1, 220 + index)
+                grid['event']['status']['terminal']['target'] = target
+                with trace.path.open('ab') as stream:
+                    stream.write(b'ordinary stderr\n' * 8200 + self.trace_line(b'GRID', grid)
+                                 + self.trace_line(b'PROVIDER', grid['event']['status']))
+                record[f'{role}_view'], record[f'{role}_renderer'] = view, renderer
+            records[profile] = record
+        evidence_path = self.state / 'final.json'
+        evidence_path.write_bytes(request_frame(records))
+        evidence_path.chmod(0o600)
+        final, _ = pressure.wait_native_record(lambda: pressure.read_if_present(evidence_path),
+                                               traces, 2, 'missing final')
+        lab = SimpleNamespace(call=lambda op: {'runtimes': inventory})
+        with (patch.object(pressure, 'tmux_target'),
+              patch.object(pressure, 'managed_executable', return_value='/fixture/provider'),
+              patch.object(pressure, 'output', return_value='1.2.3'),
+              patch.object(pressure, 'digest', return_value='fixture digest'),
+              patch.object(pressure, 'live_process', return_value={'pid': 600})):
+            results = pressure.validate_providers(final, lab, self.anchor, *traces, 210_000, self.epoch['agent'])
+        self.assertEqual(set(results), {'claude_code', 'codex'})
+        for trace in traces:
+            self.assertEqual(trace.offset, trace.path.stat().st_size)
+            self.assertEqual({sample['provider']['sampled_at_us'] for sample in trace.provider_samples()},
+                             {110, 221, 222})
+
+    def test_pressure_catch_up_holds_incomplete_or_unavailable_boundaries(self):
+        print(self._testMethodName, flush=True)
+        pressure = self.pressure
+        path = self.state / 'partial.log'
+        path.write_bytes(b'complete\npartial')
+        trace = pressure.Trace(path)
+        record, _ = pressure.wait_native_record(lambda: {'stage': 1}, (trace,), 1, 'missing')
+        self.assertEqual(record, {'stage': 1})
+        self.assertEqual(trace.offset, len(b'complete\n'))
+        self.assertEqual(trace.grids, [])
+        with path.open('ab') as stream:
+            stream.write(b' complete\n')
+        pressure.catch_up_role_logs((trace,), time.monotonic() + 1)
+        self.assertEqual(trace.offset, path.stat().st_size)
+
+        with patch.object(pressure.time, 'monotonic', side_effect=(0, 2)):
+            with self.assertRaisesRegex(pressure.ProofError, 'deadline'):
+                pressure.catch_up_role_logs((trace,), 1)
+
+        with path.open('ab') as stream:
+            stream.write(b'x' * pressure.MAX_RECORD)
+        with self.assertRaisesRegex(pressure.ProofError, 'oversized'):
+            pressure.catch_up_role_logs((trace,), time.monotonic() + 1)
+
+        with path.open('rb') as stream:
+            closed = pressure.Trace(path, stream)
+        with self.assertRaises(pressure.ProofError):
+            pressure.catch_up_role_logs((closed,), time.monotonic() + 1)
+
+        replacement = self.state / 'replacement.log'
+        replacement.write_bytes(b'replaced\n')
+        replacement.replace(path)
+        with self.assertRaisesRegex(pressure.ProofError, 'stream changed'):
+            pressure.catch_up_role_logs((trace,), time.monotonic() + 1)
 
 
 class PressureBuildTests(unittest.TestCase):

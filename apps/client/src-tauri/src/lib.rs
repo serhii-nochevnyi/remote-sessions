@@ -571,15 +571,20 @@ mod desktop {
     #[tauri::command]
     pub async fn terminal_read(
         view_id: String,
+        diagnostic: Option<bool>,
         bridge: State<'_, DesktopBridge>,
-    ) -> Result<Chunk, String> {
+    ) -> Result<Chunk, TerminalInputError> {
         let trace = resize_trace();
         let chunk = bridge.read(&view_id).await.map_err(|error| {
             let message = error.to_string();
-            if trace {
+            let (rejection, observation) =
+                remote_sessions_desktop_bridge::terminal_rejection(error, diagnostic, trace);
+            if let Some(line) = observation {
+                eprintln!("RS_W1_RESIZE_REJECTION {line}");
+            } else if trace {
                 trace_stream_failure(&view_id, "read", bridge_failure_reason(&message));
             }
-            message
+            rejection
         })?;
         if trace {
             if chunk.closed {
@@ -617,18 +622,23 @@ mod desktop {
     pub async fn terminal_acknowledge_grid(
         view_id: String,
         acknowledgement: GridAcknowledgement,
+        diagnostic: Option<bool>,
         bridge: State<'_, DesktopBridge>,
-    ) -> Result<GeometryEvent, String> {
+    ) -> Result<GeometryEvent, TerminalInputError> {
         let trace = resize_trace();
         let event = bridge
             .acknowledge_grid(&view_id, acknowledgement)
             .await
             .map_err(|error| {
                 let message = error.to_string();
-                if trace {
+                let (rejection, observation) =
+                    remote_sessions_desktop_bridge::terminal_rejection(error, diagnostic, trace);
+                if let Some(line) = observation {
+                    eprintln!("RS_W1_RESIZE_REJECTION {line}");
+                } else if trace {
                     trace_stream_failure(&view_id, "acknowledge", bridge_failure_reason(&message));
                 }
-                message
+                rejection
             })?;
         if trace && let Ok(line) = encode_renderer_observation(&event, acknowledgement) {
             eprintln!("RS_W1_RESIZE_GRID {line}");
@@ -699,6 +709,7 @@ mod desktop {
         data: Vec<u8>,
         incarnation: Option<String>,
         paste: Option<bool>,
+        diagnostic: Option<bool>,
         bridge: State<'_, DesktopBridge>,
     ) -> Result<(), TerminalInputError> {
         ordinary_input(paste, async move || {
@@ -706,7 +717,18 @@ mod desktop {
             bridge
                 .input(&view_id, data, incarnation, false)
                 .await
-                .map_err(TerminalInputError::from)
+                .map_err(|error| {
+                    let (rejection, observation) =
+                        remote_sessions_desktop_bridge::terminal_rejection(
+                            error,
+                            diagnostic,
+                            resize_trace(),
+                        );
+                    if let Some(line) = observation {
+                        eprintln!("RS_W1_RESIZE_REJECTION {line}");
+                    }
+                    rejection
+                })
         })
         .await
     }
