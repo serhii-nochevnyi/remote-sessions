@@ -830,7 +830,13 @@ case "$4" in
     nonce=$(cat nonce)
     printf 'RS_CREATE_NONCE=%s\n52|101|%s|$1|@2|%%3|501|%s|0|0|%s:$1:@2:%%3:501|0|100|30\n' "$nonce" "$token" "$(cat name)" "$nonce" ;;
   list-sessions) if test -f name; then cat name; fi ;;
-  list-panes) printf '%s\t%%3\t501\t0\t100\t30\tcodex\n' "$(cat name)" ;;
+  list-panes)
+    printf '%s\t%%3\t501\t0\t100\t30\tcodex' "$(cat name)"
+    case "$7" in
+      *'#{pid}|#{start_time}|#{?#{m/r:^[0-9a-f-]*$,#{@rs_create_generation}},#{@rs_create_generation},invalid}|#{session_id}|#{window_id}'*)
+        printf '\t52|101|%s|$1|@2' "$token" ;;
+    esac
+    printf '\n' ;;
   *) exit 1 ;;
 esac
 "#.replace("GENERATION", &generation.to_string());
