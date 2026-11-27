@@ -2,25 +2,35 @@
 use anyhow::{Context, Result, bail, ensure};
 use remote_sessions_desktop_bridge::{
     Attachment, DesktopBridge, GeometryEvent, GridAcknowledgement, ResizeEpoch, ResizeResult,
-    TerminalClosure, TerminalSize, TerminalStatus,
+    TerminalSize, TerminalStatus,
+};
+#[cfg(debug_assertions)]
+use remote_sessions_desktop_bridge::{
+    AttachmentProbe, AttachmentProbeFull, AttachmentProbeScope, AttachmentProbeSnapshot, Chunk,
+    TerminalClosure,
 };
 use remote_sessions_host::{
     decode_local_fixture, encode_local_observation,
-    model::{Request, ResizeIntent, Response, Runtime, TerminalTarget, TerminalView},
+    model::{
+        CommittedGeometry, Request, ResizeIntent, Response, Runtime, TerminalTarget, TerminalView,
+        parse_name, tmux_name,
+    },
     request, validate_directory,
 };
 #[cfg(debug_assertions)]
 use remote_sessions_host::{request_resize_probe, serve_resize_fixture};
 use serde::{Deserialize, Serialize};
-#[cfg(debug_assertions)]
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::{
     fs,
-    io::Write,
-    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     process::Stdio,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
+};
+#[cfg(debug_assertions)]
+use std::{
+    io::Write,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 fn main() -> anyhow::Result<()> {
@@ -310,7 +320,7 @@ struct CaptureAttempt {
     kind: CaptureKind,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct GuardedCapture {
     attempt: CaptureAttempt,
@@ -318,20 +328,113 @@ struct GuardedCapture {
     argv: Vec<String>,
 }
 
-fn guard_tests(guard: &str, field: &str, value: &str) -> bool {
-    guard.contains(&format!("#{{==:#{{{field}}},{value}}}"))
-}
-
 fn epoch_marker(epoch: ResizeEpoch) -> String {
     format!("{}:{}", epoch.agent, epoch.owner)
 }
 
-fn canonical_uuid(value: &str) -> bool {
-    Uuid::parse_str(value).is_ok_and(|id| !id.is_nil() && id.to_string() == value)
+fn capture_uuid(value: &str) -> Result<Uuid> {
+    let id = Uuid::parse_str(value)?;
+    ensure!(
+        !id.is_nil() && id.to_string() == value,
+        "Noncanonical capture UUID"
+    );
+    Ok(id)
+}
+
+fn capture_epoch(value: &str) -> Result<ResizeEpoch> {
+    let (agent, owner) = value.split_once(':').context("Missing captured epoch")?;
+    Ok(ResizeEpoch {
+        agent: capture_uuid(agent)?,
+        owner: capture_uuid(owner)?,
+    })
+}
+
+fn capture_number<T: std::str::FromStr + ToString>(value: &str) -> Result<T> {
+    let number: T = value.parse().ok().context("Invalid captured number")?;
+    ensure!(number.to_string() == value, "Noncanonical captured number");
+    Ok(number)
+}
+
+fn capture_id(value: &str, prefix: char) -> Result<&str> {
+    let id = value
+        .strip_prefix(prefix)
+        .context("Invalid captured target ID")?;
+    capture_number::<u32>(id)?;
+    Ok(id)
+}
+
+fn capture_size(cols: &str, rows: &str) -> Result<TerminalSize> {
+    let size = TerminalSize {
+        cols: capture_number(cols)?,
+        rows: capture_number(rows)?,
+    };
+    ensure!(size.supported(), "Unsupported captured grid");
+    Ok(size)
+}
+
+fn capture_intent(marker: &str, size: TerminalSize) -> Result<CommittedGeometry> {
+    if marker.is_empty() {
+        return Ok(CommittedGeometry {
+            size,
+            revision: 0,
+            intent: None,
+        });
+    }
+    let fields: Vec<_> = marker.rsplitn(5, ':').collect();
+    let [rows, cols, revision, id, epoch] = fields.as_slice() else {
+        bail!("Malformed captured intent marker");
+    };
+    let revision = capture_number::<u64>(revision)?;
+    ensure!(
+        (1..=(1 << 53) - 1).contains(&revision) && capture_size(cols, rows)? == size,
+        "Captured intent does not match its grid or revision range"
+    );
+    Ok(CommittedGeometry {
+        size,
+        revision,
+        intent: Some(ResizeIntent {
+            epoch: capture_epoch(epoch)?,
+            id: capture_uuid(id)?,
+        }),
+    })
+}
+
+fn guard_operand<'a>(guard: &'a str, field: &str) -> Result<&'a str> {
+    let (_, rest) = guard
+        .split_once(&format!("#{{==:#{{{field}}},"))
+        .context("Missing captured guard operand")?;
+    let (value, _) = rest
+        .split_once('}')
+        .context("Incomplete captured guard operand")?;
+    ensure!(
+        value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/-._ $@%:~".contains(&byte)),
+        "Invalid captured guard operand"
+    );
+    Ok(value)
+}
+
+fn guard_equal(field: &str, value: impl std::fmt::Display) -> String {
+    format!("#{{==:#{{{field}}},{value}}}")
+}
+
+fn guard_all(values: &[String]) -> String {
+    if let [value] = values {
+        return value.clone();
+    }
+    let (left, right) = values.split_at(values.len() / 2);
+    format!("#{{&&:{},{}}}", guard_all(left), guard_all(right))
+}
+
+#[derive(Clone, Copy)]
+struct CaptureAdmission {
+    predecessor: ResizeEpoch,
+    resize: Option<(CommittedGeometry, CommittedGeometry)>,
 }
 
 impl GuardedCapture {
-    fn validate(&self, attempt: CaptureAttempt, scope: &FixtureScope) -> Result<()> {
+    fn validate(&self, attempt: CaptureAttempt, scope: &FixtureScope) -> Result<CaptureAdmission> {
         ensure!(
             self.attempt == attempt && !attempt.nonce.is_nil() && self.scope == *scope,
             "Guarded capture did not match the current attempt and target"
@@ -354,21 +457,81 @@ impl GuardedCapture {
         ensure!(
             [no_start, socket_flag, command, format_flag, target_flag].map(String::as_str)
                 == ["-N", "-S", "if-shell", "-F", "-t"]
-                && Path::new(socket) == scope.socket.as_path()
-                && *pane == target.pane
-                && guard.starts_with("#{&&:")
-                && !guard.contains("#(")
-                && guard_tests(
-                    guard,
-                    "@rs_create_generation",
-                    &target.generation.to_string()
-                )
-                && guard_tests(guard, "session_id", &target.session)
-                && guard_tests(guard, "window_id", &target.window)
-                && guard_tests(guard, "pane_id", pane)
-                && guard_tests(guard, "pane_pid", &target.pid.to_string()),
-            "Captured guard did not match the fixture scope"
+                && scope.socket.to_str() == Some(socket.as_str())
+                && scope.socket.is_absolute()
+                && scope
+                    .socket
+                    .file_name()
+                    .is_some_and(|name| name == "tmux.sock")
+                && pane == &target.pane
+                && !target.generation.is_nil()
+                && !target.runtime_id.is_nil()
+                && target.pid > 0
+                && target.process_start > 0,
+            "Captured argv did not match the fixture scope"
         );
+        let session = capture_id(&target.session, '$')?;
+        let window = capture_id(&target.window, '@')?;
+        let pane_id = capture_id(pane, '%')?;
+        let predecessor = capture_epoch(guard_operand(guard, "@rs_resize_epoch")?)?;
+        let server_pid = capture_number::<u32>(guard_operand(guard, "pid")?)?;
+        let server_start = capture_number::<u64>(guard_operand(guard, "start_time")?)?;
+        let name = guard_operand(guard, "session_name")?;
+        let tty = guard_operand(guard, "pane_tty")?;
+        let stamp = guard_operand(guard, "@rs_create_nonce")?;
+        let launch = if stamp.is_empty() {
+            "-"
+        } else {
+            let (launch, _) = stamp
+                .split_once(':')
+                .context("Missing captured launch nonce")?;
+            capture_uuid(launch)?;
+            ensure!(
+                stamp
+                    == format!(
+                        "{launch}:{}:{}:{pane}:{}",
+                        target.session, target.window, target.pid
+                    ),
+                "Captured launch stamp did not match the exact pane"
+            );
+            launch
+        };
+        ensure!(
+            server_pid > 0
+                && server_start > 0
+                && parse_name(name).is_some_and(|(id, runtime)| !id.is_nil()
+                    && runtime == target.runtime_id
+                    && name == tmux_name(id, runtime))
+                && tty
+                    .strip_prefix("/dev/ttys")
+                    .or_else(|| tty.strip_prefix("/dev/pts/"))
+                    .is_some_and(|suffix| !suffix.is_empty()
+                        && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())),
+            "Invalid captured server, session or terminal device"
+        );
+        let geometry = guard_all(&[
+            guard_equal("pid", server_pid),
+            guard_equal("start_time", server_start),
+            guard_equal("@rs_create_generation", target.generation),
+            guard_equal("session_name", name),
+            guard_equal("session_id", &target.session),
+            guard_equal("window_id", &target.window),
+            guard_equal("pane_id", pane),
+            guard_equal("window_index", 0),
+            guard_equal("pane_index", 0),
+            guard_equal("pane_pid", target.pid),
+            guard_equal("pane_tty", tty),
+            guard_equal("@rs_create_nonce", stamp),
+            guard_equal("session_windows", 1),
+            guard_equal("window_panes", 1),
+            guard_equal("pane_dead", 0),
+            guard_equal("window-size", "manual"),
+            guard_equal("after-set-option", ""),
+            guard_equal("after-resize-window", ""),
+            guard_equal("after-display-message", ""),
+            guard_equal("command-error", ""),
+            guard_equal("@rs_resize_epoch", epoch_marker(predecessor)),
+        ]);
 
         let nodes: Vec<_> = branch.split(" ; ").collect();
         let [mutation, marker, receipt] = nodes.as_slice() else {
@@ -376,9 +539,10 @@ impl GuardedCapture {
         };
         let mutation: Vec<_> = mutation.split(' ').collect();
         let marker: Vec<_> = marker.split(' ').collect();
-        match attempt.kind {
+        let (expected_guard, resize) = match attempt.kind {
             CaptureKind::Resize => {
-                let ["resize-window", "-t", window, "-x", cols, "-y", rows] = mutation.as_slice()
+                let ["resize-window", "-t", next_window, "-x", cols, "-y", rows] =
+                    mutation.as_slice()
                 else {
                     bail!("Unexpected captured resize mutation");
                 };
@@ -393,29 +557,34 @@ impl GuardedCapture {
                 else {
                     bail!("Unexpected captured resize marker");
                 };
-                let fields: Vec<_> = intent.split(':').collect();
-                let [agent, owner, id, revision, intent_cols, intent_rows] = fields.as_slice()
-                else {
-                    bail!("Unexpected captured resize intent");
-                };
-                let size = TerminalSize {
-                    cols: cols.parse()?,
-                    rows: rows.parse()?,
-                };
+                let prior_marker = guard_operand(guard, "@rs_resize_intent")?;
+                let prior = capture_intent(
+                    prior_marker,
+                    capture_size(
+                        guard_operand(guard, "window_width")?,
+                        guard_operand(guard, "window_height")?,
+                    )?,
+                )?;
+                let proposed = capture_intent(intent, capture_size(cols, rows)?)?;
                 ensure!(
-                    *window == target.window.as_str()
+                    *next_window == target.window.as_str()
                         && *marker_pane == pane.as_str()
-                        && size.supported()
-                        && *intent_cols == *cols
-                        && *intent_rows == *rows
-                        && [agent, owner, id]
-                            .into_iter()
-                            .all(|field| canonical_uuid(field))
-                        && revision.parse::<u64>().is_ok_and(|revision| revision > 0)
-                        && guard_tests(guard, "@rs_resize_epoch", &format!("{agent}:{owner}"))
+                        && proposed
+                            .intent
+                            .is_some_and(|intent| intent.epoch == predecessor)
+                        && proposed.revision == prior.revision + 1
                         && *receipt == "display-message -p rs-committed",
                     "Unexpected captured resize command"
                 );
+                (
+                    guard_all(&[
+                        geometry,
+                        guard_equal("@rs_resize_intent", prior_marker),
+                        guard_equal("window_width", prior.size.cols),
+                        guard_equal("window_height", prior.size.rows),
+                    ]),
+                    Some((prior, proposed)),
+                )
             }
             CaptureKind::EpochSetter => {
                 let [
@@ -440,32 +609,159 @@ impl GuardedCapture {
                 else {
                     bail!("Unexpected captured epoch marker");
                 };
+                let successor = capture_epoch(epoch)?;
+                let paste_launch = guard_operand(guard, "@rs_paste_launch")?;
+                capture_uuid(paste_launch)?;
+                let prefix = format!(
+                    "v1~{}~{}~{server_pid}~{server_start}~{session}~{window}~{pane_id}~{}~{}~{launch}~{paste_launch}~",
+                    target.runtime_id, target.generation, target.pid, target.process_start
+                );
+                let check_ready = |ready: &str, epoch: &str| -> Result<()> {
+                    let nonce = ready
+                        .strip_prefix(&format!("{prefix}{epoch}~r~"))
+                        .context("Captured ready marker did not match the exact authority")?;
+                    capture_uuid(nonce)?;
+                    Ok(())
+                };
+                let prior_ready = guard_operand(guard, "@rs_paste_admission")?;
+                check_ready(prior_ready, &epoch_marker(predecessor))?;
+                check_ready(ready, epoch)?;
                 ensure!(
                     *setter_pane == pane.as_str()
                         && *marker_pane == pane.as_str()
-                        && epoch
-                            .split_once(':')
-                            .is_some_and(
-                                |(agent, owner)| canonical_uuid(agent) && canonical_uuid(owner)
-                            )
-                        && ready.starts_with(&format!(
-                            "v1~{}~{}~",
-                            target.runtime_id, target.generation
-                        ))
-                        && ready
-                            .rsplit_once("~r~")
-                            .is_some_and(|(prefix, id)| prefix.ends_with(&format!("~{epoch}"))
-                                && canonical_uuid(id))
-                        && ready
+                        && successor.agent == predecessor.agent
+                        && successor != predecessor
+                        && *receipt == format!("display-message -p -l -t {pane} rs-fenced")
+                        && socket
                             .bytes()
-                            .all(|byte| byte.is_ascii_alphanumeric() || b"~-:".contains(&byte))
-                        && *receipt == format!("display-message -p -l -t {pane} rs-fenced"),
+                            .all(|byte| byte.is_ascii_alphanumeric() || b"/-._ ".contains(&byte)),
                     "Unexpected captured epoch setter"
                 );
+                let sender = guard_all(&[
+                    guard_equal("version", "3.8"),
+                    guard_equal("socket_path", socket),
+                    guard_equal("after-load-buffer", ""),
+                    guard_equal("after-save-buffer", ""),
+                    guard_equal("after-paste-buffer", ""),
+                    guard_equal("after-delete-buffer", ""),
+                    guard_equal("after-send-keys", ""),
+                    guard_equal("after-set-option", ""),
+                    guard_equal("after-display-message", ""),
+                    guard_equal("command-error", ""),
+                ]);
+                (
+                    guard_all(&[
+                        geometry,
+                        sender,
+                        guard_equal("@rs_paste_launch", paste_launch),
+                        guard_equal("@rs_paste_admission", prior_ready),
+                    ]),
+                    None,
+                )
             }
-        }
+        };
+        ensure!(
+            *guard == expected_guard,
+            "Captured guard is not the canonical operative predicate"
+        );
+        Ok(CaptureAdmission {
+            predecessor,
+            resize,
+        })
+    }
+
+    fn check_predecessor(&self, owner: &Owner, baseline: &TerminalStatus) -> Result<()> {
+        let admission = self.validate(self.attempt, &self.scope)?;
+        ensure!(
+            baseline.terminal == owner.view
+                && baseline.terminal.target == self.scope.target
+                && baseline.epoch == Some(owner.epoch)
+                && admission.predecessor == owner.epoch
+                && admission
+                    .resize
+                    .is_none_or(|(prior, _)| prior == baseline.committed),
+            "Capture did not guard the actual current predecessor and committed grid"
+        );
         Ok(())
     }
+
+    fn guard_check_argv(&self, guard: String) -> Vec<String> {
+        let mut argv = self.argv.clone();
+        argv[7] = guard;
+        argv[8] = format!(
+            "display-message -p -l -t {} rs-eligible",
+            self.scope.target.pane
+        );
+        argv
+    }
+
+    async fn witness_predecessor(
+        self,
+        lab: &Lab,
+        owner: &Owner,
+        directory: &Path,
+        baseline: &TerminalStatus,
+        report: &mut Report,
+    ) -> Result<AdmittedReplay> {
+        self.check_predecessor(owner, baseline)?;
+        ensure!(
+            self.scope.socket == lab.directory.join("tmux.sock"),
+            "Wrong replay socket"
+        );
+        let before = status(directory, &owner.view).await?;
+        confirm_exact_state(baseline, &before)?;
+        let guard = &self.argv[7];
+        let original = self.guard_check_argv(guard.clone());
+        let altered = self.guard_check_argv(guard.replacen(
+            &guard_equal("@rs_resize_epoch", epoch_marker(owner.epoch)),
+            &guard_equal(
+                "@rs_resize_epoch",
+                epoch_marker(ResizeEpoch {
+                    owner: Uuid::nil(),
+                    ..owner.epoch
+                }),
+            ),
+            1,
+        ));
+        ensure!(
+            saved_command(lab, &original, report).await? == "rs-eligible"
+                && saved_command(lab, &altered, report).await?.is_empty(),
+            "Captured predecessor lacked an operative read-only guard and a false control"
+        );
+        let after = status(directory, &owner.view).await?;
+        confirm_exact_state(&before, &after)?;
+        report.statuses.extend([before, after]);
+        Ok(AdmittedReplay(self.argv))
+    }
+}
+
+struct AdmittedReplay(Vec<String>);
+
+fn confirm_exact_state(baseline: &TerminalStatus, observed: &TerminalStatus) -> Result<()> {
+    ensure!(
+        observed.terminal == baseline.terminal
+            && observed.epoch == baseline.epoch
+            && observed.committed == baseline.committed,
+        "Exact readback changed terminal, epoch, committed intent, revision or grid"
+    );
+    Ok(())
+}
+
+async fn replay_stale(
+    lab: &Lab,
+    captured: &AdmittedReplay,
+    directory: &Path,
+    baseline: &TerminalStatus,
+    report: &mut Report,
+) -> Result<()> {
+    ensure!(
+        saved_command(lab, &captured.0, report).await?.is_empty(),
+        "Obsolete capture unexpectedly committed"
+    );
+    let observed = status(directory, &baseline.terminal).await?;
+    confirm_exact_state(baseline, &observed)?;
+    report.statuses.push(observed);
+    Ok(())
 }
 
 fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
@@ -610,24 +906,24 @@ exec "$tmux" "$@"
         Ok(attempt)
     }
 
-    fn captured(&self, attempt: CaptureAttempt) -> Result<Vec<String>> {
+    fn captured(&self, attempt: CaptureAttempt) -> Result<(GuardedCapture, CaptureAdmission)> {
         let capture: GuardedCapture =
             decode_local_fixture(&fs::read(self.directory.join("captured"))?)?;
-        capture.validate(attempt, &self.scope)?;
-        Ok(capture.argv)
+        let admission = capture.validate(attempt, &self.scope)?;
+        Ok((capture, admission))
     }
 
-    async fn capture_delayed_setter(&self, owner: &Owner) -> Result<Vec<String>> {
+    async fn capture_delayed_setter(&self, owner: &Owner) -> Result<GuardedCapture> {
         let attempt = self.arm("before-setter")?;
         let acquired = Owner::acquire(&self.directory, owner.view.clone()).await;
         self.mode("")?;
         ensure!(acquired.is_err(), "Unconfirmed setter granted a token");
-        let argv = self.captured(attempt)?;
+        let (capture, admission) = self.captured(attempt)?;
         ensure!(
-            guard_tests(&argv[7], "@rs_resize_epoch", &epoch_marker(owner.epoch)),
+            admission.predecessor == owner.epoch,
             "Captured setter did not guard the predecessor epoch"
         );
-        Ok(argv)
+        Ok(capture)
     }
 
     fn captured_resize(
@@ -635,18 +931,15 @@ exec "$tmux" "$@"
         attempt: CaptureAttempt,
         intent: ResizeIntent,
         size: TerminalSize,
-    ) -> Result<Vec<String>> {
-        let argv = self.captured(attempt)?;
-        let marker = format!("{}:{}:", epoch_marker(intent.epoch), intent.id,);
-        let branch = &argv[8];
+    ) -> Result<GuardedCapture> {
+        let (capture, admission) = self.captured(attempt)?;
         ensure!(
-            branch.starts_with(&format!(
-                "resize-window -t {} -x {} -y {} ; ",
-                self.scope.target.window, size.cols, size.rows
-            )) && branch.contains(&format!(" @rs_resize_intent {marker}")),
+            admission.resize.is_some_and(
+                |(_, proposed)| proposed.intent == Some(intent) && proposed.size == size
+            ),
             "Captured resize did not match the admitted intent"
         );
-        Ok(argv)
+        Ok(capture)
     }
 
     #[cfg(debug_assertions)]
@@ -1055,14 +1348,17 @@ async fn unknown_and_fences(
     first: Owner,
 ) -> Result<Owner> {
     let dir = &fixture.directory;
+    let before = status(dir, &first.view).await?;
     let attempt = fixture.arm("before")?;
     let ResizeResult::Uncertain { intent, .. } = first.resize(dir, 1, NARROW).await? else {
         bail!("Lost-before request failed to close admission");
     };
-    let delayed = fixture.captured_resize(attempt, intent, NARROW)?;
-    let unchanged = status(dir, &first.view).await?;
+    let delayed = fixture
+        .captured_resize(attempt, intent, NARROW)?
+        .witness_predecessor(lab, &first, dir, &before, report)
+        .await?;
     ensure!(
-        unchanged.committed.intent != Some(intent),
+        before.committed.intent != Some(intent),
         "Lost-before request committed"
     );
     ensure!(
@@ -1071,15 +1367,15 @@ async fn unknown_and_fences(
     );
     fixture.mode("")?;
     let second = Owner::acquire(dir, first.view.clone()).await?;
+    let fresh = status(dir, &second.view).await?;
     ensure!(
-        second.epoch != first.epoch && saved_command(lab, &delayed, report).await?.is_empty(),
-        "Old guard committed after successor"
+        second.epoch != first.epoch
+            && fresh.epoch == Some(second.epoch)
+            && fresh.committed == before.committed,
+        "Successor did not preserve the exact predecessor grid"
     );
-    ensure!(
-        status(dir, &second.view).await?.committed == unchanged.committed,
-        "Delayed guard changed target"
-    );
-    report.statuses.push(unchanged);
+    report.statuses.push(fresh.clone());
+    replay_stale(lab, &delayed, dir, &fresh, report).await?;
     report.witnessed.push("unknown_before_and_stale_guard");
 
     let attempt = fixture.arm("after")?;
@@ -1102,24 +1398,22 @@ async fn unknown_and_fences(
         "Lost-after predecessor still admitted writes"
     );
 
-    let setter = fixture.capture_delayed_setter(&second).await?;
+    let setter = fixture
+        .capture_delayed_setter(&second)
+        .await?
+        .witness_predecessor(lab, &second, dir, &committed, report)
+        .await?;
     let third = Owner::acquire(dir, second.view).await?;
     let fresh = status(dir, &third.view).await?;
     ensure!(
-        fresh.epoch == Some(third.epoch)
+        third.epoch != second.epoch
+            && fresh.epoch == Some(third.epoch)
             && fresh.committed == committed.committed
             && fresh.provider.is_some(),
         "Recovery failed to bracket the committed target with a provider sample"
     );
-    ensure!(
-        saved_command(lab, &setter, report).await?.is_empty(),
-        "Obsolete setter overwrote authority"
-    );
-    ensure!(
-        status(dir, &third.view).await?.epoch == Some(third.epoch),
-        "Installed owner changed after stale setter"
-    );
-    report.statuses.extend([committed, fresh]);
+    report.statuses.extend([committed, fresh.clone()]);
+    replay_stale(lab, &setter, dir, &fresh, report).await?;
     report
         .witnessed
         .extend(["unknown_after_and_recovery", "delayed_epoch_setter"]);
@@ -1138,7 +1432,7 @@ async fn yielding_negative(
     let ResizeResult::Uncertain { intent, .. } = predecessor.resize(dir, 0, NARROW).await? else {
         bail!("Expected a captured predecessor command");
     };
-    let mut delayed = fixture.captured_resize(attempt, intent, NARROW)?;
+    let mut delayed = fixture.captured_resize(attempt, intent, NARROW)?.argv;
     fixture.mode("")?;
     let name = format!("rs-test-{}", Uuid::new_v4().simple());
     let socket = lab.directory.join("tmux.sock");
@@ -1412,8 +1706,15 @@ async fn run_matrix(lab: &Lab, report: &mut Report) -> Result<()> {
     let ResizeResult::Uncertain { intent, .. } = last.resize(dir, 0, LATEST).await? else {
         bail!("Restart fixture did not capture the old resize");
     };
-    let delayed = fixture.captured_resize(attempt, intent, LATEST)?;
-    let setter = fixture.capture_delayed_setter(&last).await?;
+    let delayed = fixture
+        .captured_resize(attempt, intent, LATEST)?
+        .witness_predecessor(lab, &last, dir, &persisted, report)
+        .await?;
+    let setter = fixture
+        .capture_delayed_setter(&last)
+        .await?
+        .witness_predecessor(lab, &last, dir, &persisted, report)
+        .await?;
     fixture.close().await?;
     report.fixture_cleaned_up = true;
 
@@ -1457,24 +1758,17 @@ async fn run_matrix(lab: &Lab, report: &mut Report) -> Result<()> {
             && fresh.epoch.agent != last.epoch.agent,
         "Restart failed to retire the actual persisted predecessor"
     );
-    ensure!(
-        saved_command(lab, &delayed, report).await?.is_empty(),
-        "Old resize committed after restart"
-    );
-    ensure!(
-        saved_command(lab, &setter, report).await?.is_empty(),
-        "Old epoch setter committed after restart"
-    );
+    report.statuses.extend([persisted, read.clone()]);
+    replay_stale(lab, &delayed, &lab.directory, &read, report).await?;
+    replay_stale(lab, &setter, &lab.directory, &read, report).await?;
     ensure!(
         last.resize(&lab.directory, 0, NORMAL).await.is_err(),
         "Old agent scope admitted a new request"
     );
     let newest = fresh.commit(&lab.directory, 0, LATEST).await?;
-    report.statuses.extend([
-        persisted,
-        read,
-        wait_provider(&lab.directory, &newest).await?,
-    ]);
+    report
+        .statuses
+        .push(wait_provider(&lab.directory, &newest).await?);
     fresh.release(&lab.directory).await?;
     report.witnessed.push("agent_only_restart");
     positive(lab, report).await
@@ -1483,7 +1777,7 @@ async fn run_matrix(lab: &Lab, report: &mut Report) -> Result<()> {
 #[cfg(all(test, debug_assertions))]
 mod resize_probe_tests {
     use super::*;
-    use remote_sessions_host::model::{CommittedGeometry, ObservationState, ProviderSample};
+    use remote_sessions_host::model::{ObservationState, ProviderSample};
     use std::os::unix::fs::symlink;
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -1603,34 +1897,82 @@ mod resize_probe_tests {
     fn capture_args(fixture: &FixtureAgent, owner: &Owner, mode: &str, nonce: Uuid) -> Vec<String> {
         let target = &owner.view.target;
         let epoch = epoch_marker(owner.epoch);
-        let guard = [
-            format!("#{{==:#{{@rs_create_generation}},{}}}", target.generation),
-            format!("#{{==:#{{session_id}},{}}}", target.session),
-            format!("#{{==:#{{window_id}},{}}}", target.window),
-            format!("#{{==:#{{pane_id}},{}}}", target.pane),
-            format!("#{{==:#{{pane_pid}},{}}}", target.pid),
-            format!("#{{==:#{{@rs_resize_epoch}},{epoch}}}"),
-        ]
-        .into_iter()
-        .reduce(|left, right| format!("#{{&&:{left},{right}}}"))
-        .unwrap();
+        let geometry = guard_all(&[
+            guard_equal("pid", 18),
+            guard_equal("start_time", 42),
+            guard_equal("@rs_create_generation", target.generation),
+            guard_equal("session_name", tmux_name(Uuid::new_v4(), target.runtime_id)),
+            guard_equal("session_id", &target.session),
+            guard_equal("window_id", &target.window),
+            guard_equal("pane_id", &target.pane),
+            guard_equal("window_index", 0),
+            guard_equal("pane_index", 0),
+            guard_equal("pane_pid", target.pid),
+            guard_equal("pane_tty", "/dev/ttys005"),
+            guard_equal("@rs_create_nonce", ""),
+            guard_equal("session_windows", 1),
+            guard_equal("window_panes", 1),
+            guard_equal("pane_dead", 0),
+            guard_equal("window-size", "manual"),
+            guard_equal("after-set-option", ""),
+            guard_equal("after-resize-window", ""),
+            guard_equal("after-display-message", ""),
+            guard_equal("command-error", ""),
+            guard_equal("@rs_resize_epoch", &epoch),
+        ]);
         let pane = &target.pane;
-        let branch = if mode == "before-setter" {
+        let socket = fixture.scope.socket.to_str().unwrap();
+        let (guard, branch) = if mode == "before-setter" {
+            let paste_launch = Uuid::new_v4();
+            let ready = |epoch: &str| {
+                format!(
+                    "v1~{}~{}~18~42~1~2~3~4~5~-~{paste_launch}~{epoch}~r~{}",
+                    target.runtime_id,
+                    target.generation,
+                    Uuid::new_v4()
+                )
+            };
+            let sender = guard_all(&[
+                guard_equal("version", "3.8"),
+                guard_equal("socket_path", socket),
+                guard_equal("after-load-buffer", ""),
+                guard_equal("after-save-buffer", ""),
+                guard_equal("after-paste-buffer", ""),
+                guard_equal("after-delete-buffer", ""),
+                guard_equal("after-send-keys", ""),
+                guard_equal("after-set-option", ""),
+                guard_equal("after-display-message", ""),
+                guard_equal("command-error", ""),
+            ]);
             let next = epoch_marker(ResizeEpoch {
                 owner: Uuid::new_v4(),
                 ..owner.epoch
             });
-            format!(
-                "set-option -p -t {pane} @rs_resize_epoch {next} ; set-option -p -t {pane} @rs_paste_admission v1~{}~{}~{next}~r~{} ; display-message -p -l -t {pane} rs-fenced",
-                target.runtime_id,
-                target.generation,
-                Uuid::new_v4(),
+            (
+                guard_all(&[
+                    geometry,
+                    sender,
+                    guard_equal("@rs_paste_launch", paste_launch),
+                    guard_equal("@rs_paste_admission", ready(&epoch)),
+                ]),
+                format!(
+                    "set-option -p -t {pane} @rs_resize_epoch {next} ; set-option -p -t {pane} @rs_paste_admission {} ; display-message -p -l -t {pane} rs-fenced",
+                    ready(&next)
+                ),
             )
         } else {
-            format!(
-                "resize-window -t {} -x 119 -y 40 ; set-option -p -t {pane} @rs_resize_intent {epoch}:{}:1:119:40 ; display-message -p rs-committed",
-                target.window,
-                Uuid::new_v4(),
+            (
+                guard_all(&[
+                    geometry,
+                    guard_equal("@rs_resize_intent", ""),
+                    guard_equal("window_width", NARROW.cols),
+                    guard_equal("window_height", NARROW.rows),
+                ]),
+                format!(
+                    "resize-window -t {} -x 119 -y 40 ; set-option -p -t {pane} @rs_resize_intent {epoch}:{}:1:119:40 ; display-message -p rs-committed",
+                    target.window,
+                    Uuid::new_v4(),
+                ),
             )
         };
         vec![
@@ -1639,7 +1981,7 @@ mod resize_probe_tests {
             nonce.to_string(),
             "-N".into(),
             "-S".into(),
-            fixture.scope.socket.to_str().unwrap().into(),
+            socket.into(),
             "if-shell".into(),
             "-F".into(),
             "-t".into(),
@@ -1734,6 +2076,326 @@ mod resize_probe_tests {
         }
     }
 
+    fn test_capture(fixture: &FixtureAgent, owner: &Owner, mode: &str) -> GuardedCapture {
+        let attempt = fixture.arm(mode).unwrap();
+        capture_fixture_command(capture_args(fixture, owner, mode, attempt.nonce)).unwrap();
+        fixture.captured(attempt).unwrap().0
+    }
+
+    fn private_tmux(fixture: &FixtureAgent, script: &str) -> Lab {
+        let tmux = fixture.directory.join("fake-tmux");
+        fs::write(&tmux, script).unwrap();
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+        Lab {
+            directory: fixture.scope.socket.parent().unwrap().to_path_buf(),
+            tmux,
+            runtime: fixture.scope.target.runtime_id,
+            agent: String::new(),
+        }
+    }
+
+    async fn reply_statuses(
+        listener: &UnixListener,
+        view: &TerminalView,
+        replies: &[TerminalStatus],
+    ) {
+        for status in replies {
+            let (mut connection, _) =
+                tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let mut frame = String::new();
+            BufReader::new(&mut connection)
+                .read_line(&mut frame)
+                .await
+                .unwrap();
+            let request: Request = decode_local_fixture(frame.as_bytes()).unwrap();
+            assert!(matches!(request, Request::TerminalStatus { terminal } if terminal == *view));
+            let line = encode_local_observation(&Response::TerminalStatus {
+                status: status.clone(),
+            })
+            .unwrap()
+                + "\n";
+            connection.write_all(line.as_bytes()).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn w1_resize_probe_rejects_inoperative_predecessor() {
+        for mode in ["before", "before-setter"] {
+            let (fixture, owner, baseline) = fixture();
+            let mut capture = test_capture(&fixture, &owner, mode);
+            let guard = capture.argv[7].clone();
+            let branch = capture.argv[8].clone();
+            for tampered in [
+                format!("#{{&&:0,{guard}}}"),
+                format!("#{{!:{guard}}}"),
+                format!("#{{||:{guard},#{{==:unrelated,unrelated}}}}"),
+                guard.replace("/dev/ttys005", "#(/usr/bin/false)"),
+                guard.replacen(
+                    &guard_equal("command-error", ""),
+                    &guard_equal("unknown", ""),
+                    1,
+                ),
+                guard.replacen("manual", "latest", 1),
+            ] {
+                capture.argv[7] = tampered;
+                assert!(capture.check_predecessor(&owner, &baseline).is_err());
+            }
+            capture.argv[7] = guard.clone();
+            capture.argv[8] = if mode == "before-setter" {
+                branch.replacen("~18~42~", "~19~42~", 1)
+            } else {
+                branch.replace(":1:119:40", ":2:119:40")
+            };
+            assert!(capture.check_predecessor(&owner, &baseline).is_err());
+            capture.argv[8] = branch;
+            let mut wrong = baseline.clone();
+            wrong.epoch = None;
+            assert!(capture.check_predecessor(&owner, &wrong).is_err());
+            if mode == "before" {
+                let mut wrong = baseline.clone();
+                wrong.committed.size = NORMAL;
+                assert!(capture.check_predecessor(&owner, &wrong).is_err());
+            }
+
+            fs::write(fixture.directory.join("guard"), &guard).unwrap();
+            fs::write(
+                fixture.directory.join("negative"),
+                guard.replacen(
+                    &format!(
+                        "#{{==:#{{@rs_resize_epoch}},{}:{}}}",
+                        owner.epoch.agent, owner.epoch.owner
+                    ),
+                    &format!(
+                        "#{{==:#{{@rs_resize_epoch}},{}:{}}}",
+                        owner.epoch.agent,
+                        Uuid::nil()
+                    ),
+                    1,
+                ),
+            )
+            .unwrap();
+            let lab = private_tmux(
+                &fixture,
+                r#"#!/bin/sh
+set -eu
+root=$(dirname "$0")
+[ "$#" -eq 9 ]
+[ "$1:$2:$3:$4:$5:$6:$7" = "-N:-S:$root/server/tmux.sock:if-shell:-F:-t:%3" ]
+[ "$9" = "display-message -p -l -t %3 rs-eligible" ]
+if [ "$8" = "$(cat "$root/guard")" ]; then
+    [ ! -f "$root/eligible" ] || echo rs-eligible
+else
+    [ "$8" = "$(cat "$root/negative")" ]
+fi
+"#,
+            );
+            let listener = UnixListener::bind(fixture.directory.join("agent.sock")).unwrap();
+            for valid in [false, true] {
+                if valid {
+                    fs::write(fixture.directory.join("eligible"), "").unwrap();
+                }
+                let capture = GuardedCapture {
+                    attempt: capture.attempt,
+                    scope: capture.scope.clone(),
+                    argv: capture.argv.clone(),
+                };
+                let replies = if valid {
+                    vec![baseline.clone(), baseline.clone()]
+                } else {
+                    vec![baseline.clone()]
+                };
+                let mut report = Report::default();
+                let (result, ()) = tokio::join!(
+                    capture.witness_predecessor(
+                        &lab,
+                        &owner,
+                        &fixture.directory,
+                        &baseline,
+                        &mut report
+                    ),
+                    reply_statuses(&listener, &owner.view, &replies),
+                );
+                assert_eq!(result.is_ok(), valid, "{:?}", result.as_ref().err());
+                if let Ok(replay) = result {
+                    assert_eq!(replay.0[7], guard);
+                    assert_eq!(report.statuses, replies);
+                    assert_eq!(report.commands.len(), 2);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn w1_resize_probe_requires_exact_restart_replay_readback() {
+        let (fixture, predecessor, mut fresh) = fixture();
+        let epoch = ResizeEpoch {
+            agent: Uuid::new_v4(),
+            owner: Uuid::new_v4(),
+        };
+        fresh.terminal.agent_epoch = epoch.agent;
+        fresh.terminal.view_id = Uuid::new_v4();
+        fresh.epoch = Some(epoch);
+        fresh.committed.revision = 5;
+        fresh.committed.intent = Some(ResizeIntent {
+            epoch: predecessor.epoch,
+            id: Uuid::new_v4(),
+        });
+        let lab = private_tmux(
+            &fixture,
+            r#"#!/bin/sh
+set -eu
+root=$(dirname "$0")
+[ "$#" -eq 9 ]
+[ "$1:$2:$3:$4:$5:$6:$7" = "-N:-S:$root/server/tmux.sock:if-shell:-F:-t:%3" ]
+[ "$8" = "$(cat "$root/guard")" ]
+[ "$9" = "$(cat "$root/branch")" ]
+: > "$root/replayed"
+"#,
+        );
+        let listener = UnixListener::bind(fixture.directory.join("agent.sock")).unwrap();
+        let mut report = Report::default();
+        for mode in ["before", "before-setter"] {
+            let replay = AdmittedReplay(test_capture(&fixture, &predecessor, mode).argv);
+            fs::write(fixture.directory.join("guard"), &replay.0[7]).unwrap();
+            fs::write(fixture.directory.join("branch"), &replay.0[8]).unwrap();
+            for mismatch in [
+                "target", "view", "epoch", "intent", "revision", "grid", "exact",
+            ] {
+                let replayed = fixture.directory.join("replayed");
+                let mut observed = fresh.clone();
+                match mismatch {
+                    "target" => observed.terminal.target.process_start += 1,
+                    "view" => observed.terminal.view_id = Uuid::new_v4(),
+                    "epoch" => observed.epoch = Some(predecessor.epoch),
+                    "intent" => observed.committed.intent.as_mut().unwrap().id = Uuid::new_v4(),
+                    "revision" => observed.committed.revision += 1,
+                    "grid" => observed.committed.size = NORMAL,
+                    _ => {}
+                }
+                observed.provider.as_mut().unwrap().sampled_at_us +=
+                    report.statuses.len() as u64 + 1;
+                let replies = [observed.clone()];
+                let readback = async {
+                    reply_statuses(&listener, &fresh.terminal, &replies).await;
+                    assert!(replayed.is_file());
+                };
+                let (result, ()) = tokio::join!(
+                    replay_stale(&lab, &replay, &fixture.directory, &fresh, &mut report),
+                    readback,
+                );
+                assert_eq!(result.is_ok(), mismatch == "exact", "{mode}: {mismatch}");
+                if mismatch == "exact" {
+                    assert_eq!(report.statuses.last(), Some(&observed));
+                }
+                fs::remove_file(replayed).unwrap();
+            }
+        }
+        assert_eq!(report.statuses.len(), 2);
+        assert_ne!(report.statuses[0].provider, report.statuses[1].provider);
+    }
+
+    #[tokio::test]
+    async fn w1_resize_probe_pressure_requires_post_full_output_and_scoped_cleanup() {
+        let (_fixture, owner, baseline) = fixture();
+        let victim = AttachmentProbeScope {
+            view_id: Uuid::new_v4(),
+            pid: 21,
+            generation: 3,
+        };
+        let before = Instant::now();
+        let full = AttachmentProbeFull {
+            high_water: 16,
+            at: before + Duration::from_millis(1),
+            at_us: 2000,
+        };
+        let after = before + Duration::from_millis(2);
+        let cleanup = AttachmentProbeSnapshot {
+            scope: victim,
+            retired_at: Some(full.at),
+            full: Some(full),
+            reader_exit: Some(after),
+            child_reaped: Some(after),
+        };
+        let mut grant = None;
+        let mut chunk = Chunk {
+            data: b"RSBRIDGEKEPT".to_vec(),
+            writable: true,
+            closed: false,
+            status: Some(baseline.clone()),
+            geometry: None,
+            paste_incarnation: Some(Uuid::new_v4()),
+            paste_completion: None,
+            paste_admission: None,
+            closure: None,
+        };
+        check_pressure_chunk(&chunk, Some(&baseline), &mut grant).unwrap();
+        let mut progress = PressureProgress::default();
+        progress.record(8192, (before, 1000));
+        progress.record(chunk.data.len(), (before, 1000));
+        assert!(pressure_witness(victim, cleanup, &progress).is_err());
+
+        chunk.status.as_mut().unwrap().terminal = TerminalView {
+            view_id: victim.view_id,
+            ..owner.view.clone()
+        };
+        assert!(check_pressure_chunk(&chunk, Some(&baseline), &mut grant).is_err());
+        chunk.status = Some(baseline.clone());
+        chunk.paste_incarnation = Some(Uuid::new_v4());
+        assert!(check_pressure_chunk(&chunk, Some(&baseline), &mut grant).is_err());
+        chunk.paste_incarnation = grant;
+        check_pressure_chunk(&chunk, Some(&baseline), &mut grant).unwrap();
+        progress.record(chunk.data.len(), (after, 3000));
+
+        for incomplete in [
+            AttachmentProbeSnapshot {
+                full: None,
+                ..cleanup
+            },
+            AttachmentProbeSnapshot {
+                reader_exit: None,
+                ..cleanup
+            },
+            AttachmentProbeSnapshot {
+                child_reaped: None,
+                ..cleanup
+            },
+            AttachmentProbeSnapshot {
+                child_reaped: Some(full.at + Duration::from_secs(3)),
+                ..cleanup
+            },
+            AttachmentProbeSnapshot {
+                scope: AttachmentProbeScope { pid: 22, ..victim },
+                ..cleanup
+            },
+            AttachmentProbeSnapshot {
+                scope: AttachmentProbeScope {
+                    view_id: owner.view.view_id,
+                    ..victim
+                },
+                ..cleanup
+            },
+            AttachmentProbeSnapshot {
+                scope: AttachmentProbeScope {
+                    generation: 4,
+                    ..victim
+                },
+                ..cleanup
+            },
+        ] {
+            assert!(
+                pressure_witness(victim, incomplete, &progress).is_err(),
+                "{incomplete:?}"
+            );
+        }
+        let output = pressure_witness(victim, cleanup, &progress).unwrap();
+        assert_eq!(output.first_at_us, 1000);
+        assert_eq!(output.last_at_us, 3000);
+        assert_eq!(output.bytes, 8192 + 2 * chunk.data.len());
+    }
+
     #[tokio::test]
     async fn w1_resize_probe_expiry_witness() {
         let (_fixture, owner, before) = fixture();
@@ -1821,6 +2483,7 @@ mod resize_probe_tests {
     }
 }
 
+#[cfg(debug_assertions)]
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PressureHeartbeat {
@@ -1830,17 +2493,29 @@ struct PressureHeartbeat {
     at_ns: u64,
 }
 
+#[cfg(debug_assertions)]
 #[derive(Serialize)]
 struct PressureView {
     view_id: String,
     pid: u32,
     started: String,
     rss_kib: u64,
+    #[serde(skip)]
+    probe: AttachmentProbe,
+    #[serde(skip)]
+    scope: AttachmentProbeScope,
 }
 
+#[cfg(debug_assertions)]
 impl PressureView {
     async fn observe(bridge: &DesktopBridge, view: &Attachment) -> Result<Self> {
-        let pid = bridge.attachment_pid(&view.view_id)?;
+        let probe = bridge.probe_attachment(&view.view_id)?;
+        let scope = probe.snapshot().scope;
+        ensure!(
+            scope.view_id == view.status.terminal.view_id,
+            "Wrong attachment probe view"
+        );
+        let pid = scope.pid;
         let pid_arg = pid.to_string();
         let ps = Path::new("/bin/ps");
         let started = command(ps, &["-p", &pid_arg, "-o", "lstart="]).await?;
@@ -1854,31 +2529,31 @@ impl PressureView {
             pid,
             started: started.trim().to_owned(),
             rss_kib: rss.trim().parse()?,
+            probe,
+            scope,
         })
     }
 
     async fn wait_reaped(&self) -> Result<()> {
-        let pid = self.pid.to_string();
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                let current = tokio::process::Command::new("/bin/ps")
-                    .args(["-p", &pid, "-o", "lstart="])
-                    .kill_on_drop(true)
-                    .output()
-                    .await?;
-                if !current.status.success()
-                    || String::from_utf8_lossy(&current.stdout).trim() != self.started.trim()
-                {
-                    return Ok(());
+                if self.probe.snapshot().confirmed_cleanup(self.scope) {
+                    return;
                 }
                 tokio::time::sleep(Duration::from_millis(15)).await;
             }
         })
         .await
-        .context("Disposable attachment client did not exit")?
+        .with_context(|| {
+            format!(
+                "Attachment {} (pid {}) lacked bounded reader exit and child reap",
+                self.view_id, self.pid
+            )
+        })
     }
 }
 
+#[cfg(debug_assertions)]
 #[derive(Serialize)]
 struct PressureOutput {
     bytes: usize,
@@ -1886,6 +2561,58 @@ struct PressureOutput {
     last_at_us: u64,
 }
 
+#[cfg(debug_assertions)]
+#[derive(Default)]
+struct PressureProgress {
+    bytes: usize,
+    first: Option<(Instant, u64)>,
+    last: Option<(Instant, u64)>,
+}
+
+#[cfg(debug_assertions)]
+impl PressureProgress {
+    fn record(&mut self, bytes: usize, at: (Instant, u64)) {
+        self.bytes += bytes;
+        self.first.get_or_insert(at);
+        self.last = Some(at);
+    }
+
+    fn across_full(&self, full: AttachmentProbeFull) -> Option<PressureOutput> {
+        let (first, first_at_us) = self.first?;
+        let (last, last_at_us) = self.last?;
+        (self.bytes > 8192
+            && first < full.at
+            && full.at < last
+            && first_at_us < full.at_us
+            && full.at_us < last_at_us)
+            .then_some(PressureOutput {
+                bytes: self.bytes,
+                first_at_us,
+                last_at_us,
+            })
+    }
+}
+
+#[cfg(debug_assertions)]
+fn pressure_witness(
+    victim: AttachmentProbeScope,
+    snapshot: AttachmentProbeSnapshot,
+    progress: &PressureProgress,
+) -> Result<PressureOutput> {
+    ensure!(
+        snapshot.confirmed_cleanup(victim),
+        "Original victim cleanup was not confirmed"
+    );
+    let full = snapshot
+        .full
+        .filter(|full| full.high_water == 16 && Some(full.at) == snapshot.retired_at)
+        .context("Original victim Full was not confirmed")?;
+    progress
+        .across_full(full)
+        .context("Owner output did not progress across victim Full")
+}
+
+#[cfg(debug_assertions)]
 #[derive(Serialize)]
 struct PressureReport {
     run_id: Uuid,
@@ -1913,10 +2640,12 @@ struct PressureReport {
     closure: TerminalClosure,
 }
 
+#[cfg(debug_assertions)]
 fn pressure_heartbeat(directory: &Path) -> Result<PressureHeartbeat> {
     decode_local_fixture(&fs::read(directory.join("pressure-heartbeat.json"))?)
 }
 
+#[cfg(debug_assertions)]
 fn wall_us() -> Result<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)?
@@ -1924,6 +2653,12 @@ fn wall_us() -> Result<u64> {
         .try_into()?)
 }
 
+#[cfg(not(debug_assertions))]
+async fn pressure_probe(_args: Vec<String>) -> Result<()> {
+    bail!("Pressure mode requires debug attachment diagnostics")
+}
+
+#[cfg(debug_assertions)]
 async fn pressure_probe(args: Vec<String>) -> Result<()> {
     ensure!(
         args.len() == 10,
@@ -1968,7 +2703,7 @@ async fn pressure_probe(args: Vec<String>) -> Result<()> {
     let victim = bridge.attach_observer(&runtime_id).await?;
     let victim_process = PressureView::observe(&bridge, &victim).await?;
     let committed = async {
-        pressure_bytes(&bridge, &victim, false, b"RSSTARTREADY").await?;
+        pressure_bytes(&bridge, &victim, b"RSSTARTREADY", None).await?;
         let size = if owner.status.committed.size == NORMAL {
             NARROW
         } else {
@@ -1983,6 +2718,11 @@ async fn pressure_probe(args: Vec<String>) -> Result<()> {
     }
     .await?;
     let owner_grid = await_grid(&bridge, &owner, &committed, true).await?;
+    ensure!(
+        committed.terminal == owner.status.terminal && committed.epoch == Some(epoch),
+        "Pressure owner baseline did not match the attachment and authority"
+    );
+    confirm_exact_state(&committed, &owner_grid.status)?;
     let heartbeat_before = pressure_heartbeat(&directory)?;
     ensure!(
         heartbeat_before.pid == heartbeat.pid && heartbeat_before.instance == heartbeat.instance,
@@ -1993,18 +2733,20 @@ async fn pressure_probe(args: Vec<String>) -> Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(directory.join("pressure-bridge.trigger"))?;
-    let peer = pressure_bytes(&bridge, &owner, true, b"RSBRIDGEKEPT");
+    let peer = pressure_bytes(
+        &bridge,
+        &owner,
+        b"RSBRIDGEKEPT",
+        Some((&committed, &victim_process.probe)),
+    );
     let overflow = async {
-        let retired = tokio::time::timeout(Duration::from_secs(12), async {
-            loop {
-                if bridge.attachment_pid(&victim.view_id).is_err() {
-                    break;
-                }
+        tokio::time::timeout(Duration::from_secs(12), async {
+            while victim_process.probe.snapshot().full.is_none() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
-        .await;
-        ensure!(retired.is_ok(), "overflow not reached");
+        .await
+        .context("overflow not reached")?;
         let chunk = bridge
             .read(&victim.view_id)
             .await
@@ -2024,7 +2766,13 @@ async fn pressure_probe(args: Vec<String>) -> Result<()> {
         victim_process.wait_reaped().await?;
         Ok::<_, anyhow::Error>((closure, at))
     };
-    let ((closure, overflow_returned_at_us), healthy_output) = tokio::try_join!(overflow, peer)?;
+    let ((closure, overflow_returned_at_us), (progress, mut grant)) =
+        tokio::try_join!(overflow, peer)?;
+    let healthy_output = pressure_witness(
+        victim_process.scope,
+        victim_process.probe.snapshot(),
+        &progress,
+    )?;
     let heartbeat_after = pressure_heartbeat(&directory)?;
     ensure!(
         heartbeat_after.pid == heartbeat_before.pid
@@ -2047,12 +2795,10 @@ async fn pressure_probe(args: Vec<String>) -> Result<()> {
             && replacement.status.committed == committed.committed,
         "Replacement did not attach to the current target and grid"
     );
-    pressure_bytes(&bridge, &replacement, false, b"RSBRIDGEKEPT").await?;
-    let incarnation = bridge
-        .read(&owner.view_id)
-        .await?
-        .paste_incarnation
-        .context("Pressure owner writer grant unavailable")?;
+    pressure_bytes(&bridge, &replacement, b"RSBRIDGEKEPT", None).await?;
+    let chunk = bridge.read(&owner.view_id).await?;
+    check_pressure_chunk(&chunk, Some(&committed), &mut grant)?;
+    let incarnation = grant.context("Pressure owner writer grant unavailable")?;
     bridge
         .input(
             &owner.view_id,
@@ -2105,38 +2851,70 @@ async fn pressure_probe(args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(debug_assertions)]
+fn check_pressure_chunk(
+    chunk: &Chunk,
+    owner: Option<&TerminalStatus>,
+    grant: &mut Option<Uuid>,
+) -> Result<()> {
+    ensure!(
+        !chunk.closed
+            && chunk.writable == owner.is_some()
+            && chunk.geometry.is_none()
+            && chunk.data.len() <= 8192,
+        "Healthy view lost stream or authority"
+    );
+    if let Some(expected) = owner {
+        if let Some(observed) = &chunk.status {
+            confirm_exact_state(expected, observed)?;
+        }
+        let incarnation = chunk
+            .paste_incarnation
+            .filter(|id| !id.is_nil())
+            .context("Pressure owner writer grant unavailable")?;
+        ensure!(
+            *grant.get_or_insert(incarnation) == incarnation,
+            "Pressure owner writer grant changed"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
 async fn pressure_bytes(
     bridge: &DesktopBridge,
     view: &Attachment,
-    writable: bool,
     marker: &[u8],
-) -> Result<PressureOutput> {
+    owner: Option<(&TerminalStatus, &AttachmentProbe)>,
+) -> Result<(PressureProgress, Option<Uuid>)> {
     tokio::time::timeout(Duration::from_secs(14), async {
         let mut tail = Vec::new();
-        let mut total = 0;
-        let mut first = None;
+        let mut progress = PressureProgress::default();
+        let mut found = false;
+        let mut grant = None;
         loop {
             let chunk = bridge.read(&view.view_id).await?;
-            ensure!(
-                !chunk.closed && chunk.writable == writable && chunk.geometry.is_none(),
-                "Healthy view lost stream or authority"
-            );
-            if chunk.data.is_empty() {
-                continue;
+            let received = Instant::now();
+            check_pressure_chunk(&chunk, owner.map(|(expected, _)| expected), &mut grant)?;
+            if !chunk.data.is_empty() {
+                progress.record(chunk.data.len(), (received, wall_us()?));
+                if !found {
+                    tail.extend(chunk.data);
+                    found = tail.windows(marker.len()).any(|window| window == marker);
+                    let keep = tail.len().min(marker.len() - 1);
+                    tail.drain(..tail.len() - keep);
+                }
             }
-            let at = wall_us()?;
-            let first_at_us = *first.get_or_insert(at);
-            total += chunk.data.len();
-            tail.extend(chunk.data);
-            if tail.windows(marker.len()).any(|window| window == marker) {
-                return Ok(PressureOutput {
-                    bytes: total,
-                    first_at_us,
-                    last_at_us: at,
-                });
+            if found
+                && owner.is_none_or(|(_, victim)| {
+                    victim
+                        .snapshot()
+                        .full
+                        .is_some_and(|full| progress.across_full(full).is_some())
+                })
+            {
+                return Ok((progress, grant));
             }
-            let keep = tail.len().min(marker.len() - 1);
-            tail.drain(..tail.len() - keep);
         }
     })
     .await

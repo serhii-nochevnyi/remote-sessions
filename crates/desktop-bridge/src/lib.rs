@@ -352,8 +352,65 @@ struct Views {
     allocated: Arc<AtomicUsize>,
     paste_holds: HashMap<Uuid, PasteAdmission>,
     control_samples: HashMap<Uuid, ControlSample>,
+    #[cfg(debug_assertions)]
+    attachment_probes: HashMap<Uuid, Weak<AttachmentProbeState>>,
     #[cfg(test)]
     paste_fixture: Option<mpsc::UnboundedSender<PasteFixtureFrame>>,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttachmentProbeScope {
+    pub view_id: Uuid,
+    pub pid: u32,
+    pub generation: u64,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, Debug)]
+pub struct AttachmentProbeFull {
+    pub high_water: usize,
+    pub at: Instant,
+    pub at_us: u64,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, Debug)]
+pub struct AttachmentProbeSnapshot {
+    pub scope: AttachmentProbeScope,
+    pub retired_at: Option<Instant>,
+    pub full: Option<AttachmentProbeFull>,
+    pub reader_exit: Option<Instant>,
+    pub child_reaped: Option<Instant>,
+}
+
+#[cfg(debug_assertions)]
+impl AttachmentProbeSnapshot {
+    pub fn confirmed_cleanup(&self, expected: AttachmentProbeScope) -> bool {
+        self.scope == expected
+            && self.retired_at.is_some_and(|retired| {
+                let deadline = retired + CLEANUP_BUDGET;
+                [self.reader_exit, self.child_reaped]
+                    .into_iter()
+                    .all(|at| at.is_some_and(|at| retired <= at && at <= deadline))
+            })
+    }
+}
+
+#[cfg(debug_assertions)]
+struct AttachmentProbeState {
+    reader: Weak<AtomicU64>,
+    snapshot: Mutex<AttachmentProbeSnapshot>,
+}
+
+#[cfg(debug_assertions)]
+pub struct AttachmentProbe(Arc<AttachmentProbeState>);
+
+#[cfg(debug_assertions)]
+impl AttachmentProbe {
+    pub fn snapshot(&self) -> AttachmentProbeSnapshot {
+        *self.0.snapshot.lock().unwrap()
+    }
 }
 
 struct WriterCandidate {
@@ -423,6 +480,14 @@ impl EofDrain {
 }
 
 impl Views {
+    #[cfg(debug_assertions)]
+    fn attachment_probe(&self, view: &View) -> Option<Arc<AttachmentProbeState>> {
+        self.attachment_probes
+            .get(&view.terminal.view_id)
+            .and_then(Weak::upgrade)
+            .filter(|probe| probe.reader.as_ptr() == Arc::as_ptr(&view.reader_state))
+    }
+
     fn forget_writer_candidate(&mut self, terminal: &TerminalView) {
         let runtime = terminal.target.runtime_id;
         if self
@@ -924,6 +989,19 @@ impl View {
             return true;
         };
         let at = self.retire_locked(&mut views, reason);
+        #[cfg(debug_assertions)]
+        if let Retirement::Typed(TerminalClosure::Overflow { high_water }) = reason
+            && let Some((probe, at_us)) = views.attachment_probe(self).zip(at)
+        {
+            let mut snapshot = probe.snapshot.lock().unwrap();
+            if let Some(at) = snapshot.retired_at {
+                snapshot.full = Some(AttachmentProbeFull {
+                    high_water,
+                    at,
+                    at_us,
+                });
+            }
+        }
         drop(views);
         if let Retirement::Typed(TerminalClosure::Overflow { high_water }) = reason {
             self.trace_pressure_at("full", Some(high_water), at);
@@ -994,6 +1072,15 @@ impl View {
             views.remember(id, closure);
         }
         let at = sample_clock().ok();
+        #[cfg(debug_assertions)]
+        if let Some(probe) = views.attachment_probe(self) {
+            probe
+                .snapshot
+                .lock()
+                .unwrap()
+                .retired_at
+                .get_or_insert_with(Instant::now);
+        }
         self.retirement.send_replace(Some(reason));
         at
     }
@@ -1098,6 +1185,13 @@ fn supervise(
 ) {
     let (mut child, allocation) = child.owned.take().unwrap();
     view.handle.block_on(view.retired());
+    #[cfg(debug_assertions)]
+    let probe = view.views.upgrade().and_then(|views| {
+        let mut views = views.lock().unwrap();
+        let probe = views.attachment_probe(&view);
+        views.attachment_probes.remove(&view.terminal.view_id);
+        probe
+    });
     let deadline = Instant::now() + CLEANUP_BUDGET;
     view.master.lock().unwrap().take();
     let output_cleanup = (!view.eof_draining()).then(|| {
@@ -1129,12 +1223,20 @@ fn supervise(
             let _ = reader.take().unwrap().join();
             #[cfg(test)]
             view.cleanup_confirmations.fetch_or(1, Ordering::Release);
+            #[cfg(debug_assertions)]
+            if let Some(probe) = &probe {
+                probe.snapshot.lock().unwrap().reader_exit = Some(Instant::now());
+            }
             view.trace_pressure("reader_exit");
         }
         if !reap && poll_child(child.as_mut(), &mut signalled) {
             reap = true;
             #[cfg(test)]
             view.cleanup_confirmations.fetch_or(2, Ordering::Release);
+            #[cfg(debug_assertions)]
+            if let Some(probe) = &probe {
+                probe.snapshot.lock().unwrap().child_reaped = Some(Instant::now());
+            }
             view.trace_pressure("child_reaped");
         }
         if reap && reader.is_none() && output_cleanup.as_ref().is_none_or(|job| job.is_finished()) {
@@ -2254,6 +2356,39 @@ impl DesktopBridge {
         Ok(self.view(view_id)?.client_pid)
     }
 
+    #[cfg(debug_assertions)]
+    pub fn probe_attachment(&self, view_id: &str) -> Result<AttachmentProbe> {
+        let id = Uuid::parse_str(view_id).context("View detached")?;
+        let mut views = self.views.lock().unwrap();
+        let view = views
+            .live
+            .get(&id)
+            .filter(|view| !view.closed() && view.client_pid != 0)
+            .context("Live attachment probe unavailable")?;
+        if let Some(probe) = views.attachment_probe(view) {
+            return Ok(AttachmentProbe(probe));
+        }
+        let probe = Arc::new(AttachmentProbeState {
+            reader: Arc::downgrade(&view.reader_state),
+            snapshot: Mutex::new(AttachmentProbeSnapshot {
+                scope: AttachmentProbeScope {
+                    view_id: id,
+                    pid: view.client_pid,
+                    generation: self.generation.load(Ordering::SeqCst),
+                },
+                retired_at: None,
+                full: None,
+                reader_exit: None,
+                child_reaped: None,
+            }),
+        });
+        views
+            .attachment_probes
+            .retain(|_, probe| probe.strong_count() != 0);
+        views.attachment_probes.insert(id, Arc::downgrade(&probe));
+        Ok(AttachmentProbe(probe))
+    }
+
     pub async fn status(&self, view_id: &str) -> Result<TerminalStatus> {
         let view = self.view(view_id)?;
         ensure!(!view.closed(), "View detached");
@@ -3046,6 +3181,147 @@ mod tests {
             assert!(matches!(request, Request::List {}));
             Self::reply(peer, Response::Runtimes { runtimes });
         }
+    }
+
+    #[cfg(debug_assertions)]
+    #[derive(Debug)]
+    struct ProbeChild {
+        can_reap: Weak<AtomicBool>,
+        first_inconclusive_wait: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    #[cfg(debug_assertions)]
+    impl portable_pty::ChildKiller for ProbeChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            panic!("The controlled wait returns either an error or the reaped child")
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(Self {
+                can_reap: self.can_reap.clone(),
+                first_inconclusive_wait: None,
+            })
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    impl Child for ProbeChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            if self
+                .can_reap
+                .upgrade()
+                .is_some_and(|ready| !ready.load(Ordering::Acquire))
+            {
+                if let Some(attempted) = self.first_inconclusive_wait.take() {
+                    let _ = attempted.send(());
+                }
+                return Err(std::io::Error::other("Controlled wait inconclusive"));
+            }
+            Ok(Some(portable_pty::ExitStatus::with_exit_code(0)))
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            panic!("Cleanup polls the owned child")
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(12)
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn w1_terminal_pressure_probe_observes_scoped_supervisor_cleanup() {
+        let harness = PasteIpc::new();
+        let bridge = &harness.bridge;
+        let (view, _) = harness.attach();
+        let (sender, receiver) = mpsc::channel(OUTPUT_SLOTS);
+        {
+            view.output.lock().await.receiver = receiver;
+        }
+        let (other, _) = harness.attach();
+        let id = view.terminal.view_id.to_string();
+        let witness = bridge.probe_attachment(&id).unwrap();
+        let unrelated = bridge
+            .probe_attachment(&other.terminal.view_id.to_string())
+            .unwrap();
+        let scope = witness.snapshot().scope;
+        assert_eq!(scope.view_id, view.terminal.view_id);
+        assert_eq!(scope.pid, view.client_pid);
+        assert!(witness.snapshot().full.is_none());
+        let allocation = bridge.reserve(scope.generation, None).unwrap();
+        let can_reap = Arc::new(AtomicBool::new(false));
+        let (attempted, inconclusive) = tokio::sync::oneshot::channel();
+        let child = AttachmentChild::new(
+            Box::new(ProbeChild {
+                can_reap: Arc::downgrade(&can_reap),
+                first_inconclusive_wait: Some(attempted),
+            }),
+            allocation,
+        );
+
+        let (filled, full) = tokio::sync::oneshot::channel();
+        let (resume, parked) = std::sync::mpsc::channel();
+        let producer = view.clone();
+        let reader = std::thread::spawn(move || {
+            let mut publish = PtyPublisher::new(sender);
+            let frame = [b'a'; OUTPUT_CHUNK_SIZE];
+            for _ in 0..OUTPUT_SLOTS {
+                assert!(producer.publish(&mut publish, PtyRead::Bytes(&frame)));
+            }
+            assert!(!producer.publish(&mut publish, PtyRead::Bytes(&frame)));
+            filled.send(()).unwrap();
+            let _ = parked.recv_timeout(Duration::from_secs(5));
+        });
+        let supervisor = tokio::task::spawn_blocking(move || supervise(view, child, Some(reader)));
+        tokio::time::timeout(Duration::from_secs(2), full)
+            .await
+            .unwrap()
+            .unwrap();
+        let overflow = witness.snapshot();
+        let at = overflow.full.unwrap();
+        assert_eq!(at.high_water, OUTPUT_SLOTS);
+        assert_eq!(overflow.retired_at, Some(at.at));
+        assert!(at.at_us > 0);
+        assert!(overflow.reader_exit.is_none() && overflow.child_reaped.is_none());
+        assert!(!overflow.confirmed_cleanup(scope));
+        assert!(unrelated.snapshot().full.is_none());
+        assert!(bridge.probe_attachment(&id).is_err());
+
+        resume.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            inconclusive.await.unwrap();
+            while witness.snapshot().reader_exit.is_none() {
+                tokio::time::sleep(CLEANUP_POLL).await;
+            }
+        })
+        .await
+        .unwrap();
+        let reader_only = witness.snapshot();
+        assert!(reader_only.child_reaped.is_none());
+        assert!(!reader_only.confirmed_cleanup(scope));
+        can_reap.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(2), supervisor)
+            .await
+            .unwrap()
+            .unwrap();
+        let completed = witness.snapshot();
+        assert!(completed.confirmed_cleanup(scope));
+        assert!(!completed.confirmed_cleanup(unrelated.snapshot().scope));
+        assert!(!completed.confirmed_cleanup(AttachmentProbeScope { pid: 99, ..scope }));
+        assert!(!completed.confirmed_cleanup(AttachmentProbeScope {
+            generation: scope.generation + 1,
+            ..scope
+        }));
+        assert_eq!(
+            bridge
+                .views
+                .lock()
+                .unwrap()
+                .allocated
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 
     #[tokio::test]
