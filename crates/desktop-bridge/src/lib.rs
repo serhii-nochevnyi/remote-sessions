@@ -870,6 +870,7 @@ fn scan_output(vt: &mut VtState, bytes: &[u8]) -> usize {
 enum GridBarrier {
     Issued(GeometryEvent),
     Successor(TerminalStatus),
+    PublishAuthority(TerminalStatus),
 }
 
 struct Output {
@@ -895,7 +896,10 @@ impl Output {
     fn drain_eof(&mut self) -> Result<Chunk> {
         ensure!(
             self.drain_started.is_none()
-                && self.pending.is_none()
+                && !matches!(
+                    &self.pending,
+                    Some(GridBarrier::Issued(_) | GridBarrier::Successor(_))
+                )
                 && self.status.committed.revision == self.applied_revision,
             DRAIN_TIMEOUT_ERROR
         );
@@ -1763,11 +1767,15 @@ async fn prepare_grid(view: &View, status: TerminalStatus) -> Result<GeometryEve
 }
 
 fn newer_geometry(issued: &TerminalStatus, current: &TerminalStatus) -> Result<bool> {
+    ensure!(
+        current.terminal == issued.terminal,
+        "Terminal attachment identity changed"
+    );
     if current.committed.revision > issued.committed.revision {
         return Ok(true);
     }
     ensure!(
-        current.epoch == issued.epoch && current.committed == issued.committed,
+        current.committed == issued.committed,
         "Terminal geometry boundary was superseded"
     );
     Ok(false)
@@ -1776,10 +1784,19 @@ fn newer_geometry(issued: &TerminalStatus, current: &TerminalStatus) -> Result<b
 async fn redraw_view(
     view: &View,
     boundary: &GeometryEvent,
-) -> Result<(GeometryEvent, Option<TerminalStatus>)> {
+) -> Result<(GeometryEvent, Option<GridBarrier>)> {
     let current = terminal_status(view).await?;
-    let (status, successor) = if newer_geometry(&boundary.status, &current)? {
-        (boundary.status.clone(), Some(current))
+    let superseded = newer_geometry(&boundary.status, &current)?;
+    let (status, pending) = if superseded {
+        (
+            boundary.status.clone(),
+            Some(GridBarrier::Successor(current)),
+        )
+    } else if boundary.status.epoch != current.epoch {
+        (
+            boundary.status.clone(),
+            Some(GridBarrier::PublishAuthority(current)),
+        )
     } else {
         (current, None)
     };
@@ -1801,7 +1818,7 @@ async fn redraw_view(
         !view.closed() && bridge_pty.size == size && client.size == size,
         "Attachment grid changed"
     );
-    if successor.is_none() {
+    if !superseded {
         view_command(
             view,
             &[
@@ -1818,7 +1835,7 @@ async fn redraw_view(
             bridge_pty,
             client,
         },
-        successor,
+        pending,
     ))
 }
 
@@ -1955,6 +1972,8 @@ async fn read_chunk(view: &View, output: &mut Output, now: impl Fn() -> Instant)
     if view.eof_draining() {
         return output.drain_eof();
     }
+    let previous_epoch = output.status.epoch;
+    let publishing_authority = matches!(&output.pending, Some(GridBarrier::PublishAuthority(_)));
     let mut chunk = match &output.pending {
         Some(GridBarrier::Successor(successor)) => {
             let remaining = drain_budget(output.drain_started, now())?;
@@ -1972,6 +1991,14 @@ async fn read_chunk(view: &View, output: &mut Output, now: impl Fn() -> Instant)
             }
         }
         Some(GridBarrier::Issued(_)) => bail!("Terminal grid acknowledgement required"),
+        Some(GridBarrier::PublishAuthority(status)) => {
+            output.status = status.clone();
+            output.pending = None;
+            Chunk {
+                status: Some(output.status.clone()),
+                ..Chunk::empty()
+            }
+        }
         None => poll_output(view, output, &now).await?,
     };
     let control_sample = view.views.upgrade().and_then(|views| {
@@ -1990,6 +2017,8 @@ async fn read_chunk(view: &View, output: &mut Output, now: impl Fn() -> Instant)
             } else if output.status.terminal == view.terminal
                 && Some(lease.epoch) == output.status.epoch
                 && lease.deadline > now()
+                && !publishing_authority
+                && (chunk.geometry.is_none() || output.status.epoch == previous_epoch)
             {
                 chunk.paste_incarnation = Some(lease.incarnation);
             }
@@ -2460,6 +2489,7 @@ impl DesktopBridge {
         view_id: &str,
         size: TerminalSize,
         epoch: ResizeEpoch,
+        incarnation: Uuid,
     ) -> Result<ResizeResult> {
         ensure!(
             size.supported(),
@@ -2475,7 +2505,9 @@ impl DesktopBridge {
             ensure!(!view.closed(), "View detached");
             let lease = control.lease.as_ref().context("Керування ще не отримано")?;
             ensure!(
-                lease.epoch == epoch && lease.writable(Instant::now()),
+                lease.incarnation == incarnation
+                    && lease.epoch == epoch
+                    && lease.writable(Instant::now()),
                 "Resize authority changed"
             );
             (lease.token, lease.resize_sequence)
@@ -2604,7 +2636,7 @@ impl DesktopBridge {
             _ = view.retired() => Err(detached()),
             result = redraw => result,
         };
-        let (event, successor) = match result {
+        let (event, pending) = match result {
             Ok(completed) => completed,
             Err(error) => {
                 let reason = if error.to_string() == DRAIN_TIMEOUT_ERROR {
@@ -2634,14 +2666,14 @@ impl DesktopBridge {
             );
             return Err(error);
         }
-        if successor.is_none() {
+        if !matches!(&pending, Some(GridBarrier::Successor(_))) {
             view.reader_state
                 .compare_exchange(PAUSE, RESUME, Ordering::AcqRel, Ordering::Acquire)
                 .map_err(|_| boundary_unavailable())?;
             output.drain_started = None;
             view.drain_revision.store(0, Ordering::Relaxed);
         }
-        output.pending = successor.map(GridBarrier::Successor);
+        output.pending = pending;
         output.applied_revision = acknowledgement.revision;
         output.renderer_id = Some(acknowledgement.renderer_id);
         Ok(event)
@@ -3561,7 +3593,12 @@ mod tests {
         );
         assert!(
             ipc.bridge
-                .resize(&observer_id, status.committed.size, epoch)
+                .resize(
+                    &observer_id,
+                    status.committed.size,
+                    epoch,
+                    previous_incarnation
+                )
                 .await
                 .is_err()
         );
@@ -3630,7 +3667,7 @@ mod tests {
             );
             assert!(
                 ipc.bridge
-                    .resize(&id, proof.committed.size, epoch)
+                    .resize(&id, proof.committed.size, epoch, previous_incarnation)
                     .await
                     .is_err()
             );
@@ -3661,7 +3698,7 @@ mod tests {
         );
         assert!(
             ipc.bridge
-                .resize(&id, proof.committed.size, epoch)
+                .resize(&id, proof.committed.size, epoch, previous_incarnation)
                 .await
                 .is_err()
         );
@@ -3849,8 +3886,11 @@ mod tests {
         };
         let bridge = ipc.bridge.clone();
         let resize_view = id.clone();
-        let first_resize =
-            tokio::spawn(async move { bridge.resize(&resize_view, first_size, epoch).await });
+        let first_resize = tokio::spawn(async move {
+            bridge
+                .resize(&resize_view, first_size, epoch, incarnation)
+                .await
+        });
         let (resize_reply, request) = ipc.receive().await;
         let Request::ResizeTerminal {
             terminal,
@@ -3967,8 +4007,11 @@ mod tests {
         };
         let bridge = ipc.bridge.clone();
         let resize_view = id;
-        let second_resize =
-            tokio::spawn(async move { bridge.resize(&resize_view, second_size, epoch).await });
+        let second_resize = tokio::spawn(async move {
+            bridge
+                .resize(&resize_view, second_size, epoch, incarnation)
+                .await
+        });
         let (second_reply, request) = ipc.receive().await;
         let Request::ResizeTerminal { sequence, size, .. } = request else {
             panic!("expected the follow-up resize request");
@@ -4014,7 +4057,10 @@ mod tests {
             cols: 113,
             rows: 35,
         };
-        let resize = tokio::spawn(async move { bridge.resize(&resize_view, size, epoch).await });
+        let resize =
+            tokio::spawn(
+                async move { bridge.resize(&resize_view, size, epoch, incarnation).await },
+            );
         let (resize_reply, request) = ipc.receive().await;
         assert!(
             matches!(request, Request::ResizeTerminal { token: actual, sequence: 0, .. } if actual == token)
@@ -4591,7 +4637,7 @@ esac
                 assert!(!chunk.closed);
                 output.extend(chunk.data);
                 if chunk.writable && output == b"initial stream\x1b[" {
-                    break chunk.paste_incarnation.unwrap().to_string();
+                    break chunk.paste_incarnation.unwrap();
                 }
             };
             assert!(
@@ -4602,14 +4648,17 @@ esac
                             rows: 201,
                             ..desired
                         },
-                        epoch
+                        epoch,
+                        incarnation
                     )
                     .await
                     .is_err()
             );
             assert_eq!(admission_count.load(Ordering::Relaxed), 0);
-            let ResizeResult::Committed { status, .. } =
-                bridge.resize(key, desired, epoch).await.unwrap()
+            let ResizeResult::Committed { status, .. } = bridge
+                .resize(key, desired, epoch, incarnation)
+                .await
+                .unwrap()
             else {
                 panic!("Expected a committed request");
             };
@@ -4701,7 +4750,12 @@ esac
                 assert!(bridge.read(key).await.is_err());
                 assert!(
                     bridge
-                        .input(key, b"after close".to_vec(), &incarnation, false)
+                        .input(
+                            key,
+                            b"after close".to_vec(),
+                            &incarnation.to_string(),
+                            false
+                        )
                         .await
                         .is_err()
                 );
@@ -4726,7 +4780,12 @@ esac
             }
             assert_eq!(resumed, b"redraw stream");
             bridge.detach(key);
-            assert!(bridge.resize(key, desired, epoch).await.is_err());
+            assert!(
+                bridge
+                    .resize(key, desired, epoch, incarnation)
+                    .await
+                    .is_err()
+            );
         })
         .await
         .unwrap();

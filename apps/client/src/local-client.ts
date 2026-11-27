@@ -917,8 +917,10 @@ export const localClient = {
   read: async (viewId: string) => parseChunk(await invoke<unknown>("terminal_read", { viewId })),
   terminalStatus: async (viewId: string): Promise<TerminalStatus> =>
     parseTerminalStatus(await invoke<unknown>("terminal_status", { viewId })),
-  resize: async (viewId: string, epoch: ResizeEpoch, size: TerminalSize) =>
-    parseResizeResult(await invoke<unknown>("terminal_resize", { viewId, epoch, size })),
+  resize: async (viewId: string, epoch: ResizeEpoch, size: TerminalSize, incarnation?: string) => {
+    if (!incarnation) throw Error("Керування ще не отримано");
+    return parseResizeResult(await invoke<unknown>("terminal_resize", { viewId, epoch, size, incarnation }));
+  },
   acknowledgeGrid: async (viewId: string, acknowledgement: GridAcknowledgement) =>
     parseGeometryEvent(await invoke<unknown>("terminal_acknowledge_grid", { viewId, acknowledgement })),
   input: async ({ viewId, data, incarnation }: { viewId: string; data: readonly number[]; incarnation: string }) => {

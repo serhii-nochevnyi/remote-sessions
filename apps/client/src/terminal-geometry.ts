@@ -123,7 +123,7 @@ export function mountedResize(callbacks: {
   owns(terminal: TerminalScope): boolean;
   canWrite(): boolean;
   ordered(): OrderedGeometry | undefined;
-  invoke(view: string, epoch: ResizeEpoch, size: TerminalSize): Promise<ResizeResult>;
+  invoke(view: string, epoch: ResizeEpoch, size: TerminalSize, incarnation?: string): Promise<ResizeResult>;
   scheduleLayout(): void;
   cancelLayout(): void;
   settled(unavailable: boolean): void;
@@ -163,7 +163,7 @@ export function mountedResize(callbacks: {
     if (!proposal) return;
     let result: ResizeResult | undefined;
     try {
-      result = await callbacks.invoke(proposal.terminal.view_id, proposal.epoch, proposal.size);
+      result = await callbacks.invoke(proposal.terminal.view_id, proposal.epoch, proposal.size, proposal.grant.incarnation);
     } catch {}
     const current = callbacks.owns(proposal.terminal);
     if (!current) close();
@@ -193,7 +193,7 @@ export function mountedResize(callbacks: {
       } else if (chunk.writable) {
         incarnation = chunk.paste_incarnation;
       }
-      const changed = proposals.observe(ordered.status, writable, ordered.applied, incarnation);
+      const changed = proposals.observe(ordered.status, writable && incarnation !== undefined, ordered.applied, incarnation);
       if (changed) scheduleLayout();
       return changed;
     },

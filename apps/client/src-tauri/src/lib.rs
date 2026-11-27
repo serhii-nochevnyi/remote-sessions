@@ -622,10 +622,14 @@ mod desktop {
         view_id: String,
         epoch: ResizeEpoch,
         size: TerminalSize,
+        incarnation: String,
         bridge: State<'_, DesktopBridge>,
     ) -> Result<ResizeResult, String> {
+        let incarnation = incarnation
+            .parse()
+            .map_err(|_| "Некоректна прив’язка зміни розміру".to_owned())?;
         bridge
-            .resize(&view_id, size, epoch)
+            .resize(&view_id, size, epoch, incarnation)
             .await
             .map_err(|e| e.to_string())
     }

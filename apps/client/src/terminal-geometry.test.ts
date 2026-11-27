@@ -307,7 +307,7 @@ async function exerciseResizeGrantGap(t: TestContext, replyFirst: boolean, nextE
   const freshGrant = uuid(33);
   await fixture.sample(initial(), oldGrant);
   const first = fixture.measure(sizes[0]);
-  const firstCall = { viewId: terminal.view_id, epoch, size: sizes[0] };
+  const firstCall = { viewId: terminal.view_id, epoch, size: sizes[0], incarnation: oldGrant };
   fixture.resize.scheduleLayout();
   const oldLayout = fixture.measure(sizes[1]);
   assert.deepEqual(fixture.calls.map(call => call.args), [firstCall]);
@@ -357,7 +357,7 @@ async function exerciseResizeGrantGap(t: TestContext, replyFirst: boolean, nextE
   fixture.acknowledgements[0]!.reply.resolve(event);
   await applying;
   assert.equal(fixture.ordered.applied, 1);
-  const expected = [firstCall, { viewId: terminal.view_id, epoch: nextEpoch, size: latest }];
+  const expected = [firstCall, { viewId: terminal.view_id, epoch: nextEpoch, size: latest, incarnation: freshGrant }];
   assert.deepEqual(fixture.calls.map(call => call.args), expected);
   const final = {
     terminal, epoch: nextEpoch, committed: { revision: 2, size: latest, intent: { epoch: nextEpoch, id: uuid(34) } },
@@ -387,6 +387,69 @@ test("resize grant recovery waits for same-view ordered grid", { timeout: 2000 }
   await t.test("new owner returns to the previous grid", sub => exerciseResizeGrantGap(sub, true, { agent, owner: uuid(35) }, original));
 });
 
+test("owner handoff settles the issued grid before enabling the successor grant", { timeout: 2000 }, async t => {
+  for (const queued of [false, true]) {
+    await t.test(queued ? "handoff before queued grid issuance" : "handoff after grid issuance", async sub => {
+      const fixture = mountedResizeFixture(sub);
+      const oldGrant = uuid(40);
+      const freshGrant = uuid(41);
+      const successor = { agent, owner: uuid(42) };
+      await fixture.sample(initial(), oldGrant);
+      const first = parseGeometryEvent(fixtureEvent());
+      const settling = fixture.sample(null, undefined, first);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(fixture.scope.canWrite, false);
+      assert.equal(fixture.ordered.applied, 0);
+      assert.deepEqual(fixture.acknowledgements[0]?.args, {
+        viewId: terminal.view_id,
+        acknowledgement: { renderer_id: uuid(30), epoch, revision: 1, size: sizes[0], focused: false },
+      });
+      fixture.acknowledgements[0]!.reply.resolve(first);
+      await settling;
+      assert.equal(fixture.ordered.applied, 1);
+      assert.deepEqual(fixture.ordered.status.epoch, epoch);
+      assert.equal(fixture.scope.canWrite, false);
+      assert.equal(fixture.calls.length, 0);
+
+      if (queued) {
+        const next = fixtureEvent(2, sizes[1]);
+        const second = parseGeometryEvent({ ...next, status: { ...next.status, epoch: successor } });
+        const applying = fixture.sample(null, undefined, second);
+        await new Promise<void>(resolve => setImmediate(resolve));
+        assert.equal(fixture.scope.canWrite, false);
+        assert.equal(fixture.ordered.applied, 1);
+        assert.deepEqual(fixture.acknowledgements[1]?.args, {
+          viewId: terminal.view_id,
+          acknowledgement: { renderer_id: uuid(30), epoch: successor, revision: 2, size: sizes[1], focused: false },
+        });
+        fixture.acknowledgements[1]!.reply.resolve(second);
+        await applying;
+        assert.equal(fixture.ordered.applied, 2);
+      } else {
+        await fixture.sample({ ...first.status, epoch: successor });
+        assert.equal(fixture.ordered.applied, 1);
+        assert.equal(fixture.acknowledgements.length, 1);
+      }
+      assert.equal(fixture.scope.canWrite, false);
+      assert.deepEqual(fixture.grids, queued ? [sizes[0], sizes[1]] : [sizes[0]]);
+      assert.deepEqual(fixture.ordered.status.epoch, successor);
+      assert.deepEqual(fixture.ordered.status.committed.intent?.epoch, epoch);
+      await fixture.sample(null, freshGrant);
+      const fresh = fixture.measure(sizes[2]);
+      assert.equal(fixture.scope.canWrite, true);
+      assert.deepEqual(fixture.calls.map(call => call.args), [{
+        viewId: terminal.view_id, epoch: successor, size: sizes[2], incarnation: freshGrant,
+      }]);
+      const revision = fixture.ordered.applied + 1;
+      const status = fixtureStatus(revision, sizes[2]);
+      fixture.calls[0]!.reply.resolve(committedReply({
+        ...status, epoch: successor, committed: { ...status.committed, intent: { epoch: successor, id: uuid(43) } },
+      }));
+      await fresh;
+    });
+  }
+});
+
 test("unknown resize drops old layout and requires reconciled geometry or a new grant", { timeout: 2000 }, async t => {
   await t.test("same grant stays closed after transport failure", async sub => {
     const fixture = mountedResizeFixture(sub);
@@ -413,7 +476,7 @@ test("unknown resize drops old layout and requires reconciled geometry or a new 
     assert.equal(fixture.pendingLayout(), true);
     assert.equal(fixture.calls.length, 1);
     const fresh = fixture.measure(sizes[2]);
-    assert.deepEqual(fixture.calls[1]?.args, { viewId: terminal.view_id, epoch, size: sizes[2] });
+    assert.deepEqual(fixture.calls[1]?.args, { viewId: terminal.view_id, epoch, size: sizes[2], incarnation });
     fixture.calls[1]!.reply.resolve(committedReply(fixtureStatus(2, sizes[2])));
     await fresh;
   });
@@ -436,7 +499,7 @@ test("unknown resize drops old layout and requires reconciled geometry or a new 
       assert.deepEqual(fixture.grids, []);
       assert.equal(fixture.calls.length, 1);
       const fresh = fixture.measure(sizes[2]);
-      assert.deepEqual(fixture.calls[1]?.args, { viewId: terminal.view_id, epoch, size: sizes[2] });
+      assert.deepEqual(fixture.calls[1]?.args, { viewId: terminal.view_id, epoch, size: sizes[2], incarnation: uuid(37) });
       fixture.calls[1]!.reply.resolve(committedReply(fixtureStatus(1, sizes[2])));
       await fresh;
     });
