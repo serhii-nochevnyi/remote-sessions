@@ -318,6 +318,12 @@ def set_old_recovery_snapshots(attempt, before_hex, retained_hex, *, capture_err
     attempt["observations"]["prompt_visible"] = True
 
 
+def set_old_recovery_counters(attempt, native_id, generation):
+    recovery = attempt["recovery"]
+    for record in (recovery["before"], recovery["retained"], recovery["restart"]["previous"]):
+        record.update(attemptId=native_id, generation=generation)
+
+
 def mark(attempt, status):
     attempt.update(status=status, reason="synthetic negative control")
     return attempt["id"]
@@ -2292,6 +2298,161 @@ class EvidenceTest(unittest.TestCase):
             set_old_recovery_snapshots(row, before_hex, retained_hex, capture_error=before_hex != retained_hex)
             mark(row, "failing")
         return report
+
+    def old_witness_rows(self, report):
+        rows = {row["id"]: row for cohort in report["cohorts"].values() for row in cohort["attempts"]}
+        return [rows[key] for key in report["decision"]["supporting_attempt_ids"]]
+
+    def assert_old_witness_comparison(self, report):
+        self.validate(report, "failing")
+        candidate = copy.deepcopy(report)
+        self.add_comparison(candidate, native_cohort())
+        self.validate(candidate, "failing")
+
+    def assert_old_witness_withheld(self, report, slot, reason):
+        baseline = report["cohorts"]["baseline"]
+        baseline_ids = report["correction"]["baseline_attempt_ids"]
+        row = self.old_witness_rows(report)[slot]
+        if slot < 2:
+            honest = report_for(baseline, "failing", "mandatory-failure", baseline_ids.copy())
+            comparison_error = candidate_error = "same unresolved measured failure twice on the baseline"
+        else:
+            honest = dict(report, decision=dict(report["decision"], disposition="mandatory-failure"))
+            comparison_error = "shell disposition must be mandatory-failure"
+            candidate_error = "comparison requires a persistent corrected-build mandatory failure"
+
+        row["status"] = "inconclusive"
+        self.reject(honest, rf"{row['id']}: expected failing \({reason}\)$")
+        row["status"] = "failing"
+
+        candidate = copy.deepcopy(report)
+        self.add_comparison(candidate, native_cohort())
+        with self.subTest(claim="review-comparison"):
+            self.reject(candidate, candidate_error)
+        with self.subTest(claim="comparison-eligible"):
+            self.reject(report, comparison_error)
+            self.validate(honest, "failing")
+            support = honest["decision"]["supporting_attempt_ids"]
+            honest["decision"]["supporting_attempt_ids"] = [key for key in support if key != row["id"]]
+            self.reject(honest, "disposition must reference the attempts that establish it")
+
+    def test_old_witness_must_precede_its_fresh_primary_for_comparison(self):
+        for case_id, change, before, retained, reason in (
+            ("app-switch", "bytes", "78", "79", "retained native bytes or events changed"),
+            ("app-switch", "events", "616263", "616263", "retained native bytes or events changed"),
+            ("lock-foreground", "initial mismatch", "78", "78", "initial bytes differ from the manifest"),
+        ):
+            report = self.old_recovery_correction(case_id, before, retained)
+            if change == "events":
+                for row in self.old_witness_rows(report):
+                    row["capture_error"] = True
+                    row["recovery"]["before"].update(acceptedEvents=2, eventLengths=[1, 2])
+                    row["recovery"]["retained"].update(acceptedEvents=2, eventLengths=[2, 1])
+            with self.subTest(change=change, control="independent"):
+                self.assert_old_witness_comparison(report)
+
+            for slot in range(3):
+                for id_offset, generation_offset in ((0, 0), (10, 10), (0, -1), (-1, 0), (10, -1), (-1, 10)):
+                    with self.subTest(change=change, slot=slot, offsets=(id_offset, generation_offset)):
+                        contradicted = copy.deepcopy(report)
+                        row = self.old_witness_rows(contradicted)[slot]
+                        set_old_recovery_counters(row, row["attemptId"] + id_offset,
+                                                  row["generation"] + generation_offset)
+                        self.assert_old_witness_withheld(contradicted, slot, reason)
+
+    def old_witness_after_english(self, case_id, slot, retained_hex, *, reset):
+        report = self.old_recovery_correction(case_id, "78", retained_hex)
+        role = "baseline" if slot < 2 else "corrected"
+        cohort = report["cohorts"][role]
+        remove_attempts(cohort, *cohort["attempts"])
+        cohort["launches"].clear()
+        suffixes = ("original", "repeat") if role == "baseline" else ("corrected",)
+        for index, suffix in enumerate(suffixes):
+            target = index == slot or role == "corrected"
+            if target:
+                if index:
+                    start_launch(cohort)
+                for tag in ("prior-one", "prior-two"):
+                    add_attempt(cohort, self.cases["english-return"], tag)
+                if reset:
+                    start_launch(cohort)
+            row = add_attempt(cohort, self.cases[case_id], suffix)
+            if target and reset:
+                counters = dict(attemptId=6, generation=6)
+                set_measurement_counters(cohort, row, **counters)
+                row["recovery"]["restart"]["observed"].update(counters)
+                retained_record(cohort, row)["recovery_capture"].update(counters)
+                set_old_recovery_counters(row, 5, 5)
+            set_old_recovery_snapshots(row, "78", retained_hex, capture_error=retained_hex != "78")
+            mark(row, "failing")
+        return report
+
+    def test_old_witness_must_follow_retained_primaries_in_its_signed_launch(self):
+        for case_id, retained_hex, reason in (
+            ("app-switch", "79", "retained native bytes or events changed"),
+            ("lock-foreground", "78", "initial bytes differ from the manifest"),
+        ):
+            for slot in range(3):
+                report = self.old_witness_after_english(case_id, slot, retained_hex, reset=False)
+                reset = self.old_witness_after_english(case_id, slot, retained_hex, reset=True)
+                with self.subTest(case=case_id, slot=slot, counters=(5, 5)):
+                    self.assert_old_witness_comparison(report)
+                for counters in ((2, 2), (2, 5), (5, 2), (4, 5), (5, 4), (1, 1), (1, 5), (5, 1)):
+                    with self.subTest(case=case_id, slot=slot, counters=counters, separate_launch=True):
+                        set_old_recovery_counters(self.old_witness_rows(reset)[slot], *counters)
+                        self.assert_old_witness_comparison(reset)
+                    with self.subTest(case=case_id, slot=slot, counters=counters, separate_launch=False):
+                        contradicted = copy.deepcopy(report)
+                        set_old_recovery_counters(self.old_witness_rows(contradicted)[slot], *counters)
+                        self.assert_old_witness_withheld(contradicted, slot, reason)
+
+    def test_old_witness_uses_retained_order_even_for_a_moved_failure(self):
+        report = self.old_recovery_correction("app-switch", "78", "79")
+        corrected = report["cohorts"]["corrected"]
+        first, second, target = corrected["attempts"]
+        corrected["attempts"][:] = [target, first, second]
+        for row in (first, second):
+            mark(row, "inconclusive")
+        for suffix in ("later-one", "later-two"):
+            add_attempt(corrected, self.cases["english-return"], suffix)
+        self.assert_old_witness_comparison(report)
+
+        set_old_recovery_counters(target, 1, 1)
+        self.assert_old_witness_withheld(report, 2, "retained native bytes or events changed")
+
+    def test_old_witness_cannot_reuse_a_later_retained_primary_counter(self):
+        report = self.old_recovery_correction("app-switch", "78", "79")
+        corrected = report["cohorts"]["corrected"]
+        following = add_attempt(corrected, self.cases["english-return"], "later")
+        self.assert_old_witness_comparison(report)
+
+        for counters in ({"attemptId": 5}, {"generation": 5}):
+            with self.subTest(counters=counters):
+                contradicted = copy.deepcopy(report)
+                cohort = contradicted["cohorts"]["corrected"]
+                row = cohort["attempts"][-1]
+                set_measurement_counters(cohort, row, **counters)
+                self.reject(contradicted, f"{following['id']}: expected inconclusive .*is out of order")
+                mark(row, "inconclusive")
+                self.assert_old_witness_withheld(contradicted, 2, "retained native bytes or events changed")
+
+    def test_old_witness_requires_visible_fresh_role_and_matching_final_identity(self):
+        report = self.old_recovery_correction("app-switch", "78", "79")
+        self.assert_old_witness_comparison(report)
+        for slot in range(3):
+            for defect in ("unknown fresh role", "not fresh", "missing final", "wrong final identity"):
+                with self.subTest(slot=slot, defect=defect):
+                    contradicted = copy.deepcopy(report)
+                    row = self.old_witness_rows(contradicted)[slot]
+                    if defect == "unknown fresh role":
+                        del row["observations"]["started_fresh"]
+                    elif defect == "not fresh":
+                        row["observations"]["started_fresh"] = False
+                    elif defect == "missing final":
+                        del row["final"]
+                    else:
+                        row["final"]["generation"] += 1
+                    self.assert_old_witness_withheld(contradicted, slot, "retained native bytes or events changed")
 
     def test_shared_old_recovery_observation_cannot_authorize_comparison(self):
         for case_id, before_hex, retained_hex, detail in (

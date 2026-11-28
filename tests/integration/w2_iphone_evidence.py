@@ -3,7 +3,7 @@
 import argparse
 from collections import Counter
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import math
@@ -82,6 +82,7 @@ class Result:
     detail: str = ""
     observed: tuple = ()
     old_observation: tuple | None = None
+    old_witness_eligible: bool = False
 
     @property
     def failure_signature(self):
@@ -937,7 +938,7 @@ class CaseRecord:
                 supporting.clear()
             else:
                 latest = value.failure_signature
-                if latest == signature:
+                if latest == signature and (value.old_observation is None or value.old_witness_eligible):
                     supporting.add(attempt_id)
         if latest != signature or not supporting.issuperset(ids):
             return None
@@ -1185,6 +1186,24 @@ def chronology_holds(identities):
     return holds
 
 
+def old_witness_qualifies(attempt, measurement, recovery, old_observation, identities):
+    if attempt["observations"].get("started_fresh") is not True or (
+        recovery is not None and recovery.outcome != "fresh"
+    ):
+        return False
+    primary, = native_keys(measurement.retained)
+    launch, native_id, generation = primary
+    _, case_id, old_id, old_generation = old_observation
+    try:
+        snapshot(attempt.get("final"), (case_id, native_id, generation))
+    except EvidenceError:
+        return False
+    launch_identities = {row_id: keys for row_id, keys in identities.items() if keys[0][0] == launch}
+    attempt_id = measurement.retained.record["attempt_id"]
+    launch_identities[attempt_id] = ((launch, old_id, old_generation), primary)
+    return attempt_id not in chronology_holds(launch_identities)
+
+
 @dataclass
 class CohortAssessment:
     readiness: Result
@@ -1286,11 +1305,16 @@ def assess_cohort(cohort, prepared, cases, captures):
         result = holds.get(attempt_id)
         if result is None:
             case, qualification = cases[case_id], prepared.recipes.get(case_id)
-            retained = prepared.measurements[attempt_id].retained
+            measurement = prepared.measurements[attempt_id]
+            retained = measurement.retained
             paste_route = verified_paste_route(attempt, retained.record)
             recovery, issue = recoveries[attempt_id]
             result = evaluate_attempt(attempt, case, cohort, qualification, retained.launch["id"], paste_route,
                                       recovery, issue)
+            if result.old_observation is not None:
+                eligible = old_witness_qualifies(attempt, measurement, recovery, result.old_observation,
+                                                 prepared.identities)
+                result = replace(result, old_witness_eligible=eligible)
             conditions = verified_conditions(attempt, case, cohort, qualification, result, paste_route)
             # Keep verified failures at their retained positions and disqualify moved passes.
             if result.status == "pass" and attempt_id in prepared.moved:
