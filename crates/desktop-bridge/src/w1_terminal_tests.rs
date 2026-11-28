@@ -3142,6 +3142,12 @@ case "$4" in
   list-commands|save-buffer)
     test "$sender" = 1
     exec ./paste-tmux "$@" ;;
+  show-options)
+    test "$#" -eq 14 && test "$5 $6 $7 $8" = "-pq -t %0 @rs_create_initializer"
+    test "${9} ${10} ${11} ${12} ${13} ${14}" = "; show-options -pq -t %0 @rs_create_birth"
+    name=$(cat active)
+    if test -f "$name.initializer"; then printf 'present\n'; fi
+    if test -f "$name.birth"; then printf 'present\n'; fi ;;
   show-environment)
     name=${6#=}
     test "$#" = 14 && test "$7" = RS_CREATE_NONCE
@@ -3152,7 +3158,12 @@ case "$4" in
     if test -f names; then cat names; fi ;;
   list-panes)
     while IFS= read -r name; do
-      printf '%s\t%%0\t%s\t0\t100\t30\tcodex\n' "$name" "$pid"
+      printf '%s\t%%0\t%s\t0\t100\t30\tcodex' "$name" "$pid"
+      case "$7" in
+        *'#{pid}|#{start_time}|#{?#{m/r:^[0-9a-f-]*$,#{@rs_create_generation}},#{@rs_create_generation},invalid}|#{session_id}|#{window_id}'*)
+          printf '\t52|101|%s|$0|@0' "$token" ;;
+      esac
+      printf '\n'
     done < names ;;
   *) printf '%s\n' "$*" >> unexpected; exit 1 ;;
 esac
@@ -3199,10 +3210,14 @@ def custody_path(option):
 def custody_value(value):
     assert len(value) <= 2048 and re.fullmatch(r"[a-zA-Z0-9:/_~-]+", value)
     version, mutation, state, *fields = value.split("~")
-    assert version == "v1" and str(uuid.UUID(mutation)) == mutation
+    assert version in ("v1", "v2") and str(uuid.UUID(mutation)) == mutation
     assert uuid.UUID(mutation).version == 4
     if state == "free":
-        assert not fields
+        assert version == "v1" and not fields
+    elif version == "v2":
+        assert state in ("possible", "completed") and len(fields) == 17
+        assert fields[0] == "probe" and fields[2:5] == [read("generation"), "52", "101"]
+        assert fields[-1] == "rs-paste-probe-" + uuid.UUID(fields[-2]).hex
     else:
         assert state in ("possible", "completed") and len(fields) == 19
         assert fields[2] == "v1" and fields[4:7] == [read("generation"), "52", "101"]
@@ -3281,7 +3296,7 @@ else:
         "pid": "52", "start_time": "101", "@rs_create_generation": read("generation"),
         "session_name": name, "session_id": "$0", "window_id": "@0", "pane_id": pane,
         "window_index": "0", "pane_index": "0", "pane_pid": pid, "pane_tty": read("tty"),
-        "@rs_create_nonce": f"{nonce}:$0:@0:%0:{pid}", "session_windows": "1",
+        "@rs_create_nonce": f"{nonce}:$0:@0:%0:{pid}", "@rs_diagnostic_create": "", "session_windows": "1",
         "window_panes": "1", "pane_dead": "0", "window-size": "manual",
         "@rs_resize_epoch": read("epoch"), "version": "3.8", "socket_path": sys.argv[3],
         "@rs_paste_launch": read("launch"), "@rs_paste_admission": read("marker"),
@@ -3318,7 +3333,12 @@ else:
                 if state == "completed":
                     assert fields == old_fields
             if state == "possible":
-                assert fields[:2] == [name, read("tty")] and "~".join(fields[2:]) == read("marker")
+                if fields[0] == "probe":
+                    assert fields[1] == name and fields[5:11] == ["0", "0", "0", pid, read("pane-start"), read("tty")]
+                    assert fields[-3] == "managed:" + ":".join(read(name + ".initializer").split("~")[4:8:2]) + ":" + read(name + ".initializer").split("~")[7]
+                    assert not read("marker") and not read("launch")
+                else:
+                    assert fields[:2] == [name, read("tty")] and "~".join(fields[2:]) == read("marker")
             if len(nodes) == 2:
                 assert state == "free" and nodes[0] == f"delete-buffer -b {old_fields[-1]}"
                 buffer_path(old_fields[-1]).unlink()
@@ -3348,6 +3368,9 @@ else:
         elif action == "load-buffer":
             flag, buffer, source = words
             assert (flag, source) == ("-b", "-")
+            assert options and prior is not None
+            _, state, fields = custody_value(prior)
+            assert state == "possible" and fields[-1] == buffer
             buffer_path(buffer).write_bytes(sys.stdin.buffer.read())
         elif action == "delete-buffer":
             flag, buffer = words
@@ -3356,7 +3379,7 @@ else:
         elif action == "list-buffers":
             _, flag, present, filter_flag, condition = shlex.split(node)
             assert (flag, present, filter_flag) == ("-F", "present", "-f") and options
-            name = re.fullmatch(r"#\{==:#\{buffer_name\},(rs-paste-[0-9a-f]{32})\}", condition).group(1)
+            name = re.fullmatch(r"#\{==:#\{buffer_name\},(rs-paste-(?:probe-)?[0-9a-f]{32})\}", condition).group(1)
             assert custody_value(prior)[2][-1] == name
             if buffer_path(name).exists():
                 print("present")
@@ -3409,6 +3432,141 @@ pub(super) fn write_catalog_birth_fixture(directory: &Path, tty: &Path, scope: &
     fs::write(directory.join("pane-start"), start.to_string()).unwrap();
     fs::write(directory.join("pane-scope"), scope).unwrap();
     fs::write(directory.join("tty"), tty.to_str().unwrap()).unwrap();
+}
+
+#[cfg(debug_assertions)]
+pub(super) fn seed_historical_terminal(
+    directory: &Path,
+    runtime: &Runtime,
+    scope: (u32, u32, u32),
+    disposition: char,
+) -> String {
+    let (session, window, pane) = scope;
+    let name = &runtime.tmux_name;
+    for option in ["initializer", "birth"] {
+        fs::remove_file(directory.join(format!("{name}.{option}"))).unwrap();
+    }
+    let read = |name: &str| fs::read_to_string(directory.join(name)).unwrap();
+    let generation = read("generation");
+    let pid = read("pane-pid");
+    let start = read("pane-start");
+    let nonce = read(&format!("{name}.nonce"));
+    let launch = Uuid::new_v4();
+    let marker_nonce = Uuid::new_v4();
+    let (epoch, marker_epoch, suffix) = if disposition == 'r' {
+        (String::new(), String::new(), format!("r~{marker_nonce}"))
+    } else {
+        let epoch = format!("{}:{}", Uuid::new_v4(), Uuid::new_v4());
+        let suffix = format!(
+            "{disposition}~{marker_nonce}~1~rs-paste-{}",
+            Uuid::new_v4().simple()
+        );
+        (epoch.clone(), epoch, suffix)
+    };
+    let marker = format!(
+        "v1~{}~{}~52~101~{session}~{window}~{pane}~{}~{}~{}~{launch}~{marker_epoch}~{suffix}",
+        runtime.runtime_id,
+        generation.trim_end(),
+        pid.trim_end(),
+        start.trim_end(),
+        nonce.trim_end()
+    );
+    fs::write(directory.join("epoch"), epoch).unwrap();
+    fs::write(directory.join("launch"), launch.to_string()).unwrap();
+    fs::write(directory.join("marker"), &marker).unwrap();
+    marker
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn w1_legacy_provenance_bridge_restores_finished_held_and_retains_bound_read() {
+    let host = AgentFixture::new();
+    let attachment = AgentFixture::new();
+    let generation = Uuid::new_v4();
+    let provider = native_pty_system()
+        .openpty(pty_size(TerminalSize {
+            cols: 100,
+            rows: 30,
+        }))
+        .unwrap();
+    let tty = provider.master.tty_name().unwrap();
+    let (server, workspace_id) = start_catalog_terminal_fixture(&host, generation, &tty).await;
+    let original = launch_catalog_terminal(&host, workspace_id).await;
+    fs::write(host.0.join("active"), &original.tmux_name).unwrap();
+    let marker = seed_historical_terminal(&host.0, &original, (0, 0, 0), 's');
+
+    let tmux = attachment_tmux(&attachment, generation, "ignore-size");
+    let listener = UnixListener::bind(attachment.0.join("agent.sock")).unwrap();
+    let relay_host = host.0.clone();
+    let relay = tokio::spawn(async move {
+        loop {
+            let (mut peer, command) = receive(&listener).await;
+            assert!(matches!(
+                command,
+                Request::OpenTerminal { .. }
+                    | Request::TerminalStatus { .. }
+                    | Request::List {}
+                    | Request::Health {}
+            ));
+            respond(&mut peer, request(&relay_host, &command).await.unwrap()).await;
+        }
+    });
+    let runtime = original.runtime_id.to_string();
+    let bridge = DesktopBridge::new(Some(attachment.0.clone()), tmux);
+    let attached = bridge.attach_observer(&runtime).await.unwrap();
+    let restoration = || TerminalRestoration {
+        previous: attached.status.terminal.clone(),
+        agent_pid: std::process::id(),
+        session_id: original.session_id,
+        operation_id: original.operation_id,
+    };
+    let restored = bridge
+        .restore_attachment(&runtime, restoration())
+        .await
+        .unwrap();
+    assert_ne!(restored.view_id, attached.view_id);
+    assert_eq!(
+        restored.status.terminal.target,
+        attached.status.terminal.target
+    );
+    assert!(restored.status.epoch.is_some());
+    bridge.detach(&attached.view_id);
+    assert_eq!(
+        read_until_bytes(&bridge, &restored.view_id, b"buffered attachment output").await,
+        b"buffered attachment output"
+    );
+
+    fs::rename(
+        host.0.join("catalog/catalog.sqlite3"),
+        host.0.join("retained.sqlite3"),
+    )
+    .unwrap();
+    bridge
+        .view(&restored.view_id)
+        .unwrap()
+        .output
+        .lock()
+        .await
+        .refresh_at = Instant::now();
+    let status = bridge.status(&restored.view_id).await.unwrap();
+    assert_eq!(status.terminal, restored.status.terminal);
+    assert_eq!(status.observation, ObservationState::Observed);
+    let refused = bridge
+        .restore_attachment(&runtime, restoration())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(refused.to_string(), "Attachment not authorized");
+    assert_eq!(fs::read_to_string(host.0.join("marker")).unwrap(), marker);
+    assert!(!host.0.join("unexpected").exists());
+    assert!(!host.0.join("pane-bytes").exists());
+
+    bridge.detach(&restored.view_id);
+    until(|| allocation_counts(&bridge) == (0, 0)).await;
+    relay.abort();
+    server.abort();
+    assert!(relay.await.unwrap_err().is_cancelled());
+    assert!(server.await.unwrap_err().is_cancelled());
 }
 
 #[cfg(debug_assertions)]

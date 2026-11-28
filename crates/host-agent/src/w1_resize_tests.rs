@@ -67,7 +67,7 @@ fn test_pty() -> TestPty {
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self::build(SEND_WATCHDOG, Some(test_pty()))
     }
 
@@ -203,9 +203,13 @@ def custody_path(option):
 def custody_value(value):
     assert len(value) <= 2048 and re.fullmatch(r"[a-zA-Z0-9:/_~-]+", value)
     version, nonce, state, *fields = value.split("~")
-    assert version == "v1" and re.fullmatch(r"[0-9a-f-]{36}", nonce)
+    assert version in ("v1", "v2") and re.fullmatch(r"[0-9a-f-]{36}", nonce)
     if state == "free":
-        assert not fields
+        assert version == "v1" and not fields
+    elif version == "v2":
+        assert state in ("possible", "completed") and len(fields) == 17
+        assert fields[0] == "probe" and fields[2:5] == ["GENERATION", "987", "123456"]
+        assert fields[-1] == "rs-paste-probe-" + fields[-2].replace("-", "")
     else:
         assert state in ("possible", "completed") and len(fields) == 19
         assert fields[2] == "v1" and fields[4:7] == ["GENERATION", "987", "123456"]
@@ -266,6 +270,9 @@ def check(guard, pane, write_input=False):
             expected["after-" + hook] = ""
         if "after-list-buffers" in guard:
             expected["after-list-buffers"] = ""
+        if "#{==:#{@rs_create_initializer},}" in guard:
+            expected.update({"@rs_create_initializer": "", "@rs_create_birth": "",
+                             "@rs_diagnostic_create": ""})
         if write_input:
             expected["pane_input_off"] = "1" if read("input-off") else "0"
         return not read("scope") and allows(guard, expected)
@@ -438,8 +445,14 @@ elif command == "if-shell":
         else:
             assert flag == "-so" and state == "possible"
         if state == "possible":
-            assert fields[0] == pane_row(pane)[7] and fields[1] == pane_row(pane)[15]
-            assert "~".join(fields[2:]) == read(key("marker", pane))
+            row = pane_row(pane)
+            if fields[0] == "probe":
+                assert fields[1] == row[7] and fields[5:9] == [identity[1:] for identity in row[3:6]] + [row[6]]
+                assert fields[10] == row[15] and fields[-3] == "local"
+                assert not read(key("marker", pane)) and not read(key("launch", pane))
+            else:
+                assert fields[0] == row[7] and fields[1] == row[15]
+                assert "~".join(fields[2:]) == read(key("marker", pane))
         if read("custody-write") == "before":
             sys.exit(1)
         if len(nodes) == 2:
@@ -489,15 +502,21 @@ elif command == "if-shell":
             assert re.fullmatch("[0-9a-f]{32}", identifier)
             if read("load-mode") == "before":
                 sys.exit(1)
+            slots = re.findall(r"#\{==:#\{(@rs_paste_custody_[^}]+)\},", guard)
+            option, = slots
+            _, state, fields = custody_value(custody_path(option).read_text())
+            assert state == "possible" and fields[-1] == buffer
             (root / buffer).write_bytes(sys.stdin.buffer.read())
             write("last-load", buffer)
-            if not buffer.startswith("rs-paste-probe-"):
+            if buffer.startswith("rs-paste-probe-"):
+                append("probe-loads", (pane + "\n").encode())
+            else:
                 append("paste-loads", (pane + "\n").encode())
             if read("load-mode") == "lost":
                 sys.exit(1)
         elif action[0] == "list-buffers":
             assert action[1:4] == ["-F", "present", "-f"]
-            buffer = re.fullmatch(r"'#\{==:#\{buffer_name\},(rs-paste-[0-9a-f]{32})\}'",
+            buffer = re.fullmatch(r"'#\{==:#\{buffer_name\},(rs-paste-(?:probe-)?[0-9a-f]{32})\}'",
                                   action[4]).group(1)
             if (root / buffer).exists():
                 print("present")
@@ -541,7 +560,7 @@ elif command == "if-shell":
             append("pane" + pane[1:] + "-bytes", bytes.fromhex(" ".join(send_keys[4:])))
             print(reply[-1])
     elif branch.startswith("set-option"):
-        if not check(guard, pane):
+        if not check(guard, pane, "@rs_paste_launch" in branch):
             if otherwise:
                 print(rejection(otherwise[0]))
             sys.exit()
@@ -913,7 +932,7 @@ async fn w1_paste_catalog_fault_at_send_preserves_armed_custody() {
             .active
             .as_ref()
             .unwrap()
-            .completed
+            .completed()
     );
     assert_eq!(fs::read(root.join(&buffer.name)).unwrap(), payload);
     let last_write = fs::read(root.join("last-write")).unwrap();
@@ -923,7 +942,7 @@ async fn w1_paste_catalog_fault_at_send_preserves_armed_custody() {
     assert_eq!(fs::read(root.join(&buffer.name)).unwrap(), payload);
     assert_eq!(fs::read(root.join("last-write")).unwrap(), last_write);
     let after = engine.read_custody(read.server).await.unwrap();
-    for (old, new) in prior.iter().zip(&after) {
+    for (old, new) in prior.iter().zip(after.iter()) {
         assert_eq!(
             old.as_ref().map(|slot| &slot.value),
             new.as_ref().map(|slot| &slot.value)
@@ -1127,7 +1146,11 @@ async fn w1_paste_collision() {
     };
     let claimed = engine.read_custody(server).await.unwrap();
     let winner_slot = claimed[0].as_ref().unwrap();
-    let winning_claim = winner_slot.active.as_ref().unwrap();
+    let winning_claim = winner_slot
+        .active
+        .as_ref()
+        .and_then(CustodyBinding::payload)
+        .unwrap();
     assert!(winning_claim.completed);
     assert_eq!(winning_claim.runtime, winner.terminal.target.runtime_id);
     assert_eq!(winning_claim.pane, winner.terminal.target.pane);
@@ -1314,11 +1337,8 @@ async fn w1_terminal_paste_capability_gap_retains_exact_buffer_custody() {
         .await
         .unwrap()
         .unwrap();
-    fixture
-        .engine
-        .load_paste(&loading, &bound.name, draft, None)
-        .await
-        .unwrap();
+    // Seed the pre-custody buffer from an old producer.
+    fs::write(root.join(&bound.name), draft).unwrap();
     let canary = format!("rs-paste-{}", Uuid::new_v4().simple());
     fs::write(root.join(&canary), b"unrelated buffer").unwrap();
 
@@ -1579,7 +1599,11 @@ async fn w1_resize_production_paste_custody_survives_pane_loss_and_agent_restart
     let mut entries = snapshot.iter().flatten();
     let slot = entries.next().expect("expected a production reservation");
     assert!(entries.next().is_none());
-    let active = slot.active.as_ref().unwrap();
+    let active = slot
+        .active
+        .as_ref()
+        .and_then(CustodyBinding::payload)
+        .unwrap();
     let loading = fixture
         .engine
         .geometry(runtime_id, &old_pane)
@@ -2708,9 +2732,10 @@ os.execvp(cli[0], [*cli, *args])
         .expect("The queued guard must reject while the original pane still exists");
         let mut loading = armed;
         loading.paste_marker = buffer.marker(&loading, 'l');
+        let stale = CustodySlot::bind(&loading, 0, &buffer, "possible").unwrap();
         assert!(
             engine
-                .load_paste(&loading, &buffer.name, b"stale load", None)
+                .load_paste(&loading, b"stale load", &stale)
                 .await
                 .is_err()
         );
@@ -2838,10 +2863,15 @@ os.execvp(cli[0], [*cli, *args])
             .await
             .unwrap()
             .unwrap();
-        engine
-            .load_paste(&loading, &buffer.name, DRAFT, None)
-            .await
-            .unwrap();
+        // Reproduce the historical pane marker and named buffer with no server record.
+        fixture
+            .tmux(&[
+                "set-buffer",
+                "-b",
+                &buffer.name,
+                std::str::from_utf8(DRAFT).unwrap(),
+            ])
+            .await;
         let retained = fixture.exit(&engine, &runtime).await;
         let scope = fixture.scope(pane).await;
         let old_epoch = engine.agent_epoch;
@@ -2952,5 +2982,247 @@ os.execvp(cli[0], [*cli, *args])
         );
         assert!(fixture.temp.path().join("cleanup-reply-lost").is_file());
         fixture.assert_stopped(&retained, &buffer).await;
+    }
+}
+
+#[tokio::test]
+async fn w1_probe_custody_classifies_exact_load_readback_and_retirement() {
+    for case in [
+        "healthy",
+        "missing-flags",
+        "wrong-bytes",
+        "load-reply-lost",
+        "delete-failed",
+        "claim-hidden",
+        "claim-failed",
+        "claim-reply-lost",
+        "delete-reply-lost",
+    ] {
+        let fixture = Fixture::new();
+        let engine = &fixture.engine;
+        let root = fixture.temp.path();
+        for option in ["launch", "marker"] {
+            fs::remove_file(root.join(option)).unwrap();
+        }
+        let read = engine.scoped_geometry(&fixture.terminal).await.unwrap();
+        match case {
+            "missing-flags" => fs::write(root.join("probe-mode"), "missing-flag"),
+            "wrong-bytes" => fs::write(root.join("probe-mode"), "truncated"),
+            "load-reply-lost" => fs::write(root.join("load-mode"), "lost"),
+            "delete-failed" => fs::write(root.join("cleanup-blocked"), "1"),
+            "claim-hidden" => fs::write(root.join("custody-snapshot"), "hide-write"),
+            "claim-failed" => fs::write(root.join("custody-write"), "before"),
+            "claim-reply-lost" => fs::write(root.join("custody-write"), "lost"),
+            "delete-reply-lost" => fs::write(root.join("lose-cleanup-reply"), "1"),
+            _ => Ok(()),
+        }
+        .unwrap();
+        let result = engine
+            .prove_paste_buffer_io(&read, ProbeSource::CatalogFree)
+            .await;
+        assert_eq!(
+            result.is_ok(),
+            matches!(case, "healthy" | "claim-reply-lost" | "delete-reply-lost"),
+            "{case}: {result:?}"
+        );
+        let loads = fs::read(root.join("probe-loads")).unwrap_or_default();
+        let loaded = !matches!(case, "missing-flags" | "claim-hidden" | "claim-failed");
+        assert_eq!(
+            loads,
+            if loaded { b"%0\n".as_slice() } else { b"" },
+            "{case}"
+        );
+        let deletions = fs::read_to_string(root.join("deletions")).unwrap_or_default();
+        fs::write(root.join("custody-snapshot"), "").unwrap();
+        let slots = engine.read_custody(read.server).await.unwrap();
+        let slot = slots[0].as_ref();
+        match case {
+            "missing-flags" | "claim-failed" => assert!(slot.is_none() && deletions.is_empty()),
+            "claim-hidden" | "delete-failed" => {
+                let slot = slot.unwrap();
+                let active = slot
+                    .active
+                    .as_ref()
+                    .and_then(CustodyBinding::probe)
+                    .unwrap();
+                assert_eq!(active.completed, case == "delete-failed");
+                assert_eq!(active.target, read.target);
+                assert_eq!(active.tty, read.tty);
+                assert_eq!(active.source.encode(), "local");
+                assert_eq!(root.join(&active.buffer).exists(), active.completed);
+                assert!(deletions.is_empty());
+                let repeat = engine
+                    .prove_paste_buffer_io(&read, ProbeSource::CatalogFree)
+                    .await;
+                assert!(repeat.is_err());
+                assert_eq!(
+                    engine.read_custody(read.server).await.unwrap()[0]
+                        .as_ref()
+                        .unwrap()
+                        .value,
+                    slot.value
+                );
+                assert_eq!(
+                    fs::read(root.join("probe-loads")).unwrap_or_default(),
+                    loads
+                );
+            }
+            _ => {
+                assert!(slot.unwrap().active.is_none());
+                let buffer = fs::read_to_string(root.join("last-load")).unwrap();
+                assert_eq!(deletions, format!("{buffer}\n"));
+                assert!(!root.join(buffer).exists());
+            }
+        }
+        for effect in ["launch", "marker", "pane0-bytes", "submissions", "effects"] {
+            assert!(!root.join(effect).exists(), "{case}: {effect}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn w1_probe_custody_refuses_invalid_mixed_snapshots_and_stale_originals() {
+    let fixture = Fixture::new();
+    let engine = &fixture.engine;
+    let root = fixture.temp.path();
+    let ready = engine.scoped_geometry(&fixture.terminal).await.unwrap();
+    let epoch = ResizeEpoch {
+        agent: Uuid::new_v4(),
+        owner: Uuid::new_v4(),
+    };
+    let mut payload_read = ready.clone();
+    payload_read.epoch = Some(epoch);
+    payload_read.target.runtime_id = Uuid::new_v4();
+    payload_read.target.pane = "%5".into();
+    payload_read.name = tmux_name(Uuid::new_v4(), payload_read.target.runtime_id);
+    let buffer = PasteBuffer {
+        nonce: Uuid::new_v4(),
+        operation: 1,
+        name: format!("rs-paste-{}", Uuid::new_v4().simple()),
+    };
+    let payload = CustodySlot::bind(&payload_read, 1, &buffer, "possible").unwrap();
+    for option in ["launch", "marker"] {
+        fs::remove_file(root.join(option)).unwrap();
+    }
+    let read = engine.scoped_geometry(&fixture.terminal).await.unwrap();
+    let server = read.server;
+    let probe = CustodySlot::bind_probe(&read, 0, ProbeSource::CatalogFree).unwrap();
+    let probe_value = probe.value.as_str();
+    fs::create_dir(root.join("custody")).unwrap();
+    let path = |index| root.join("custody").join(custody_option(server, index));
+    fs::write(path(0), probe_value).unwrap();
+    fs::write(path(1), &payload.value).unwrap();
+    let mixed = engine.read_custody(server).await.unwrap();
+    assert_eq!(mixed[0].as_ref().unwrap().value, probe_value);
+    assert_eq!(mixed[1].as_ref().unwrap().value, payload.value);
+
+    let distinct = format!("v1~{}~free", Uuid::new_v4());
+    let replacement = probe_value.replace("v2~", "v3~");
+    let wrong_generation =
+        probe_value.replace(&server.token.to_string(), &Uuid::new_v4().to_string());
+    let oversized = "x".repeat(CUSTODY_VALUE_LIMIT + 1);
+    let extra = format!("{probe_value}~extra");
+    let wrong_buffer = probe_value.replace("rs-paste-probe-", "rs-paste-");
+    let mut duplicate_runtime = payload_read;
+    duplicate_runtime.target.runtime_id = read.target.runtime_id;
+    duplicate_runtime.name = read.name.clone();
+    let duplicate_runtime = CustodySlot::bind(&duplicate_runtime, 1, &buffer, "possible").unwrap();
+    for (first, second) in [
+        (replacement.as_str(), payload.value.as_str()),
+        (wrong_generation.as_str(), payload.value.as_str()),
+        (oversized.as_str(), payload.value.as_str()),
+        (extra.as_str(), payload.value.as_str()),
+        (wrong_buffer.as_str(), payload.value.as_str()),
+        (probe_value, duplicate_runtime.value.as_str()),
+    ] {
+        fs::write(path(0), first).unwrap();
+        fs::write(path(1), second).unwrap();
+        assert!(
+            engine
+                .prove_paste_buffer_io(&read, ProbeSource::CatalogFree)
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read_to_string(path(0)).unwrap(), first);
+        assert_eq!(fs::read_to_string(path(1)).unwrap(), second);
+    }
+
+    fs::write(path(0), &distinct).unwrap();
+    fs::write(path(1), &payload.value).unwrap();
+    let stale_snapshot = engine.read_custody(server).await.unwrap();
+    let active = probe
+        .active
+        .as_ref()
+        .and_then(CustodyBinding::probe)
+        .unwrap();
+    assert!(
+        engine
+            .load_paste(&read, b"stale claim", &probe)
+            .await
+            .is_err()
+    );
+    assert!(
+        engine
+            .retire_custody(&read, &probe, Some(&active.buffer))
+            .await
+            .is_err()
+    );
+    let mut wrong = read.clone();
+    wrong.target.process_start += 1;
+    assert!(
+        engine
+            .mutate_custody(&wrong, stale_snapshot[0].as_ref(), &probe, None)
+            .await
+            .is_err()
+    );
+    wrong = read.clone();
+    wrong.target.window = "@9".into();
+    assert!(
+        engine
+            .mutate_custody(&wrong, stale_snapshot[0].as_ref(), &probe, None)
+            .await
+            .is_err()
+    );
+    wrong = read.clone();
+    wrong.tty = PathBuf::from("/dev/ttys999999");
+    assert!(
+        engine
+            .mutate_custody(&wrong, stale_snapshot[0].as_ref(), &probe, None)
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read_to_string(path(0)).unwrap(), distinct);
+    assert_eq!(fs::read_to_string(path(1)).unwrap(), payload.value);
+    for index in 0..CUSTODY_SLOTS {
+        let mut other = read.clone();
+        other.target.runtime_id = Uuid::new_v4();
+        other.target.pane = format!("%{}", index + 1);
+        other.name = tmux_name(Uuid::new_v4(), other.target.runtime_id);
+        let occupied = CustodySlot::bind_probe(&other, index, ProbeSource::CatalogFree).unwrap();
+        fs::write(path(index), occupied.value).unwrap();
+    }
+    assert!(
+        engine
+            .read_custody(server)
+            .await
+            .unwrap()
+            .iter()
+            .all(|slot| slot.as_ref().is_some_and(|slot| slot.active.is_some()))
+    );
+    assert!(
+        engine
+            .prove_paste_buffer_io(&read, ProbeSource::CatalogFree)
+            .await
+            .is_err()
+    );
+    for effect in [
+        "probe-loads",
+        "deletions",
+        "custody-writes",
+        "pane0-bytes",
+        "submissions",
+        "effects",
+    ] {
+        assert!(!root.join(effect).exists(), "{effect}");
     }
 }
