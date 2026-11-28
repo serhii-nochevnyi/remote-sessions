@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    catalog::{Operation, OperationStage, ServerGeneration},
+    catalog::{Operation, OperationStage, ServerGeneration, StoredOutcome},
     model::{
         CreateState, ObservationState, PaneLiveness, PasteBinding, PasteResult, ProviderProfile,
         RuntimeOrigin, TerminalSize, TerminalStatus, tmux_name,
@@ -19,6 +19,17 @@ set -eu
 cd "$(dirname "$3")"
 token=""
 if test -f generation; then token=$(cat generation); fi
+if test -f trace-mutations; then
+  case "$4" in
+    if-shell)
+      case "${9-${7-}}" in
+        *set-option*|*set-environment*|*new-session*|*kill-session*|*resize-window*|*send-keys*|*load-buffer*|*paste-buffer*|*delete-buffer*)
+          printf '%s\n' "${9-${7-}}" >> mutation-attempts ;;
+      esac ;;
+    set-option|set-environment|new-session|kill-session|resize-window|send-keys|load-buffer|paste-buffer|delete-buffer)
+      printf '%s\n' "$4" >> mutation-attempts ;;
+  esac
+fi
 guard_equals() {
   case "$guard" in *"#{==:#{$1},$2}"*) return 0 ;; *) return 1 ;; esac
 }
@@ -65,12 +76,15 @@ custody_snapshot() {
 case "$4" in
   display-message)
     if test "${6-}" = -t; then
-      if test "$#" = 8 && test -f geometry-1; then
-        printf '%s\n' "$7" >> geometry-samples
-        sample=$(awk 'END {print NR}' geometry-samples)
-        cat "geometry-$sample"
-        exit
-      fi
+      case "$8" in
+        *'#{session_windows}|#{window_panes}|#{window-size}|#{pane_tty}|'*)
+          if test "$#" = 8 && test -f geometry-1; then
+            printf '%s\n' "$7" >> geometry-samples
+            sample=$(awk 'END {print NR}' geometry-samples)
+            cat "geometry-$sample"
+            exit
+          fi ;;
+      esac
       for name in $(cat names); do
         IFS='|' read -r session window pane pid < "$name.pane"
         if test "$pane" != "$7"; then continue; fi
@@ -93,14 +107,17 @@ case "$4" in
           printf '42|100|%s|%s\n' "$next_token" "$row"
           exit 0
         fi
-        if test "$8" = '#{@rs_create_initializer}|#{@rs_create_birth}'; then
-          printf '%s|%s\n' "$(option_value "$name.initializer")" "$(option_value "$name.birth")"
-          exit 0
-        fi
         nonce=$(option_value "$name.nonce")
         stamp=$(option_value "$name.stamp")
         proof=""
         if test -n "$stamp"; then proof="$nonce:$stamp"; fi
+        birth_format='#{pid}|#{start_time}|#{@rs_create_generation}|#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}|#{session_name}|#{window_index}|#{pane_index}|#{@rs_create_nonce}|#{pane_dead}|#{pane_tty}|#{@rs_create_initializer}|#{@rs_create_birth}'
+        if test "$8" = "$birth_format"; then
+          printf '42|100|%s|%s|%s|0|0|%s|%s|%s|%s|%s\n' \
+            "$token" "$(cat "$name.pane")" "$name" "$proof" "$(cat "$name.dead")" \
+            "$(cat tty)" "$(option_value "$name.initializer")" "$(option_value "$name.birth")"
+          exit 0
+        fi
         epoch=$(cat epoch 2>/dev/null || :)
         launch=$(cat paste-launch 2>/dev/null || :)
         marker=$(cat marker 2>/dev/null || :)
@@ -349,6 +366,9 @@ case "$4" in
         guard=$6
         custody_snapshot "$7" ;;
       'set-option -s @rs_create_generation '*)
+        guard=$6
+        guard_equals pid 42 && guard_equals start_time 100 &&
+          guard_equals @rs_create_generation "" || exit 0
         test -z "$token"
         printf '%s\n' "$7" | awk '{print $4}' > generation ;;
       'new-session '*)
@@ -800,6 +820,22 @@ fn create(key: Uuid, workspace_id: Uuid, reservation: Option<Uuid>) -> ProductRe
     }
 }
 
+async fn fixture_operation(lane: &CatalogLane, key: Uuid) -> Operation {
+    lane.run(move |db, _| Ok(db.operation(key)?.unwrap()))
+        .await
+        .unwrap()
+}
+
+fn assert_same_reservation(original: &Operation, after: &Operation) {
+    assert_eq!(after.key, original.key);
+    assert_eq!(after.id, original.id);
+    assert_eq!(after.session_id, original.session_id);
+    assert_eq!(after.runtime_id, original.runtime_id);
+    assert_eq!(after.target, original.target);
+    assert_eq!(after.nonce, original.nonce);
+    assert_eq!(after.generation, original.generation);
+}
+
 fn diagnostic_create(fixture: &Fixture, session_id: Uuid, runtime_id: Uuid) -> Request {
     Request::Create {
         session_id,
@@ -834,6 +870,8 @@ fn seed_visible(fixture: &Fixture, count: usize) -> Vec<String> {
 async fn w1_create_shared_capacity_keeps_original_reservation_and_deduplicates_visible_marks() {
     for already_visible in [false, true] {
         let fixture = Fixture::new();
+        let (_master, _slave, tty) = observation_pty();
+        fixture.birth_device(&tty);
         let lane = fixture.lane().await;
         let job = fixture.serve(lane.clone()).await;
         let workspace = fixture.register().await;
@@ -1209,6 +1247,8 @@ async fn w1_create_guarded_paste_probe() {
 #[tokio::test]
 async fn w1_create_inventory_corroborates_origin() {
     let fixture = Fixture::new();
+    let (_master, _slave, tty) = observation_pty();
+    fixture.birth_device(&tty);
     let lane = fixture.lane().await;
     let job = fixture.serve(lane).await;
     let workspace = fixture.register().await;
@@ -1329,8 +1369,7 @@ async fn w1_create_inventory_corroborates_origin() {
 async fn w1_create_terminal_status_classifies_first_and_second_sample_replacement() {
     let fixture = Fixture::new();
     let (_master, _slave, tty) = observation_pty();
-    fixture.set("tty", &tty);
-    fixture.set("pane-pid", std::process::id().to_string());
+    fixture.birth_device(&tty);
     let job = fixture.serve(fixture.lane().await).await;
     let workspace = fixture.register().await;
     let launch = async || {
@@ -1361,6 +1400,7 @@ async fn w1_create_terminal_status_classifies_first_and_second_sample_replacemen
     assert_eq!(opened.provider.unwrap().size, opened.committed.size);
 
     fixture.set("pane-slot", "1");
+    fixture.set("names", "");
     let replacement = launch().await;
     assert_eq!(original.pane_id, replacement.pane_id);
     assert_ne!(original.runtime_id, replacement.runtime_id);
@@ -1490,8 +1530,110 @@ async fn w1_create_terminal_status_classifies_first_and_second_sample_replacemen
     stop(job).await;
 }
 
+async fn check_cold_catalog_fault_read_only() {
+    let fixture = Fixture::new();
+    let (_master, _slave, tty) = observation_pty();
+    fixture.set("tty", &tty);
+    fixture.set("trace-mutations", "");
+    let [name] = seed_visible(&fixture, 1).try_into().unwrap();
+    let (_, runtime_id) = crate::model::parse_name(&name).unwrap();
+    let pane = format!("$30|@30|%30|{}\n", std::process::id());
+    fixture.set(&format!("{name}.pane"), &pane);
+    let read = |path: &str| fs::read(fixture.root.join(path)).ok();
+    let options = [
+        "generation".to_owned(),
+        format!("{name}.nonce"),
+        format!("{name}.stamp"),
+        format!("{name}.initializer"),
+        format!("{name}.birth"),
+        "epoch".to_owned(),
+        "marker".to_owned(),
+        "paste-launch".to_owned(),
+    ];
+    assert!(options.iter().all(|path| read(path).is_none()));
+    let job = fixture.serve(fixture.lane().await).await;
+    let local = async |message| request(&fixture.root, &message).await.unwrap();
+    let inventory = async || {
+        let Response::Runtimes { runtimes } = local(Request::List {}).await else {
+            panic!("cold legacy pane missing from inventory");
+        };
+        runtimes
+    };
+    let before = inventory().await;
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].runtime_id, runtime_id);
+    assert_eq!(before[0].origin, RuntimeOrigin::Legacy);
+    let path = fixture.catalog.join("catalog.sqlite3");
+    let retained = fixture.catalog.join("retained.sqlite3");
+    fs::rename(&path, &retained).unwrap();
+
+    let open = || Request::OpenTerminal {
+        runtime_id,
+        view_id: Uuid::new_v4(),
+    };
+    assert!(matches!(local(open()).await, Response::Error { message }
+        if message == format!("Terminal observation unavailable for runtime {runtime_id}")));
+    for command in [
+        Request::Acquire { runtime_id },
+        Request::Stop {
+            runtime_id,
+            expected_pane_id: "%30".into(),
+        },
+        diagnostic_create(&fixture, Uuid::new_v4(), Uuid::new_v4()),
+    ] {
+        let reply = local(command).await;
+        assert!(
+            matches!(&reply, Response::Error { message }
+            if message == "Terminal generation unavailable: CatalogMissing"),
+            "{reply:?}"
+        );
+    }
+    assert!(matches!(
+        local(Request::Input {
+            runtime_id,
+            token: Uuid::new_v4(),
+            sequence: 0,
+            data: b"x".to_vec(),
+            paste: false,
+        })
+        .await,
+        Response::Error { .. }
+    ));
+    assert_eq!(inventory().await, before);
+    assert_eq!(read("names").unwrap(), format!("{name}\n").as_bytes());
+    assert_eq!(read(&format!("{name}.pane")).unwrap(), pane.as_bytes());
+    assert_eq!(read(&format!("{name}.dead")).unwrap(), b"0\n");
+    assert!(options.iter().all(|path| read(path).is_none()));
+    for effect in [
+        "mutation-attempts",
+        "dispatched",
+        "diagnostic-dispatched",
+        "inputs",
+    ] {
+        assert!(!fixture.root.join(effect).exists(), "{effect}");
+    }
+
+    fs::rename(&retained, &path).unwrap();
+    let job = fixture.restart(job).await;
+    let Response::TerminalOpened { status } = local(open()).await else {
+        panic!("healthy catalog did not bootstrap legacy observation");
+    };
+    assert_eq!(status.terminal.target.runtime_id, runtime_id);
+    assert_eq!(status.terminal.target.pane, "%30");
+    assert!(!status.terminal.target.generation.is_nil());
+    assert_eq!(
+        read("generation").unwrap(),
+        format!("{}\n", status.terminal.target.generation).as_bytes()
+    );
+    let attempts = fs::read_to_string(fixture.root.join("mutation-attempts")).unwrap();
+    assert_eq!(attempts.lines().count(), 1);
+    assert!(attempts.starts_with("set-option -s @rs_create_generation "));
+    stop(job).await;
+}
+
 #[tokio::test]
 async fn w1_create_catalog_fault_read_only() {
+    check_cold_catalog_fault_read_only().await;
     let fixture = Fixture::new();
     let (_master, _slave, tty) = observation_pty();
     fixture.birth_device(&tty);
@@ -1970,6 +2112,8 @@ async fn w1_create_state_guard_precedes_catalog() {
 #[tokio::test]
 async fn w1_create_concurrent_equal_keys_finalize_once_and_preserve_original_result() {
     let fixture = Fixture::new();
+    let (_master, _slave, tty) = observation_pty();
+    fixture.birth_device(&tty);
     let job = fixture.serve(fixture.lane().await).await;
     let workspace = fixture.register().await;
     let key = Uuid::new_v4();
@@ -2039,6 +2183,8 @@ async fn w1_create_concurrent_equal_keys_finalize_once_and_preserve_original_res
 #[tokio::test]
 async fn w1_create_reserved_retry_uses_original_ids_and_absent_retry_cannot_allocate() {
     let fixture = Fixture::new();
+    let (_master, _slave, tty) = observation_pty();
+    fixture.birth_device(&tty);
     let lane = fixture.lane().await;
     let job = fixture.serve(lane.clone()).await;
     let workspace = fixture.register().await;
@@ -2236,8 +2382,10 @@ async fn w1_create_unproved_or_previously_used_birth_stays_read_only_after_recon
         let fixture = Fixture::new();
         let (_master, _slave, tty) = observation_pty();
         fixture.birth_device(&tty);
+        fixture.set("trace-mutations", "");
+        let lane = fixture.lane().await;
         let job = fixture
-            .serve_engine(fixture.engine().with_fixture_sender(), fixture.lane().await)
+            .serve_engine(fixture.engine().with_fixture_sender(), lane.clone())
             .await;
         let workspace = fixture.register().await;
         let key = Uuid::new_v4();
@@ -2246,6 +2394,8 @@ async fn w1_create_unproved_or_previously_used_birth_stays_read_only_after_recon
             fixture.call(&create(key, workspace, None)).await,
             CreateState::Unknown { .. }
         ));
+        let original = fixture_operation(&lane, key).await;
+        assert_eq!(original.stage, OperationStage::Marked);
         let name = fs::read_to_string(fixture.root.join("names")).unwrap();
         let name = name.trim_end();
         let file = format!("{name}.birth");
@@ -2281,33 +2431,50 @@ async fn w1_create_unproved_or_previously_used_birth_stays_read_only_after_recon
             fixture.set(&file, edited);
         }
         let marker = fs::read(fixture.root.join("marker")).ok();
+        let attempts = fs::read(fixture.root.join("mutation-attempts")).unwrap();
         let recovered = fixture.status(key).await;
-        let CreateState::Confirmed {
-            outcome,
-            current: PaneLiveness::Live,
-            ..
-        } = &recovered
-        else {
-            panic!("original pane lost observation in {mode}: {recovered:?}");
-        };
-        let runtime_id = outcome.runtime.runtime_id;
+        let runtime_id = original.runtime_id;
         let local = async |request_value| request(&fixture.root, &request_value).await.unwrap();
         let opened = local(Request::OpenTerminal {
             runtime_id,
             view_id: Uuid::new_v4(),
         })
         .await;
-        let Response::TerminalOpened { status } = opened else {
-            panic!("pane unavailable in {mode}: {opened:?}");
-        };
-        let acquire = local(Request::AcquireTerminal {
-            terminal: status.terminal,
-        })
-        .await;
-        assert!(
-            matches!(acquire, Response::ControlRecovering { .. }),
-            "{mode}: {acquire:?}"
-        );
+        if matches!(mode, "used" | "prior-send") {
+            let CreateState::Confirmed {
+                outcome,
+                current: PaneLiveness::Live,
+                ..
+            } = &recovered
+            else {
+                panic!("original pane lost observation in {mode}: {recovered:?}");
+            };
+            assert_eq!(outcome.runtime.runtime_id, runtime_id);
+            assert_eq!(outcome.runtime.session_id, original.session_id);
+            assert_eq!(outcome.runtime.operation_id, Some(original.id));
+            let Response::TerminalOpened { status } = opened else {
+                panic!("pane unavailable in {mode}: {opened:?}");
+            };
+            let acquire = local(Request::AcquireTerminal {
+                terminal: status.terminal,
+            })
+            .await;
+            assert!(
+                matches!(acquire, Response::ControlRecovering { .. }),
+                "{mode}: {acquire:?}"
+            );
+        } else {
+            assert_eq!(recovered, CreateState::Unknown { issue: None }, "{mode}");
+            assert!(
+                matches!(opened, Response::Error { .. }),
+                "{mode}: {opened:?}"
+            );
+            let acquire = local(Request::Acquire { runtime_id }).await;
+            assert!(
+                matches!(acquire, Response::Error { .. }),
+                "{mode}: {acquire:?}"
+            );
+        }
         assert!(matches!(
             local(Request::Input {
                 runtime_id,
@@ -2320,13 +2487,70 @@ async fn w1_create_unproved_or_previously_used_birth_stays_read_only_after_recon
             Response::Error { .. }
         ));
         assert_eq!(fixture.status(key).await, recovered);
+        assert_eq!(
+            fixture
+                .call(&create(key, workspace, Some(runtime_id)))
+                .await,
+            recovered
+        );
+        let after = fixture_operation(&lane, key).await;
+        assert_same_reservation(&original, &after);
+        if let CreateState::Confirmed { outcome, .. } = &recovered {
+            assert!(
+                matches!(&after.stage, OperationStage::Finished(StoredOutcome::Launched { outcome: stored, .. }) if stored.as_ref() == outcome)
+            );
+        } else {
+            assert_eq!(after.stage, OperationStage::Marked);
+        }
         assert_eq!(fixture.dispatches(), 1);
+        assert_eq!(
+            fs::read(fixture.root.join("mutation-attempts")).unwrap(),
+            attempts
+        );
         assert_eq!(fs::read(fixture.root.join("marker")).ok(), marker);
         assert_eq!(fs::read_to_string(fixture.root.join(file)).ok(), changed);
         for effect in ["inputs", "buffer-loads", "unexpected-terminal-mutations"] {
             assert!(!fixture.root.join(effect).exists(), "{mode}: {effect}");
         }
         stop(job).await;
+        drop(lane);
+        if mode == "used" {
+            let CreateState::Confirmed { outcome, .. } = recovered else {
+                unreachable!();
+            };
+            fixture.wait_restart_released().await;
+            let lane = fixture.lane().await;
+            let start = crate::engine::launch_fixture_process_start(std::process::id()).unwrap();
+            let job = fixture
+                .serve_engine(
+                    fixture
+                        .engine()
+                        .with_creation_fixture(None, Some(start + 1)),
+                    lane.clone(),
+                )
+                .await;
+            let unavailable = CreateState::Confirmed {
+                outcome,
+                current: PaneLiveness::Unavailable,
+                setup_issue: None,
+            };
+            assert_eq!(fixture.status(key).await, unavailable);
+            assert_eq!(
+                fixture
+                    .call(&create(key, workspace, Some(runtime_id)))
+                    .await,
+                unavailable
+            );
+            let replaced = fixture_operation(&lane, key).await;
+            assert_same_reservation(&original, &replaced);
+            assert_eq!(replaced.stage, after.stage);
+            assert_eq!(fixture.dispatches(), 1);
+            assert_eq!(
+                fs::read(fixture.root.join("mutation-attempts")).unwrap(),
+                attempts
+            );
+            stop(job).await;
+        }
     }
 }
 
@@ -2533,15 +2757,84 @@ async fn check_real_create_reply_loss(replacement: bool) {
     drop(lane);
     stop(job).await;
     fixture.wait_restart_released().await;
+    let lane = fixture.lane().await;
     let job = fixture
         .serve_engine(
             fixture
                 .engine()
                 .with_creation_fixture(None, replacement.then_some(start + 1)),
-            fixture.lane().await,
+            lane.clone(),
         )
         .await;
+    let options = || {
+        let output = tmux
+            .command()
+            .args(["show-options", "-p", "-t", pane])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        output.stdout
+    };
+    let original_options = options();
     let recovered = fixture.status(key).await;
+    let runtime_id = original.runtime_id;
+    let open = Request::OpenTerminal {
+        runtime_id,
+        view_id: Uuid::new_v4(),
+    };
+    if replacement {
+        assert_eq!(recovered, CreateState::Unknown { issue: None });
+        assert_eq!(fixture.call(&command).await, recovered);
+        assert_eq!(
+            fixture
+                .call(&create(key, workspace, Some(runtime_id)))
+                .await,
+            recovered
+        );
+        let after = fixture_operation(&lane, key).await;
+        assert_same_reservation(&original, &after);
+        assert_eq!(after.stage, OperationStage::Marked);
+        let local = async |request_value| request(&fixture.root, &request_value).await.unwrap();
+        assert!(matches!(local(open).await, Response::Error { .. }));
+        for _ in 0..2 {
+            assert!(matches!(
+                local(Request::Acquire { runtime_id }).await,
+                Response::Error { .. }
+            ));
+        }
+        assert!(matches!(
+            local(Request::Input {
+                runtime_id,
+                token: Uuid::new_v4(),
+                sequence: 0,
+                data: b"x".to_vec(),
+                paste: false,
+            })
+            .await,
+            Response::Error { .. }
+        ));
+        assert_eq!(pane_scope(), before);
+        assert_eq!(options(), original_options);
+        assert_eq!(
+            crate::engine::launch_fixture_process_start(pid).unwrap(),
+            start
+        );
+        assert!(
+            fs::read(fixture.root.join("provider-input"))
+                .unwrap_or_default()
+                .is_empty()
+        );
+        assert_eq!(
+            fs::read(fixture.root.join("real-spawns")).unwrap(),
+            b"spawned\n"
+        );
+        assert_eq!(
+            fs::read(fixture.root.join("provider-starts")).unwrap(),
+            b"start\n"
+        );
+        stop(job).await;
+        return;
+    }
     let CreateState::Confirmed {
         outcome,
         current: PaneLiveness::Live,
@@ -2555,17 +2848,10 @@ async fn check_real_create_reply_loss(replacement: bool) {
         (runtime.session_id, runtime.runtime_id, runtime.operation_id),
         (original.session_id, original.runtime_id, Some(original.id))
     );
-    let open = Request::OpenTerminal {
-        runtime_id: runtime.runtime_id,
-        view_id: Uuid::new_v4(),
-    };
     let Response::TerminalOpened { status } = request(&fixture.root, &open).await.unwrap() else {
         panic!("original pane cannot be observed");
     };
-    assert_eq!(
-        status.terminal.target.process_start,
-        start + u64::from(replacement)
-    );
+    assert_eq!(status.terminal.target.process_start, start);
     assert_eq!(status.terminal.target.pid, pid);
     assert_eq!(status.terminal.target.pane, runtime.pane_id);
     assert_eq!(pane_scope(), before);
@@ -2573,17 +2859,8 @@ async fn check_real_create_reply_loss(replacement: bool) {
         terminal: status.terminal,
     };
     let granted = request(&fixture.root, &acquire).await.unwrap();
-    let token = if replacement {
-        assert!(
-            matches!(granted, Response::ControlRecovering { .. }),
-            "{granted:?}"
-        );
-        Uuid::new_v4()
-    } else {
-        let Response::TerminalControl { token, .. } = granted else {
-            panic!("original child did not grant fresh control: {granted:?}");
-        };
-        token
+    let Response::TerminalControl { token, .. } = granted else {
+        panic!("original child did not grant fresh control: {granted:?}");
     };
     let input = Request::Input {
         runtime_id: runtime.runtime_id,
@@ -2593,26 +2870,18 @@ async fn check_real_create_reply_loss(replacement: bool) {
         paste: false,
     };
     let reply = request(&fixture.root, &input).await.unwrap();
-    if replacement {
-        assert!(matches!(reply, Response::Error { .. }), "{reply:?}");
-        assert!(
-            fs::read(fixture.root.join("provider-input"))
-                .unwrap_or_default()
-                .is_empty()
-        );
-        assert!(matches!(
-            request(&fixture.root, &acquire).await.unwrap(),
-            Response::ControlRecovering { .. }
-        ));
-    } else {
-        assert!(matches!(reply, Response::Accepted {}), "{reply:?}");
-        assert_eq!(wait("provider-input").await, b"x");
-        assert!(matches!(
-            request(&fixture.root, &input).await.unwrap(),
-            Response::Error { .. }
-        ));
-    }
+    assert!(matches!(reply, Response::Accepted {}), "{reply:?}");
+    assert_eq!(wait("provider-input").await, b"x");
+    assert!(matches!(
+        request(&fixture.root, &input).await.unwrap(),
+        Response::Error { .. }
+    ));
     assert_eq!(fixture.call(&command).await, recovered);
+    let finished = fixture_operation(&lane, key).await;
+    assert_same_reservation(&original, &finished);
+    assert!(
+        matches!(&finished.stage, OperationStage::Finished(StoredOutcome::Launched { outcome: stored, .. }) if stored.as_ref() == outcome)
+    );
     assert_eq!(
         fs::read(fixture.root.join("real-spawns")).unwrap(),
         b"spawned\n"
@@ -2621,90 +2890,90 @@ async fn check_real_create_reply_loss(replacement: bool) {
         fs::read(fixture.root.join("provider-starts")).unwrap(),
         b"start\n"
     );
-    if !replacement {
-        let pane = runtime.pane_id.as_str();
-        let birth = || {
-            tmux.command()
-                .args(["show-options", "-pqv", "-t", pane, "@rs_create_birth"])
-                .output()
-                .unwrap()
-        };
-        let used = birth();
-        assert!(
-            used.status.success() && used.stdout.starts_with(b"used~v1~"),
-            "{used:?}"
-        );
-        fs::remove_file(fixture.root.join("provider-starts")).unwrap();
-        fs::remove_file(fixture.root.join("provider-input")).unwrap();
-        let respawn = tmux
-            .command()
-            .args(["respawn-pane", "-k", "-t", pane])
+    let pane = runtime.pane_id.as_str();
+    let birth = || {
+        tmux.command()
+            .args(["show-options", "-pqv", "-t", pane, "@rs_create_birth"])
             .output()
-            .unwrap();
-        assert!(respawn.status.success(), "{respawn:?}");
-        assert_eq!(wait("provider-starts").await, b"start\n");
-        assert_eq!(birth().stdout, used.stdout);
-        assert!(matches!(
-            fixture.status(key).await,
-            CreateState::Confirmed {
-                current: PaneLiveness::Unavailable,
-                ..
-            }
-        ));
-        assert!(matches!(
-            request(&fixture.root, &acquire).await.unwrap(),
-            Response::Error { .. }
-        ));
-        let stale = Request::Input {
-            runtime_id: runtime.runtime_id,
-            token,
-            sequence: 1,
-            data: b"y".to_vec(),
-            paste: false,
-        };
-        assert!(matches!(
-            request(&fixture.root, &stale).await.unwrap(),
-            Response::Error { .. }
-        ));
-        assert!(
-            fs::read(fixture.root.join("provider-input"))
-                .unwrap_or_default()
-                .is_empty()
-        );
-        assert_eq!(
-            fs::read(fixture.root.join("real-spawns")).unwrap(),
-            b"spawned\n"
-        );
-        let diagnostic = Request::Create {
-            session_id: Uuid::new_v4(),
-            runtime_id: Uuid::new_v4(),
-            cwd: fixture.workspace.clone(),
-            argv: vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                "printf '%s\\n%s' \"$(/bin/pwd)\" \"$2\" > \"$1.tmp\"; /bin/mv \"$1.tmp\" \"$1\""
-                    .into(),
-                "fixture".into(),
-                fixture
-                    .root
-                    .join("diagnostic-output")
-                    .to_str()
-                    .unwrap()
-                    .into(),
-                "literal #{} $name ' \" ; value".into(),
-            ],
-        };
-        let created = request(&fixture.root, &diagnostic).await.unwrap();
-        assert!(matches!(created, Response::Created { .. }), "{created:?}");
-        assert_eq!(
-            wait("diagnostic-output").await,
-            format!(
-                "{}\nliteral #{{}} $name ' \" ; value",
-                fixture.workspace.display()
-            )
-            .as_bytes()
-        );
-    }
+            .unwrap()
+    };
+    let used = birth();
+    assert!(
+        used.status.success() && used.stdout.starts_with(b"used~v1~"),
+        "{used:?}"
+    );
+    fs::remove_file(fixture.root.join("provider-starts")).unwrap();
+    fs::remove_file(fixture.root.join("provider-input")).unwrap();
+    let respawn = tmux
+        .command()
+        .args(["respawn-pane", "-k", "-t", pane])
+        .output()
+        .unwrap();
+    assert!(respawn.status.success(), "{respawn:?}");
+    assert_eq!(wait("provider-starts").await, b"start\n");
+    assert_eq!(birth().stdout, used.stdout);
+    assert_eq!(
+        fixture.status(key).await,
+        CreateState::Confirmed {
+            outcome: outcome.clone(),
+            current: PaneLiveness::Unavailable,
+            setup_issue: None,
+        }
+    );
+    assert_eq!(fixture_operation(&lane, key).await.stage, finished.stage);
+    assert!(matches!(
+        request(&fixture.root, &acquire).await.unwrap(),
+        Response::Error { .. }
+    ));
+    let stale = Request::Input {
+        runtime_id: runtime.runtime_id,
+        token,
+        sequence: 1,
+        data: b"y".to_vec(),
+        paste: false,
+    };
+    assert!(matches!(
+        request(&fixture.root, &stale).await.unwrap(),
+        Response::Error { .. }
+    ));
+    assert!(
+        fs::read(fixture.root.join("provider-input"))
+            .unwrap_or_default()
+            .is_empty()
+    );
+    assert_eq!(
+        fs::read(fixture.root.join("real-spawns")).unwrap(),
+        b"spawned\n"
+    );
+    let diagnostic = Request::Create {
+        session_id: Uuid::new_v4(),
+        runtime_id: Uuid::new_v4(),
+        cwd: fixture.workspace.clone(),
+        argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf '%s\\n%s' \"$(/bin/pwd)\" \"$2\" > \"$1.tmp\"; /bin/mv \"$1.tmp\" \"$1\""
+                .into(),
+            "fixture".into(),
+            fixture
+                .root
+                .join("diagnostic-output")
+                .to_str()
+                .unwrap()
+                .into(),
+            "literal #{} $name ' \" ; value".into(),
+        ],
+    };
+    let created = request(&fixture.root, &diagnostic).await.unwrap();
+    assert!(matches!(created, Response::Created { .. }), "{created:?}");
+    assert_eq!(
+        wait("diagnostic-output").await,
+        format!(
+            "{}\nliteral #{{}} $name ' \" ; value",
+            fixture.workspace.display()
+        )
+        .as_bytes()
+    );
     stop(job).await;
 }
 
@@ -2788,6 +3057,8 @@ async fn w1_create_delayed_dispatch_times_out_and_does_not_send_again() {
 async fn w1_create_sqlite_full_blocks_failed_marker_or_finalization_and_preserves_legacy() {
     for full_at in ["marked", "finished"] {
         let fixture = Fixture::new();
+        let (_master, _slave, tty) = observation_pty();
+        fixture.birth_device(&tty);
         let lane = fixture.lane().await;
         let job = fixture.serve(lane.clone()).await;
         let workspace = fixture.register().await;
