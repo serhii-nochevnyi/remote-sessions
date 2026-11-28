@@ -133,17 +133,17 @@ impl LaunchGuard {
         Ok(serde_json::from_slice(&bytes?)?)
     }
 
-    fn exec(&self) -> ProductIssue {
+    fn validate(&self) -> Result<(), ProductIssue> {
         if self.policy.policy_version != POLICY_VERSION
             || std::env::var(NONCE_ENV).ok().as_deref() != Some(&self.nonce.to_string())
         {
-            return ProductIssue::LaunchSetupFailed;
+            return Err(ProductIssue::LaunchSetupFailed);
         }
         let Ok(cwd) = fs::metadata(".") else {
-            return ProductIssue::WorkspaceChanged;
+            return Err(ProductIssue::WorkspaceChanged);
         };
         if (cwd.dev(), cwd.ino()) != (self.policy.workspace.device, self.policy.workspace.inode) {
-            return ProductIssue::WorkspaceChanged;
+            return Err(ProductIssue::WorkspaceChanged);
         }
         let profiles = ServiceProfiles::new(Some(OsStr::new(&self.policy.path)));
         match profiles.preflight(
@@ -151,9 +151,15 @@ impl LaunchGuard {
             &self.policy.workspace,
             self.profile,
         ) {
-            Ok(policy) if policy == self.policy => {}
-            Ok(_) => return ProductIssue::ProviderNotExecutable,
-            Err(issue) => return issue,
+            Ok(policy) if policy == self.policy => Ok(()),
+            Ok(_) => Err(ProductIssue::ProviderNotExecutable),
+            Err(issue) => Err(issue),
+        }
+    }
+
+    fn exec(&self) -> ProductIssue {
+        if let Err(issue) = self.validate() {
+            return issue;
         }
         if let Some(birth) = &self.birth
             && std::env::var(TICKET_ENV).ok().as_deref() == Some(&birth.ticket.to_string())
@@ -162,6 +168,9 @@ impl LaunchGuard {
                 .build()
         {
             let _ = runtime.block_on(birth.publish(&self.service_state, self.nonce));
+            if let Err(issue) = self.validate() {
+                return issue;
+            }
         }
         let _error = std::process::Command::new(&self.policy.executable)
             .env("PATH", &self.policy.path)

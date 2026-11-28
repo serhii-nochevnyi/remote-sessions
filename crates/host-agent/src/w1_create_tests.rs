@@ -3516,6 +3516,41 @@ struct PrivateCreateTmux {
 
 #[cfg(target_os = "macos")]
 impl PrivateCreateTmux {
+    fn start(fixture: &Fixture) -> Self {
+        let tmux = Self {
+            binary: find_executable("tmux").expect("selected tmux 3.8 is required"),
+            socket: fixture.root.join("tmux.sock"),
+        };
+        assert_eq!(
+            std::process::Command::new(&tmux.binary)
+                .arg("-V")
+                .output()
+                .unwrap()
+                .stdout,
+            b"tmux 3.8\n"
+        );
+        let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/tmux.conf");
+        let started = std::process::Command::new(&tmux.binary)
+            .arg("-f")
+            .arg(config)
+            .arg("-S")
+            .arg(&tmux.socket)
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                "canary",
+                "--",
+                "/bin/sleep",
+                "75",
+            ])
+            .env_remove("TMUX")
+            .output()
+            .unwrap();
+        assert!(started.status.success(), "{started:?}");
+        tmux
+    }
+
     fn command(&self) -> std::process::Command {
         let mut command = std::process::Command::new(&self.binary);
         command
@@ -3535,41 +3570,8 @@ impl Drop for PrivateCreateTmux {
 
 #[cfg(target_os = "macos")]
 async fn check_real_create_reply_loss(replacement: bool) {
-    use std::process::Command;
-
     let fixture = Fixture::new();
-    let tmux = PrivateCreateTmux {
-        binary: find_executable("tmux")
-            .expect("tmux 3.8 is required for private launch verification"),
-        socket: fixture.root.join("tmux.sock"),
-    };
-    assert_eq!(
-        Command::new(&tmux.binary)
-            .arg("-V")
-            .output()
-            .unwrap()
-            .stdout,
-        b"tmux 3.8\n"
-    );
-    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/tmux.conf");
-    let started = Command::new(&tmux.binary)
-        .arg("-f")
-        .arg(config)
-        .arg("-S")
-        .arg(&tmux.socket)
-        .args([
-            "new-session",
-            "-d",
-            "-s",
-            "canary",
-            "--",
-            "/bin/sleep",
-            "75",
-        ])
-        .env_remove("TMUX")
-        .output()
-        .unwrap();
-    assert!(started.status.success(), "{started:?}");
+    let tmux = PrivateCreateTmux::start(&fixture);
     tests::fixture_program(
         &fixture.root.join("tmux"),
         &format!(
@@ -4061,6 +4063,219 @@ fn launcher_child_fixture() {
     std::process::exit(17);
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn w1_create_managed_child_revalidates_after_birth_publication() {
+    use std::{io::Write, os::unix::fs::symlink, process::Command};
+
+    for issue in [
+        Some(ProductIssue::WorkspaceChanged),
+        Some(ProductIssue::ProviderNotExecutable),
+        None,
+    ] {
+        let mut fixture = Fixture::new();
+        let original_directory = fixture.workspace.clone();
+        fixture.workspace = fixture.root.join("locator");
+        symlink(&original_directory, &fixture.workspace).unwrap();
+        let replacement_directory = fixture.root.join("replacement-workspace");
+        fs::create_dir(&replacement_directory).unwrap();
+        let tmux = PrivateCreateTmux::start(&fixture);
+        let run = |args: &[&str]| {
+            let output = tmux.command().args(args).output().unwrap();
+            assert!(output.status.success(), "{args:?}: {output:?}");
+            String::from_utf8(output.stdout).unwrap()
+        };
+        assert_eq!(run(&["display-message", "-p", "#{version}"]), "3.8\n");
+
+        let fifo = fixture.root.join("release");
+        assert!(
+            Command::new("/usr/bin/mkfifo")
+                .args(["-m", "600"])
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        tests::fixture_program(
+            &fixture.root.join("tmux"),
+            &format!(
+                r#"#!/bin/sh
+set -eu
+case "${{9-}}" in
+  'set-option -po -t '*' @rs_create_birth '*)
+    printf 'entered\n' >> '{root}/birth-entered'
+    IFS= read -r release < '{root}/release'
+    test "$release" = publish
+    '{bin}' "$@"
+    printf 'published\n' >> '{root}/birth-completed'
+    exit 0 ;;
+esac
+case "${{7-}}" in
+  'new-session '*' __managed-launch '*)
+    printf 'spawned\n' >> '{root}/spawns' ;;
+esac
+exec '{bin}' "$@"
+"#,
+                root = fixture.root.display(),
+                bin = tmux.binary.display(),
+            ),
+        );
+        let launch = fixture.root.join("launch");
+        tests::fixture_program(
+            &launch,
+            &format!(
+                "#!/bin/sh\ntest \"$1\" = __managed-launch || exit 2\nexport RS_W1_LAUNCH_POLICY=\"$2\"\nexec '{}' --exact w1_create_tests::launcher_child_fixture --ignored\n",
+                std::env::current_exe().unwrap().display(),
+            ),
+        );
+        for (executable, witness) in [
+            ("codex", "original-exec"),
+            ("replacement-codex", "replacement-exec"),
+        ] {
+            tests::fixture_program(
+                &fixture.root.join(executable),
+                &format!(
+                    "#!/bin/sh\nset -eu\ntest -z \"${{RS_CREATE_NONCE+x}}${{RS_CREATE_TICKET+x}}\"\nprintf 'exec\n' >> '{}/{witness}'\n",
+                    fixture.root.display()
+                ),
+            );
+        }
+
+        let lane = fixture.lane().await;
+        let job = fixture
+            .serve_engine(
+                fixture.engine().with_creation_fixture(Some(launch), None),
+                lane.clone(),
+            )
+            .await;
+        let workspace = fixture.register().await;
+        let key = Uuid::new_v4();
+        let command = create(key, workspace, None);
+        let initial = fixture.call(&command).await;
+        assert!(
+            matches!(initial, CreateState::Unknown { .. }),
+            "{initial:?}"
+        );
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while !fixture.root.join("birth-entered").exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("child did not reach birth publication");
+        let original = fixture_operation(&lane, key).await;
+        assert_eq!(original.stage, OperationStage::Marked);
+        let mut release = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                match OpenOptions::new()
+                    .write(true)
+                    .custom_flags(nix::libc::O_NONBLOCK)
+                    .open(&fifo)
+                {
+                    Ok(gate) => break gate,
+                    Err(error) if error.raw_os_error() == Some(nix::libc::ENXIO) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("could not open publication gate: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("child did not wait for publication release");
+        match issue {
+            Some(ProductIssue::WorkspaceChanged) => {
+                fs::remove_file(&fixture.workspace).unwrap();
+                symlink(&replacement_directory, &fixture.workspace).unwrap();
+                assert_eq!(
+                    resolve_workspace(&original_directory).unwrap(),
+                    original.policy.workspace
+                );
+            }
+            Some(ProductIssue::ProviderNotExecutable) => {
+                fs::rename(
+                    fixture.root.join("replacement-codex"),
+                    fixture.root.join("codex"),
+                )
+                .unwrap();
+            }
+            None => {}
+            _ => unreachable!(),
+        }
+        release.write_all(b"publish\n").unwrap();
+        let target = format!("={}:0.0", original.target);
+        let exit = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let sample = tokio::process::Command::from(tmux.command())
+                    .args([
+                        "display-message",
+                        "-p",
+                        "-t",
+                        &target,
+                        "#{pane_id}|#{pane_dead}|#{pane_dead_status}|#{@rs_create_birth}",
+                    ])
+                    .kill_on_drop(true)
+                    .output()
+                    .await
+                    .unwrap();
+                assert!(sample.status.success(), "{sample:?}");
+                let row = String::from_utf8(sample.stdout).unwrap();
+                if row.split('|').nth(1) == Some("1") {
+                    break row;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("managed pane did not retain its exit");
+        let fields: Vec<_> = exit.trim_end().split('|').collect();
+        assert_eq!(fields.len(), 4);
+        assert!(fields[0].starts_with('%'), "{exit:?}");
+        assert_eq!(fields[2], if issue.is_some() { "17" } else { "0" });
+        let birth: Vec<_> = fields[3].split('~').collect();
+        assert_eq!(birth.len(), 17, "{exit:?}");
+        assert_eq!(birth[4], original.id.to_string());
+        assert_eq!(birth[5], original.runtime_id.to_string());
+        assert_eq!(birth[6], original.nonce.to_string());
+        assert_eq!(birth[10], fields[0]);
+        assert_eq!(
+            fs::read(fixture.root.join("birth-entered")).unwrap(),
+            b"entered\n"
+        );
+        assert_eq!(
+            fs::read(fixture.root.join("birth-completed")).unwrap(),
+            b"published\n"
+        );
+        assert_eq!(read_setup_fault(&fixture.root, original.nonce), issue);
+        let state = fixture.call(&ProductRequest::CreateStatus { key }).await;
+        let CreateState::Confirmed {
+            outcome,
+            current: PaneLiveness::Exited,
+            setup_issue,
+        } = &state
+        else {
+            panic!("original retained pane did not settle: {state:?}");
+        };
+        assert_eq!(*setup_issue, issue);
+        assert_eq!(outcome.setup_issue, issue);
+        assert_eq!(outcome.runtime.session_id, original.session_id);
+        assert_eq!(outcome.runtime.runtime_id, original.runtime_id);
+        assert_eq!(outcome.runtime.pane_id, fields[0]);
+        assert_same_reservation(&original, &fixture_operation(&lane, key).await);
+        assert_eq!(fixture.call(&command).await, state);
+        assert_eq!(fs::read(fixture.root.join("spawns")).unwrap(), b"spawned\n");
+        assert!(!fixture.root.join("replacement-exec").exists());
+        if issue.is_some() {
+            assert!(!fixture.root.join("original-exec").exists());
+        } else {
+            assert_eq!(
+                fs::read(fixture.root.join("original-exec")).unwrap(),
+                b"exec\n"
+            );
+        }
+        stop(job).await;
+    }
+}
+
 #[test]
 fn w1_create_guard_rejects_tmux_fallback_and_replaced_cwd_before_provider_exec() {
     let fixture = Fixture::new();
@@ -4539,6 +4754,12 @@ async fn w1_legacy_provenance_finished_held_views_and_faults_preserve_marker_byt
         if status.terminal == warm && status.observation == ObservationState::Observed)
     );
 
+    fixture.set("marker", format!("{progressed}~invalid"));
+    assert!(matches!(
+        local(query(warm.clone())).await,
+        Response::Error { .. } | Response::TerminalChanged {}
+    ));
+    fixture.set("marker", &progressed);
     stop(job).await;
     drop(lane);
     fixture.wait_restart_released().await;

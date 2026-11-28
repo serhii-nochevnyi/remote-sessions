@@ -3480,6 +3480,8 @@ pub(super) fn seed_historical_terminal(
 #[cfg(debug_assertions)]
 #[tokio::test]
 async fn w1_legacy_provenance_bridge_restores_finished_held_and_retains_bound_read() {
+    use std::io::Write;
+
     let host = AgentFixture::new();
     let attachment = AgentFixture::new();
     let generation = Uuid::new_v4();
@@ -3498,6 +3500,10 @@ async fn w1_legacy_provenance_bridge_restores_finished_held_and_retains_bound_re
     let tmux = attachment_tmux(&attachment, generation, "ignore-size");
     let listener = UnixListener::bind(attachment.0.join("agent.sock")).unwrap();
     let relay_host = host.0.clone();
+    let opens = Arc::new(AtomicU64::new(0));
+    let accepted = Arc::new(AtomicU64::new(0));
+    let relay_opens = Arc::clone(&opens);
+    let relay_accepted = Arc::clone(&accepted);
     let relay = tokio::spawn(async move {
         loop {
             let (mut peer, command) = receive(&listener).await;
@@ -3508,7 +3514,14 @@ async fn w1_legacy_provenance_bridge_restores_finished_held_and_retains_bound_re
                     | Request::List {}
                     | Request::Health {}
             ));
-            respond(&mut peer, request(&relay_host, &command).await.unwrap()).await;
+            let response = request(&relay_host, &command).await.unwrap();
+            if matches!(command, Request::OpenTerminal { .. }) {
+                relay_opens.fetch_add(1, Ordering::Relaxed);
+                if matches!(response, Response::TerminalOpened { .. }) {
+                    relay_accepted.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            respond(&mut peer, response).await;
         }
     });
     let runtime = original.runtime_id.to_string();
@@ -3531,6 +3544,7 @@ async fn w1_legacy_provenance_bridge_restores_finished_held_and_retains_bound_re
     );
     assert!(restored.status.epoch.is_some());
     bridge.detach(&attached.view_id);
+    until(|| allocation_counts(&bridge) == (1, 1)).await;
     assert_eq!(
         read_until_bytes(&bridge, &restored.view_id, b"buffered attachment output").await,
         b"buffered attachment output"
@@ -3541,22 +3555,68 @@ async fn w1_legacy_provenance_bridge_restores_finished_held_and_retains_bound_re
         host.0.join("retained.sqlite3"),
     )
     .unwrap();
-    bridge
-        .view(&restored.view_id)
-        .unwrap()
-        .output
-        .lock()
-        .await
-        .refresh_at = Instant::now();
     let status = bridge.status(&restored.view_id).await.unwrap();
     assert_eq!(status.terminal, restored.status.terminal);
     assert_eq!(status.observation, ObservationState::Observed);
+    let view = bridge.view(&restored.view_id).unwrap();
+    let client = fs::read_to_string(attachment.0.join("client")).unwrap();
+    let mut client_lines = client.lines();
+    assert_eq!(
+        client_lines.next().unwrap().parse::<u32>().unwrap(),
+        view.client_pid
+    );
+    assert_eq!(Path::new(client_lines.next().unwrap()), view.tty);
+    let mut output = fs::OpenOptions::new().write(true).open(&view.tty).unwrap();
+    let expected = b"new PTY bytes during catalog fault";
+    output.write_all(expected).unwrap();
+    drop(output);
+    view.output.lock().await.refresh_at = Instant::now();
+    let bytes = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut bytes = Vec::new();
+        let mut refreshed = false;
+        while bytes.len() < expected.len() {
+            let chunk = bridge.read(&restored.view_id).await.unwrap();
+            assert!(!chunk.closed && !chunk.writable && chunk.geometry.is_none());
+            assert!(chunk.paste_incarnation.is_none() && chunk.paste_completion.is_none());
+            if let Some(current) = chunk.status {
+                assert_eq!(current.terminal, status.terminal);
+                assert_eq!(current.observation, ObservationState::Observed);
+                refreshed = true;
+            }
+            bytes.extend(chunk.data);
+        }
+        assert!(refreshed);
+        bytes
+    })
+    .await
+    .unwrap();
+    assert_eq!(bytes, expected);
+    let refused_observer = bridge
+        .attach_observer(&runtime)
+        .await
+        .err()
+        .expect("catalog fault admitted a fresh observer");
+    assert_eq!(refused_observer.to_string(), "Attachment not authorized");
     let refused = bridge
-        .restore_attachment(&runtime, restoration())
+        .restore_attachment(
+            &runtime,
+            TerminalRestoration {
+                previous: status.terminal.clone(),
+                ..restoration()
+            },
+        )
         .await
         .err()
         .unwrap();
     assert_eq!(refused.to_string(), "Attachment not authorized");
+    assert_eq!(opens.load(Ordering::Relaxed), 4);
+    assert_eq!(accepted.load(Ordering::Relaxed), 2);
+    assert_eq!(allocation_counts(&bridge), (1, 1));
+    assert!(Arc::ptr_eq(&view, &bridge.view(&restored.view_id).unwrap()));
+    assert_eq!(
+        fs::read_to_string(attachment.0.join("client")).unwrap(),
+        client
+    );
     assert_eq!(fs::read_to_string(host.0.join("marker")).unwrap(), marker);
     assert!(!host.0.join("unexpected").exists());
     assert!(!host.0.join("pane-bytes").exists());

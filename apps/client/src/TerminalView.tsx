@@ -6,9 +6,9 @@ import { bindTerminalPaste, bindTerminalProtocol } from "./terminal-protocol";
 import { localClient, TerminalViewScope } from "./local-client";
 import type { GeometryEvent, TerminalDelivery, TerminalSize, TerminalStatus, TerminalStreamFailure } from "./local-client";
 import { acceptMountedRenderer, adoptCurrentTerminal, confirmMountedWriter, desiredTerminalMode, explicitClosedReconnect,
-  mountedTerminalEntry, runMountedTerminalStream, TerminalAttachmentIdentityError, terminalProofOnly, terminalStreamAccess,
+  mountedTerminalEffect, mountedTerminalEntry, runMountedTerminalStream, TerminalAttachmentIdentityError, terminalProofOnly, terminalStreamAccess,
   updateMountedStream } from "./session-state";
-import type { AttachmentMode, BoundTerminal, MountedTerminal, TerminalBindingState } from "./session-state";
+import type { ActiveTerminalEffect, BoundTerminal, MountedTerminal, TerminalBindingState } from "./session-state";
 import { GeometryBoundaryError, mountedResize, OrderedGeometry, sameTerminal } from "./terminal-geometry";
 import "@xterm/xterm/css/xterm.css";
 
@@ -54,16 +54,14 @@ export function TerminalView({ runtimeId, label, fontSize, mounted, previousBind
   const updateFont = useRef<((size: number) => void) | null>(null);
   const reconnectDelay = useRef(500);
   const previousRef = useRef(previousBinding);
-  const activeMode = useRef<AttachmentMode | undefined>(undefined);
-  const activeAgent = useRef<number | undefined>(undefined);
+  const activeEffect = useRef<ActiveTerminalEffect | undefined>(undefined);
   const updateEligibility = useRef<((reconnect?: boolean) => void) | null>(null);
   const retainedRenderer = useRef<{ binding: BoundTerminal; dispose: () => void } | null>(null);
   const [status, setStatus] = useState("Підключення…");
   const [retry, setRetry] = useState(0);
   const [, refreshDelivery] = useState(0);
-  const { intent, outputOnly } = mounted;
-  const mode = intent ? desiredTerminalMode(intent, activeMode.current, delivery.mayRestore) : outputOnly ? activeMode.current : undefined;
-  const agent = intent?.identity.agentPid ?? (outputOnly ? activeAgent.current : undefined);
+  const { intent, observation, outputOnly } = mounted;
+  const { mode, agent } = mountedTerminalEffect(mounted, activeEffect.current, delivery.mayRestore);
   useLayoutEffect(() => () => { retainedRenderer.current?.dispose(); }, []);
   useLayoutEffect(() => {
     previousRef.current = previousBinding;
@@ -73,7 +71,7 @@ export function TerminalView({ runtimeId, label, fontSize, mounted, previousBind
   }, [mounted, attempt]);
   useLayoutEffect(() => {
     delivery.onChange = () => {
-      if (activeMode.current !== "ordinary") refreshDelivery(value => value + 1);
+      if (activeEffect.current?.mode !== "ordinary") refreshDelivery(value => value + 1);
     };
     return () => { delivery.onChange = undefined; };
   }, [delivery]);
@@ -90,8 +88,8 @@ export function TerminalView({ runtimeId, label, fontSize, mounted, previousBind
     if (mountedTerminalEntry(currentAttachment(runtimeId, previous, attempt),
       retainedAtEntry?.binding, delivery.mayRestore) !== mode) return;
     const attachmentMode = mode;
-    activeMode.current = attachmentMode;
-    activeAgent.current = agent;
+    const effect: ActiveTerminalEffect = { mode: attachmentMode, agent };
+    activeEffect.current = effect;
     const container = mountedElement;
     const rendererId = crypto.randomUUID();
     const terminal = new Terminal({ disableStdin: true, fontSize: font.current, lineHeight: 1.25,
@@ -226,8 +224,7 @@ export function TerminalView({ runtimeId, label, fontSize, mounted, previousBind
             if (binding) onBinding(binding, identityChanged ? "changed" : draining ? "ended" : "retired", binding, attempt);
             else if (previous && (identityChanged || reopening)) onBinding(previous, identityChanged ? "changed" : "view-closed", previous, attempt);
           }
-          activeMode.current = undefined;
-          activeAgent.current = undefined;
+          activeEffect.current = undefined;
         }
         container.removeAttribute("data-terminal-attached");
         updateEligibility.current = null;
@@ -259,7 +256,8 @@ export function TerminalView({ runtimeId, label, fontSize, mounted, previousBind
         scope.setInputEligible(false);
         scope.retire();
       } else if (binding) {
-        if (updateMountedStream(streamEligibility) === "draining") report();
+        const access = updateMountedStream(streamEligibility, confirmation);
+        if (access === "draining" || access === "observing") report();
       } else if (desiredTerminalMode(currentIntent(), attachmentMode, delivery.mayRestore) !== attachmentMode) {
         scope.setInputEligible(false);
         scope.retire();
@@ -303,7 +301,7 @@ export function TerminalView({ runtimeId, label, fontSize, mounted, previousBind
         }, () => delivery.mayRestore, scope, accepted => {
           proofOnly = terminalProofOnly(current(), attachmentMode, delivery.mayRestore);
           if (!onBinding(accepted, proofOnly ? "proved" : "bound", previous, attempt)) return false;
-          binding = accepted;
+          effect.binding = binding = accepted;
           previousRef.current = accepted;
           return true;
         }, detached.current, localClient);
@@ -374,13 +372,12 @@ export function TerminalView({ runtimeId, label, fontSize, mounted, previousBind
       stale = true;
       scope.retire();
       if (!retained) disposeRenderer();
-      activeMode.current = undefined;
-      activeAgent.current = undefined;
+      activeEffect.current = undefined;
     };
   }, [runtimeId, mode, agent, attempt, retry, currentAttachment, delivery, detached, onBinding]);
   const displayStatus = mounted.mode === "completed" ? "Процес завершився · режим перегляду"
     : mounted.mode === "view-closed" && !intent ? "Потік термінала закрито · режим перегляду"
-    : intent || outputOnly ? status : "Очікуємо підтвердження термінала…";
+    : intent || (observation && mode) || outputOnly ? status : "Очікуємо підтвердження термінала…";
   return <><div className="stream-status" role="status"><span>{displayStatus}</span><button type="button"
     disabled={intent?.reconnect === true || (!intent && !explicitClosedReconnect(mounted))} onClick={() => {
     const current = currentAttachment(runtimeId, previousRef.current, attempt);
