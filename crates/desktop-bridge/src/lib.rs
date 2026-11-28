@@ -2496,10 +2496,13 @@ impl DesktopBridge {
             "Terminal proposal outside supported range"
         );
         let view = self.view(view_id)?;
-        let _pending = view
-            .resize
-            .try_lock()
-            .context("Terminal resize already in progress")?;
+        let busy = || ResizeResult::Busy {
+            terminal: view.terminal.clone(),
+            size,
+        };
+        let Ok(_pending) = view.resize.try_lock() else {
+            return Ok(busy());
+        };
         let (token, sequence) = {
             let control = view.control.lock().await;
             ensure!(!view.closed(), "View detached");
@@ -2507,9 +2510,12 @@ impl DesktopBridge {
             ensure!(
                 lease.incarnation == incarnation
                     && lease.epoch == epoch
-                    && lease.writable(Instant::now()),
+                    && lease.deadline > Instant::now(),
                 "Resize authority changed"
             );
+            if lease.pending_paste.is_some() {
+                return Ok(busy());
+            }
             (lease.token, lease.resize_sequence)
         };
         let reply = view
@@ -2521,28 +2527,53 @@ impl DesktopBridge {
             })
             .await;
         let mut control = view.control.lock().await;
-        ensure!(!view.closed(), "View detached");
+        let same_lease = |lease: &NativeLease| lease.token == token && lease.epoch == epoch;
+        let reply = {
+            let views = self.views.lock().unwrap();
+            ensure!(
+                !view.closed()
+                    && views
+                        .live
+                        .get(&view.terminal.view_id)
+                        .is_some_and(|live| Arc::ptr_eq(live, &view)),
+                "View detached"
+            );
+            match reply {
+                Ok(Response::Resize {
+                    resize: ResizeResult::Committed { admission, status },
+                }) if status.terminal == view.terminal
+                    && status.epoch == Some(epoch)
+                    && status.committed.intent == Some(admission)
+                    && admission.epoch == epoch
+                    && !admission.id.is_nil()
+                    && status.committed.revision > 0
+                    && status.committed.size == size =>
+                {
+                    if let Some(lease) = control.lease.as_mut().filter(|lease| same_lease(lease)) {
+                        lease.resize_sequence = sequence
+                            .checked_add(1)
+                            .context("Resize sequence exhausted")?;
+                    }
+                    return Ok(ResizeResult::Committed { admission, status });
+                }
+                Ok(Response::Resize {
+                    resize:
+                        ResizeResult::Busy {
+                            terminal,
+                            size: refused,
+                        },
+                }) if terminal == view.terminal && refused == size => return Ok(busy()),
+                reply => reply,
+            }
+        };
         let pending_paste = control
             .lease
             .as_ref()
-            .filter(|lease| lease.token == token)
+            .filter(|lease| same_lease(lease))
             .context("Resize authority changed")?
             .pending_paste
             .is_some();
         match reply {
-            Ok(Response::Resize {
-                resize: ResizeResult::Committed { admission, status },
-            }) if status.terminal == view.terminal
-                && status.epoch == Some(epoch)
-                && status.committed.intent == Some(admission)
-                && admission.epoch == epoch
-                && status.committed.size == size =>
-            {
-                control.lease.as_mut().unwrap().resize_sequence = sequence
-                    .checked_add(1)
-                    .context("Resize sequence exhausted")?;
-                Ok(ResizeResult::Committed { admission, status })
-            }
             Ok(Response::Resize {
                 resize: ResizeResult::Uncertain { terminal, intent },
             }) if terminal == view.terminal && intent.epoch == epoch => {

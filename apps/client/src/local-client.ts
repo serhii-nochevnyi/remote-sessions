@@ -73,6 +73,7 @@ export interface GridAcknowledgement {
   readonly focused: boolean;
 }
 export type ResizeResult = { readonly result: "committed"; readonly admission: ResizeIntent; readonly status: TerminalStatus }
+  | { readonly result: "busy"; readonly terminal: TerminalScope; readonly size: TerminalSize }
   | { readonly result: "uncertain" | "rejected"; readonly terminal: TerminalScope; readonly intent: ResizeIntent };
 export type TerminalClosure = { readonly reason: "overflow"; readonly high_water: 16 }
   | { readonly reason: "eof" | "detached" | "geometry_timeout" };
@@ -743,6 +744,10 @@ export function parseTerminalStatus(value: unknown): TerminalStatus {
 }
 export function parseResizeResult(value: unknown): ResizeResult {
   const item = record(value);
+  if (item.result === "busy") {
+    expectKeys(item, "result", "terminal", "size");
+    return { result: "busy", terminal: parseTerminalScope(item.terminal), size: parseSize(item.size) };
+  }
   if (item.result === "committed") {
     expectKeys(item, "result", "admission", "status");
     const status = parseTerminalStatus(item.status);
