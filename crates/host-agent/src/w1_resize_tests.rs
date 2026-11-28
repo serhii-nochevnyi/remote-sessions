@@ -563,14 +563,25 @@ else:
             "987|123456|{generation}|$0|@0|%0|{pid}|{name}|0|0||0|1|1|manual|{}",
             tty.display()
         );
-        fs::write(
-            &tmux,
-            script
-                .replace("PREFIX", &prefix)
-                .replace("GENERATION", &generation.to_string()),
-        )
-        .unwrap();
-        fs::set_permissions(tmux, fs::Permissions::from_mode(0o700)).unwrap();
+        let script = script
+            .replace("PREFIX", &prefix)
+            .replace("GENERATION", &generation.to_string());
+        let status = std::process::Command::new("python3")
+            .args([
+                "-c",
+                r#"from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+path.write_text(sys.argv[2], encoding="utf-8")
+path.chmod(0o700)
+"#,
+            ])
+            .arg(&tmux)
+            .arg(script)
+            .status()
+            .unwrap();
+        assert!(status.success(), "Fixture script creation failed: {status}");
         Self {
             engine,
             terminal,
