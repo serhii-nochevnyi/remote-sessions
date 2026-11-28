@@ -2997,8 +2997,7 @@ impl Engine {
                 && (ready || PasteBuffer::from_marker(read).is_some()),
             "Historical writer marker is unconfirmed"
         );
-        // The old marker contains the original start, not an inode. Corroborate the
-        // current device on each side of the exact tmux identity and option reads.
+        // @invariant: Historical markers bind start; verify the current TTY device around identity reads.
         let device = tty_identity(&fs::symlink_metadata(&read.tty)?)?;
         let first = self.corroborate_terminal(&read.identity(), nonce).await?;
         let birth = self
@@ -3996,7 +3995,7 @@ impl Engine {
             .context("Missing probe custody")?;
         let sample = format!("{}\n\t\u{2603}", Uuid::new_v4());
         if let Err(error) = self.load_paste(read, sample.as_bytes(), &possible).await {
-            // An absent buffer cannot settle a possibly pending stdin job.
+            // @invariant: Buffer absence cannot settle an outstanding stdin load.
             let _ = self.close_custody(read, &possible).await;
             return Err(error);
         }

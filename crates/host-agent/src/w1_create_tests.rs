@@ -4261,7 +4261,7 @@ async fn w1_legacy_provenance_marked_ready_finalizes_original_once_across_reply_
     );
     assert!(!fixture.root.join("mutation-attempts").exists());
 
-    // The failed SQLite write leaves this catalog lane unavailable until restart.
+    // @contract: A failed catalog write keeps the lane unavailable until restart.
     stop(job).await;
     drop(lane);
     fixture.wait_restart_released().await;

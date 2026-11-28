@@ -1337,7 +1337,7 @@ async fn w1_terminal_paste_capability_gap_retains_exact_buffer_custody() {
         .await
         .unwrap()
         .unwrap();
-    // Seed the pre-custody buffer from an old producer.
+    // @contract: Preserve buffer state from a producer predating server custody.
     fs::write(root.join(&bound.name), draft).unwrap();
     let canary = format!("rs-paste-{}", Uuid::new_v4().simple());
     fs::write(root.join(&canary), b"unrelated buffer").unwrap();
@@ -2863,7 +2863,7 @@ os.execvp(cli[0], [*cli, *args])
             .await
             .unwrap()
             .unwrap();
-        // Reproduce the historical pane marker and named buffer with no server record.
+        // @contract: Preserve the historical pane marker and exact buffer without a server record.
         fixture
             .tmux(&[
                 "set-buffer",
