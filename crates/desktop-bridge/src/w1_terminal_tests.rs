@@ -3098,6 +3098,7 @@ case "$4" in
       device=$(cat tty)
       case "$8" in
         "$birth_format")
+          if test -s samples; then name=$(tail -n 1 samples); fi
           nonce=$(cat "$name.nonce")
           printf '52|101|%s|$0|@0|%%0|%s|%s|0|0|%s:$0:@0:%%0:%s|0|%s|%s|%s\n' \
             "$token" "$pid" "$name" "$nonce" "$pid" "$device" \
@@ -3542,12 +3543,70 @@ async fn check_real_eof_status(outcome: RealEofStatus, standalone: bool) {
         read_until_bytes(&bridge, &id, b"buffered attachment output").await,
         b"buffered attachment output"
     );
+    let birth_path = host.0.join(format!("{}.birth", original.tmux_name));
+    let birth = fs::read_to_string(&birth_path).unwrap();
+    let start = fs::read_to_string(host.0.join("pane-start")).unwrap();
+    let mut fields: Vec<_> = birth.split('~').collect();
+    let start_index = fields.len() - 5;
+    assert_eq!(fields[start_index], start);
+    let other_start = (start.parse::<u64>().unwrap() + 1).to_string();
+    fields[start_index] = &other_start;
+    fs::write(&birth_path, fields.join("~")).unwrap();
+    let restored = DesktopBridge::new(Some(host.0.clone()), "/unused/tmux".into());
+    let restoration = || TerminalRestoration {
+        previous: status.terminal.clone(),
+        agent_pid: std::process::id(),
+        session_id: original.session_id,
+        operation_id: original.operation_id,
+    };
+    let refused = restored
+        .restore_attachment(&runtime, restoration())
+        .await
+        .err()
+        .expect("restored view adopted unproved birth");
+    assert_eq!(refused.to_string(), "Attachment not authorized");
+    assert_eq!(allocation_counts(&restored), (0, 0));
+    fs::write(&birth_path, birth).unwrap();
+    let exact = request(
+        &host.0,
+        &Request::TerminalStatus {
+            terminal: status.terminal.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(exact, Response::TerminalStatus { status: exact } if exact.terminal == status.terminal)
+    );
     let replacement = launch_catalog_terminal(&host, workspace_id).await;
     assert_eq!(replacement.pane_id, original.pane_id);
     assert_ne!(replacement.runtime_id, original.runtime_id);
 
     let samples = match outcome {
         RealEofStatus::Unavailable => {
+            fs::write(host.0.join("active"), &original.tmux_name).unwrap();
+            fs::rename(
+                host.0.join("catalog/catalog.sqlite3"),
+                host.0.join("retained.sqlite3"),
+            )
+            .unwrap();
+            let exact = request(
+                &host.0,
+                &Request::TerminalStatus {
+                    terminal: status.terminal.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(exact, Response::TerminalStatus { status: exact }
+                if exact.terminal == status.terminal && exact.observation == ObservationState::Observed));
+            let refused = restored
+                .restore_attachment(&runtime, restoration())
+                .await
+                .err()
+                .expect("faulted catalog admitted an unbound view");
+            assert_eq!(refused.to_string(), "Attachment not authorized");
+            assert_eq!(allocation_counts(&restored), (0, 0));
             fs::write(host.0.join("fail-query"), "").unwrap();
             vec![&original.tmux_name]
         }

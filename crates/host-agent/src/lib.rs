@@ -551,6 +551,181 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_dispatch_fences_catalog_fault_while_catalog_free_legacy_stops_exactly() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let catalog_dir = root.join("catalog");
+        catalog::provision(&catalog_dir).unwrap();
+        let lane =
+            CatalogLane::start_fixture(move || Ok(catalog_dir), ServiceProfiles::new(None), None)
+                .await
+                .unwrap();
+        let (_master, _slave, tty) = w1_create_tests::observation_pty();
+        let tmux = root.join("tmux");
+        fixture_program(&tmux, w1_create_tests::TMUX);
+        let engine = Engine::new(tmux, root.join("tmux.sock"));
+        let runtime_id = Uuid::new_v4();
+        let name = tmux_name(Uuid::new_v4(), runtime_id);
+        fs::write(root.join("names"), format!("{name}\n")).unwrap();
+        fs::write(
+            root.join(format!("{name}.pane")),
+            format!("$1|@1|%1|{}\n", std::process::id()),
+        )
+        .unwrap();
+        fs::write(root.join(format!("{name}.dead")), "0\n").unwrap();
+        fs::write(root.join("tty"), tty).unwrap();
+
+        let creations = Mutex::new(());
+        let opening = serde_json::to_vec(&Request::OpenTerminal {
+            runtime_id,
+            view_id: Uuid::new_v4(),
+        })
+        .unwrap();
+        let opened: Response = serde_json::from_slice(
+            &dispatch(&opening, &engine, &creations, Some(&lane))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let Response::TerminalOpened { status } = opened else {
+            panic!("legacy observation failed");
+        };
+        assert_eq!(status.provider.unwrap().size, status.committed.size);
+        assert_eq!(
+            fs::read_to_string(root.join("generation-attempts"))
+                .unwrap()
+                .trim(),
+            status.terminal.target.generation.to_string()
+        );
+        fs::rename(
+            root.join("catalog/catalog.sqlite3"),
+            root.join("retained.sqlite3"),
+        )
+        .unwrap();
+        fs::write(root.join("trace-mutations"), "").unwrap();
+        let stop = serde_json::to_vec(&Request::Stop {
+            runtime_id,
+            expected_pane_id: "%1".into(),
+        })
+        .unwrap();
+        let denied = dispatch(&stop, &engine, &creations, Some(&lane))
+            .await
+            .unwrap_err();
+        assert!(denied.to_string().contains("CatalogMissing"), "{denied:#}");
+        assert!(!root.join("mutation-attempts").exists());
+        let stopped: Response =
+            serde_json::from_slice(&dispatch(&stop, &engine, &creations, None).await.unwrap())
+                .unwrap();
+        assert!(
+            matches!(stopped, Response::Stopped { runtime_id: stopped } if stopped == runtime_id)
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("stopped")).unwrap(),
+            format!("{name}\n")
+        );
+        assert!(fs::read_to_string(root.join("names")).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn configured_diagnostic_dispatch_keeps_retained_tuple_and_frees_slot() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let catalog_dir = root.join("catalog");
+        catalog::provision(&catalog_dir).unwrap();
+        let lane =
+            CatalogLane::start_fixture(move || Ok(catalog_dir), ServiceProfiles::new(None), None)
+                .await
+                .unwrap();
+        let (_master, _slave, tty) = w1_create_tests::observation_pty();
+        let tmux = root.join("tmux");
+        fixture_program(&tmux, w1_create_tests::TMUX);
+        let engine = Engine::new(tmux, root.join("tmux.sock"));
+        let (session_id, runtime_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let target = tmux_name(session_id, runtime_id);
+        let create = |session_id, runtime_id| Request::Create {
+            session_id,
+            runtime_id,
+            cwd: root.clone(),
+            argv: vec!["/bin/sh".into(), "-c".into(), "exit".into()],
+        };
+        let creations = Mutex::new(());
+        let send = async |request: Request| -> Result<Response> {
+            let json = serde_json::to_vec(&request)?;
+            Ok(serde_json::from_slice(
+                &dispatch(&json, &engine, &creations, Some(&lane)).await?,
+            )?)
+        };
+        fs::write(root.join("diagnostic-pid"), std::process::id().to_string()).unwrap();
+        fs::write(root.join("tty"), tty).unwrap();
+        fs::write(root.join("diagnostic-mode"), "hidden").unwrap();
+        let mut names = String::new();
+        for slot in 1..=15 {
+            let name = tmux_name(Uuid::new_v4(), Uuid::new_v4());
+            names.push_str(&format!("{name}\n"));
+            fs::write(
+                root.join(format!("{name}.pane")),
+                format!("${slot}|@{slot}|%{slot}|{}\n", std::process::id()),
+            )
+            .unwrap();
+            fs::write(root.join(format!("{name}.dead")), "0\n").unwrap();
+        }
+        fs::write(root.join("names"), &names).unwrap();
+        assert!(send(create(session_id, runtime_id)).await.is_err());
+        let mark = lane
+            .run(move |db, _| Ok(db.diagnostic(runtime_id, session_id)?.unwrap()))
+            .await
+            .unwrap();
+        assert!(mark.pane.is_none());
+        assert_eq!(
+            mark.generation.token.to_string(),
+            fs::read_to_string(root.join("generation-attempts"))
+                .unwrap()
+                .trim()
+        );
+        let (next_session, next_runtime) = (Uuid::new_v4(), Uuid::new_v4());
+        let capacity = send(create(next_session, next_runtime)).await.unwrap_err();
+        assert!(capacity.to_string().contains("limit is 16"), "{capacity:#}");
+
+        let pane_path = root.join(format!("{target}.pane"));
+        assert_eq!(
+            fs::read_to_string(&pane_path).unwrap(),
+            format!("$99|@99|%99|{}\n", std::process::id())
+        );
+        fs::write(&pane_path, "$99|@99|%99|\n").unwrap();
+        fs::write(root.join(format!("{target}.dead")), "1\n").unwrap();
+        fs::write(root.join("names"), format!("{names}{target}\n")).unwrap();
+        let stop = send(Request::Stop {
+            runtime_id,
+            expected_pane_id: "%99".into(),
+        })
+        .await
+        .unwrap();
+        assert!(matches!(stop, Response::Stopped { runtime_id: stopped } if stopped == runtime_id));
+        assert!(send(create(session_id, runtime_id)).await.is_err());
+        let settled = lane
+            .run(move |db, _| Ok(db.diagnostic(runtime_id, session_id)?.unwrap()))
+            .await
+            .unwrap();
+        let pane = settled.pane.unwrap();
+        assert_eq!(
+            (&*pane.session, &*pane.window, &*pane.pane, pane.pid),
+            ("$99", "@99", "%99", std::process::id())
+        );
+        assert_eq!(settled.nonce, mark.nonce);
+        fs::remove_file(root.join("diagnostic-mode")).unwrap();
+        fs::write(root.join("diagnostic-slot"), "100").unwrap();
+        let Response::Created { runtime } = send(create(next_session, next_runtime)).await.unwrap()
+        else {
+            panic!("exact Stop did not release capacity");
+        };
+        assert_eq!(runtime.runtime_id, next_runtime);
+        assert_eq!(
+            fs::read_to_string(root.join("diagnostic-dispatched")).unwrap(),
+            format!("{target}\n{}\n", tmux_name(next_session, next_runtime))
+        );
+    }
+
+    #[tokio::test]
     async fn w1_readiness_private_ipc_preserves_inventory_and_never_launches() {
         let temp = tempfile::Builder::new()
             .permissions(fs::Permissions::from_mode(0o700))
@@ -760,13 +935,16 @@ mod tests {
             panic!("inventory unavailable")
         };
         assert_eq!(runtimes[0].runtime_id, runtime_id);
-        let Response::Attachment { tmux_name } = request(root, &Request::Attach { runtime_id })
+        let Response::Error { message } = request(root, &Request::Attach { runtime_id })
             .await
             .unwrap()
         else {
-            panic!("attachment unavailable")
+            panic!("faulted catalog admitted a new attachment")
         };
-        assert_eq!(tmux_name, name);
+        assert_eq!(
+            message,
+            "Managed terminal catalog unavailable: CatalogMissing"
+        );
         assert_eq!(
             fs::read_to_string(tmux_calls).unwrap(),
             "list-sessions\nlist-panes\nlist-sessions\nlist-panes\n"

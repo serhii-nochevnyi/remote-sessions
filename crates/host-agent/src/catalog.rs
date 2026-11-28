@@ -31,7 +31,7 @@ use std::{
 };
 
 const APPLICATION_ID: i32 = 0x5253_4341;
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 const BUSY_TIMEOUT_MS: u32 = 100;
 const PRODUCT_TIMEOUT: Duration = Duration::from_secs(2);
 const DB: &str = "catalog.sqlite3";
@@ -72,6 +72,15 @@ const OPERATION_SCHEMA: &str = "CREATE TABLE create_operations (
     stage TEXT NOT NULL CHECK (stage IN ('reserved', 'marked', 'finished')),
     outcome TEXT,
     CHECK ((stage = 'finished') = (outcome IS NOT NULL))
+) STRICT";
+
+const DIAGNOSTIC_SCHEMA: &str = "CREATE TABLE diagnostic_creates (
+    runtime_id TEXT PRIMARY KEY NOT NULL,
+    session_id TEXT NOT NULL UNIQUE,
+    target TEXT NOT NULL UNIQUE,
+    nonce TEXT NOT NULL UNIQUE,
+    generation TEXT NOT NULL,
+    pane TEXT
 ) STRICT";
 
 type CatalogResult<T> = Result<T, ProductIssue>;
@@ -360,6 +369,8 @@ pub(crate) fn provision(dir: &Path) -> CatalogResult<()> {
         .map_err(database_error)?;
     migrate_to_v1(&transaction)?;
     migrate_to_v2(&transaction)?;
+    migrate_to_v3(&transaction)?;
+    validate_schema(&transaction, SCHEMA_VERSION)?;
     transaction.commit().map_err(database_error)?;
 
     let mut record = file_options()
@@ -445,6 +456,9 @@ fn validate_schema(connection: &Connection, version: i32) -> CatalogResult<()> {
             ("sessions", SESSION_SCHEMA),
         ]);
     }
+    if version >= 3 {
+        expected.push(("diagnostic_creates", DIAGNOSTIC_SCHEMA));
+    }
     expected.sort_unstable_by_key(|(name, _)| *name);
     if !actual
         .iter()
@@ -474,6 +488,15 @@ fn migrate_to_v2(connection: &Connection) -> CatalogResult<()> {
         .map_err(database_error)
 }
 
+fn migrate_to_v3(connection: &Connection) -> CatalogResult<()> {
+    connection
+        .execute_batch(DIAGNOSTIC_SCHEMA)
+        .map_err(database_error)?;
+    connection
+        .pragma_update(None, "user_version", 3)
+        .map_err(database_error)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ServerGeneration {
     pub pid: u32,
@@ -487,6 +510,16 @@ pub(crate) struct PaneIdentity {
     pub window: String,
     pub pane: String,
     pub pid: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiagnosticCreate {
+    pub session_id: Uuid,
+    pub runtime_id: Uuid,
+    pub target: String,
+    pub nonce: Uuid,
+    pub generation: ServerGeneration,
+    pub pane: Option<PaneIdentity>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -523,30 +556,66 @@ pub(crate) struct Operation {
 
 const OPERATION_QUERY: &str = "SELECT o.key, o.id, s.workspace_id, o.profile, s.id, a.id,
     a.target, a.nonce, a.generation, w.locator, a.policy, o.stage, o.outcome
-    FROM create_operations o JOIN runtime_attempts a ON a.id = o.runtime_id
-    JOIN sessions s ON s.id = a.session_id JOIN workspaces w ON w.id = s.workspace_id";
+    FROM runtime_attempts a LEFT JOIN create_operations o ON o.runtime_id = a.id
+    LEFT JOIN sessions s ON s.id = a.session_id LEFT JOIN workspaces w ON w.id = s.workspace_id";
 
 fn json<T: Serialize>(value: &T) -> CatalogResult<String> {
     serde_json::to_string(value).map_err(|_| ProductIssue::CatalogUnavailable)
 }
 
+fn invalid(index: usize, error: impl std::error::Error + Send + Sync + 'static) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, Box::new(error))
+}
+
+fn uuid(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Uuid> {
+    Uuid::try_parse(&row.get::<_, String>(index)?).map_err(|error| invalid(index, error))
+}
+
+fn decode<T: DeserializeOwned>(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<T> {
+    serde_json::from_str(&row.get::<_, String>(index)?).map_err(|error| invalid(index, error))
+}
+
+fn read_target(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(Uuid, Uuid, String, Uuid, ServerGeneration)> {
+    let runtime_id = uuid(row, 0)?;
+    let session_id = uuid(row, 1)?;
+    let target: String = row.get(2)?;
+    let nonce = uuid(row, 3)?;
+    let generation: ServerGeneration = decode(row, 4)?;
+    if session_id.is_nil()
+        || runtime_id.is_nil()
+        || nonce.is_nil()
+        || target != tmux_name(session_id, runtime_id)
+        || generation.pid == 0
+        || generation.start == 0
+        || generation.token.is_nil()
+    {
+        return Err(invalid(
+            2,
+            io::Error::other("invalid reserved runtime identity"),
+        ));
+    }
+    Ok((runtime_id, session_id, target, nonce, generation))
+}
+
+fn read_diagnostic(row: &rusqlite::Row<'_>) -> rusqlite::Result<DiagnosticCreate> {
+    let (runtime_id, session_id, target, nonce, generation) = read_target(row)?;
+    let pane = row
+        .get::<_, Option<String>>(5)?
+        .map(|text| serde_json::from_str::<PaneIdentity>(&text).map_err(|error| invalid(5, error)))
+        .transpose()?;
+    Ok(DiagnosticCreate {
+        runtime_id,
+        session_id,
+        target,
+        nonce,
+        generation,
+        pane,
+    })
+}
+
 fn read_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Operation> {
-    fn invalid(
-        index: usize,
-        error: impl std::error::Error + Send + Sync + 'static,
-    ) -> rusqlite::Error {
-        rusqlite::Error::FromSqlConversionFailure(
-            index,
-            rusqlite::types::Type::Text,
-            Box::new(error),
-        )
-    }
-    fn uuid(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Uuid> {
-        Uuid::try_parse(&row.get::<_, String>(index)?).map_err(|error| invalid(index, error))
-    }
-    fn decode<T: DeserializeOwned>(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<T> {
-        serde_json::from_str(&row.get::<_, String>(index)?).map_err(|error| invalid(index, error))
-    }
     let session_id = uuid(row, 4)?;
     let runtime_id = uuid(row, 5)?;
     let target: String = row.get(6)?;
@@ -653,10 +722,14 @@ impl Catalog {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(database_error)?;
+            validate_schema(&transaction, version)?;
             if version == 0 {
                 migrate_to_v1(&transaction)?;
             }
-            migrate_to_v2(&transaction)?;
+            if version < 2 {
+                migrate_to_v2(&transaction)?;
+            }
+            migrate_to_v3(&transaction)?;
             validate_schema(&transaction, SCHEMA_VERSION)?;
             transaction.commit().map_err(database_error)?;
         }
@@ -682,9 +755,7 @@ impl Catalog {
     pub(crate) fn by_runtime(&self, ids: &[Uuid]) -> CatalogResult<Vec<Operation>> {
         let mut query = self
             .connection
-            .prepare(&format!(
-                "{OPERATION_QUERY} WHERE a.id = ?1 AND o.stage = 'finished'"
-            ))
+            .prepare(&format!("{OPERATION_QUERY} WHERE a.id = ?1"))
             .map_err(database_error)?;
         ids.iter()
             .filter_map(|id| {
@@ -697,19 +768,129 @@ impl Catalog {
             .map_err(database_error)
     }
 
+    pub(crate) fn operation_for_target(
+        &self,
+        runtime_id: Uuid,
+        session_id: Uuid,
+    ) -> CatalogResult<Option<Operation>> {
+        let mut query = self
+            .connection
+            .prepare(&format!(
+                "{OPERATION_QUERY} WHERE a.id = ?1 OR a.session_id = ?2"
+            ))
+            .map_err(database_error)?;
+        let mut rows = query
+            .query_map(
+                params![runtime_id.to_string(), session_id.to_string()],
+                read_operation,
+            )
+            .map_err(database_error)?;
+        let found = rows.next().transpose().map_err(database_error)?;
+        if rows.next().is_some()
+            || found.as_ref().is_some_and(|operation| {
+                (operation.runtime_id, operation.session_id) != (runtime_id, session_id)
+            })
+        {
+            return Err(ProductIssue::CreateConflict);
+        }
+        Ok(found)
+    }
+
     pub(crate) fn marked_targets(
         &self,
         generation: ServerGeneration,
     ) -> CatalogResult<Vec<String>> {
-        let mut query = self.connection.prepare(
-            "SELECT a.target FROM runtime_attempts a JOIN create_operations o ON o.runtime_id = a.id
-             WHERE o.stage = 'marked' AND a.generation = ?1",
-        ).map_err(database_error)?;
+        let mut query = self
+            .connection
+            .prepare(
+                "SELECT a.id, a.session_id, a.target, a.nonce, a.generation
+             FROM create_operations o LEFT JOIN runtime_attempts a ON o.runtime_id = a.id
+             WHERE o.stage = 'marked'
+             UNION ALL
+             SELECT runtime_id, session_id, target, nonce, generation FROM diagnostic_creates
+             WHERE pane IS NULL",
+            )
+            .map_err(database_error)?;
         query
-            .query_map([json(&generation)?], |row| row.get(0))
+            .query_map([], read_target)
             .map_err(database_error)?
+            .filter_map(|row| match row {
+                Ok((_, _, target, _, server)) if server == generation => Some(Ok(target)),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
             .collect::<rusqlite::Result<_>>()
             .map_err(database_error)
+    }
+
+    pub(crate) fn diagnostic(
+        &self,
+        runtime_id: Uuid,
+        session_id: Uuid,
+    ) -> CatalogResult<Option<DiagnosticCreate>> {
+        let mut query = self
+            .connection
+            .prepare(
+                "SELECT runtime_id, session_id, target, nonce, generation, pane
+             FROM diagnostic_creates WHERE runtime_id = ?1 OR session_id = ?2",
+            )
+            .map_err(database_error)?;
+        let mut rows = query
+            .query_map(
+                params![runtime_id.to_string(), session_id.to_string()],
+                read_diagnostic,
+            )
+            .map_err(database_error)?;
+        let found = rows.next().transpose().map_err(database_error)?;
+        if rows.next().is_some() {
+            return Err(ProductIssue::CreateConflict);
+        }
+        Ok(found)
+    }
+
+    pub(crate) fn mark_diagnostic(&mut self, mark: &DiagnosticCreate) -> CatalogResult<bool> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
+        let changed = tx.execute(
+            "INSERT INTO diagnostic_creates (runtime_id, session_id, target, nonce, generation)
+             SELECT ?1, ?2, ?3, ?4, ?5
+             WHERE NOT EXISTS (SELECT 1 FROM runtime_attempts WHERE id = ?1 OR session_id = ?2)
+               AND NOT EXISTS (SELECT 1 FROM diagnostic_creates WHERE runtime_id = ?1 OR session_id = ?2)",
+            params![mark.runtime_id.to_string(), mark.session_id.to_string(), mark.target,
+                mark.nonce.to_string(), json(&mark.generation)?],
+        ).map_err(database_error)?;
+        tx.commit().map_err(database_error)?;
+        Ok(changed == 1)
+    }
+
+    pub(crate) fn settle_diagnostic(
+        &mut self,
+        mark: &DiagnosticCreate,
+        pane: &PaneIdentity,
+    ) -> CatalogResult<bool> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
+        let changed = tx
+            .execute(
+                "UPDATE diagnostic_creates SET pane = ?6
+             WHERE runtime_id = ?1 AND session_id = ?2 AND target = ?3 AND nonce = ?4
+               AND generation = ?5 AND (pane IS NULL OR pane = ?6)",
+                params![
+                    mark.runtime_id.to_string(),
+                    mark.session_id.to_string(),
+                    mark.target,
+                    mark.nonce.to_string(),
+                    json(&mark.generation)?,
+                    json(pane)?
+                ],
+            )
+            .map_err(database_error)?;
+        tx.commit().map_err(database_error)?;
+        Ok(changed == 1)
     }
 
     pub(crate) fn reserve(&mut self, operation: &Operation) -> CatalogResult<bool> {
@@ -721,6 +902,21 @@ impl Catalog {
             .query_row(
                 "SELECT 1 FROM create_operations WHERE key = ?1",
                 [operation.key.to_string()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(database_error)?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        if tx
+            .query_row(
+                "SELECT 1 FROM diagnostic_creates WHERE runtime_id = ?1 OR session_id = ?2",
+                params![
+                    operation.runtime_id.to_string(),
+                    operation.session_id.to_string()
+                ],
                 |_| Ok(()),
             )
             .optional()
@@ -1417,8 +1613,8 @@ mod tests {
         let mut reader = connect(&dir).unwrap();
         reader
             .execute_batch(
-                "DROP TABLE create_operations; DROP TABLE runtime_attempts;
-                DROP TABLE sessions; PRAGMA user_version = 1;",
+                "DROP TABLE diagnostic_creates; DROP TABLE create_operations;
+                DROP TABLE runtime_attempts; DROP TABLE sessions; PRAGMA user_version = 1;",
             )
             .unwrap();
         let before = fs::read(dir.join(DB)).unwrap();
@@ -1438,6 +1634,106 @@ mod tests {
         assert_eq!(
             pragma::<i32>(&reopened.connection, "user_version").unwrap(),
             SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn w1_create_v2_migration_rolls_back_and_preserves_populated_operations() {
+        let (temp, dir) = fixture();
+        let workspace = temp.path().canonicalize().unwrap();
+        let locator = workspace.to_str().unwrap().to_owned();
+        let identity = resolve_workspace(&workspace).unwrap();
+        let mut opened = open_fixture(&dir).unwrap();
+        let saved = opened.register(locator.clone(), identity.clone()).unwrap();
+        let runtime_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let operation = Operation {
+            key: Uuid::new_v4(),
+            id: Uuid::new_v4(),
+            workspace_id: saved.workspace_id,
+            profile: ProviderProfile::Codex,
+            session_id,
+            runtime_id,
+            target: tmux_name(session_id, runtime_id),
+            nonce: Uuid::new_v4(),
+            generation: ServerGeneration {
+                pid: 19,
+                start: 31,
+                token: Uuid::new_v4(),
+            },
+            locator: locator.clone(),
+            policy: PreparedLaunch {
+                policy_version: 1,
+                workspace: identity.clone(),
+                executable: workspace.join("codex"),
+                path: locator.clone(),
+                executable_identity: (7, 11),
+            },
+            stage: OperationStage::Reserved,
+        };
+        assert!(opened.reserve(&operation).unwrap());
+        assert!(opened.mark(operation.key, runtime_id).unwrap());
+        let prior_state = format!("{:?}", opened.operation(operation.key).unwrap().unwrap());
+        drop(opened);
+
+        let mut reader = connect(&dir).unwrap();
+        reader
+            .execute_batch("DROP TABLE diagnostic_creates; PRAGMA user_version = 2;")
+            .unwrap();
+        validate_schema(&reader, 2).unwrap();
+        let prior = fs::read(dir.join(DB)).unwrap();
+        let snapshot = reader.transaction().unwrap();
+        assert_eq!(pragma::<i32>(&snapshot, "user_version").unwrap(), 2);
+        assert_eq!(Catalog::open(&dir).err(), Some(ProductIssue::CatalogBusy));
+        snapshot.rollback().unwrap();
+        assert_eq!(fs::read(dir.join(DB)).unwrap(), prior);
+        validate_schema(&reader, 2).unwrap();
+        assert_eq!(pragma::<i32>(&reader, "user_version").unwrap(), 2);
+        require_no_sidecars(&dir).unwrap();
+        drop(reader);
+
+        for _ in 0..2 {
+            let db = open_fixture(&dir).unwrap();
+            assert_eq!(pragma::<i32>(&db.connection, "user_version").unwrap(), 3);
+            validate_schema(&db.connection, 3).unwrap();
+            assert_eq!(
+                db.workspace(saved.workspace_id).unwrap(),
+                (locator.clone(), identity.clone())
+            );
+            assert_eq!(
+                format!("{:?}", db.operation(operation.key).unwrap().unwrap()),
+                prior_state
+            );
+            assert_eq!(
+                db.marked_targets(operation.generation).unwrap(),
+                std::slice::from_ref(&operation.target)
+            );
+            assert!(db.diagnostic(runtime_id, session_id).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn w1_create_v0_catalog_provision_identity_survives_migration() {
+        let (_temp, dir) = fixture();
+        let opened = open_fixture(&dir).unwrap();
+        let provision = opened.provision_id;
+        drop(opened);
+        let reader = connect(&dir).unwrap();
+        reader
+            .execute_batch(
+                "DROP TABLE diagnostic_creates; DROP TABLE create_operations;
+             DROP TABLE runtime_attempts; DROP TABLE sessions; DROP TABLE workspaces;
+             PRAGMA user_version = 0;",
+            )
+            .unwrap();
+        validate_schema(&reader, 0).unwrap();
+        drop(reader);
+        let reopened = open_fixture(&dir).unwrap();
+        assert_eq!(reopened.provision_id, provision);
+        validate_schema(&reopened.connection, 3).unwrap();
+        assert_eq!(
+            pragma::<i32>(&reopened.connection, "user_version").unwrap(),
+            3
         );
     }
 }
