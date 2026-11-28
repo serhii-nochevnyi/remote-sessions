@@ -971,7 +971,7 @@ async fn configured_paste_refusal(refusal: PasteRefusal) {
         );
         fs::remove_file(root.join(name)).unwrap();
     }
-    // @invariant: Try the old commit before offset zero can erase a surviving stage by itself.
+    // @contract: Rejection precedes offset zero so a surviving stage cannot conceal a failed invalidation.
     assert_eq!(
         paste_ipc(root, commit(&old, old_bytes.len())).await,
         PasteResult::Stale {}
