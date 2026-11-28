@@ -53,11 +53,17 @@ async fn run(first: String, mut args: impl Iterator<Item = String>) -> Result<()
     if first == "pressure" {
         return pressure_probe(args.collect()).await;
     }
-    legacy(first.into(), args.next().context("runtime id")?).await
+    let runtime = args.next().context("runtime id")?;
+    let tmux = PathBuf::from(args.next().context("absolute path to selected tmux")?);
+    ensure!(
+        tmux.is_absolute(),
+        "Expected an absolute path to the selected tmux executable"
+    );
+    legacy(first.into(), runtime, tmux).await
 }
 
-async fn legacy(directory: PathBuf, runtime: String) -> Result<()> {
-    let bridge = DesktopBridge::new(Some(directory), "/opt/homebrew/bin/tmux".into());
+async fn legacy(directory: PathBuf, runtime: String, tmux: PathBuf) -> Result<()> {
+    let bridge = DesktopBridge::new(Some(directory), tmux);
     for _ in 0..3 {
         let before = bridge
             .inventory()

@@ -382,7 +382,7 @@ def close_w1_locked(manifest, *, fixture, lab_id=None):
 
 
 class Lab:
-    def __init__(self, *, w1=False, fixture=False, manifest=None, pressure=False):
+    def __init__(self, *, w1=False, fixture=False, manifest=None, pressure=False, writable_smoke=False):
         if sys.platform != 'darwin':
             raise RuntimeError('launchd lifecycle proof requires macOS')
         if fixture and not w1:
@@ -392,11 +392,12 @@ class Lab:
         self.host = ROOT / 'target/debug/host-agent'
         self.tmux = shutil.which('tmux')
         tmux_remedy = f'Put tmux {W1_TMUX_VERSION} first on PATH and retry setup.'
-        if w1 and not self.tmux:
+        if (w1 or writable_smoke) and not self.tmux:
             raise RuntimeError(f'W1 requires tmux {W1_TMUX_VERSION} on PATH. Observed unavailable. {tmux_remedy}')
         if not self.host.is_file() or not self.tmux:
             raise RuntimeError('build host-agent and install tmux first')
         self.w1 = w1
+        self.writable_smoke = writable_smoke
         self.fixture = fixture
         self.id = uuid.uuid4().hex[:12]
         self.catalog = None
@@ -413,15 +414,14 @@ class Lab:
             if (self.catalog.parent.resolve(strict=True) != self.catalog.parent
                     or self.catalog.parent.stat().st_dev != internal_device()):
                 raise RuntimeError('W1 requires a real Application Support directory on the internal data volume')
+        if w1 or writable_smoke:
             try:
                 self.tmux = str(Path(self.tmux).resolve(strict=True))
             except (OSError, RuntimeError) as error:
                 raise RuntimeError(f'W1 requires tmux {W1_TMUX_VERSION} at {self.tmux}. Observed unavailable. '
                                    f'{tmux_remedy}') from error
-            require_w1_tmux_version(
-                lambda: run(self.tmux, '-V', check=False), f'tmux {W1_TMUX_VERSION}',
-                f'the selected binary at {self.tmux}', tmux_remedy,
-            )
+            self.require_writable_tmux_binary()
+        if w1:
             self.state.mkdir(mode=0o700)
             self.state_identity = directory_identity(self.state)
         else:
@@ -438,6 +438,26 @@ class Lab:
             'tmux': [self.tmux, '-D', '-S', str(self.state / 'tmux.sock'), '-f', str(self.state / 'tmux.conf')],
             'agent': [str(self.service_host), '--state-dir', str(self.state), '--tmux', self.tmux, 'serve'],
         }
+
+    def require_writable_tmux_binary(self):
+        require_w1_tmux_version(
+            lambda: run(self.tmux, '-V', check=False), f'tmux {W1_TMUX_VERSION}',
+            f'the selected binary at {self.tmux}',
+            f'Put tmux {W1_TMUX_VERSION} first on PATH and retry setup.',
+        )
+
+    def require_writable_tmux_server(self, *, wait_until_ready=False):
+        def server_version():
+            if wait_until_ready:
+                self.wait_for_tmux()
+            return self.tmux_call('display-message', '-p', '#{version}')
+
+        remedy = (f'Run the scoped down command for this lab, then retry with tmux {W1_TMUX_VERSION}.'
+                  if self.w1 else f'Put tmux {W1_TMUX_VERSION} first on PATH and rerun make check-desktop.')
+        require_w1_tmux_version(
+            server_version, W1_TMUX_VERSION,
+            f'the dedicated tmux server at {self.state / "tmux.sock"} using {self.tmux}', remedy,
+        )
 
     def w1_record(self):
         return {
@@ -514,23 +534,15 @@ class Lab:
                     path.chmod(0o600)
                 run('launchctl', 'bootstrap', self.domain, path, pass_fds=launch_fds)
                 self.loaded.append(self.domain + '/' + label)
-            if self.w1:
-                def server_version():
-                    self.wait_for_tmux()
-                    return self.tmux_call('display-message', '-p', '#{version}')
-
-                require_w1_tmux_version(
-                    server_version, W1_TMUX_VERSION,
-                    f'the dedicated tmux server at {self.state / "tmux.sock"} using {self.tmux}',
-                    f'Run the scoped down command for this lab, then retry with tmux {W1_TMUX_VERSION}.',
-                )
+            if self.w1 or self.writable_smoke:
+                self.require_writable_tmux_server(wait_until_ready=True)
             wait_for(lambda: self.call('health').get('agent_pid'))
             if self.w1:
                 if not wait_for(lambda: catalog_message(self.state)).startswith('local catalog ready ('):
                     raise RuntimeError('W1 catalog failed to open')
                 self.recovery['startup_complete'] = True
                 write_w1_manifest(self.recovery_path, self.recovery, replace=True)
-            else:
+            elif not self.writable_smoke:
                 self.wait_for_tmux()
             return self
         except (Exception, KeyboardInterrupt):
