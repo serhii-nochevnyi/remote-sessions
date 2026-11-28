@@ -828,6 +828,128 @@ class LossTests(unittest.TestCase):
             self.assertEqual(result.get('request'), request_bytes)
         return received
 
+    @staticmethod
+    def resize_request():
+        return {
+            'op': 'resize_terminal',
+            'terminal': {
+                'target': {'runtime_id': str(uuid4()), 'generation': str(uuid4()), 'session': '$1',
+                           'window': '@2', 'pane': '%3', 'pid': 42, 'process_start': 123},
+                'view_id': 'abcdefab-cdef-abcd-efab-cdefabcdefab', 'agent_epoch': str(uuid4()),
+            },
+            'size': {'cols': 80, 'rows': 24}, 'token': str(uuid4()), 'sequence': 1,
+        }
+
+    def assert_bad_resize_reply(self, upstream, path, loss, request, frame):
+        before = loss.cancel_snapshot()
+        self.assertEqual(self.relay_exchange(upstream, path, request, frame), b'')
+        self.assertEqual(loss.cancel_snapshot(), {**before, 'failures': before['failures'] + 1})
+
+    def test_handler_forwards_resize_busy_verbatim(self):
+        request = self.resize_request()
+        canonical = request['terminal']
+        aliases = deepcopy(canonical)
+        aliases['target']['runtime_id'] = UUID(canonical['target']['runtime_id']).hex
+        aliases['target']['generation'] = UUID(canonical['target']['generation']).urn
+        aliases['view_id'] = canonical['view_id'].upper()
+        aliases['agent_epoch'] = '{' + canonical['agent_epoch'] + '}'
+
+        with self.relay_fixture() as (upstream, path, loss):
+            before = loss.cancel_snapshot()
+            for terminal, size in ((canonical, {'cols': 2, 'rows': 2}), (aliases, {'cols': 500, 'rows': 200})):
+                with self.subTest(size=size):
+                    resize = {'size': size, 'terminal': canonical, 'result': 'busy'}
+                    frame = ('  ' + json.dumps({'resize': resize, 'result': 'resize'}) + '\t\r\n').encode()
+                    proposed = {**request, 'terminal': terminal, 'size': size}
+                    self.assertEqual(self.relay_exchange(upstream, path, proposed, frame), frame)
+                    self.assertEqual(loss.cancel_snapshot(), before)
+
+    def test_handler_rejects_malformed_resize_busy(self):
+        request = self.resize_request()
+        terminal, size = request['terminal'], request['size']
+        target = terminal['target']
+        busy = {'result': 'busy', 'terminal': terminal, 'size': size}
+        valid_frame = request_frame({'result': 'resize', 'resize': busy})
+        bad_variants = (
+            {'result': 'error', 'message': 'busy'},
+            {**busy, 'result': True},
+            {'result': 'busy', 'terminal': terminal},
+            {'result': 'busy', 'size': size},
+            {**busy, 'message': 'busy'},
+            {**busy, 'terminal': []},
+            {**busy, 'terminal': {key: value for key, value in terminal.items() if key != 'view_id'}},
+            {**busy, 'terminal': {**terminal, 'extra': True}},
+            {**busy, 'terminal': {**terminal, 'target': {key: value for key, value in target.items() if key != 'pid'}}},
+            {**busy, 'terminal': {**terminal, 'target': {**target, 'extra': True}}},
+            {**busy, 'terminal': {**terminal, 'view_id': 'invalid'}},
+            {**busy, 'terminal': {**terminal, 'target': {**target, 'pid': 42.0}}},
+            {**busy, 'size': [80, 24]},
+            {**busy, 'size': {'cols': 80}},
+            {**busy, 'size': {**size, 'extra': True}},
+            {**busy, 'size': {**size, 'cols': 80.0}},
+            {**busy, 'size': {**size, 'rows': '24'}},
+            {**busy, 'size': {**size, 'rows': True}},
+        )
+        bad_frames = (
+            b'{"result":"resize","resize":\n',
+            valid_frame.replace(b'"result":"busy"', b'"result":"busy","result":"busy"'),
+            request_frame({'result': 'resize', 'resize': busy, 'extra': True}),
+            *(request_frame({'result': 'resize', 'resize': variant}) for variant in bad_variants),
+        )
+        with self.relay_fixture() as (upstream, path, loss):
+            for frame in bad_frames:
+                with self.subTest(frame=frame):
+                    self.assert_bad_resize_reply(upstream, path, loss, request, frame)
+            for axis, value in (('cols', 1), ('cols', 501), ('rows', 1), ('rows', 201)):
+                with self.subTest(axis=axis, value=value):
+                    unsupported = {**size, axis: value}
+                    frame = request_frame({'result': 'resize', 'resize': {**busy, 'size': unsupported}})
+                    self.assert_bad_resize_reply(upstream, path, loss, {**request, 'size': unsupported}, frame)
+
+    def test_handler_rejects_resize_busy_for_a_different_request(self):
+        request = self.resize_request()
+        terminal, size = request['terminal'], request['size']
+        target = terminal['target']
+        busy = {'result': 'busy', 'terminal': terminal, 'size': size}
+        other_id = str(uuid4())
+        other_target_fields = {'runtime_id': other_id, 'generation': other_id, 'session': '$2',
+                               'window': '@3', 'pane': '%4', 'pid': 43, 'process_start': 124}
+        with self.relay_fixture() as (upstream, path, loss):
+            for field, value in other_target_fields.items():
+                with self.subTest(field=field):
+                    mismatch = {**terminal, 'target': {**target, field: value}}
+                    frame = request_frame({'result': 'resize', 'resize': {**busy, 'terminal': mismatch}})
+                    self.assert_bad_resize_reply(upstream, path, loss, request, frame)
+            for field in ('view_id', 'agent_epoch'):
+                with self.subTest(field=field):
+                    mismatch = {**terminal, field: other_id}
+                    frame = request_frame({'result': 'resize', 'resize': {**busy, 'terminal': mismatch}})
+                    self.assert_bad_resize_reply(upstream, path, loss, request, frame)
+            for axis, value in (('cols', 81), ('rows', 25)):
+                with self.subTest(axis=axis):
+                    frame = request_frame({'result': 'resize', 'resize': {**busy, 'size': {**size, axis: value}}})
+                    self.assert_bad_resize_reply(upstream, path, loss, request, frame)
+
+    def test_handler_preserves_other_resize_replies(self):
+        request = self.resize_request()
+        terminal = request['terminal']
+        epoch = {'agent': terminal['agent_epoch'], 'owner': str(uuid4())}
+        intent = {'epoch': epoch, 'id': str(uuid4())}
+        status = {'terminal': terminal, 'epoch': epoch,
+                  'committed': {'size': request['size'], 'revision': 1, 'intent': intent},
+                  'provider': None, 'observation': 'pending'}
+        with self.relay_fixture() as (upstream, path, loss):
+            before = loss.cancel_snapshot()
+            for resize in (
+                {'result': 'committed', 'admission': intent, 'status': status},
+                {'result': 'rejected', 'terminal': terminal, 'intent': intent},
+                {'result': 'uncertain', 'terminal': terminal, 'intent': intent},
+            ):
+                with self.subTest(result=resize['result']):
+                    frame = request_frame({'result': 'resize', 'resize': resize})
+                    self.assertEqual(self.relay_exchange(upstream, path, request, frame), frame)
+                    self.assertEqual(loss.cancel_snapshot(), before)
+
     def forward_inventory(self, upstream, path, rows, pid=42):
         health = request_frame({'result': 'health', 'agent_pid': pid, 'remote_execution_enabled': False})
         inventory = request_frame({'result': 'runtimes', 'runtimes': rows})
