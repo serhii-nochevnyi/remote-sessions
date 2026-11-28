@@ -1,119 +1,419 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import type { RefObject } from "react";
+import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
-import { suppressViewerQueries } from "./terminal-protocol";
-import { localClient } from "./local-client";
+import { bindTerminalPaste, bindTerminalProtocol } from "./terminal-protocol";
+import { localClient, TerminalViewScope } from "./local-client";
+import type { GeometryEvent, TerminalDelivery, TerminalSize, TerminalStatus, TerminalStreamFailure } from "./local-client";
+import { acceptMountedRenderer, adoptCurrentTerminal, confirmMountedWriter, desiredTerminalMode, explicitClosedReconnect,
+  makeRefusedWriterReconnect, mountedTerminalEffect, mountedTerminalEntry, runMountedTerminalStream, TerminalAttachmentIdentityError, terminalProofOnly, terminalStreamAccess,
+  updateMountedStream } from "./session-state";
+import type { ActiveTerminalEffect, BoundTerminal, MountedTerminal, TerminalBindingState } from "./session-state";
+import { GeometryBoundaryError, mountedResize, OrderedGeometry, sameTerminal } from "./terminal-geometry";
 import "@xterm/xterm/css/xterm.css";
 
-export function TerminalView({ runtimeId, epoch, label }: { runtimeId: string; epoch: number; label: string }) {
+function geometryText(status: TerminalStatus): string {
+  const { cols, rows } = status.committed.size;
+  const provider = status.provider;
+  const measured = provider ? `розмір процесу ${provider.size.cols}×${provider.size.rows}` : "розмір процесу недоступний";
+  const pending = status.observation === "pending" ? " · зміна триває" : "";
+  return `Сітка ${cols}×${rows} · ${measured}${pending}`;
+}
+
+function streamFailure(error: unknown, stage: TerminalStreamFailure): TerminalStreamFailure {
+  if (error instanceof GeometryBoundaryError) return error.reason;
+  if (!(error instanceof Error)) return stage;
+  switch (error.message) {
+    case "Потік перервано": return "stream_closed";
+    case "Стан термінала змінився": return "terminal_status_changed";
+    case "Розміри відображення не збігаються": return "renderer_grid_mismatch";
+    case "Підтвердження розміру застаріло": return "stale_grid_ack";
+    case "Не вдалося обробити вивід термінала": return "renderer_write_timeout";
+    default: return stage;
+  }
+}
+
+interface TerminalViewProps {
+  readonly runtimeId: string;
+  readonly label: string;
+  readonly fontSize: number;
+  readonly mounted: MountedTerminal;
+  readonly previousBinding: BoundTerminal | null;
+  readonly attempt: number;
+  readonly delivery: TerminalDelivery;
+  readonly detached: RefObject<Promise<void>>;
+  readonly currentAttachment: (id: string, previous: BoundTerminal | null, attempt: number) => MountedTerminal;
+  readonly onBinding: (binding: BoundTerminal, state: TerminalBindingState | "rendered", previous: BoundTerminal | null, attempt: number) => boolean;
+  readonly onReconnectClosed: (id: string, binding: BoundTerminal, attempt: number) => void;
+}
+
+export function TerminalView({ runtimeId, label, fontSize, mounted, previousBinding, attempt, delivery, detached, currentAttachment, onBinding,
+  onReconnectClosed }: TerminalViewProps) {
   const element = useRef<HTMLDivElement>(null);
+  const font = useRef(fontSize);
+  const updateFont = useRef<((size: number) => void) | null>(null);
+  const reconnectDelay = useRef(500);
+  const previousRef = useRef(previousBinding);
+  const activeEffect = useRef<ActiveTerminalEffect | undefined>(undefined);
+  const updateEligibility = useRef<(() => void) | null>(null);
+  const reconnectCurrent = useRef<(() => boolean) | null>(null);
+  const retainedRenderer = useRef<{ binding: BoundTerminal; dispose: () => void } | null>(null);
   const [status, setStatus] = useState("Підключення…");
   const [retry, setRetry] = useState(0);
+  const [, refreshDelivery] = useState(0);
+  const { intent, observation, outputOnly } = mounted;
+  const { mode, agent } = mountedTerminalEffect(mounted, activeEffect.current, delivery.mayRestore);
+  useLayoutEffect(() => () => { retainedRenderer.current?.dispose(); }, []);
+  useLayoutEffect(() => {
+    previousRef.current = previousBinding;
+  }, [previousBinding]);
+  useLayoutEffect(() => {
+    updateEligibility.current?.();
+  }, [mounted, attempt]);
+  useLayoutEffect(() => {
+    delivery.onChange = () => {
+      if (activeEffect.current?.mode !== "ordinary") refreshDelivery(value => value + 1);
+    };
+    return () => { delivery.onChange = undefined; };
+  }, [delivery]);
   useEffect(() => {
-    if (!element.current) return;
-    const terminal = new Terminal({ disableStdin: true, fontSize: 13, lineHeight: 1.25,
+    font.current = fontSize;
+    updateFont.current?.(fontSize);
+  }, [fontSize]);
+  useEffect(() => {
+    const mountedElement = element.current;
+    if (!mountedElement || !mode || agent === undefined) return;
+    const previous = previousRef.current;
+    const retainedAtEntry = retainedRenderer.current;
+    const initial = currentAttachment(runtimeId, previous, attempt);
+    const reopening = retainedAtEntry !== null || initial.reconnectFrom !== undefined;
+    if (mountedTerminalEntry(initial, retainedAtEntry?.binding, delivery.mayRestore) !== mode) return;
+    const attachmentMode = mode;
+    const effect: ActiveTerminalEffect = { mode: attachmentMode, agent };
+    activeEffect.current = effect;
+    const container = mountedElement;
+    const rendererId = crypto.randomUUID();
+    const terminal = new Terminal({ disableStdin: true, fontSize: font.current, lineHeight: 1.25,
       fontFamily: "Menlo, Monaco, monospace", screenReaderMode: true, scrollback: 2000,
       theme: { background: "#111a21", foreground: "#d9e6e2" } });
-    const queryHandlers = suppressViewerQueries(terminal);
-    terminal.open(element.current);
-    const container = element.current;
-    function fitDisplay() {
-      const style = getComputedStyle(container);
-      const width = container.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
-      const height = container.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
-      terminal.options.fontSize = Math.min(13, Math.max(9, Math.floor(Math.min(width / (terminal.cols * 0.62), height / (terminal.rows * 1.3)))));
-    }
-    const observer = new ResizeObserver(fitDisplay);
-    observer.observe(container);
-    // Native input is leased by the host. Do not enable OSC clipboard or link handlers.
-    let disposed = false;
-    let currentView: string | null = null;
-    let writable = false;
-    let inputFailed = false;
-    let pendingBytes = 0;
-    let inputChain = Promise.resolve();
+    const fit = new FitAddon();
+    terminal.loadAddon(fit);
+
+    let routing: OrderedGeometry | undefined;
+    let resizeUnavailable = false;
+    let inputIssue: string | undefined;
     let finishWrite: (() => void) | undefined;
-    function send(data: Uint8Array, paste = false) {
-      const view = currentView;
-      if (!view || !writable || disposed || inputFailed) return;
-      if (pendingBytes + data.length > 65536) {
-        inputFailed = true; terminal.options.disableStdin = true;
-        setStatus("Ввід завеликий. Перепідключіть термінал перед продовженням."); return;
+    let reconnect: ReturnType<typeof setTimeout> | undefined;
+    let frame = 0;
+    let binding: BoundTerminal | undefined;
+    let identityChanged = false;
+    let proofOnly = false;
+    let retained = false;
+    let rendererOpened = false;
+    let confirmation: ReturnType<typeof confirmMountedWriter> | undefined;
+    let disposed = false;
+    let stale = false;
+    let clipboard: ReturnType<typeof bindTerminalPaste> | undefined;
+    const detach = (view: string, failure?: TerminalStreamFailure) => localClient.detach(view, failure).catch(() => undefined);
+    const current = () => currentAttachment(runtimeId, binding ?? previous, attempt);
+    const currentIntent = () => {
+      const intent = current().intent;
+      return !stale && intent?.identity.agentPid === agent ? intent : undefined;
+    };
+    const access = (): ReturnType<typeof terminalStreamAccess> => binding && !stale
+      ? terminalStreamAccess(current(), binding, attachmentMode, delivery.mayRestore) : "stale";
+
+    function report() {
+      if (confirmation?.recovery) {
+        setStatus("Перевіряємо останній вивід · режим перегляду…");
+        return;
       }
-      pendingBytes += data.length;
-      inputChain = inputChain.then(async () => {
-        try {
-          for (let offset = 0; offset < data.length;) {
-            if (disposed || inputFailed || currentView !== view) return;
-            let end = Math.min(offset + 4096, data.length);
-            if (paste && end < data.length) {
-              while (end > offset && ((data[end] ?? 0) & 0xc0) === 0x80) end--;
-            }
-            await localClient.input(view, Array.from(data.subarray(offset, end)), paste);
-            offset = end;
-          }
-        } catch (error) {
-          inputFailed = true; terminal.options.disableStdin = true;
-          if (!disposed) setStatus(`Ввід перервано; автоматично не повторюємо. ${String(error)}`);
-        } finally { pendingBytes -= data.length; }
-      });
+      if (current().mode === "draining") {
+        setStatus("Процес завершився · читаємо останній вивід…");
+        return;
+      }
+      if (!routing || !scope.viewId) return;
+      const paste = scope.pasteMessage;
+      const deliveryIssue = delivery.inputIssue;
+      const issue = deliveryIssue === undefined ? inputIssue
+        : `Ввід перервано; автоматично не повторюємо.${deliveryIssue ? ` ${deliveryIssue}` : ""}`;
+      if (issue) {
+        setStatus(paste ? `${issue} · ${paste}` : issue);
+        return;
+      }
+      const control = !protocol.inputAvailable ? "ввід недоступний" : scope.canWrite ? "ви керуєте" : "режим перегляду";
+      setStatus(`Наживо · ${control} · ${geometryText(routing.status)}${resizeUnavailable ? " · зміна розміру недоступна" : ""}${paste ? ` · ${paste}` : ""}`);
     }
-    const input = terminal.onData(data => {
-      const paste = data.startsWith("\x1b[200~") && data.endsWith("\x1b[201~");
-      send(new TextEncoder().encode(paste ? data.slice(6, -6) : data), paste);
+
+    const resize = mountedResize({
+      owns: terminal => binding !== undefined && sameTerminal(binding.terminal, terminal) &&
+        scope.owns(terminal.view_id) && access() !== "stale",
+      canWrite: () => scope.canWrite,
+      ordered: () => routing,
+      invoke: localClient.resize,
+      scheduleLayout: () => { frame = requestAnimationFrame(layout); },
+      cancelLayout: () => cancelAnimationFrame(frame),
+      settled(unavailable) {
+        resizeUnavailable = unavailable;
+        report();
+      },
     });
-    const binaryInput = terminal.onBinary(data => send(Uint8Array.from(data, char => char.charCodeAt(0))));
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let wake: (() => void) | undefined;
-    const detach = (view: string) => localClient.detach(view).catch(() => undefined);
-    const pause = (ms: number) => new Promise<void>(resolve => { wake = resolve; timer = setTimeout(resolve, ms); });
-    async function stream() {
-      let backoff = 500;
-      while (!disposed) {
-        let ownedView: string | null = null;
-        try {
-          setStatus("Підключення…");
-          const attachment = await localClient.attach(runtimeId);
-          ownedView = attachment.view_id;
-          if (disposed) { await detach(ownedView); return; }
-          currentView = ownedView;
-          terminal.reset();
-          terminal.resize(attachment.cols, attachment.rows);
-          fitDisplay();
-          setStatus("Наживо · отримуємо керування…");
-          backoff = 500;
-          while (!disposed) {
-            const chunk = await localClient.read(ownedView);
-            if (disposed || currentView !== ownedView) return;
-            if (chunk.closed) throw Error("Потік перервано");
-            const gainedControl = chunk.writable && !writable;
-            writable = chunk.writable;
-            terminal.options.disableStdin = !writable || inputFailed;
-            if (!inputFailed) setStatus(writable ? "Наживо · ви керуєте · натисніть у терміналі для вводу" : "Наживо · інший клієнт керує · очікуємо звільнення");
-            if (gainedControl && !inputFailed) terminal.focus();
-            if (chunk.data.length) {
-              // Await parsing before pulling another bounded native chunk.
-              await new Promise<void>(resolve => { finishWrite = resolve; terminal.write(Uint8Array.from(chunk.data), resolve); });
+
+    function layout() {
+      if (!routing || !scope.canWrite || !container.clientWidth || !container.clientHeight) return;
+      const size = fit.proposeDimensions();
+      if (!size || !Number.isFinite(size.cols) || !Number.isFinite(size.rows)) return;
+      void resize.offer({ cols: Math.min(500, Math.max(2, size.cols)), rows: Math.min(200, Math.max(2, size.rows)) });
+    }
+
+    const setRendererFont = (size: number) => {
+      terminal.options.fontSize = size;
+      resize.scheduleLayout();
+    };
+    const observer = new ResizeObserver(resize.scheduleLayout);
+    function openRenderer() {
+      terminal.options.fontSize = font.current;
+      terminal.open(container);
+      if (document.activeElement === container) terminal.focus();
+      updateFont.current = setRendererFont;
+      observer.observe(container);
+      clipboard = bindTerminalPaste(container, bytes => { void scope.paste(bytes); });
+    }
+
+    function revokeMutations() {
+      resize.suspend();
+      protocol.pauseInput();
+    }
+
+    function disposeRenderer() {
+      if (disposed) return;
+      disposed = true;
+      protocol.dispose();
+      if (updateFont.current === setRendererFont) updateFont.current = null;
+      if (terminal.textarea && terminal.textarea === document.activeElement && container.isConnected) container.focus();
+      terminal.dispose();
+    }
+
+    let streamStage: TerminalStreamFailure = "attachment_setup";
+    let failure: TerminalStreamFailure | undefined;
+    const scope = new TerminalViewScope({
+      input: (viewId, data, incarnation) => localClient.input({ viewId, data, incarnation }),
+      inputEligible: () => rendererOpened && attachmentMode === "ordinary" && access() === "attached",
+      paste: {
+        stage: localClient.pasteStage,
+        commit: localClient.pasteCommit,
+        ack: localClient.pasteAck,
+        changed() {
+          if (!scope.canWrite) protocol.pauseInput();
+          report();
+        },
+      },
+      inputFailure(error) {
+        revokeMutations();
+        if (error === undefined && !delivery.held) inputIssue = "Ввід завеликий. Перепідключіть термінал перед продовженням.";
+        report();
+      },
+      grantRejected() {
+        if (resize.grantRejected()) protocol.pauseInput();
+        report();
+      },
+      retire(view) {
+        confirmation?.stop();
+        const draining = current().mode === "draining";
+        if (!retained) {
+          if (!proofOnly) {
+            if (binding) {
+              // @invariant: A retired refused candidate waits for deliberate restoration even after remount.
+              const state = identityChanged ? "changed" : draining ? "ended"
+                : confirmation?.refused ? "view-closed" : "retired";
+              onBinding(binding, state, binding, attempt);
+            } else if (previous && (identityChanged || reopening)) {
+              onBinding(previous, identityChanged ? "changed" : "view-closed", previous, attempt);
             }
           }
-        } catch (error) {
-          writable = false; terminal.options.disableStdin = true;
-          if (!disposed) setStatus(`Перепідключення… ${String(error)}`);
-        } finally {
-          if (ownedView) await detach(ownedView);
-          if (currentView === ownedView) currentView = null;
+          activeEffect.current = undefined;
         }
-        if (!disposed) { await pause(backoff); backoff = Math.min(backoff * 2, 4000); }
+        container.removeAttribute("data-terminal-attached");
+        updateEligibility.current = null;
+        reconnectCurrent.current = null;
+        routing?.close();
+        resize.close();
+        protocol.pauseInput();
+        finishWrite?.();
+        observer.disconnect();
+        clipboard?.dispose();
+        if (view) detached.current = detach(view, failure);
+        if (retained && binding) retainedRenderer.current = { binding, dispose: disposeRenderer };
+        else disposeRenderer();
+      },
+      reconnect(error) {
+        setStatus(`Перепідключення… ${String(error)}`);
+        if (confirmation?.refused || (reopening && !binding) || identityChanged || !currentIntent()) return;
+        reconnect = setTimeout(() => {
+          if (currentIntent()) setRetry(value => value + 1);
+        }, reconnectDelay.current);
+        reconnectDelay.current = Math.min(reconnectDelay.current * 2, 4000);
+      },
+    }, delivery);
+    const protocol = bindTerminalProtocol(terminal, bytes => { void scope.send(bytes); });
+    if (!reopening && attachmentMode === "ordinary") openRenderer();
+    const streamEligibility = { scope, access, revokeMutations, identityChanged() { identityChanged = true; } };
+    const reconnectRefused = makeRefusedWriterReconnect(scope,
+      expected => !stale && activeEffect.current === effect && binding === expected ? current() : { mode: "missing" },
+      () => delivery.mayRestore, accepted => {
+        retained = onBinding(accepted, "view-closed", accepted, attempt);
+        if (!retained) return false;
+        scope.retire();
+        onReconnectClosed(runtimeId, accepted, attempt);
+        return true;
+      }, localClient);
+    reconnectCurrent.current = () => {
+      if (confirmation?.refused) {
+        if (binding) void reconnectRefused(binding, confirmation);
+        return false;
+      }
+      stale = true;
+      scope.setInputEligible(false);
+      scope.retire();
+      return true;
+    };
+    updateEligibility.current = () => {
+      if (binding) {
+        const access = updateMountedStream(streamEligibility, confirmation);
+        if (access === "draining" || access === "observing") report();
+      } else if (desiredTerminalMode(currentIntent(), attachmentMode, delivery.mayRestore) !== attachmentMode) {
+        scope.setInputEligible(false);
+        scope.retire();
+      }
+    };
+    const sink = {
+      write: (data: readonly number[]) => new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          if (finishWrite === parsed) finishWrite = undefined;
+          reject(Error("Не вдалося обробити вивід термінала"));
+        }, 1500);
+        const parsed = () => {
+          clearTimeout(timer);
+          if (finishWrite === parsed) finishWrite = undefined;
+          resolve();
+        };
+        finishWrite = parsed;
+        terminal.write(Uint8Array.from(data), parsed);
+      }),
+      resize: (size: TerminalSize) => {
+        terminal.resize(size.cols, size.rows);
+        return { cols: terminal.cols, rows: terminal.rows };
+      },
+      acknowledge: (event: GeometryEvent, size: TerminalSize) => {
+        streamStage = "grid_ack_response";
+        return localClient.acknowledgeGrid(event.status.terminal.view_id, {
+          renderer_id: rendererId,
+          epoch: event.status.epoch,
+          revision: event.status.committed.revision,
+          size,
+          focused: terminal.textarea === document.activeElement,
+        });
+      },
+    };
+    async function stream() {
+      try {
+        setStatus("Підключення…");
+        const candidate = await adoptCurrentTerminal(runtimeId, previous, attachmentMode, expected => {
+          const mounted = currentAttachment(runtimeId, expected, attempt);
+          return stale || (mounted.intent && mounted.intent.identity.agentPid !== agent) ? { mode: "missing" } : mounted;
+        }, () => delivery.mayRestore, scope, accepted => {
+          proofOnly = terminalProofOnly(current(), attachmentMode, delivery.mayRestore);
+          if (!onBinding(accepted, proofOnly ? "proved" : "bound", previous, attempt)) return false;
+          effect.binding = binding = accepted;
+          previousRef.current = accepted;
+          return true;
+        }, detached.current, localClient);
+        if (!candidate) {
+          if (scope.active) scope.retire({ error: Error("Очікуємо підтвердження термінала") });
+          return;
+        }
+        const { attachment } = candidate;
+        if (proofOnly) {
+          scope.retire();
+          return;
+        }
+        if (!scope.owns(attachment.view_id) || updateMountedStream(streamEligibility) === "stale") return;
+        const ordered = new OrderedGeometry(attachment.status);
+        routing = ordered;
+        confirmation = confirmMountedWriter(candidate, attachmentMode, current, () => delivery.mayRestore,
+          streamEligibility, report, localClient);
+        await runMountedTerminalStream({
+          ...streamEligibility, binding: candidate.binding, routing: ordered, sink, confirmation,
+          inventory: localClient.inventory,
+          acceptRenderer() {
+            if (rendererOpened) return true;
+            if (!acceptMountedRenderer(current(), candidate.binding, attachmentMode, delivery.mayRestore,
+              retainedAtEntry?.binding, retainedRenderer.current?.binding,
+              () => onBinding(candidate.binding, "rendered", candidate.binding, attempt))) return false;
+            retainedAtEntry?.dispose();
+            retainedRenderer.current = null;
+            terminal.resize(attachment.cols, attachment.rows);
+            if (reopening || attachmentMode === "observer") openRenderer();
+            rendererOpened = true;
+            container.setAttribute("data-terminal-attached", "");
+            resize.scheduleLayout();
+            return true;
+          },
+          read(view) {
+            streamStage = "read_response";
+            return localClient.read(view);
+          },
+          consume(view, chunk, render) {
+            streamStage = "geometry_routing";
+            return protocol.consume(scope, view, chunk, render);
+          },
+          rendered(chunk) {
+            if (access() === "attached" && resize.observe(chunk)) {
+              resizeUnavailable = false;
+            }
+            if (chunk.geometry) resizeUnavailable = false;
+            reconnectDelay.current = 500;
+            report();
+            void resize.propose();
+          },
+          eof(state) {
+            retained = onBinding(candidate.binding, state, candidate.binding, attempt);
+          },
+          closed() { failure = "stream_closed"; },
+        });
+      } catch (error) {
+        if (!scope.active) return;
+        if (binding && updateMountedStream(streamEligibility) === "stale") return;
+        if (error instanceof TerminalAttachmentIdentityError) identityChanged = error.replacement;
+        failure = streamFailure(error, streamStage);
+        scope.retire({ error });
       }
     }
     void stream();
     return () => {
-      disposed = true;
-      clearTimeout(timer); wake?.(); finishWrite?.();
-      input.dispose(); binaryInput.dispose(); observer.disconnect();
-      if (currentView) void detach(currentView);
-      queryHandlers.forEach(handler => handler.dispose());
-      terminal.dispose();
+      clearTimeout(reconnect);
+      stale = true;
+      scope.retire();
+      if (!retained) disposeRenderer();
+      activeEffect.current = undefined;
     };
-  }, [runtimeId, epoch, retry]);
-  return <><div className="stream-status" role="status"><span>{status}</span><button onClick={() => setRetry(value => value + 1)}>Перепідключити</button></div><div className="terminal-view live-terminal" ref={element} aria-label={label} /></>;
+  }, [runtimeId, mode, agent, attempt, retry, currentAttachment, delivery, detached, onBinding, onReconnectClosed]);
+  const displayStatus = mounted.mode === "completed" ? "Процес завершився · режим перегляду"
+    : mounted.mode === "view-closed" && !intent ? "Потік термінала закрито · режим перегляду"
+    : intent || (observation && mode) || outputOnly ? status : "Очікуємо підтвердження термінала…";
+  return <><div className="stream-status" role="status"><span>{displayStatus}</span><button type="button"
+    disabled={intent?.reconnect === true || (!intent && !explicitClosedReconnect(mounted))} onClick={() => {
+    const current = currentAttachment(runtimeId, previousRef.current, attempt);
+    const closedBinding = explicitClosedReconnect(current);
+    if (closedBinding) {
+      element.current?.focus();
+      onReconnectClosed(runtimeId, closedBinding, attempt);
+      return;
+    }
+    if (!current.intent || current.intent.reconnect) return;
+    element.current?.focus();
+    if (reconnectCurrent.current && !reconnectCurrent.current()) return;
+    setRetry(value => value + 1);
+  }}>Перепідключити</button></div>
+    <div className="terminal-view"><div className="live-terminal" ref={element} role="region" aria-label={label} tabIndex={0} /></div></>;
 }

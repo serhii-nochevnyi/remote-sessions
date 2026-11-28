@@ -1,13 +1,23 @@
 //! Local-only P0 runtime adapter. Network transport is absent; local input requires an exclusive lease.
+mod catalog;
 pub mod engine;
 pub mod model;
 pub mod ownership;
+pub mod product_launch;
+#[cfg(test)]
+mod w1_create_tests;
 
 use anyhow::{Context, Result, ensure};
+use catalog::CatalogLane;
 use engine::Engine;
-use model::{Request, Response};
+use model::{ProductEnvelope, ProductIssue, ProductRequest, ProductResponse, Request, Response};
+#[cfg(debug_assertions)]
+use model::{ResizeEpoch, TerminalTarget};
 use nix::unistd::geteuid;
+use product_launch::ServiceProfiles;
+use serde::{Serialize, de::DeserializeOwned};
 use std::{
+    cell::Cell,
     fs::{self, File, OpenOptions},
     os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -20,6 +30,18 @@ use tokio::{
     sync::{Mutex, Semaphore},
     task::JoinSet,
 };
+
+pub use catalog::{initialize_catalog, product_catalog_directory};
+
+#[doc(hidden)]
+pub fn encode_local_observation(value: &impl Serialize) -> Result<String> {
+    Ok(serde_json::to_string(value)?)
+}
+
+#[doc(hidden)]
+pub fn decode_local_fixture<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    Ok(serde_json::from_slice(bytes)?)
+}
 
 const REQUEST_LIMIT: usize = 65_536;
 const RESPONSE_LIMIT: usize = 1_048_576;
@@ -101,14 +123,60 @@ async fn read_frame<R: AsyncRead + Unpin>(stream: &mut R, limit: usize) -> Resul
 }
 
 pub async fn request(directory: &Path, request: &Request) -> Result<Response> {
-    validate_directory(directory)?;
-    let mut stream = UnixStream::connect(directory.join("agent.sock"))
+    exchange(directory, request).await
+}
+
+pub async fn product_request(
+    directory: &Path,
+    product: &ProductRequest,
+) -> Result<ProductResponse> {
+    let reply: ProductEnvelope<ProductResponse> =
+        exchange(directory, &ProductEnvelope { product }).await?;
+    Ok(reply.product)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateDeliveryError {
+    BeforeSend,
+    Uncertain,
+}
+
+pub async fn submit_product_create(
+    directory: &Path,
+    product: &ProductRequest,
+) -> std::result::Result<ProductResponse, CreateDeliveryError> {
+    let stream = connect_agent(directory)
         .await
-        .context("local agent is unavailable")?;
+        .map_err(|_| CreateDeliveryError::BeforeSend)?;
+    let reply: ProductEnvelope<ProductResponse> = exchange_on(stream, &ProductEnvelope { product })
+        .await
+        .map_err(|_| CreateDeliveryError::Uncertain)?;
+    Ok(reply.product)
+}
+
+async fn connect_agent(directory: &Path) -> Result<UnixStream> {
+    validate_directory(directory)?;
+    let stream = tokio::time::timeout(
+        IO_TIMEOUT,
+        UnixStream::connect(directory.join("agent.sock")),
+    )
+    .await?
+    .context("local agent is unavailable")?;
     ensure!(
         stream.peer_cred()?.uid() == geteuid().as_raw(),
         "unexpected agent UID"
     );
+    Ok(stream)
+}
+
+async fn exchange<T: Serialize, R: DeserializeOwned>(directory: &Path, request: &T) -> Result<R> {
+    exchange_on(connect_agent(directory).await?, request).await
+}
+
+async fn exchange_on<T: Serialize, R: DeserializeOwned>(
+    mut stream: UnixStream,
+    request: &T,
+) -> Result<R> {
     let mut bytes = serde_json::to_vec(request)?;
     bytes.push(b'\n');
     ensure!(bytes.len() <= REQUEST_LIMIT, "request too large");
@@ -118,14 +186,284 @@ pub async fn request(directory: &Path, request: &Request) -> Result<Response> {
 }
 
 pub async fn serve(directory: PathBuf, tmux: PathBuf) -> Result<()> {
-    let guard = AgentLock::acquire(&directory)?;
+    let guard = Arc::new(AgentLock::acquire(&directory)?);
+    serve_local(Engine::new(tmux, directory.join("tmux.sock")), guard, None).await
+}
+
+#[cfg(debug_assertions)]
+pub async fn serve_resize_fixture(
+    directory: PathBuf,
+    tmux: PathBuf,
+    tmux_socket: PathBuf,
+    target: TerminalTarget,
+) -> Result<()> {
+    let socket_directory = tmux_socket
+        .parent()
+        .context("Missing fixture tmux directory")?;
+    ensure!(
+        directory.canonicalize()? != socket_directory.canonicalize()?,
+        "Resize fixture requires an isolated agent directory"
+    );
+    let guard = Arc::new(AgentLock::acquire(&directory)?);
+    let engine = Engine::new(tmux, tmux_socket)
+        .for_resize_fixture(target)
+        .await?;
+    serve_local(engine, guard, None).await
+}
+
+#[cfg(debug_assertions)]
+#[derive(serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ResizeProbeRequest<T> {
+    resize_probe: T,
+    epoch: ResizeEpoch,
+    attempt: uuid::Uuid,
+}
+
+#[cfg(debug_assertions)]
+pub async fn request_resize_probe(
+    directory: &Path,
+    resize: &Request,
+    epoch: ResizeEpoch,
+    attempt: uuid::Uuid,
+) -> Result<Response> {
+    exchange(
+        directory,
+        &ResizeProbeRequest {
+            resize_probe: resize,
+            epoch,
+            attempt,
+        },
+    )
+    .await
+}
+
+#[cfg(debug_assertions)]
+async fn dispatch_resize_fixture(
+    bytes: &[u8],
+    diagnostic: bool,
+    engine: &Engine,
+    target: &TerminalTarget,
+) -> Result<Response> {
+    if diagnostic {
+        let ResizeProbeRequest {
+            resize_probe:
+                Request::ResizeTerminal {
+                    terminal,
+                    token,
+                    sequence,
+                    size,
+                },
+            epoch,
+            attempt,
+        } = serde_json::from_slice::<ResizeProbeRequest<Request>>(bytes)?
+        else {
+            anyhow::bail!("Expected a resize probe request");
+        };
+        ensure!(
+            terminal.target == *target && !attempt.is_nil(),
+            "Invalid resize probe scope"
+        );
+        return match engine
+            .resize_terminal(terminal, token, sequence, size, None, Some(epoch))
+            .await
+        {
+            Err(error) if error.is::<ownership::ResizeDeadlineReached>() => Ok(Response::Error {
+                message: format!("resize admission expired: {attempt}"),
+            }),
+            result => result,
+        };
+    }
+
+    let request = serde_json::from_slice::<Request>(bytes)?;
+    let allowed = match &request {
+        Request::Health {} => true,
+        Request::OpenTerminal { runtime_id, .. }
+        | Request::Release { runtime_id, .. }
+        | Request::Input {
+            runtime_id,
+            paste: false,
+            ..
+        } => *runtime_id == target.runtime_id,
+        Request::TerminalStatus { terminal }
+        | Request::AcquireTerminal { terminal }
+        | Request::ResizeTerminal { terminal, .. } => terminal.target == *target,
+        _ => false,
+    };
+    ensure!(allowed, "Request outside the resize fixture scope");
+    engine.handle(request, None).await
+}
+
+pub async fn serve_with_catalog(directory: PathBuf, tmux: PathBuf, catalog: PathBuf) -> Result<()> {
+    let service_path = std::env::var_os("PATH");
+    serve_with_catalog_directory(
+        directory,
+        tmux,
+        move || product_catalog_directory(&catalog),
+        ServiceProfiles::new(service_path.as_deref()),
+    )
+    .await
+}
+
+async fn serve_with_catalog_directory(
+    directory: PathBuf,
+    tmux: PathBuf,
+    open_directory: impl FnOnce() -> Result<PathBuf> + Send + 'static,
+    profiles: ServiceProfiles,
+) -> Result<()> {
+    let guard = Arc::new(AgentLock::acquire(&directory)?);
+    let lane = start_catalog_worker(&guard, open_directory, profiles);
+    serve_local(
+        Engine::new(tmux, directory.join("tmux.sock")),
+        guard,
+        Some(lane),
+    )
+    .await
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub async fn serve_catalog_fixture(
+    directory: PathBuf,
+    tmux: PathBuf,
+    catalog: PathBuf,
+    service_path: &std::ffi::OsStr,
+) -> Result<()> {
+    serve_catalog_fixture_with(
+        directory,
+        tmux,
+        catalog,
+        service_path,
+        catalog::provision,
+        None,
+    )
+    .await
+}
+
+#[cfg(debug_assertions)]
+async fn serve_catalog_fixture_with(
+    directory: PathBuf,
+    tmux: PathBuf,
+    catalog: PathBuf,
+    service_path: &std::ffi::OsStr,
+    provision: impl FnOnce(&Path) -> Result<(), ProductIssue>,
+    busy: Option<catalog::FixtureBusyObserver>,
+) -> Result<()> {
+    let guard = Arc::new(AgentLock::acquire(&directory)?);
+    provision(&catalog).map_err(|issue| anyhow::anyhow!("fixture catalog: {issue:?}"))?;
+    let lane = CatalogLane::start_fixture(
+        catalog_directory_with_guard(Arc::clone(&guard), move || Ok(catalog)),
+        ServiceProfiles::new(Some(service_path)),
+        busy,
+    )
+    .await?;
+    serve_local(
+        Engine::new(tmux, directory.join("tmux.sock")),
+        guard,
+        Some(lane),
+    )
+    .await
+}
+
+fn start_catalog_worker(
+    guard: &Arc<AgentLock>,
+    open_directory: impl FnOnce() -> Result<PathBuf> + Send + 'static,
+    profiles: ServiceProfiles,
+) -> CatalogLane {
+    CatalogLane::start(
+        catalog_directory_with_guard(Arc::clone(guard), open_directory),
+        profiles,
+    )
+}
+
+fn catalog_directory_with_guard(
+    guard: Arc<AgentLock>,
+    open_directory: impl FnOnce() -> Result<PathBuf> + Send + 'static,
+) -> impl FnOnce() -> Result<PathBuf> + Send + 'static {
+    move || {
+        thread_local! {
+            static AGENT_LOCK: Cell<Option<Arc<AgentLock>>> = const { Cell::new(None) };
+        }
+        AGENT_LOCK.set(Some(guard));
+        open_directory()
+    }
+}
+
+async fn dispatch(
+    bytes: &[u8],
+    engine: &Engine,
+    creations: &Mutex<()>,
+    catalog: Option<&CatalogLane>,
+) -> Result<Vec<u8>> {
+    let envelope = serde_json::from_slice::<serde_json::Value>(bytes)?;
+    #[cfg(debug_assertions)]
+    if let Some(target) = engine.resize_fixture_target() {
+        let response = dispatch_resize_fixture(
+            bytes,
+            envelope.get("resize_probe").is_some(),
+            engine,
+            target,
+        )
+        .await?;
+        return Ok(serde_json::to_vec(&response)?);
+    }
+    if envelope.get("product").is_some() {
+        let product = match serde_json::from_slice::<ProductEnvelope<ProductRequest>>(bytes) {
+            Ok(envelope) => match (catalog, envelope.product) {
+                (
+                    Some(lane),
+                    ProductRequest::CreateManaged {
+                        key,
+                        workspace_id,
+                        profile,
+                        reservation,
+                    },
+                ) => {
+                    let _creation = creations.lock().await;
+                    let state = engine
+                        .create(lane, key, workspace_id, profile, reservation)
+                        .await;
+                    ProductResponse::Create { state }
+                }
+                (Some(lane), ProductRequest::CreateStatus { key }) => {
+                    let _creation = creations.lock().await;
+                    let state = engine.create_status(lane, key).await;
+                    ProductResponse::Create { state }
+                }
+                (Some(lane), product) => lane.call(product).await,
+                (None, _) => ProductResponse::Blocked {
+                    issue: ProductIssue::CatalogUnconfigured,
+                },
+            },
+            Err(_) => ProductResponse::Blocked {
+                issue: ProductIssue::InvalidRequest,
+            },
+        };
+        return Ok(serde_json::to_vec(&ProductEnvelope { product })?);
+    }
+    let request = serde_json::from_slice::<Request>(bytes)?;
+    let response = match request {
+        Request::List {} => Response::Runtimes {
+            runtimes: engine.inventory(catalog).await?,
+        },
+        request @ Request::Create { .. } => {
+            let _creation = creations.lock().await;
+            engine.handle(request, catalog).await?
+        }
+        request => engine.handle(request, catalog).await?,
+    };
+    Ok(serde_json::to_vec(&response)?)
+}
+
+async fn serve_local(
+    engine: Engine,
+    guard: Arc<AgentLock>,
+    catalog: Option<CatalogLane>,
+) -> Result<()> {
     let listener = UnixListener::bind(&guard.socket)?;
     fs::set_permissions(&guard.socket, fs::Permissions::from_mode(0o600))?;
-    let engine = Arc::new(Mutex::new(Engine {
-        tmux,
-        socket: directory.join("tmux.sock"),
-        ownership: Default::default(),
-    }));
+    let engine = Arc::new(engine);
+    let creations = Arc::new(Mutex::new(()));
     let permits = Arc::new(Semaphore::new(16));
     let mut jobs = JoinSet::new();
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -137,18 +475,19 @@ pub async fn serve(directory: PathBuf, tmux: PathBuf) -> Result<()> {
             Some(_) = jobs.join_next(), if !jobs.is_empty() => {},
             accepted = listener.accept() => {
                 let (mut stream, _) = accepted?;
-                if stream.peer_cred()?.uid() != geteuid().as_raw() { continue; }
+                if !stream.peer_cred().is_ok_and(|peer| peer.uid() == geteuid().as_raw()) { continue; }
                 let Ok(permit) = permits.clone().try_acquire_owned() else { continue; };
                 let engine = engine.clone();
+                let creations = creations.clone();
+                let catalog = catalog.clone();
                 jobs.spawn(async move {
                     let _permit = permit;
-                    let result: Result<Response> = async {
+                    let result: Result<Vec<u8>> = async {
                         let bytes = read_frame(&mut stream, REQUEST_LIMIT).await?;
-                        let request: Request = serde_json::from_slice(&bytes)?;
-                        engine.lock().await.handle(request).await
+                        dispatch(&bytes, &engine, &creations, catalog.as_ref()).await
                     }.await;
-                    let response = result.unwrap_or_else(|error| Response::Error { message: error.to_string() });
-                    if let Ok(mut bytes) = serde_json::to_vec(&response) {
+                    let response = result.or_else(|error| serde_json::to_vec(&Response::Error { message: error.to_string() }));
+                    if let Ok(mut bytes) = response && bytes.len() < RESPONSE_LIMIT {
                         bytes.push(b'\n');
                         let _ = tokio::time::timeout(IO_TIMEOUT, stream.write_all(&bytes)).await;
                     }
@@ -159,6 +498,8 @@ pub async fn serve(directory: PathBuf, tmux: PathBuf) -> Result<()> {
     jobs.abort_all();
     while jobs.join_next().await.is_some() {}
     // Deliberately no tmux/session stop: the separate service owns all runtimes.
+    drop(listener);
+    drop(catalog);
     drop(guard);
     Ok(())
 }
@@ -182,6 +523,9 @@ pub fn find_executable(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ProviderProfile, tmux_name};
+    use std::os::unix::{ffi::OsStringExt, fs::symlink};
+    use uuid::Uuid;
     #[test]
     fn only_one_agent_can_claim_a_private_directory() {
         let dir = tempfile::tempdir_in("/tmp").unwrap();
@@ -199,5 +543,418 @@ mod tests {
         assert!(read_frame(&mut oversized, 4).await.is_err());
         let mut partial = &b"{}"[..];
         assert!(read_frame(&mut partial, 10).await.is_err());
+    }
+
+    pub(super) fn fixture_program(path: &Path, script: &str) {
+        fs::write(path, script).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn w1_legacy_provenance_dispatch_checks_cli_preflight_without_mutating_pane() {
+        w1_create_tests::w1_legacy_provenance_dispatch_body().await;
+    }
+
+    #[tokio::test]
+    async fn configured_dispatch_fences_catalog_fault_while_catalog_free_legacy_stops_exactly() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let catalog_dir = root.join("catalog");
+        catalog::provision(&catalog_dir).unwrap();
+        let lane =
+            CatalogLane::start_fixture(move || Ok(catalog_dir), ServiceProfiles::new(None), None)
+                .await
+                .unwrap();
+        let (_master, _slave, tty) = w1_create_tests::observation_pty();
+        let tmux = root.join("tmux");
+        fixture_program(&tmux, w1_create_tests::TMUX);
+        let engine = Engine::new(tmux, root.join("tmux.sock"));
+        let runtime_id = Uuid::new_v4();
+        let name = tmux_name(Uuid::new_v4(), runtime_id);
+        fs::write(root.join("names"), format!("{name}\n")).unwrap();
+        fs::write(
+            root.join(format!("{name}.pane")),
+            format!("$1|@1|%1|{}\n", std::process::id()),
+        )
+        .unwrap();
+        fs::write(root.join(format!("{name}.dead")), "0\n").unwrap();
+        fs::write(root.join("tty"), tty).unwrap();
+
+        let creations = Mutex::new(());
+        let opening = serde_json::to_vec(&Request::OpenTerminal {
+            runtime_id,
+            view_id: Uuid::new_v4(),
+        })
+        .unwrap();
+        let opened: Response = serde_json::from_slice(
+            &dispatch(&opening, &engine, &creations, Some(&lane))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let Response::TerminalOpened { status } = opened else {
+            panic!("legacy observation failed");
+        };
+        assert_eq!(status.provider.unwrap().size, status.committed.size);
+        assert_eq!(
+            fs::read_to_string(root.join("generation-attempts"))
+                .unwrap()
+                .trim(),
+            status.terminal.target.generation.to_string()
+        );
+        fs::rename(
+            root.join("catalog/catalog.sqlite3"),
+            root.join("retained.sqlite3"),
+        )
+        .unwrap();
+        fs::write(root.join("trace-mutations"), "").unwrap();
+        let stop = serde_json::to_vec(&Request::Stop {
+            runtime_id,
+            expected_pane_id: "%1".into(),
+        })
+        .unwrap();
+        let denied = dispatch(&stop, &engine, &creations, Some(&lane))
+            .await
+            .unwrap_err();
+        assert!(denied.to_string().contains("CatalogMissing"), "{denied:#}");
+        assert!(!root.join("mutation-attempts").exists());
+        let stopped: Response =
+            serde_json::from_slice(&dispatch(&stop, &engine, &creations, None).await.unwrap())
+                .unwrap();
+        assert!(
+            matches!(stopped, Response::Stopped { runtime_id: stopped } if stopped == runtime_id)
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("stopped")).unwrap(),
+            format!("{name}\n")
+        );
+        assert!(fs::read_to_string(root.join("names")).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn configured_diagnostic_dispatch_keeps_retained_tuple_and_frees_slot() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let catalog_dir = root.join("catalog");
+        catalog::provision(&catalog_dir).unwrap();
+        let lane =
+            CatalogLane::start_fixture(move || Ok(catalog_dir), ServiceProfiles::new(None), None)
+                .await
+                .unwrap();
+        let (_master, _slave, tty) = w1_create_tests::observation_pty();
+        let tmux = root.join("tmux");
+        fixture_program(&tmux, w1_create_tests::TMUX);
+        let engine = Engine::new(tmux, root.join("tmux.sock"));
+        let (session_id, runtime_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let target = tmux_name(session_id, runtime_id);
+        let create = |session_id, runtime_id| Request::Create {
+            session_id,
+            runtime_id,
+            cwd: root.clone(),
+            argv: vec!["/bin/sh".into(), "-c".into(), "exit".into()],
+        };
+        let creations = Mutex::new(());
+        let send = async |request: Request| -> Result<Response> {
+            let json = serde_json::to_vec(&request)?;
+            Ok(serde_json::from_slice(
+                &dispatch(&json, &engine, &creations, Some(&lane)).await?,
+            )?)
+        };
+        fs::write(root.join("diagnostic-pid"), std::process::id().to_string()).unwrap();
+        fs::write(root.join("tty"), tty).unwrap();
+        fs::write(root.join("diagnostic-mode"), "hidden").unwrap();
+        let mut names = String::new();
+        for slot in 1..=15 {
+            let name = tmux_name(Uuid::new_v4(), Uuid::new_v4());
+            names.push_str(&format!("{name}\n"));
+            fs::write(
+                root.join(format!("{name}.pane")),
+                format!("${slot}|@{slot}|%{slot}|{}\n", std::process::id()),
+            )
+            .unwrap();
+            fs::write(root.join(format!("{name}.dead")), "0\n").unwrap();
+        }
+        fs::write(root.join("names"), &names).unwrap();
+        assert!(send(create(session_id, runtime_id)).await.is_err());
+        let mark = lane
+            .run(move |db, _| Ok(db.diagnostic(runtime_id, session_id)?.unwrap()))
+            .await
+            .unwrap();
+        assert!(mark.pane.is_none());
+        assert_eq!(
+            mark.generation.token.to_string(),
+            fs::read_to_string(root.join("generation-attempts"))
+                .unwrap()
+                .trim()
+        );
+        let (next_session, next_runtime) = (Uuid::new_v4(), Uuid::new_v4());
+        let capacity = send(create(next_session, next_runtime)).await.unwrap_err();
+        assert!(capacity.to_string().contains("limit is 16"), "{capacity:#}");
+
+        let pane_path = root.join(format!("{target}.pane"));
+        assert_eq!(
+            fs::read_to_string(&pane_path).unwrap(),
+            format!("$99|@99|%99|{}\n", std::process::id())
+        );
+        fs::write(&pane_path, "$99|@99|%99|\n").unwrap();
+        fs::write(root.join(format!("{target}.dead")), "1\n").unwrap();
+        fs::write(root.join("names"), format!("{names}{target}\n")).unwrap();
+        let stop = send(Request::Stop {
+            runtime_id,
+            expected_pane_id: "%99".into(),
+        })
+        .await
+        .unwrap();
+        assert!(matches!(stop, Response::Stopped { runtime_id: stopped } if stopped == runtime_id));
+        assert!(send(create(session_id, runtime_id)).await.is_err());
+        let settled = lane
+            .run(move |db, _| Ok(db.diagnostic(runtime_id, session_id)?.unwrap()))
+            .await
+            .unwrap();
+        let pane = settled.pane.unwrap();
+        assert_eq!(
+            (&*pane.session, &*pane.window, &*pane.pane, pane.pid),
+            ("$99", "@99", "%99", std::process::id())
+        );
+        assert_eq!(settled.nonce, mark.nonce);
+        fs::remove_file(root.join("diagnostic-mode")).unwrap();
+        fs::write(root.join("diagnostic-slot"), "100").unwrap();
+        let Response::Created { runtime } = send(create(next_session, next_runtime)).await.unwrap()
+        else {
+            panic!("exact Stop did not release capacity");
+        };
+        assert_eq!(runtime.runtime_id, next_runtime);
+        assert_eq!(
+            fs::read_to_string(root.join("diagnostic-dispatched")).unwrap(),
+            format!("{target}\n{}\n", tmux_name(next_session, next_runtime))
+        );
+    }
+
+    #[tokio::test]
+    async fn w1_readiness_private_ipc_preserves_inventory_and_never_launches() {
+        let temp = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = &temp.path().canonicalize().unwrap();
+        let catalog_dir = root.join("catalog");
+        catalog::provision(&catalog_dir).unwrap();
+        let workspace = root.join("Проєкт з пробілами");
+        fs::create_dir(&workspace).unwrap();
+        let selected = root.join("Вибрана папка");
+        symlink(&workspace, &selected).unwrap();
+        let denied = root.join("denied");
+        fs::create_dir(&denied).unwrap();
+        fs::set_permissions(&denied, fs::Permissions::from_mode(0o000)).unwrap();
+        let provider_runs = root.join("provider-ran");
+        let script = format!("#!/bin/sh\ntouch '{}'\n", provider_runs.display());
+        fixture_program(&root.join("claude"), &script);
+        fixture_program(&root.join("node"), &script);
+        fixture_program(&root.join("codex"), "#!/usr/bin/env node\n");
+
+        let runtime_id = Uuid::new_v4();
+        let name = tmux_name(Uuid::new_v4(), runtime_id);
+        let tmux = root.join("tmux");
+        let tmux_calls = root.join("tmux-calls");
+        fixture_program(
+            &tmux,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$4\" >> '{}'\ncase \"$4\" in\n  list-sessions) printf '%s\\n' '{name}' ;;\n  list-panes) printf '%s\\t%%1\\t41\\t0\\t100\\t30\\tcodex\\n' '{name}' ;;\n  *) exit 1 ;;\nesac\n",
+                tmux_calls.display(),
+            ),
+        );
+        let search = std::env::join_paths([Path::new("."), root]).unwrap();
+        w1_create_tests::wait_lock_release(
+            &catalog_dir.join("catalog.lock"),
+            Duration::from_secs(3),
+            || {},
+        )
+        .await
+        .expect("catalog ownership did not release");
+        let fixture_catalog = catalog_dir.clone();
+        let mut server = tokio::spawn(serve_with_catalog_directory(
+            root.to_owned(),
+            tmux,
+            move || Ok(fixture_catalog),
+            ServiceProfiles::new(Some(&search)),
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !root.join("agent.sock").exists() {
+                if server.is_finished() {
+                    panic!(
+                        "fixture agent exited before opening its socket: {:?}",
+                        (&mut server).await
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let register = |locator: &Path| ProductRequest::RegisterWorkspace {
+            locator: locator.to_str().unwrap().to_owned(),
+        };
+        let ProductResponse::WorkspaceRegistered { workspace: display } =
+            product_request(root, &register(&selected)).await.unwrap()
+        else {
+            panic!("registration failed")
+        };
+        assert_eq!(display.label, "Вибрана папка");
+        assert!(!display.workspace_id.is_nil());
+        let check = |profile| ProductRequest::WorkspaceReadiness {
+            workspace_id: display.workspace_id,
+            profile,
+        };
+        assert_eq!(
+            product_request(root, &register(&selected)).await.unwrap(),
+            ProductResponse::WorkspaceRegistered {
+                workspace: model::WorkspaceDisplay {
+                    workspace_id: display.workspace_id,
+                    label: display.label
+                },
+            }
+        );
+        for profile in [ProviderProfile::ClaudeCode, ProviderProfile::Codex] {
+            assert_eq!(
+                product_request(root, &check(profile)).await.unwrap(),
+                ProductResponse::Ready {}
+            );
+        }
+        let forged = ProductRequest::WorkspaceReadiness {
+            workspace_id: Uuid::new_v4(),
+            profile: ProviderProfile::Codex,
+        };
+        assert_eq!(
+            product_request(root, &forged).await.unwrap(),
+            ProductResponse::Blocked {
+                issue: ProductIssue::WorkspaceUnknown
+            }
+        );
+        let malformed = serde_json::json!({"product": { "op": "workspace_readiness", "workspace_id": display.workspace_id, "profile": "shell" }});
+        let reply: ProductEnvelope<ProductResponse> = exchange(root, &malformed).await.unwrap();
+        assert_eq!(
+            reply.product,
+            ProductResponse::Blocked {
+                issue: ProductIssue::InvalidRequest
+            }
+        );
+        let injected = serde_json::json!({"product": { "op": "workspace_readiness", "workspace_id": display.workspace_id,
+            "profile": "codex", "argv": ["anything"] }});
+        let reply: ProductEnvelope<ProductResponse> = exchange(root, &injected).await.unwrap();
+        assert_eq!(
+            reply.product,
+            ProductResponse::Blocked {
+                issue: ProductIssue::InvalidRequest
+            }
+        );
+
+        fs::remove_file(root.join("node")).unwrap();
+        assert_eq!(
+            product_request(root, &check(ProviderProfile::Codex))
+                .await
+                .unwrap(),
+            ProductResponse::Blocked {
+                issue: ProductIssue::InterpreterUnavailable
+            }
+        );
+        fs::set_permissions(root.join("claude"), fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            product_request(root, &check(ProviderProfile::ClaudeCode))
+                .await
+                .unwrap(),
+            ProductResponse::Blocked {
+                issue: ProductIssue::ProviderNotExecutable
+            }
+        );
+        fs::remove_file(root.join("claude")).unwrap();
+        assert_eq!(
+            product_request(root, &check(ProviderProfile::ClaudeCode))
+                .await
+                .unwrap(),
+            ProductResponse::Blocked {
+                issue: ProductIssue::ProviderMissing
+            }
+        );
+        if !geteuid().is_root() {
+            assert_eq!(
+                product_request(root, &register(&denied)).await.unwrap(),
+                ProductResponse::Blocked {
+                    issue: ProductIssue::FolderAccessDenied
+                }
+            );
+            fs::set_permissions(&workspace, fs::Permissions::from_mode(0o000)).unwrap();
+            assert_eq!(
+                product_request(root, &check(ProviderProfile::Codex))
+                    .await
+                    .unwrap(),
+                ProductResponse::Blocked {
+                    issue: ProductIssue::FolderAccessDenied
+                }
+            );
+            fs::set_permissions(&workspace, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::rename(&workspace, root.join("moved")).unwrap();
+        fs::create_dir(&workspace).unwrap();
+        assert_eq!(
+            product_request(root, &check(ProviderProfile::Codex))
+                .await
+                .unwrap(),
+            ProductResponse::Blocked {
+                issue: ProductIssue::WorkspaceChanged
+            }
+        );
+        fs::remove_file(&selected).unwrap();
+        symlink(root.join("moved"), &selected).unwrap();
+        assert_eq!(
+            product_request(root, &check(ProviderProfile::Codex))
+                .await
+                .unwrap(),
+            ProductResponse::Blocked {
+                issue: ProductIssue::WorkspaceChanged
+            }
+        );
+        let non_utf8 = root.join(std::ffi::OsString::from_vec(vec![0xff]));
+        assert_eq!(
+            product_launch::resolve_workspace(&non_utf8),
+            Err(ProductIssue::UnsupportedPath)
+        );
+        assert!(!provider_runs.exists());
+        assert!(!tmux_calls.exists());
+
+        fs::rename(
+            catalog_dir.join("catalog.sqlite3"),
+            catalog_dir.join("retained.sqlite3"),
+        )
+        .unwrap();
+        assert_eq!(
+            product_request(root, &check(ProviderProfile::Codex))
+                .await
+                .unwrap(),
+            ProductResponse::Blocked {
+                issue: ProductIssue::CatalogMissing
+            }
+        );
+        let Response::Runtimes { runtimes } = request(root, &Request::List {}).await.unwrap()
+        else {
+            panic!("inventory unavailable")
+        };
+        assert_eq!(runtimes[0].runtime_id, runtime_id);
+        let Response::Error { message } = request(root, &Request::Attach { runtime_id })
+            .await
+            .unwrap()
+        else {
+            panic!("faulted catalog admitted a new attachment")
+        };
+        assert_eq!(
+            message,
+            "Managed terminal catalog unavailable: CatalogMissing"
+        );
+        assert_eq!(
+            fs::read_to_string(tmux_calls).unwrap(),
+            "list-sessions\nlist-panes\nlist-sessions\nlist-panes\n"
+        );
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 }

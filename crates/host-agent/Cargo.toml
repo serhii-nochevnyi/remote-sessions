@@ -16,6 +16,7 @@ tokio.workspace = true
 clap.workspace = true
 uuid.workspace = true
 nix.workspace = true
+rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3"

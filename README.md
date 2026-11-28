@@ -6,11 +6,16 @@ Repository location: `/Volumes/KINGSTON/remote-sessions`. The earlier Codex outp
 
 ## Current state
 
-P0 scaffold plus a **local desktop terminal and tmux runtime spike**. The Rust CLI can create actual managed processes, list/snapshot them, attach a read-only terminal and explicitly stop a selected runtime. tmux and the agent run as separate macOS user services in the development lab.
+**Installed acceptance:** DEFERRED\
+**Follow-up:** OPEN — [GitHub issue #10](https://github.com/serhii-nochevnyi/remote-sessions/issues/10)
 
-The native React/Tauri app discovers real local sessions, opens tabs, streams terminal output and reconnects. Active views acquire exclusive, expiring host input leases for text, paste, Enter and arrow keys. Closing a view releases control and leaves the process alive. Pairing, relay and E2EE are not implemented. The server exposes only loopback liveness and advertises no remote capabilities.
+The native Mac app can select an existing project folder, check Claude Code or Codex readiness and create a durable local session. The managed runtime opens in one terminal tab with live output, exclusive expiring input leases, and owner-authorized resize. Tabs support zoom, expanded layout, fullscreen and reconnect. Closing a view leaves the process alive. If a create outcome is unknown, refresh or reconnect to its original operation before deciding to launch separately.
 
-See [development waves](docs/ROADMAP.md), [runtime lab](docs/RUNTIME-LAB.md), [development setup](docs/DEVELOPMENT.md), and the [Rust decision](docs/STACK.md).
+Start with the [local desktop workflow and setup](docs/LOCAL-DESKTOP-WORKFLOW.md). The [W1 verification report](docs/W1-VERIFICATION.md) and [machine-readable evidence](docs/W1-EVIDENCE.json) list the installed provider, WebView and physical-device observations still owed. W1, P0 and pilot completion remain held.
+
+The server exposes only loopback liveness and advertises no remote runtime capabilities. Remote execution stays disabled until owner authentication, trusted pairing and end-to-end encryption are implemented and tested.
+
+See the [roadmap](docs/ROADMAP.md), [development setup](docs/DEVELOPMENT.md), [runtime lab](docs/RUNTIME-LAB.md), [desktop workflow decision](docs/decisions/ADR-13-local-desktop-workflow.md) and [Rust decision](docs/STACK.md).
 
 ## Stack
 
@@ -18,21 +23,21 @@ See [development waves](docs/ROADMAP.md), [runtime lab](docs/RUNTIME-LAB.md), [d
 - Rust corporate server with Tokio/Axum; currently liveness only.
 - Shared Rust protocol crate and client native core.
 - Tauri 2 + React + TypeScript + Vite, with separate desktop/phone layouts.
-- xterm.js renderer; SQLite/PostgreSQL remain planned persistence choices.
+- xterm.js terminal rendering and an implemented, private SQLite catalog under the user's internal macOS application state. PostgreSQL remains the future corporate server storage choice.
 - npm workspace and Cargo workspace, both with lockfiles.
 
 The user selected Rust for both agent and server after the initial scaffold. No Go implementation or Go toolchain requirement remains.
 
 ## Run
 
-Prerequisites: Node 24, npm 11, Rust 1.97.1; macOS and tmux for the lifecycle proof. Full Xcode/signing/device setup is required for iOS work.
+Use Node 24, npm 11 and Rust 1.97.1. The local native lab requires macOS and tmux. iOS work requires full Xcode, signing and device setup.
 
 ```sh
 npm ci
 npm run dev
 ```
 
-Vite previews the shell only. Real local sessions require the native desktop app. See [desktop setup and evidence](docs/P0-DESKTOP-VERIFICATION.md); browser and physical iPhone access are not implemented.
+Vite previews the shell only. The native desktop setup above builds the debug app and starts its separate macOS user services. The [P0 desktop report](docs/P0-DESKTOP-VERIFICATION.md) records the earlier spike.
 
 For the isolated Rust toolchain already prepared in this checkout:
 
@@ -81,4 +86,4 @@ docs/planning/           Historical v0.2 architecture/plan/UI/mockups
 
 The private repository is [serhii-nochevnyi/remote-sessions](https://github.com/serhii-nochevnyi/remote-sessions). Development uses GitHub milestones/issues, feature branches and pull requests. Internal `.planning/` artifacts remain local; the reviewed roadmap is published in `docs/ROADMAP.md`. Product name and `dev.remotesessions.app` remain development placeholders; choose a company-owned identifier before signing/pairing rollout.
 
-Detailed next-wave delivery: [W1 implementation plan](docs/W1-PLAN.md) and [GitHub milestone](https://github.com/serhii-nochevnyi/remote-sessions/milestone/1).
+See the [W1 delivery plan](docs/W1-PLAN.md), [source handoff issue](https://github.com/serhii-nochevnyi/remote-sessions/issues/79) and [GitHub milestone](https://github.com/serhii-nochevnyi/remote-sessions/milestone/1).
