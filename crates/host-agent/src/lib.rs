@@ -551,6 +551,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn w1_legacy_provenance_dispatch_checks_cli_preflight_without_mutating_pane() {
+        w1_create_tests::w1_legacy_provenance_dispatch_body().await;
+    }
+
+    #[tokio::test]
     async fn configured_dispatch_fences_catalog_fault_while_catalog_free_legacy_stops_exactly() {
         let temp = tempfile::tempdir_in("/tmp").unwrap();
         let root = temp.path().canonicalize().unwrap();

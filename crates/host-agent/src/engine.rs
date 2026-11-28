@@ -39,6 +39,7 @@ pub struct Engine {
     agent_epoch: Uuid,
     ownership: Arc<Mutex<crate::ownership::Ownership>>,
     lanes: Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<ResizeLane>>>>,
+    historical_views: Mutex<HashMap<Uuid, IssuedHistoricalView>>,
     #[cfg(debug_assertions)]
     resize_fixture_target: Option<TerminalTarget>,
     #[cfg(test)]
@@ -122,7 +123,7 @@ impl PasteBuffer {
     }
 }
 
-struct CustodyBinding {
+struct PayloadCustody {
     runtime: Uuid,
     pane: String,
     name: String,
@@ -132,13 +133,253 @@ struct CustodyBinding {
     completed: bool,
 }
 
-impl CustodyBinding {
+impl PayloadCustody {
     fn matches(&self, read: &GeometryReadback, buffer: &PasteBuffer) -> bool {
         self.name == read.name
             && Path::new(&self.tty) == read.tty
             && self.buffer == *buffer
             && self.marker == buffer.marker(read, 'l')
     }
+}
+
+enum CustodyBinding {
+    Payload(PayloadCustody),
+    Probe(ProbeCustody),
+}
+
+impl CustodyBinding {
+    fn identity(&self) -> (Uuid, &str, Uuid, &str) {
+        match self {
+            Self::Payload(p) => (p.runtime, &p.pane, p.buffer.nonce, &p.buffer.name),
+            Self::Probe(p) => (p.target.runtime_id, &p.target.pane, p.operation, &p.buffer),
+        }
+    }
+
+    fn completed(&self) -> bool {
+        match self {
+            Self::Payload(p) => p.completed,
+            Self::Probe(p) => p.completed,
+        }
+    }
+
+    fn payload(&self) -> Option<&PayloadCustody> {
+        match self {
+            Self::Payload(p) => Some(p),
+            Self::Probe(_) => None,
+        }
+    }
+
+    fn probe(&self) -> Option<&ProbeCustody> {
+        match self {
+            Self::Probe(p) => Some(p),
+            Self::Payload(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProbeSource {
+    Managed {
+        operation: Uuid,
+        nonce: Uuid,
+        ticket: Uuid,
+    },
+    Diagnostic(Uuid),
+    CatalogFree,
+}
+
+impl ProbeSource {
+    fn parse(source: &str) -> Result<Self> {
+        let fields: Vec<_> = source.split(':').collect();
+        match fields.as_slice() {
+            ["managed", operation, nonce, ticket] => Ok(Self::Managed {
+                operation: parse_v4(operation)?,
+                nonce: parse_v4(nonce)?,
+                ticket: parse_v4(ticket)?,
+            }),
+            ["diagnostic", nonce] => Ok(Self::Diagnostic(parse_v4(nonce)?)),
+            ["local"] => Ok(Self::CatalogFree),
+            _ => bail!("Invalid probe custody provenance"),
+        }
+    }
+
+    fn encode(self) -> String {
+        match self {
+            Self::Managed {
+                operation,
+                nonce,
+                ticket,
+            } => format!("managed:{operation}:{nonce}:{ticket}"),
+            Self::Diagnostic(nonce) => format!("diagnostic:{nonce}"),
+            Self::CatalogFree => "local".into(),
+        }
+    }
+}
+
+struct ProbeCustody {
+    server: ServerGeneration,
+    target: TerminalTarget,
+    name: String,
+    tty: PathBuf,
+    device: TtyIdentity,
+    source: ProbeSource,
+    operation: Uuid,
+    buffer: String,
+    completed: bool,
+}
+
+impl ProbeCustody {
+    fn parse(server: ServerGeneration, completed: bool, fields: &[&str]) -> Result<Self> {
+        let [
+            "probe",
+            name,
+            token,
+            pid,
+            start,
+            sid,
+            wid,
+            pane,
+            process,
+            process_start,
+            tty,
+            dev,
+            ino,
+            rdev,
+            source,
+            operation,
+            buffer,
+        ] = fields
+        else {
+            bail!("Malformed probe custody binding");
+        };
+        let (session, runtime_id) = parse_name(name).context("Invalid probe runtime name")?;
+        let session_id = format!("${sid}");
+        let window = format!("@{wid}");
+        let pane = format!("%{pane}");
+        let process = u32::try_from(canonical_number(process)?)?;
+        let process_start = canonical_number(process_start)?;
+        let operation = parse_v4(operation)?;
+        let device = (
+            canonical_number(dev)?,
+            canonical_number(ino)?,
+            canonical_number(rdev)?,
+        );
+        ensure!(
+            !session.is_nil()
+                && !runtime_id.is_nil()
+                && tmux_name(session, runtime_id) == *name
+                && parse_uuid(token)? == server.token
+                && canonical_number(pid)? == u64::from(server.pid)
+                && canonical_number(start)? == server.start
+                && canonical_tmux_id(&session_id, '$')
+                && canonical_tmux_id(&window, '@')
+                && canonical_tmux_id(&pane, '%')
+                && process > 0
+                && process_start > 0
+                && valid_pane_tty(tty)
+                && device.1 > 0
+                && *buffer == format!("rs-paste-probe-{}", operation.simple()),
+            "Invalid probe custody identity"
+        );
+        let source = ProbeSource::parse(source)?;
+        ensure!(
+            !matches!(source, ProbeSource::Managed { operation: create, nonce, ticket }
+                if [create, nonce, ticket].contains(&operation))
+                && !matches!(source, ProbeSource::Diagnostic(nonce) if operation == nonce),
+            "Probe operation duplicates launch provenance"
+        );
+        Ok(Self {
+            server,
+            target: TerminalTarget {
+                runtime_id,
+                generation: server.token,
+                session: session_id,
+                window,
+                pane,
+                pid: process,
+                process_start,
+            },
+            name: (*name).into(),
+            tty: PathBuf::from(tty),
+            device,
+            source,
+            operation,
+            buffer: (*buffer).into(),
+            completed,
+        })
+    }
+
+    fn original_guard(&self, read: &GeometryReadback) -> Result<String> {
+        ensure!(
+            read.state == PaneState::Live
+                && read.target == self.target
+                && read.server == self.server
+                && read.name == self.name
+                && read.tty == self.tty
+                && read.epoch.is_none()
+                && read.paste_launch.is_empty()
+                && read.paste_marker.is_empty()
+                && process_start(read.target.pid)? == self.target.process_start
+                && tty_identity(&fs::symlink_metadata(&read.tty)?)? == self.device,
+            "Original pre-Ready process or TTY is unconfirmed"
+        );
+        let t = &self.target;
+        let tuple = format!("{}:{}:{}:{}", t.session, t.window, t.pane, t.pid);
+        let (init, record) = match self.source {
+            ProbeSource::Managed {
+                operation,
+                nonce,
+                ticket,
+            } => {
+                ensure!(
+                    read.nonce == format!("{nonce}:{tuple}") && read.diagnostic.is_none(),
+                    "Original managed probe stamp changed"
+                );
+                let pane = PaneIdentity {
+                    session: t.session.clone(),
+                    window: t.window.clone(),
+                    pane: t.pane.clone(),
+                    pid: t.pid,
+                };
+                let init = initializer(
+                    &birth_prefix(self.server, operation, t.runtime_id, nonce),
+                    ticket,
+                    &pane,
+                );
+                let record = birth_text(&init, self.target.process_start, &self.tty, self.device);
+                (init, record)
+            }
+            ProbeSource::Diagnostic(nonce) => {
+                ensure!(
+                    read.nonce.is_empty()
+                        && read.diagnostic.as_deref() == Some(&format!("{nonce}:{tuple}")),
+                    "Original diagnostic probe stamp changed"
+                );
+                (String::new(), String::new())
+            }
+            ProbeSource::CatalogFree => {
+                ensure!(
+                    read.nonce.is_empty() && read.diagnostic.is_none(),
+                    "Original catalog-free probe stamp changed"
+                );
+                (String::new(), String::new())
+            }
+        };
+        Ok(format_all([
+            format_equal(DIAGNOSTIC_OPTION, read.diagnostic.as_deref().unwrap_or("")),
+            format_equal(INITIALIZER_OPTION, init),
+            format_equal(BIRTH_OPTION, record),
+        ]))
+    }
+}
+
+fn parse_v4(value: &str) -> Result<Uuid> {
+    let id = parse_uuid(value)?;
+    ensure!(
+        id.get_version_num() == 4,
+        "Expected a version 4 custody nonce"
+    );
+    Ok(id)
 }
 
 struct CustodySlot {
@@ -148,7 +389,7 @@ struct CustodySlot {
     active: Option<CustodyBinding>,
 }
 
-type CustodySnapshot = [Option<CustodySlot>; CUSTODY_SLOTS];
+type CustodySnapshot = Box<[Option<CustodySlot>; CUSTODY_SLOTS]>;
 
 #[derive(Debug)]
 struct CustodyClaimConflict;
@@ -206,12 +447,14 @@ impl CustodySlot {
             "Invalid paste custody value"
         );
         let mut fields = value.split('~');
-        ensure!(fields.next() == Some("v1"), "Unknown paste custody version");
-        let mutation = parse_uuid(fields.next().context("Missing custody mutation")?)?;
-        ensure!(mutation.get_version_num() == 4, "Invalid custody mutation");
-        let active = match fields.next() {
-            Some("free") if fields.next().is_none() => None,
-            Some(state @ ("possible" | "completed")) => {
+        let version = fields.next();
+        let mutation = parse_v4(fields.next().context("Missing custody mutation")?)?;
+        let active = match (version, fields.next()) {
+            (Some("v1"), Some("free")) if fields.next().is_none() => None,
+            (Some("v2"), Some(state @ ("possible" | "completed"))) => Some(CustodyBinding::Probe(
+                ProbeCustody::parse(server, state == "completed", &fields.collect::<Vec<_>>())?,
+            )),
+            (Some("v1"), Some(state @ ("possible" | "completed"))) => {
                 let rest: Vec<_> = fields.collect();
                 let [
                     name,
@@ -273,7 +516,7 @@ impl CustodySlot {
                         && uuid.simple().to_string() == id,
                     "Invalid paste custody buffer"
                 );
-                Some(CustodyBinding {
+                Some(CustodyBinding::Payload(PayloadCustody {
                     runtime,
                     pane,
                     name: (*name).into(),
@@ -285,9 +528,9 @@ impl CustodySlot {
                         name: (*buffer).into(),
                     },
                     completed: state == "completed",
-                })
+                }))
             }
-            _ => bail!("Invalid paste custody state"),
+            _ => bail!("Invalid paste custody version or state"),
         };
         Ok(Self {
             index,
@@ -297,9 +540,58 @@ impl CustodySlot {
         })
     }
 
+    fn bind_probe(read: &GeometryReadback, index: usize, source: ProbeSource) -> Result<Self> {
+        let t = &read.target;
+        let (dev, ino, rdev) = tty_identity(&fs::symlink_metadata(&read.tty)?)?;
+        let operation = Uuid::new_v4();
+        let buffer = format!("rs-paste-probe-{}", operation.simple());
+        Self::parse(
+            read.server,
+            index,
+            &format!(
+                "v2~{}~possible~probe~{}~{}~{}~{}~{}~{}~{}~{}~{}~{}~{dev}~{ino}~{rdev}~{}~{operation}~{buffer}",
+                Uuid::new_v4(),
+                read.name,
+                t.generation,
+                read.server.pid,
+                read.server.start,
+                &t.session[1..],
+                &t.window[1..],
+                &t.pane[1..],
+                t.pid,
+                t.process_start,
+                read.tty.display(),
+                source.encode(),
+            ),
+        )
+    }
+
+    fn complete_probe(&self, server: ServerGeneration) -> Result<Self> {
+        let (header, binding) = self
+            .value
+            .split_once("~possible~")
+            .context("Missing possible probe custody")?;
+        ensure!(
+            header == format!("v2~{}", self.mutation),
+            "Invalid possible probe custody"
+        );
+        Self::parse(
+            server,
+            self.index,
+            &format!("v2~{}~completed~{binding}", Uuid::new_v4()),
+        )
+    }
+
     fn guard(&self, server: ServerGeneration) -> String {
         format_equal(&custody_option(server, self.index), &self.value)
     }
+}
+
+fn free_custody_index(snapshot: &CustodySnapshot) -> Option<usize> {
+    snapshot
+        .iter()
+        .position(|slot| slot.as_ref().is_some_and(|slot| slot.active.is_none()))
+        .or_else(|| snapshot.iter().position(Option::is_none))
 }
 
 fn paste_process_stamp(marker: &str) -> Result<(&str, u64)> {
@@ -434,6 +726,7 @@ struct GeometryReadback {
     input_enabled: bool,
 }
 
+#[derive(Clone, Copy)]
 struct GeometryIdentity<'a> {
     target: &'a TerminalTarget,
     state: PaneState,
@@ -442,6 +735,7 @@ struct GeometryIdentity<'a> {
     nonce: &'a str,
     diagnostic: Option<&'a str>,
     tty: &'a Path,
+    sample: Option<&'a GeometryReadback>,
 }
 
 struct RuntimeCatalog {
@@ -667,6 +961,57 @@ struct Observation {
     runtime: Runtime,
 }
 
+enum ManagedProvenance {
+    Birth(OriginalBirth),
+    Historical(HistoricalProof),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct HistoricalOrigin {
+    server: ServerGeneration,
+    name: String,
+    nonce: String,
+    launch: Uuid,
+    tty: PathBuf,
+    device: TtyIdentity,
+}
+
+struct HistoricalProof {
+    origin: HistoricalOrigin,
+    marker: String,
+    ready: bool,
+}
+
+struct IssuedHistoricalView {
+    terminal: TerminalView,
+    origin: HistoricalOrigin,
+    expires: Instant,
+}
+
+const HISTORICAL_VIEW_LIMIT: usize = 64;
+const HISTORICAL_VIEW_TTL: Duration = Duration::from_secs(300);
+
+impl ManagedProvenance {
+    fn tty(&self) -> &Path {
+        match self {
+            Self::Birth(proof) => &proof.tty,
+            Self::Historical(proof) => &proof.origin.tty,
+        }
+    }
+
+    fn guard(&self) -> String {
+        match self {
+            Self::Birth(proof) => proof.guard(),
+            Self::Historical(proof) => format_all([
+                format_equal(INITIALIZER_OPTION, ""),
+                format_equal(BIRTH_OPTION, ""),
+                format_equal(PASTE_LAUNCH_OPTION, proof.origin.launch),
+                format_equal(PASTE_OPTION, &proof.marker),
+            ]),
+        }
+    }
+}
+
 struct OriginalBirth {
     initializer: String,
     record: String,
@@ -759,9 +1104,7 @@ fn server_fields(line: &str) -> Option<(u32, u64, &str)> {
 
 fn generation(line: &str) -> Option<ServerGeneration> {
     let (pid, start, token) = server_fields(line)?;
-    let token = Uuid::try_parse(token)
-        .ok()
-        .filter(|token| !token.is_nil())?;
+    let token = parse_uuid(token).ok()?;
     Some(ServerGeneration { pid, start, token })
 }
 
@@ -915,6 +1258,7 @@ impl GeometryReadback {
             nonce: &self.nonce,
             diagnostic: self.diagnostic.as_deref(),
             tty: &self.tty,
+            sample: Some(self),
         }
     }
 
@@ -969,6 +1313,12 @@ impl GeometryReadback {
 
     fn birth(&self) -> Option<&str> {
         self.paste_launch.split_once('~').map(|(_, birth)| birth)
+    }
+
+    fn historical_launch(&self) -> Option<Uuid> {
+        parse_uuid(&self.paste_launch).ok().filter(|launch| {
+            launch.get_version_num() == 4 && launch.get_variant() == uuid::Variant::RFC4122
+        })
     }
 
     fn birth_bound(&self) -> bool {
@@ -1084,6 +1434,9 @@ impl GeometryReadback {
         ];
         if self.birth_bound() {
             predicates.push(format_equal(BIRTH_OPTION, self.birth().unwrap_or("")));
+        } else if !self.nonce.is_empty() && self.historical_launch().is_some() {
+            predicates.push(format_equal(INITIALIZER_OPTION, ""));
+            predicates.push(format_equal(BIRTH_OPTION, ""));
         }
         if let Some(stamp) = &self.diagnostic {
             predicates.push(format_equal(DIAGNOSTIC_OPTION, stamp));
@@ -1219,6 +1572,7 @@ impl Engine {
             agent_epoch: Uuid::new_v4(),
             ownership: Arc::default(),
             lanes: Mutex::default(),
+            historical_views: Mutex::default(),
             #[cfg(debug_assertions)]
             resize_fixture_target: None,
             #[cfg(test)]
@@ -2075,7 +2429,11 @@ impl Engine {
                     Ok(observed) if observed.identity == *identity => {
                         if observed.runtime.exited {
                             PaneLiveness::Exited
-                        } else if self.prove_live_birth(&operation, identity).await.is_ok() {
+                        } else if self
+                            .prove_observed_managed(&operation, &observed, false)
+                            .await
+                            .is_ok()
+                        {
                             PaneLiveness::Live
                         } else {
                             PaneLiveness::Unavailable
@@ -2110,10 +2468,17 @@ impl Engine {
             return unknown(None);
         };
         if !observed.runtime.exited {
-            let Ok(birth) = self.prove_live_birth(operation, &observed.identity).await else {
-                return unknown(None);
+            let proof = match self
+                .prove_observed_managed(operation, &observed, true)
+                .await
+            {
+                Ok(ManagedProvenance::Historical(proof)) if !proof.ready => return unknown(None),
+                Ok(proof) => proof,
+                Err(_) => return unknown(None),
             };
-            if !birth.used {
+            if let ManagedProvenance::Birth(birth) = proof
+                && !birth.used
+            {
                 let current = match Self::load_operation(catalog, operation.key).await {
                     Ok(Some(current)) => current,
                     Ok(None) => return unknown(None),
@@ -2227,7 +2592,7 @@ impl Engine {
                         && observed.runtime.exited == runtime.exited
                         && (runtime.exited
                             || self
-                                .verify_live_birth(operation, identity, false)
+                                .prove_observed_managed(operation, &observed, false)
                                 .await
                                 .is_ok())
                     {
@@ -2610,11 +2975,201 @@ impl Engine {
         Ok(identity)
     }
 
+    async fn verify_historical(&self, read: &GeometryReadback) -> Result<HistoricalProof> {
+        let launch = read
+            .historical_launch()
+            .context("Missing historical launch")?;
+        let (session, runtime) = parse_name(&read.name).context("Invalid historical target")?;
+        let (nonce, _) = read
+            .nonce
+            .split_once(':')
+            .context("Missing historical nonce")?;
+        let target = &read.target;
+        let ready = read.paste_ready();
+        ensure!(
+            read.state == PaneState::Live
+                && !session.is_nil()
+                && !runtime.is_nil()
+                && runtime == target.runtime_id
+                && read.name == tmux_name(session, runtime)
+                && parse_uuid(nonce).is_ok()
+                && read.diagnostic.is_none()
+                && (ready || PasteBuffer::from_marker(read).is_some()),
+            "Historical writer marker is unconfirmed"
+        );
+        // @invariant: Historical markers bind start; verify the current TTY device around identity reads.
+        let device = tty_identity(&fs::symlink_metadata(&read.tty)?)?;
+        let first = self.corroborate_terminal(&read.identity(), nonce).await?;
+        let birth = self
+            .sample_live_birth(
+                BirthTarget {
+                    name: &read.name,
+                    server: read.server,
+                    nonce: parse_uuid(nonce)?,
+                },
+                &first,
+            )
+            .await?;
+        ensure!(
+            birth.tty == read.tty && birth.initializer.is_empty() && birth.record.is_empty(),
+            "Historical terminal has initializer or birth metadata"
+        );
+        let pane = &target.pane;
+        ensure!(
+            self.geometry_command(&[
+                "show-options",
+                "-pq",
+                "-t",
+                pane,
+                INITIALIZER_OPTION,
+                ";",
+                "show-options",
+                "-pq",
+                "-t",
+                pane,
+                BIRTH_OPTION,
+            ])
+            .await?
+            .is_empty(),
+            "Historical terminal has initializer or birth metadata"
+        );
+        let after = self.geometry(runtime, pane).await?;
+        ensure!(
+            after.same_pane(read)
+                && after.epoch == read.epoch
+                && after.paste_marker == read.paste_marker
+                && self.corroborate_terminal(&after.identity(), nonce).await? == first
+                && tty_identity(&fs::symlink_metadata(&after.tty)?)? == device,
+            "Historical process changed during proof"
+        );
+        Ok(HistoricalProof {
+            origin: HistoricalOrigin {
+                server: read.server,
+                name: read.name.clone(),
+                nonce: read.nonce.clone(),
+                launch,
+                tty: read.tty.clone(),
+                device,
+            },
+            marker: read.paste_marker.clone(),
+            ready,
+        })
+    }
+
+    async fn prove_observed_managed(
+        &self,
+        operation: &Operation,
+        observed: &Observation,
+        wait_for_record: bool,
+    ) -> Result<ManagedProvenance> {
+        match self
+            .verify_live_birth(operation, &observed.identity, wait_for_record)
+            .await
+        {
+            Ok(birth) => Ok(ManagedProvenance::Birth(birth)),
+            Err(birth_error) => {
+                let read = self
+                    .geometry_for_runtime(&observed.runtime, operation.generation)
+                    .await?;
+                self.verify_historical_operation(&read.identity(), operation, &observed.identity)
+                    .await
+                    .map(ManagedProvenance::Historical)
+                    .with_context(|| birth_error.to_string())
+            }
+        }
+    }
+
+    async fn verify_historical_operation(
+        &self,
+        read: &GeometryIdentity<'_>,
+        operation: &Operation,
+        identity: &PaneIdentity,
+    ) -> Result<HistoricalProof> {
+        ensure!(
+            operation.target == tmux_name(operation.session_id, operation.runtime_id)
+                && read.name == operation.target
+                && read.target.runtime_id == operation.runtime_id
+                && read.server == operation.generation
+                && read.target.session == identity.session
+                && read.target.window == identity.window
+                && read.target.pane == identity.pane
+                && read.target.pid == identity.pid
+                && read
+                    .nonce
+                    .split_once(':')
+                    .is_some_and(|(nonce, _)| parse_uuid(nonce).ok() == Some(operation.nonce)),
+            "Historical catalog identity changed"
+        );
+        let sampled;
+        let geometry = match read.sample {
+            Some(geometry) => geometry,
+            None => {
+                sampled = self
+                    .geometry(read.target.runtime_id, &read.target.pane)
+                    .await?;
+                ensure!(
+                    &sampled.target == read.target
+                        && sampled.server == read.server
+                        && sampled.name == read.name
+                        && sampled.nonce == read.nonce
+                        && sampled.tty == read.tty,
+                    "Historical terminal sample changed"
+                );
+                &sampled
+            }
+        };
+        self.verify_historical(geometry).await
+    }
+
+    fn remember_historical_view(&self, terminal: &TerminalView, proof: Option<&ManagedProvenance>) {
+        let mut views = self.historical_views.lock().expect("historical view lock");
+        views.remove(&terminal.view_id);
+        if let Some(ManagedProvenance::Historical(proof)) = proof {
+            let now = self.now();
+            views.retain(|_, view| view.expires > now);
+            if views.len() == HISTORICAL_VIEW_LIMIT
+                && let Some(id) = views
+                    .iter()
+                    .min_by_key(|(_, view)| view.expires)
+                    .map(|(id, _)| *id)
+            {
+                views.remove(&id);
+            }
+            views.insert(
+                terminal.view_id,
+                IssuedHistoricalView {
+                    terminal: terminal.clone(),
+                    origin: proof.origin.clone(),
+                    expires: now + HISTORICAL_VIEW_TTL,
+                },
+            );
+        }
+    }
+
+    fn historical_view(&self, terminal: &TerminalView) -> Option<HistoricalOrigin> {
+        self.historical_views
+            .lock()
+            .expect("historical view lock")
+            .get(&terminal.view_id)
+            .filter(|view| view.terminal == *terminal && view.expires > self.now())
+            .map(|view| view.origin.clone())
+    }
+
+    fn refresh_historical_view(&self, terminal: &TerminalView, proof: &HistoricalProof) {
+        let mut views = self.historical_views.lock().expect("historical view lock");
+        if let Some(view) = views.get_mut(&terminal.view_id)
+            && view.terminal == *terminal
+            && view.origin == proof.origin
+        {
+            view.expires = self.now() + HISTORICAL_VIEW_TTL;
+        }
+    }
+
     async fn verify_terminal_operation(
         &self,
         read: &GeometryIdentity<'_>,
         operation: Option<&Operation>,
-    ) -> Result<Option<OriginalBirth>> {
+    ) -> Result<Option<ManagedProvenance>> {
         ensure!(
             read.diagnostic.is_none(),
             "Diagnostic terminal is uncorroborated"
@@ -2641,7 +3196,7 @@ impl Engine {
             .await
             .context(UnprovenTerminalBirth)?;
         ensure!(
-            birth.as_ref().is_none_or(|proof| proof.tty == read.tty),
+            birth.as_ref().is_none_or(|proof| proof.tty() == read.tty),
             "Managed terminal TTY changed"
         );
         Ok(birth)
@@ -2652,16 +3207,24 @@ impl Engine {
         read: &GeometryIdentity<'_>,
         operation: &Operation,
         identity: &PaneIdentity,
-    ) -> Result<Option<OriginalBirth>> {
+    ) -> Result<Option<ManagedProvenance>> {
         if read.state != PaneState::Live {
             return Ok(None);
         }
-        let birth = self.verify_live_birth(operation, identity, false).await?;
-        ensure!(
-            birth.start == read.target.process_start,
-            "Managed terminal birth changed"
-        );
-        Ok(Some(birth))
+        match self.verify_live_birth(operation, identity, false).await {
+            Ok(birth) => {
+                ensure!(
+                    birth.start == read.target.process_start,
+                    "Managed terminal birth changed"
+                );
+                Ok(Some(ManagedProvenance::Birth(birth)))
+            }
+            Err(birth_error) => self
+                .verify_historical_operation(read, operation, identity)
+                .await
+                .map(|proof| Some(ManagedProvenance::Historical(proof)))
+                .with_context(|| birth_error.to_string()),
+        }
     }
 
     async fn verify_diagnostic_terminal(
@@ -2721,13 +3284,12 @@ impl Engine {
         &self,
         read: &GeometryIdentity<'_>,
         catalog: Option<&CatalogLane>,
-    ) -> Result<()> {
+    ) -> Result<Option<ManagedProvenance>> {
         if catalog.is_none() && read.nonce.is_empty() && read.diagnostic.is_none() {
-            return Ok(());
+            return Ok(None);
         }
         self.observe_terminal_records(read, Self::terminal_catalog(read, catalog).await, false)
             .await
-            .map(drop)
     }
 
     async fn prove_independent_live_birth(&self, read: &GeometryIdentity<'_>) -> Result<bool> {
@@ -2768,7 +3330,7 @@ impl Engine {
         read: &GeometryIdentity<'_>,
         records: Result<RuntimeCatalog, ProductIssue>,
         bound: bool,
-    ) -> Result<Option<OriginalBirth>> {
+    ) -> Result<Option<ManagedProvenance>> {
         match records {
             Ok(RuntimeCatalog {
                 diagnostic: Some(mark),
@@ -2833,7 +3395,7 @@ impl Engine {
         &self,
         read: &GeometryIdentity<'_>,
         catalog: Option<&CatalogLane>,
-        bound: bool,
+        terminal: Option<&TerminalView>,
     ) -> Result<bool, TerminalStatusFailure> {
         if catalog.is_none() && read.nonce.is_empty() && read.diagnostic.is_none() {
             return Ok(true);
@@ -2866,9 +3428,23 @@ impl Engine {
             let proof = self
                 .verify_terminal_birth(read, operation, identity)
                 .await?;
-            return Ok(proof.is_none_or(|birth| birth.tty == read.tty));
+            if let (Some(terminal), Some(ManagedProvenance::Historical(proof))) = (terminal, &proof)
+            {
+                self.refresh_historical_view(terminal, proof);
+            }
+            return Ok(proof.is_none_or(|proof| proof.tty() == read.tty));
         }
-        if !bound
+        if let Some(terminal) = terminal
+            && let Some(sample) = read.sample
+            && matches!(records, Err(issue) if issue.storage_fault() || issue == ProductIssue::WorkspaceCheckTimedOut)
+            && let Some(origin) = self.historical_view(terminal)
+        {
+            if self.verify_historical(sample).await?.origin != origin {
+                return Err(TerminalStatusFailure::Changed);
+            }
+            return Ok(true);
+        }
+        if terminal.is_none()
             && read.state == PaneState::Live
             && !read.nonce.is_empty()
             && matches!(records, Err(issue) if issue.storage_fault() || issue == ProductIssue::WorkspaceCheckTimedOut)
@@ -2878,7 +3454,8 @@ impl Engine {
             }
             return Ok(true);
         }
-        self.observe_terminal_records(read, records, bound).await?;
+        self.observe_terminal_records(read, records, terminal.is_some())
+            .await?;
         Ok(true)
     }
 
@@ -2897,7 +3474,7 @@ impl Engine {
         read: &GeometryReadback,
         catalog: Option<&CatalogLane>,
         settle_diagnostic: bool,
-    ) -> Result<Option<OriginalBirth>> {
+    ) -> Result<Option<ManagedProvenance>> {
         let identity = &read.identity();
         let Some(catalog) = catalog else {
             ensure!(
@@ -2928,8 +3505,16 @@ impl Engine {
                 "Managed terminal birth operation changed"
             );
         }
-        self.verify_terminal_operation(identity, records.managed.as_ref())
-            .await
+        let proof = self
+            .verify_terminal_operation(identity, records.managed.as_ref())
+            .await?;
+        ensure!(
+            !matches!(proof, Some(ManagedProvenance::Birth(_)))
+                || !read.paste_ready()
+                || read.birth_bound(),
+            "Managed writer launch does not match its birth"
+        );
+        Ok(proof)
     }
 
     async fn scoped_geometry(&self, terminal: &TerminalView) -> Result<GeometryReadback> {
@@ -2987,9 +3572,10 @@ impl Engine {
                 },
                 diagnostic: fields[10].strip_prefix('~'),
                 tty: Path::new(fields[15]),
+                sample: None,
             };
             if target.runtime_id == expected.runtime_id {
-                self.observe_status_identity(&identity, catalog, false)
+                self.observe_status_identity(&identity, catalog, None)
                     .await?;
             } else {
                 self.observe_terminal(&identity, catalog).await?;
@@ -3062,7 +3648,7 @@ impl Engine {
             .status_geometry(&terminal.target, None, catalog)
             .await?;
         let tty_matches = self
-            .observe_status_identity(&before.identity(), catalog, true)
+            .observe_status_identity(&before.identity(), catalog, Some(&terminal))
             .await?;
         let measurement = tty_matches.then(|| self.measure_provider(&before));
         let after = self
@@ -3071,7 +3657,7 @@ impl Engine {
         let provider = match after {
             Ok(after) => {
                 let tty_matches = self
-                    .observe_status_identity(&after.identity(), catalog, true)
+                    .observe_status_identity(&after.identity(), catalog, Some(&terminal))
                     .await?;
                 measurement
                     .filter(|_| tty_matches)
@@ -3081,6 +3667,11 @@ impl Engine {
                     })
             }
             Err(TerminalStatusFailure::Changed) => return Err(TerminalStatusFailure::Changed),
+            Err(error @ TerminalStatusFailure::Unavailable(_))
+                if before.historical_launch().is_some() && !before.nonce.is_empty() =>
+            {
+                return Err(error);
+            }
             Err(TerminalStatusFailure::Unavailable(_)) => None,
         };
         Ok(before.status(terminal, provider))
@@ -3242,7 +3833,15 @@ impl Engine {
         );
         let (_, device) = sample_tty(&read.tty)?;
         ensure!(device == birth.device, "Managed terminal device changed");
-        self.prove_paste_buffer_io(&read).await?;
+        self.prove_paste_buffer_io(
+            &read,
+            ProbeSource::Managed {
+                operation: operation.id,
+                nonce: operation.nonce,
+                ticket: birth.ticket,
+            },
+        )
+        .await?;
         let fresh = self.geometry(operation.runtime_id, pane).await?;
         ensure!(
             fresh == read && tty_identity(&fs::symlink_metadata(&fresh.tty)?)? == device,
@@ -3304,10 +3903,28 @@ impl Engine {
             "Paste launch provenance is unavailable"
         );
         self.authorize_terminal_writer(&read, catalog).await?;
-        self.prove_paste_buffer_io(&read).await?;
-        self.authorize_terminal_writer(&read, catalog).await?;
+        let source = match diagnostic {
+            Some(stamp) => ProbeSource::Diagnostic(parse_uuid(
+                stamp
+                    .split_once(':')
+                    .context("Missing diagnostic probe stamp")?
+                    .0,
+            )?),
+            None => ProbeSource::CatalogFree,
+        };
+        let device = self.prove_paste_buffer_io(&read, source).await?;
+        let fresh = self.geometry(runtime.runtime_id, &identity.pane).await?;
+        ensure!(
+            fresh == read && tty_identity(&fs::symlink_metadata(&fresh.tty)?)? == device,
+            "Diagnostic process changed before writer initialization"
+        );
+        self.authorize_terminal_writer(&fresh, catalog).await?;
 
-        let guard = format_all([self.paste_guard(&read), format_equal("pane_input_off", 0)]);
+        let guard = format_all([
+            self.paste_guard(&fresh),
+            format_equal("pane_input_off", 0),
+            format_equal("after-if-shell", ""),
+        ]);
         let launch = Uuid::new_v4().to_string();
         let mut stamped = read.clone();
         stamped.paste_launch.clone_from(&launch);
@@ -3329,7 +3946,11 @@ impl Engine {
         Ok(())
     }
 
-    async fn prove_paste_buffer_io(&self, read: &GeometryReadback) -> Result<()> {
+    async fn prove_paste_buffer_io(
+        &self,
+        read: &GeometryReadback,
+        source: ProbeSource,
+    ) -> Result<TtyIdentity> {
         let commands = self.geometry_command(&["list-commands"]).await?;
         ensure!(
             commands
@@ -3340,20 +3961,54 @@ impl Engine {
                     .any(|line| line.starts_with("load-buffer ")),
             "Exact paste sender is unavailable"
         );
-        let name = format!("rs-paste-probe-{}", Uuid::new_v4().simple());
-        let sample = format!("{}\n\t\u{2603}", Uuid::new_v4());
-        let loaded = self.load_paste(read, &name, sample.as_bytes(), None).await;
-        let returned = match loaded {
-            Ok(()) => {
-                self.geometry_command(&["save-buffer", "-b", &name, "-"])
-                    .await
+        let mut snapshot = self.read_custody(read.server).await?;
+        for slot in snapshot.iter().flatten() {
+            let Some(active) = &slot.active else { continue };
+            let (runtime, pane, _, _) = active.identity();
+            if runtime == read.target.runtime_id || pane == read.target.pane {
+                ensure!(
+                    pane != read.target.pane && runtime == read.target.runtime_id,
+                    "Original probe custody remains on this pane"
+                );
+                self.close_replaced_custody(read, slot, active).await?;
             }
-            Err(error) => Err(error),
-        };
-        let deleted = self.delete_paste(read, &name, false).await;
+        }
+        snapshot = self.read_custody(read.server).await?;
+        ensure!(
+            !snapshot
+                .iter()
+                .flatten()
+                .any(|slot| slot.active.as_ref().is_some_and(|active| {
+                    let (runtime, pane, _, _) = active.identity();
+                    runtime == read.target.runtime_id || pane == read.target.pane
+                })),
+            "Probe predecessor custody is unsettled"
+        );
+        let index = free_custody_index(&snapshot).context("Probe custody slots are full")?;
+        let possible = CustodySlot::bind_probe(read, index, source)?;
+        self.mutate_custody(read, snapshot[index].as_ref(), &possible, None)
+            .await?;
+        let active = possible
+            .active
+            .as_ref()
+            .and_then(CustodyBinding::probe)
+            .context("Missing probe custody")?;
+        let sample = format!("{}\n\t\u{2603}", Uuid::new_v4());
+        if let Err(error) = self.load_paste(read, sample.as_bytes(), &possible).await {
+            // @invariant: Buffer absence cannot settle an outstanding stdin load.
+            let _ = self.close_custody(read, &possible).await;
+            return Err(error);
+        }
+        let completed = possible.complete_probe(read.server)?;
+        self.mutate_custody(read, Some(&possible), &completed, None)
+            .await?;
+        let returned = self
+            .geometry_command(&["save-buffer", "-b", &active.buffer, "-"])
+            .await;
+        self.retire_custody(read, &completed, Some(&active.buffer))
+            .await?;
         ensure!(returned? == sample, "Paste sender stdin readback differs");
-        deleted?;
-        Ok(())
+        Ok(active.device)
     }
 
     async fn transition_marker(
@@ -3467,9 +4122,10 @@ impl Engine {
             rows.next() == Some(CUSTODY_END),
             "Incomplete paste custody snapshot"
         );
-        let mut slots: CustodySnapshot = std::array::from_fn(|_| None);
+        let mut slots: CustodySnapshot = Box::new(std::array::from_fn(|_| None));
         let mut mutations = HashSet::new();
         let mut panes = HashSet::new();
+        let mut runtimes = HashSet::new();
         let mut buffers = HashSet::new();
         let mut nonces = HashSet::new();
         for row in rows {
@@ -3484,10 +4140,12 @@ impl Engine {
                 "Duplicate paste custody slot or mutation"
             );
             if let Some(active) = &slot.active {
+                let (runtime, pane, nonce, buffer) = active.identity();
                 ensure!(
-                    panes.insert(active.pane.clone())
-                        && buffers.insert(active.buffer.name.clone())
-                        && nonces.insert(active.buffer.nonce),
+                    runtimes.insert(runtime)
+                        && panes.insert(pane.to_owned())
+                        && buffers.insert(buffer.to_owned())
+                        && nonces.insert(nonce),
                     "Duplicate paste custody binding"
                 );
             }
@@ -3527,20 +4185,43 @@ impl Engine {
             }
             None => ("-so", format_equal(&option, "")),
         };
-        let guard = self.custody_guard(read, compare);
+        let active = next
+            .active
+            .as_ref()
+            .or_else(|| previous.and_then(|slot| slot.active.as_ref()));
+        let origin = active
+            .and_then(CustodyBinding::probe)
+            .filter(|probe| next.active.is_some() || probe.target.pane == *pane)
+            .map(|probe| probe.original_guard(read))
+            .transpose()?;
+        let checked = |comparison| {
+            format_all(
+                std::iter::once(self.custody_guard(read, comparison)).chain(origin.iter().cloned()),
+            )
+        };
+        let guard = checked(compare);
         let set = format!("set-option {flag} {option} {}", next.value);
         let branch = match delete {
-            Some(buffer) => format!("delete-buffer -b {buffer} ; {set}"),
+            Some(buffer) => {
+                ensure!(
+                    next.active.is_none()
+                        && previous
+                            .and_then(|slot| slot.active.as_ref())
+                            .is_some_and(|active| active.identity().3 == buffer),
+                    "Custody retirement deletion does not match its record"
+                );
+                format!("delete-buffer -b {buffer} ; {set}")
+            }
             None => set,
         };
         let claim = next.active.as_ref().filter(|active| {
-            !active.completed
+            !active.completed()
                 && previous.is_none_or(|slot| slot.active.is_none())
                 && delete.is_none()
         });
         let rejection = claim.map(|_| {
             let prior = previous.map_or("", |slot| slot.value.as_str());
-            let changed = self.custody_guard(read, format!("#{{!=:#{{{option}}},{prior}}}"));
+            let changed = checked(format!("#{{!=:#{{{option}}},{prior}}}"));
             let witness = format!("rs-paste-custody-conflict-{}", next.mutation);
             let otherwise = format!(
                 "if-shell -F -t {pane} {} {}",
@@ -3572,10 +4253,13 @@ impl Engine {
             })
             && !observed.iter().flatten().any(|slot| {
                 slot.active.as_ref().is_some_and(|active| {
-                    active.runtime == claim.runtime
-                        || active.pane == claim.pane
-                        || active.buffer.name == claim.buffer.name
-                        || active.buffer.nonce == claim.buffer.nonce
+                    let (runtime, pane, nonce, buffer) = active.identity();
+                    let (claimed_runtime, claimed_pane, claimed_nonce, claimed_buffer) =
+                        claim.identity();
+                    runtime == claimed_runtime
+                        || pane == claimed_pane
+                        || nonce == claimed_nonce
+                        || buffer == claimed_buffer
                 })
             })
         {
@@ -3601,22 +4285,33 @@ impl Engine {
     async fn load_paste(
         &self,
         read: &GeometryReadback,
-        name: &str,
         data: &[u8],
-        custody: Option<&CustodySlot>,
+        custody: &CustodySlot,
     ) -> Result<()> {
         ensure!(
             self.private_sender_socket(),
             "Paste load target unavailable"
         );
+        let active = custody.active.as_ref().context("Missing load custody")?;
+        ensure!(!active.completed(), "Load custody already completed");
         let pane = &read.target.pane;
+        let mut guard = self.custody_guard(read, custody.guard(read.server));
+        let name = match active {
+            CustodyBinding::Payload(payload) => {
+                ensure!(
+                    payload.matches(read, &payload.buffer) && read.paste_marker == payload.marker,
+                    "Payload load custody does not match its pane"
+                );
+                &payload.buffer.name
+            }
+            CustodyBinding::Probe(probe) => {
+                guard = format_all([guard, probe.original_guard(read)?]);
+                &probe.buffer
+            }
+        };
         let witness = format!("rs-paste-loaded-{}", Uuid::new_v4());
         let printed = pane_witness(pane, &witness);
         let branch = format!("load-buffer -b {name} - ; {printed}");
-        let guard = match custody {
-            Some(slot) => self.custody_guard(read, slot.guard(read.server)),
-            None => self.paste_guard(read),
-        };
         tokio::time::timeout(self.terminal_command_watchdog(), async {
             let mut child = Command::new(&self.tmux)
                 .args(["-N", "-S"])
@@ -3702,12 +4397,19 @@ impl Engine {
             read.sender_supported && self.private_sender_socket(),
             "Paste cleanup unavailable"
         );
-        let buffer = active.buffer.name.as_str();
-        let guard = format_all([
+        let (_, _, _, buffer) = active.identity();
+        let mut guards = vec![
             self.custody_guard(read, slot.guard(read.server)),
             format_equal("after-list-buffers", ""),
-        ]);
-        let delete = if active.completed {
+        ];
+        if let Some(probe) = active
+            .probe()
+            .filter(|probe| probe.target.pane == read.target.pane)
+        {
+            guards.push(probe.original_guard(read)?);
+        }
+        let guard = format_all(guards);
+        let delete = if active.completed() {
             self.paste_buffer_present(&read.target.pane, &guard, buffer)
                 .await?
         } else {
@@ -3800,6 +4502,46 @@ impl Engine {
         Ok(())
     }
 
+    async fn close_replaced_custody(
+        &self,
+        current: &GeometryReadback,
+        slot: &CustodySlot,
+        active: &CustodyBinding,
+    ) -> Result<()> {
+        let (runtime, pane, _, _) = active.identity();
+        ensure!(
+            runtime == current.target.runtime_id,
+            "Replacement runtime changed"
+        );
+        let live_probe = active.probe().is_some() && current.state == PaneState::Live;
+        let device = live_probe
+            .then(|| tty_identity(&fs::symlink_metadata(&current.tty)?))
+            .transpose()?;
+        self.prove_paste_replacement(current.server, pane, current)
+            .await?;
+        if active.probe().is_some() {
+            let fresh = self
+                .geometry_in_state(
+                    runtime,
+                    &current.target.pane,
+                    current.state != PaneState::Live,
+                )
+                .await?;
+            ensure!(
+                fresh == *current,
+                "Replacement probe cleanup target changed"
+            );
+            if let Some(device) = device {
+                ensure!(
+                    process_start(fresh.target.pid)? == fresh.target.process_start
+                        && tty_identity(&fs::symlink_metadata(&fresh.tty)?)? == device,
+                    "Replacement probe process or TTY changed"
+                );
+            }
+        }
+        self.close_custody(current, slot).await
+    }
+
     async fn reclaim_superseded_paste(
         &self,
         scope: &PasteScope,
@@ -3843,26 +4585,25 @@ impl Engine {
         }
         let mut predecessors_closed = true;
         for slot in snapshot.iter().flatten() {
-            let Some(active) = slot.active.as_ref().filter(|active| {
-                active.runtime == current.target.runtime_id && active.pane != current.target.pane
-            }) else {
+            let Some(active) = &slot.active else { continue };
+            let (runtime, pane, _, _) = active.identity();
+            if runtime != current.target.runtime_id || pane == current.target.pane {
                 continue;
-            };
+            }
             if self
-                .prove_paste_replacement(current.server, &active.pane, current)
+                .close_replaced_custody(current, slot, active)
                 .await
-                .is_ok()
-                && self.close_custody(current, slot).await.is_ok()
+                .is_err()
             {
+                predecessors_closed = false;
+            } else if let Some(payload) = active.payload() {
                 lane.paste_quarantines.retain(|scope| {
                     scope.original.server != current.server
                         || !scope
                             .buffer
                             .as_ref()
-                            .is_some_and(|buffer| active.matches(&scope.original, buffer))
+                            .is_some_and(|buffer| payload.matches(&scope.original, buffer))
                 });
-            } else {
-                predecessors_closed = false;
             }
         }
         let mut index = 0;
@@ -3872,7 +4613,7 @@ impl Engine {
                 || snapshot.iter().flatten().any(|slot| {
                     slot.active.as_ref().is_some_and(|active| {
                         scope.original.server == current.server
-                            && active.pane == scope.original.target.pane
+                            && active.identity().1 == scope.original.target.pane
                     })
                 });
             if !has_server_record && self.reclaim_superseded_paste(scope, current).await.is_ok() {
@@ -4022,15 +4763,18 @@ impl Engine {
         if snapshot.iter().flatten().any(|slot| {
             slot.active
                 .as_ref()
-                .is_some_and(|active| active.pane == read.target.pane)
+                .is_some_and(|active| active.identity().1 == read.target.pane)
         }) {
             return self.quarantine(&mut lane, &binding, PasteScope::sampled(&read));
         }
-        let Some(index) = snapshot
-            .iter()
-            .position(|slot| slot.as_ref().is_some_and(|slot| slot.active.is_none()))
-            .or_else(|| snapshot.iter().position(Option::is_none))
-        else {
+        if snapshot.iter().flatten().any(|slot| {
+            slot.active
+                .as_ref()
+                .is_some_and(|active| active.identity().0 == runtime)
+        }) {
+            return PasteResult::Unavailable {};
+        }
+        let Some(index) = free_custody_index(&snapshot) else {
             return PasteResult::Unavailable {};
         };
         let buffer = PasteBuffer {
@@ -4117,9 +4861,7 @@ impl Engine {
         {
             return self.quarantine(&mut lane, &binding, scope);
         }
-        let loaded = self
-            .load_paste(&scope.original, &buffer.name, &data, Some(custody))
-            .await;
+        let loaded = self.load_paste(&scope.original, &data, custody).await;
         drop(data);
         if loaded.is_err() {
             return self.quarantine(&mut lane, &binding, scope);
@@ -4143,8 +4885,6 @@ impl Engine {
         }
         let armed = buffer.marker(&scope.original, 'a');
         let spent = buffer.marker(&scope.original, 's');
-        let buffer_name = buffer.name.clone();
-        let nonce = buffer.nonce;
         scope.custody = Some(completed);
         if self
             .authorize_terminal_writer(&scope.original, catalog)
@@ -4171,13 +4911,18 @@ impl Engine {
                 && read.paste_marker == armed
                 && read.sender_supported
         });
-        let send = self.guarded_paste(
-            &scope.original,
-            &spent,
-            &buffer_name,
-            nonce,
-            scope.custody.as_ref().expect("completed paste custody"),
-        );
+        let custody = scope.custody.as_ref().expect("completed paste custody");
+        let Some(payload) = custody
+            .active
+            .as_ref()
+            .and_then(CustodyBinding::payload)
+            .filter(|payload| {
+                payload.completed && payload.matches(&scope.original, &payload.buffer)
+            })
+        else {
+            return self.quarantine(&mut lane, &binding, scope);
+        };
+        let send = self.guarded_paste(&scope.original, &spent, custody, payload);
         // @invariant: The serialized monotonic check is the last admission step before submission.
         let rejection = match exact {
             Some(read) if self.owners().paste_live(&binding, self.now()) => {
@@ -4223,10 +4968,11 @@ impl Engine {
         &self,
         held: &GeometryReadback,
         spent: &str,
-        buffer: &str,
-        nonce: Uuid,
         custody: &CustodySlot,
+        payload: &PayloadCustody,
     ) -> GuardedPaste {
+        let buffer = &payload.buffer.name;
+        let nonce = payload.buffer.nonce;
         let pane = held.target.pane.clone();
         let guard = format_all([
             self.custody_guard(held, custody.guard(held.server)),
@@ -4432,7 +5178,7 @@ impl Engine {
         if snapshot.iter().flatten().any(|slot| {
             slot.active
                 .as_ref()
-                .is_some_and(|active| active.pane == read.target.pane)
+                .is_some_and(|active| active.identity().1 == read.target.pane)
         }) {
             return Ok(control_hold());
         }
@@ -4440,7 +5186,7 @@ impl Engine {
             || snapshot.iter().flatten().any(|slot| {
                 slot.active
                     .as_ref()
-                    .is_some_and(|active| active.runtime == runtime_id)
+                    .is_some_and(|active| active.identity().0 == runtime_id)
             })
         {
             if terminal.is_some() {
@@ -4457,6 +5203,14 @@ impl Engine {
                 read = current;
             }
             self.reconcile_paste(&mut lane, &read, &snapshot).await;
+            if snapshot.iter().flatten().any(|slot| {
+                slot.active
+                    .as_ref()
+                    .and_then(CustodyBinding::probe)
+                    .is_some_and(|probe| probe.target.runtime_id == runtime_id)
+            }) {
+                return Ok(control_hold());
+            }
         }
         if let Some(hold) = read.paste_admission_hold() {
             if hold == PasteAdmission::PriorSendUnknown {
@@ -4652,10 +5406,19 @@ impl Engine {
             self.reconcile_paste(lane, &read, snapshot).await,
             "Original paste custody is unconfirmed"
         );
+        if let Some(probe) = snapshot.iter().flatten().find(|slot| {
+            slot.active
+                .as_ref()
+                .and_then(CustodyBinding::probe)
+                .is_some_and(|probe| probe.target.pane == read.target.pane)
+        }) {
+            self.close_custody(&read, probe).await?;
+        }
         let sampled = PasteScope::sampled(&read);
         let slot = snapshot.iter().flatten().find(|slot| {
             slot.active
                 .as_ref()
+                .and_then(CustodyBinding::payload)
                 .is_some_and(|active| active.pane == read.target.pane)
         });
         ensure!(
@@ -4680,7 +5443,9 @@ impl Engine {
                 "Original paste buffer identity is unconfirmed"
             );
         }
-        let active = slot.and_then(|slot| slot.active.as_ref());
+        let active = slot
+            .and_then(|slot| slot.active.as_ref())
+            .and_then(CustodyBinding::payload);
         if let Some(active) = active {
             ensure!(
                 sampled
@@ -4775,7 +5540,7 @@ impl Engine {
                 format_equal("after-kill-session", ""),
             ]
             .into_iter()
-            .chain(birth.as_ref().map(OriginalBirth::guard)),
+            .chain(birth.as_ref().map(ManagedProvenance::guard)),
         );
         let witness = format!("rs-stopped-{}", Uuid::new_v4());
         let printed = pane_witness(pane, &witness);
@@ -4802,11 +5567,31 @@ impl Engine {
         Ok(Response::Stopped { runtime_id })
     }
 
+    async fn prove_cli_legacy(&self, runtime: &Runtime) -> Result<()> {
+        let output = self.geometry_output(&runtime.pane_id).await?;
+        let fields = Self::geometry_fields(&output)?;
+        ensure!(
+            fields[5] == runtime.pane_id
+                && fields[7] == runtime.tmux_name
+                && fields[10].is_empty()
+                && fields[11] == if runtime.exited { "1" } else { "0" },
+            "CLI terminal provenance is unconfirmed"
+        );
+        self.corroborate_legacy(
+            &runtime.pane_id,
+            &runtime.tmux_name,
+            runtime.pane_pid,
+            runtime.exited,
+            &fields[..5].join("|"),
+        )
+        .await
+    }
+
     async fn cli_observation(
         &self,
         runtime: &Runtime,
         catalog: &CatalogLane,
-    ) -> Result<Option<(GeometryReadback, Option<OriginalBirth>)>> {
+    ) -> Result<Option<(GeometryReadback, Option<ManagedProvenance>)>> {
         let id = runtime.runtime_id;
         let records = Self::runtime_catalog(id, runtime.session_id, catalog)
             .await
@@ -4816,24 +5601,7 @@ impl Engine {
         } else if let Some(mark) = &records.diagnostic {
             mark.generation
         } else {
-            let output = self.geometry_output(&runtime.pane_id).await?;
-            let fields = Self::geometry_fields(&output)?;
-            ensure!(
-                fields[5] == runtime.pane_id
-                    && fields[7] == runtime.tmux_name
-                    && fields[10].is_empty()
-                    && fields[11] == if runtime.exited { "1" } else { "0" },
-                "CLI terminal provenance is unconfirmed"
-            );
-            let scope = fields[..5].join("|");
-            self.corroborate_legacy(
-                &runtime.pane_id,
-                &runtime.tmux_name,
-                runtime.pane_pid,
-                runtime.exited,
-                &scope,
-            )
-            .await?;
+            self.prove_cli_legacy(runtime).await?;
             return Ok(None);
         };
         let read = if runtime.exited {
@@ -5089,7 +5857,10 @@ impl Engine {
                 let runtime = self.find(runtime_id).await?;
                 let checked = match catalog {
                     Some(catalog) => self.cli_observation(&runtime, catalog).await?,
-                    None => None,
+                    None => {
+                        self.prove_cli_legacy(&runtime).await?;
+                        None
+                    }
                 };
                 let text = if let Some((read, birth)) = checked {
                     let pane = &read.target.pane;
@@ -5123,6 +5894,8 @@ impl Engine {
                 );
                 if let Some(catalog) = catalog {
                     self.cli_observation(&runtime, catalog).await?;
+                } else {
+                    self.prove_cli_legacy(&runtime).await?;
                 }
                 Ok(Response::Attachment {
                     tmux_name: runtime.tmux_name,
@@ -5144,13 +5917,14 @@ impl Engine {
                         format!("Terminal observation unavailable for runtime {runtime_id}")
                     })?;
                 let read = self.geometry_for_runtime(&runtime, server).await?;
-                self.observe_terminal(&read.identity(), catalog).await?;
+                let proof = self.observe_terminal(&read.identity(), catalog).await?;
                 let terminal = TerminalView {
                     target: read.target.clone(),
                     agent_epoch: self.agent_epoch,
                     view_id,
                 };
                 let sample = self.sample_provider(&read).await.ok();
+                self.remember_historical_view(&terminal, proof.as_ref());
                 Ok(Response::TerminalOpened {
                     status: read.status(terminal, sample),
                 })
@@ -5160,9 +5934,21 @@ impl Engine {
                     .await
             }
             Request::TerminalStatus { terminal } => {
-                match self.observe_terminal_status(terminal, catalog).await {
+                match self
+                    .observe_terminal_status(terminal.clone(), catalog)
+                    .await
+                {
                     Ok(status) => Ok(Response::TerminalStatus { status }),
-                    Err(TerminalStatusFailure::Changed) => Ok(Response::TerminalChanged {}),
+                    Err(TerminalStatusFailure::Changed) => {
+                        let mut views = self.historical_views.lock().expect("historical view lock");
+                        if views
+                            .get(&terminal.view_id)
+                            .is_some_and(|issued| issued.terminal == terminal)
+                        {
+                            views.remove(&terminal.view_id);
+                        }
+                        Ok(Response::TerminalChanged {})
+                    }
                     Err(TerminalStatusFailure::Unavailable(error)) => Err(error),
                 }
             }
@@ -5444,8 +6230,20 @@ mod tests {
         let occupied = f.engine.read_custody(server).await.unwrap();
         let old = occupied[0].as_ref().unwrap();
         let neighbor = occupied[1].as_ref().unwrap();
-        let old_binding = old.active.as_ref().unwrap();
-        assert!(old_binding.completed && neighbor.active.as_ref().unwrap().completed);
+        let old_binding = old
+            .active
+            .as_ref()
+            .and_then(CustodyBinding::payload)
+            .unwrap();
+        assert!(
+            old_binding.completed
+                && neighbor
+                    .active
+                    .as_ref()
+                    .and_then(CustodyBinding::payload)
+                    .unwrap()
+                    .completed
+        );
         assert_eq!(
             paste_reply(&f.engine, ack(&first, first_receipt)).await,
             PasteResult::Acknowledged { writable: true }
@@ -5462,10 +6260,21 @@ mod tests {
         let next_receipt = receipt(paste_reply(&f.engine, commit(&first, DRAFT.len())).await);
         let reused = f.engine.read_custody(server).await.unwrap();
         let next = reused[0].as_ref().unwrap();
-        assert!(next.active.as_ref().unwrap().completed);
+        assert!(
+            next.active
+                .as_ref()
+                .and_then(CustodyBinding::payload)
+                .unwrap()
+                .completed
+        );
         assert_ne!(next.mutation, free.mutation);
         assert_ne!(
-            next.active.as_ref().unwrap().buffer.name,
+            next.active
+                .as_ref()
+                .and_then(CustodyBinding::payload)
+                .unwrap()
+                .buffer
+                .name,
             old_binding.buffer.name
         );
         let read = f.engine.scoped_geometry(&first.terminal).await.unwrap();
@@ -5575,6 +6384,8 @@ mod tests {
                 "full" => {
                     for i in 0..CUSTODY_SLOTS {
                         read.target.pane = format!("%{}", i + 1);
+                        read.target.runtime_id = Uuid::new_v4();
+                        read.name = tmux_name(Uuid::new_v4(), read.target.runtime_id);
                         put(
                             i,
                             &CustodySlot::bind(&read, i, &bound(), "possible")
@@ -5713,7 +6524,11 @@ mod tests {
             let server = f.engine.generation().await.unwrap();
             let reserved = f.engine.read_custody(server).await.unwrap();
             let slot = reserved[0].as_ref().unwrap();
-            let active = slot.active.as_ref().unwrap();
+            let active = slot
+                .active
+                .as_ref()
+                .and_then(CustodyBinding::payload)
+                .unwrap();
             assert_eq!(active.completed, completed);
             let buffer = &active.buffer.name;
             if completed {
@@ -5854,7 +6669,7 @@ mod tests {
 
     #[tokio::test]
     async fn w1_terminal_paste_sender_proof() {
-        let f = Fixture::paste();
+        let f = Fixture::new();
         let target = &f.terminal.target;
         let read = f
             .engine

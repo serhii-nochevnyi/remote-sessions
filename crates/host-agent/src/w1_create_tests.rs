@@ -214,10 +214,15 @@ case "$4" in
           guard=$8
           pane=$7
           guard_equals pane_id "$pane" && guard_equals @rs_create_generation "$token" || exit 0
+          if guard_equals @rs_create_initializer ""; then
+            guard_equals @rs_create_birth "" &&
+              guard_equals @rs_paste_launch "$(option_value paste-launch)" &&
+              guard_equals @rs_paste_admission "$(option_value marker)" || exit 1
+          fi
           cat output
           printf '%s\n' "$9" | awk '{print $NF}' ;;
         'set-option -s'*' @rs_paste_custody_'*|'delete-buffer '*' ; set-option -s @rs_paste_custody_'*)
-          test "$5" = -F && test "$#" = 9 && test "$3" = "$PWD/tmux.sock"
+          test "$5" = -F && { test "$#" = 9 || test "$#" = 10; } && test "$3" = "$PWD/tmux.sock"
           guard=$8
           target=$7
           set -f
@@ -251,9 +256,10 @@ case "$4" in
           rest=${value#*~}
           mutation=${rest%%~*}
           state=${rest#*~}
-          test "$version" = v1 && test "${#mutation}" -eq 36
+          case "$version" in v1|v2) ;; *) exit 1 ;; esac
+          test "${#mutation}" -eq 36
           case "$mutation" in *[!0-9a-f-]*) exit 1 ;; esac
-          case "$prior" in "v1~$mutation~"*) exit 1 ;; esac
+          case "$prior" in v[12]"~$mutation~"*) exit 1 ;; esac
           for name in $(cat names); do
             IFS='|' read -r session window pane pid < "$name.pane"
             if test "$pane" != "$target"; then continue; fi
@@ -262,7 +268,6 @@ case "$4" in
               guard_equals session_id "$session" && guard_equals window_id "$window" &&
               guard_equals pane_id "$pane" && guard_equals pane_pid "$pid" &&
               guard_equals pane_tty "$(cat tty)" && guard_equals pane_dead "$(cat "$name.dead")" &&
-              guard_equals @rs_create_nonce "$(cat "$name.nonce"):$(cat "$name.stamp")" &&
               guard_equals @rs_resize_epoch "$(option_value epoch)" &&
               guard_equals @rs_paste_launch "$(option_value paste-launch)" &&
               guard_equals @rs_paste_admission "$(option_value marker)" &&
@@ -270,6 +275,11 @@ case "$4" in
               guard_equals window_index 0 && guard_equals pane_index 0 &&
               guard_equals window-size manual && guard_equals version 3.8 &&
               guard_equals socket_path "$PWD/tmux.sock" || exit 0
+            if test -f "$name.nonce"; then
+              guard_equals @rs_create_nonce "$(cat "$name.nonce"):$(cat "$name.stamp")" || exit 0
+            else
+              guard_equals @rs_create_nonce "" || exit 0
+            fi
             case "$(option_value paste-launch)" in
               ??????????????8*) guard_equals @rs_create_birth "$(cat "$name.birth")" || exit 0 ;;
             esac
@@ -277,6 +287,17 @@ case "$4" in
               guard_equals "$hook" "" || exit 0
             done
             case "$state" in
+              "possible~probe~$name~$token~42~100~"*)
+                test "$version" = v2
+                case "$prior" in ''|v1~*~free) ;; *) exit 1 ;; esac
+                guard_equals @rs_create_initializer "$(option_value "$name.initializer")" &&
+                  guard_equals @rs_create_birth "$(option_value "$name.birth")" &&
+                  guard_equals @rs_diagnostic_create "$(option_value "$name.diagnostic")" || exit 0
+                probe_tuple="${session#?}~${window#?}~${pane#?}~$pid"
+                case "$state" in *"~$probe_tuple~"*"~$(cat tty)~"*) ;; *) exit 1 ;; esac
+                valid_buffer "${state##*~}"
+                printf '%s\n' "$option" > last-probe-option
+                printf '%s' "$value" > last-probe-claim ;;
               "possible~$name~$(cat tty)~$(cat marker)")
                 case "$prior" in ''|v1~*~free) ;; *) exit 1 ;; esac
                 case "$(cat marker)" in v1~*~"$token"~42~100~*~l~*) ;; *) exit 1 ;; esac
@@ -285,7 +306,8 @@ case "$4" in
                 old=${prior#*~}; old=${old#*~}
                 test "$old" = "possible~${state#*~}" || exit 1 ;;
               free)
-                case "$prior" in v1~*~possible~*|v1~*~completed~*) ;; *) exit 1 ;; esac ;;
+                test "$version" = v1
+                case "$prior" in v[12]~*~possible~*|v[12]~*~completed~*) ;; *) exit 1 ;; esac ;;
               *) exit 1 ;;
             esac
             if test -n "$cleanup"; then
@@ -330,8 +352,10 @@ case "$4" in
             if test "$pane" != "$target"; then continue; fi
             dead=$(cat "$name.dead")
             tty=$(cat tty)
-            nonce=$(cat "$name.nonce")
-            stamp=$(cat "$name.stamp")
+            nonce=$(option_value "$name.nonce")
+            stamp=$(option_value "$name.stamp")
+            create_stamp=""
+            if test -n "$nonce"; then create_stamp="$nonce:$stamp"; fi
             epoch=$(option_value epoch)
             launch=$(option_value paste-launch)
             marker=$(option_value marker)
@@ -341,7 +365,7 @@ case "$4" in
               guard_equals session_name "$name" && guard_equals session_id "$session" &&
               guard_equals window_id "$window" && guard_equals pane_id "$pane" &&
               guard_equals pane_pid "$pid" && guard_equals pane_tty "$tty" &&
-              guard_equals @rs_create_nonce "$nonce:$stamp" &&
+              guard_equals @rs_create_nonce "$create_stamp" &&
               guard_equals @rs_resize_epoch "$epoch" &&
               guard_equals @rs_paste_launch "$launch" &&
               guard_equals @rs_paste_admission "$marker" &&
@@ -366,8 +390,14 @@ case "$4" in
                   case "$prior" in
                     v1~*~possible~"$name"~"$tty"~"$marker")
                       test "${prior##*~}" = "$buffer" || exit 0 ;;
+                    v2~*~possible~probe~"$name"~"$token"~42~100~*)
+                      test "${prior##*~}" = "$buffer" &&
+                        guard_equals @rs_create_initializer "$(option_value "$name.initializer")" &&
+                        guard_equals @rs_create_birth "$(option_value "$name.birth")" &&
+                        guard_equals @rs_diagnostic_create "$(option_value "$name.diagnostic")" || exit 0 ;;
                     *) exit 0 ;;
                   esac ;;
+                *) exit 0 ;;
               esac
               cat > "buffers/$buffer"
               printf 'load\n' >> buffer-loads
@@ -544,6 +574,17 @@ PY
         printf '%s\n' "$receipt" ;;
       *) exit 1 ;;
     esac ;;
+  show-options)
+    test "$#" -eq 14
+    test "$5 $6 $8 $9 ${10} ${11} ${12} ${13} ${14}" = "-pq -t @rs_create_initializer ; show-options -pq -t $7 @rs_create_birth"
+    for name in $(cat names); do
+      IFS='|' read -r session window pane pid < "$name.pane"
+      if test "$pane" != "$7"; then continue; fi
+      if test -f "$name.initializer"; then printf '@rs_create_initializer %s\n' "$(cat "$name.initializer")"; fi
+      if test -f "$name.birth"; then printf '@rs_create_birth %s\n' "$(cat "$name.birth")"; fi
+      exit 0
+    done
+    exit 1 ;;
   show-environment)
     test "$#" -eq 14
     case "$6" in =rs_*) ;; *) exit 1 ;; esac
@@ -1697,8 +1738,6 @@ async fn w1_create_guarded_paste_probe() {
 
     let guard = fs::read_to_string(fixture.root.join("last-buffer-guard")).unwrap();
     let guard = guard.trim_end();
-    let rejected = guard.replace("#{==:#{pane_id},%1}", "#{==:#{pane_id},%2}");
-    assert_ne!(guard, rejected);
     let name = probe.trim_end();
     let bytes = "  first\n\tСніг ☃\n ".as_bytes();
     let run = |args: &[&str], input: Option<&[u8]>| {
@@ -1725,14 +1764,25 @@ async fn w1_create_guarded_paste_probe() {
         format!("load-buffer -b {name} - ; display-message -p -l -t %1 rs-paste-loaded-control");
     let delete =
         format!("delete-buffer -b {name} ; display-message -p -l -t %1 rs-paste-cleanup-control");
-    let cleanup_guard = format!("#{{&&:{guard},#{{==:#{{after-list-buffers}},}}}}");
-    let rejected_cleanup = cleanup_guard.replace("#{==:#{pane_id},%1}", "#{==:#{pane_id},%2}");
     let guarded = |guard, branch, input| run(&["if-shell", "-F", "-t", "%1", guard, branch], input);
     let before = fixture.buffer_snapshot();
+    assert!(guarded(guard, &load, Some(bytes)).is_empty());
+    assert_eq!(fixture.buffer_snapshot(), before);
+
+    let option = fs::read_to_string(fixture.root.join("last-probe-option")).unwrap();
+    let prior = fs::read_to_string(fixture.root.join("last-probe-claim")).unwrap();
+    let (_, original) = prior.split_once("~possible~").unwrap();
+    let possible = format!("v2~{}~possible~{original}", Uuid::new_v4());
+    fixture.set(&format!("custody/{}", option.trim_end()), &possible);
+    let fresh_guard = guard.replace(&prior, &possible);
+    let rejected = fresh_guard.replace("#{==:#{pane_id},%1}", "#{==:#{pane_id},%2}");
+    assert_ne!(fresh_guard, rejected);
+    let cleanup_guard = format!("#{{&&:{fresh_guard},#{{==:#{{after-list-buffers}},}}}}");
+    let rejected_cleanup = cleanup_guard.replace("#{==:#{pane_id},%1}", "#{==:#{pane_id},%2}");
     assert!(guarded(&rejected, &load, None).is_empty());
     assert_eq!(fixture.buffer_snapshot(), before);
     assert_eq!(
-        guarded(guard, &load, Some(bytes)),
+        guarded(&fresh_guard, &load, Some(bytes)),
         b"rs-paste-loaded-control\n"
     );
     assert_eq!(run(&["save-buffer", "-b", name, "-"], None), bytes);
@@ -4076,4 +4126,1096 @@ fn w1_create_guard_rejects_tmux_fallback_and_replaced_cwd_before_provider_exec()
         Some(ProductIssue::WorkspaceChanged)
     );
     assert!(!witness.exists());
+}
+
+async fn seed_historical_create(
+    fixture: &Fixture,
+    lane: &CatalogLane,
+    workspace: Uuid,
+) -> Operation {
+    let key = Uuid::new_v4();
+    fixture.set("mode", "effect-lost");
+    assert!(matches!(
+        fixture.call(&create(key, workspace, None)).await,
+        CreateState::Unknown { .. }
+    ));
+    let operation = fixture_operation(lane, key).await;
+    assert_eq!(operation.stage, OperationStage::Marked);
+    for option in ["initializer", "birth"] {
+        fs::remove_file(fixture.root.join(format!("{}.{option}", operation.target))).unwrap();
+    }
+    operation
+}
+
+fn historical_marker(fixture: &Fixture, operation: &Operation, disposition: char) -> String {
+    let launch = Uuid::new_v4();
+    let nonce = Uuid::new_v4();
+    let pid = std::process::id();
+    let start = crate::engine::launch_fixture_process_start(pid).unwrap();
+    let epoch = if disposition == 'r' {
+        String::new()
+    } else {
+        format!("{}:{}", Uuid::new_v4(), Uuid::new_v4())
+    };
+    let suffix = if disposition == 'r' {
+        format!("r~{nonce}")
+    } else {
+        format!(
+            "{disposition}~{nonce}~1~rs-paste-{}",
+            Uuid::new_v4().simple()
+        )
+    };
+    assert_eq!(operation.generation.pid, 42);
+    fixture.set("paste-launch", launch.to_string());
+    fixture.set("epoch", &epoch);
+    let marker = format!(
+        "v1~{}~{}~42~100~1~1~1~{pid}~{start}~{}~{launch}~{epoch}~{suffix}",
+        operation.runtime_id, operation.generation.token, operation.nonce
+    );
+    fixture.set("marker", &marker);
+    marker
+}
+
+fn assert_original_operation(actual: &Operation, expected: &Operation) {
+    assert_same_reservation(expected, actual);
+    assert_eq!(actual.workspace_id, expected.workspace_id);
+    assert_eq!(actual.profile, expected.profile);
+    assert_eq!(actual.locator, expected.locator);
+    assert_eq!(actual.policy, expected.policy);
+    assert_eq!(actual.stage, expected.stage);
+}
+
+async fn inject_finalize_failure(lane: &CatalogLane) {
+    lane.run(|db, _| {
+        db.connection_for_test()
+            .execute_batch(
+                "CREATE TRIGGER fail_old_finalize BEFORE UPDATE ON create_operations
+             WHEN NEW.stage = 'finished' BEGIN SELECT RAISE(ABORT, 'fixture'); END;",
+            )
+            .unwrap();
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+fn clear_finalize_failure(fixture: &Fixture) {
+    rusqlite::Connection::open(fixture.catalog.join("catalog.sqlite3"))
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_old_finalize;")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn w1_legacy_provenance_marked_ready_finalizes_original_once_across_reply_loss() {
+    let fixture = Fixture::new();
+    let (_master, _slave, tty) = observation_pty();
+    fixture.birth_device(&tty);
+    let lane = fixture.lane().await;
+    let job = fixture
+        .serve_engine(fixture.engine().with_fixture_sender(), lane.clone())
+        .await;
+    let workspace = fixture.register().await;
+    let original = seed_historical_create(&fixture, &lane, workspace).await;
+    let key = original.key;
+    let runtime_id = original.runtime_id;
+    fixture.set("trace-mutations", "");
+    let held = historical_marker(&fixture, &original, 's');
+    assert!(matches!(
+        fixture.status(key).await,
+        CreateState::Unknown { .. }
+    ));
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("marker")).unwrap(),
+        held
+    );
+
+    let ready = historical_marker(&fixture, &original, 'r');
+    inject_finalize_failure(&lane).await;
+    let unavailable = CreateState::Unknown {
+        issue: Some(ProductIssue::CatalogUnavailable),
+    };
+    assert_eq!(fixture.status(key).await, unavailable);
+    assert_eq!(
+        fixture
+            .call(&create(key, workspace, Some(runtime_id)))
+            .await,
+        unavailable
+    );
+    let local = async |command| request(&fixture.root, &command).await.unwrap();
+    assert!(matches!(
+        local(Request::Acquire { runtime_id }).await,
+        Response::Error { .. }
+    ));
+    assert!(matches!(
+        local(Request::OpenTerminal {
+            runtime_id,
+            view_id: Uuid::new_v4()
+        })
+        .await,
+        Response::Error { .. }
+    ));
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("marker")).unwrap(),
+        ready
+    );
+    assert!(!fixture.root.join("mutation-attempts").exists());
+
+    // @contract: A failed catalog write keeps the lane unavailable until restart.
+    stop(job).await;
+    drop(lane);
+    fixture.wait_restart_released().await;
+    clear_finalize_failure(&fixture);
+    let lane = fixture.lane().await;
+    assert_original_operation(&fixture_operation(&lane, key).await, &original);
+    let job = fixture
+        .serve_engine(fixture.engine().with_fixture_sender(), lane.clone())
+        .await;
+
+    let mut abandoned = tokio::net::UnixStream::connect(fixture.root.join("agent.sock"))
+        .await
+        .unwrap();
+    let mut frame = serde_json::to_vec(&ProductEnvelope {
+        product: ProductRequest::CreateStatus { key },
+    })
+    .unwrap();
+    frame.push(b'\n');
+    use tokio::io::AsyncWriteExt;
+    abandoned.write_all(&frame).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), abandoned.readable())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(abandoned);
+    assert!(matches!(
+        fixture_operation(&lane, key).await.stage,
+        OperationStage::Finished(StoredOutcome::Launched { .. })
+    ));
+
+    let got = fixture.status(key).await;
+    let CreateState::Confirmed {
+        outcome,
+        current: PaneLiveness::Live,
+        ..
+    } = &got
+    else {
+        panic!("legacy result not recovered: {got:?}");
+    };
+    let mut saved = fixture_operation(&lane, key).await;
+    let stage = std::mem::replace(&mut saved.stage, OperationStage::Marked);
+    assert_original_operation(&saved, &original);
+    let OperationStage::Finished(StoredOutcome::Launched {
+        outcome: stored,
+        identity,
+    }) = stage
+    else {
+        panic!("missing original finished row");
+    };
+    assert_eq!(stored.as_ref(), outcome);
+    assert_eq!(
+        (
+            identity.session.as_str(),
+            identity.window.as_str(),
+            identity.pane.as_str(),
+            identity.pid
+        ),
+        ("$1", "@1", "%1", std::process::id())
+    );
+    assert_eq!(
+        fixture
+            .call(&create(key, workspace, Some(runtime_id)))
+            .await,
+        got
+    );
+    assert_eq!(fixture.dispatches(), 1);
+    assert!(!fixture.root.join("mutation-attempts").exists());
+
+    let Response::Control { token } = local(Request::Acquire { runtime_id }).await else {
+        panic!("historical Ready denied after its durable result");
+    };
+    let input = |token, sequence| Request::Input {
+        runtime_id,
+        token,
+        sequence,
+        data: b"x".to_vec(),
+        paste: false,
+    };
+    assert!(matches!(
+        local(input(Uuid::new_v4(), 0)).await,
+        Response::Error { .. }
+    ));
+    assert!(matches!(
+        local(input(token, 0)).await,
+        Response::Accepted {}
+    ));
+    assert!(matches!(
+        local(input(token, 0)).await,
+        Response::Error { .. }
+    ));
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("inputs")).unwrap(),
+        "send-keys -H -t %1 78 ; display-message -p -l -t %1 rs-input-accepted\n"
+    );
+    let effects = fs::read_to_string(fixture.root.join("mutation-attempts")).unwrap();
+    assert_eq!(effects.lines().count(), 2);
+    assert!(effects.contains("@rs_resize_epoch") && effects.contains("send-keys"));
+    assert!(fixture.buffer_snapshot().0.is_empty());
+    stop(job).await;
+}
+
+#[tokio::test]
+async fn w1_legacy_provenance_finished_held_views_and_faults_preserve_marker_bytes() {
+    let fixture = Fixture::new();
+    let (_master, _slave, tty) = observation_pty();
+    fixture.birth_device(&tty);
+    let lane = fixture.lane().await;
+    let job = fixture
+        .serve_engine(fixture.engine().with_fixture_sender(), lane.clone())
+        .await;
+    let workspace = fixture.register().await;
+    let original = seed_historical_create(&fixture, &lane, workspace).await;
+    let runtime_id = original.runtime_id;
+    historical_marker(&fixture, &original, 'r');
+    let state = fixture.status(original.key).await;
+    let CreateState::Confirmed {
+        outcome,
+        current: PaneLiveness::Live,
+        ..
+    } = state
+    else {
+        panic!("expected original Finished launch: {state:?}");
+    };
+    fixture.set("trace-mutations", "");
+    fixture.set("output", "historical screen\n");
+    let local = async |command| request(&fixture.root, &command).await.unwrap();
+    let open = |view_id| Request::OpenTerminal {
+        runtime_id,
+        view_id,
+    };
+    let query = |terminal| Request::TerminalStatus { terminal };
+    let mut warm = None;
+    let mut original_marker = String::new();
+    for disposition in ['l', 'a', 's', 'q', 'f'] {
+        let marker = historical_marker(&fixture, &original, disposition);
+        let buffer = marker.rsplit('~').next().unwrap();
+        let held_bytes = format!("historical held {disposition}\n\t☃");
+        let path = format!("buffers/{buffer}");
+        fixture.set(&path, &held_bytes);
+        let Response::TerminalOpened { status } = local(open(Uuid::new_v4())).await else {
+            panic!("failed to open historical {disposition}");
+        };
+        assert_eq!(status.observation, ObservationState::Observed);
+        assert!(
+            matches!(local(query(status.terminal.clone())).await, Response::TerminalStatus { status: current }
+            if current.terminal == status.terminal && current.observation == ObservationState::Observed)
+        );
+        assert!(matches!(
+            local(Request::AcquireTerminal {
+                terminal: status.terminal.clone()
+            })
+            .await,
+            Response::ControlRecovering {
+                paste_admission: PasteAdmission::PriorSendUnknown
+            }
+        ));
+        assert!(
+            matches!(local(Request::Snapshot { runtime_id }).await, Response::Snapshot { text } if text == "historical screen\n")
+        );
+        assert!(
+            matches!(local(Request::Attach { runtime_id }).await, Response::Attachment { tmux_name } if tmux_name == original.target)
+        );
+        assert!(
+            matches!(local(Request::List {}).await, Response::Runtimes { runtimes } if runtimes == vec![outcome.runtime.clone()])
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("marker")).unwrap(),
+            marker
+        );
+        assert_eq!(
+            fs::read(fixture.root.join(path)).unwrap(),
+            held_bytes.as_bytes()
+        );
+        assert!(fixture.buffer_snapshot().1.is_empty());
+        warm = Some(status.terminal);
+        original_marker = marker;
+    }
+    let warm = warm.unwrap();
+    let held_launch = fs::read_to_string(fixture.root.join("paste-launch")).unwrap();
+    let bad_start = {
+        let mut fields: Vec<_> = original_marker.split('~').map(str::to_owned).collect();
+        fields[9] = (warm.target.process_start + 1).to_string();
+        fields.join("~")
+    };
+    let bad_markers = [
+        String::new(),
+        format!("{original_marker}~extra"),
+        bad_start,
+        original_marker.replacen(&original.nonce.to_string(), &Uuid::new_v4().to_string(), 1),
+        original_marker.replacen(
+            &original.runtime_id.to_string(),
+            &Uuid::new_v4().to_string(),
+            1,
+        ),
+        original_marker.replacen(
+            &original.generation.token.to_string(),
+            &Uuid::new_v4().to_string(),
+            1,
+        ),
+        original_marker.replacen(&held_launch, &Uuid::new_v4().to_string(), 1),
+        original_marker.replace("~1~rs-paste-", "~01~rs-paste-"),
+    ];
+    for malformed in bad_markers {
+        fixture.set("marker", malformed);
+        assert!(matches!(
+            local(open(Uuid::new_v4())).await,
+            Response::Error { .. }
+        ));
+        assert!(matches!(
+            local(query(warm.clone())).await,
+            Response::Error { .. }
+        ));
+        assert!(matches!(
+            local(Request::Acquire { runtime_id }).await,
+            Response::Error { .. }
+        ));
+        assert!(matches!(
+            local(Request::Snapshot { runtime_id }).await,
+            Response::Error { .. }
+        ));
+        assert!(matches!(
+            local(Request::Attach { runtime_id }).await,
+            Response::Error { .. }
+        ));
+        assert!(
+            matches!(fixture.status(original.key).await, CreateState::Confirmed { outcome: saved, current: PaneLiveness::Unavailable, .. } if saved == outcome)
+        );
+    }
+    fixture.set("marker", &original_marker);
+    let partial = format!("{}.initializer", original.target);
+    fixture.set(&partial, "");
+    assert!(matches!(
+        local(open(Uuid::new_v4())).await,
+        Response::Error { .. }
+    ));
+    fs::remove_file(fixture.root.join(partial)).unwrap();
+
+    let db = fixture.catalog.join("catalog.sqlite3");
+    fs::rename(&db, fixture.catalog.join("retained.sqlite3")).unwrap();
+    assert!(
+        matches!(local(query(warm.clone())).await, Response::TerminalStatus { status }
+        if status.terminal == warm && status.observation == ObservationState::Observed)
+    );
+    let mut forged = warm.clone();
+    forged.view_id = Uuid::new_v4();
+    assert!(matches!(local(query(forged)).await, Response::Error { .. }));
+    assert!(matches!(
+        local(open(Uuid::new_v4())).await,
+        Response::Error { .. }
+    ));
+    assert!(matches!(
+        local(Request::AcquireTerminal {
+            terminal: warm.clone()
+        })
+        .await,
+        Response::Error { .. }
+    ));
+    assert!(matches!(
+        local(Request::Stop {
+            runtime_id,
+            expected_pane_id: "%1".into()
+        })
+        .await,
+        Response::Error { .. }
+    ));
+    let held_epoch = fs::read_to_string(fixture.root.join("epoch")).unwrap();
+    let progressed_epoch = format!("{}:{}", Uuid::new_v4(), Uuid::new_v4());
+    let progressed = original_marker
+        .replace(&held_epoch, &progressed_epoch)
+        .replace("~f~", "~q~");
+    fixture.set("epoch", progressed_epoch);
+    fixture.set("marker", &progressed);
+    assert!(
+        matches!(local(query(warm.clone())).await, Response::TerminalStatus { status }
+        if status.terminal == warm && status.observation == ObservationState::Observed)
+    );
+
+    stop(job).await;
+    drop(lane);
+    fixture.wait_restart_released().await;
+    let job = fixture.serve(fixture.lane().await).await;
+    assert!(matches!(
+        local(query(warm)).await,
+        Response::TerminalChanged {}
+    ));
+    assert!(matches!(
+        local(open(Uuid::new_v4())).await,
+        Response::Error { .. }
+    ));
+    assert!(!fixture.root.join("mutation-attempts").exists());
+    assert_eq!(fixture.dispatches(), 1);
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("marker")).unwrap(),
+        progressed
+    );
+    stop(job).await;
+}
+
+pub(super) async fn w1_legacy_provenance_dispatch_body() {
+    use crate::model::Response;
+    let fixture = Fixture::new();
+    let (_master, _slave, tty) = observation_pty();
+    fixture.birth_device(&tty);
+    fixture.set("mode", "effect-lost");
+    let lane = fixture.lane().await;
+    let engine = fixture.engine().with_fixture_sender();
+    let creations = tokio::sync::Mutex::new(());
+    let call = async |message: Vec<u8>, catalog: Option<&CatalogLane>| {
+        dispatch(&message, &engine, &creations, catalog).await
+    };
+    let registration = serde_json::to_vec(&ProductEnvelope {
+        product: ProductRequest::RegisterWorkspace {
+            locator: fixture.workspace.to_str().unwrap().into(),
+        },
+    })
+    .unwrap();
+    let ProductEnvelope {
+        product: ProductResponse::WorkspaceRegistered { workspace },
+    } = serde_json::from_slice(&call(registration, Some(&lane)).await.unwrap()).unwrap()
+    else {
+        panic!("workspace unavailable");
+    };
+    let key = Uuid::new_v4();
+    let create_frame = serde_json::to_vec(&ProductEnvelope {
+        product: create(key, workspace.workspace_id, None),
+    })
+    .unwrap();
+    let status_frame = serde_json::to_vec(&ProductEnvelope {
+        product: ProductRequest::CreateStatus { key },
+    })
+    .unwrap();
+    let _: ProductEnvelope<ProductResponse> =
+        serde_json::from_slice(&call(create_frame, Some(&lane)).await.unwrap()).unwrap();
+    let original = fixture_operation(&lane, key).await;
+    assert_eq!(original.stage, OperationStage::Marked);
+    for option in ["initializer", "birth"] {
+        fs::remove_file(fixture.root.join(format!("{}.{option}", original.target))).unwrap();
+    }
+    let marker = historical_marker(&fixture, &original, 'r');
+    fixture.set("trace-mutations", "");
+    fixture.set("output", "screen\n");
+    inject_finalize_failure(&lane).await;
+    let failed = call(status_frame.clone(), Some(&lane)).await.unwrap();
+    let failed: ProductEnvelope<ProductResponse> = serde_json::from_slice(&failed).unwrap();
+    assert!(matches!(
+        failed.product,
+        ProductResponse::Create {
+            state: CreateState::Unknown {
+                issue: Some(ProductIssue::CatalogUnavailable)
+            }
+        }
+    ));
+    assert_eq!(
+        lane.run(move |db, _| db.operation(key)).await.unwrap_err(),
+        ProductIssue::CatalogUnavailable
+    );
+    drop(lane);
+    fixture.wait_catalog_released().await;
+    clear_finalize_failure(&fixture);
+    let lane = fixture.lane().await;
+    assert_original_operation(&fixture_operation(&lane, key).await, &original);
+    let response_frame = call(status_frame, Some(&lane)).await.unwrap();
+    let confirmed: ProductEnvelope<ProductResponse> =
+        serde_json::from_slice(&response_frame).unwrap();
+    assert!(
+        matches!(confirmed.product, ProductResponse::Create { state: CreateState::Confirmed {
+        current: PaneLiveness::Live, ref outcome, ..
+    }} if outcome.runtime.operation_id == Some(original.id))
+    );
+    for request in [
+        Request::Snapshot {
+            runtime_id: original.runtime_id,
+        },
+        Request::Attach {
+            runtime_id: original.runtime_id,
+        },
+    ] {
+        let request = serde_json::to_vec(&request).unwrap();
+        let response: Response =
+            serde_json::from_slice(&call(request.clone(), Some(&lane)).await.unwrap()).unwrap();
+        assert!(matches!(
+            response,
+            Response::Snapshot { .. } | Response::Attachment { .. }
+        ));
+        assert!(call(request, None).await.is_err());
+    }
+    let open = Request::OpenTerminal {
+        runtime_id: original.runtime_id,
+        view_id: Uuid::new_v4(),
+    };
+    let open = serde_json::to_vec(&open).unwrap();
+    let Response::TerminalOpened { status } =
+        serde_json::from_slice(&call(open.clone(), Some(&lane)).await.unwrap()).unwrap()
+    else {
+        panic!("positive historical open failed");
+    };
+    assert_eq!(status.observation, ObservationState::Observed);
+    let query = |terminal| serde_json::to_vec(&Request::TerminalStatus { terminal }).unwrap();
+    let sample = || query(status.terminal.clone());
+    let launch = fs::read_to_string(fixture.root.join("paste-launch")).unwrap();
+    let pid = std::process::id();
+    let row = format!(
+        "42|100|{}|$1|@1|%1|{pid}|{}|0|0|{}:$1:@1:%1:{pid}|0|1|1|manual|{tty}|100|30|100|30|||{launch}|{marker}|0|1\n",
+        original.generation.token, original.target, original.nonce
+    );
+    for fail_at in [1, 3] {
+        fixture.set("geometry-samples", "");
+        for index in 1..=4 {
+            fixture.set(
+                &format!("geometry-{index}"),
+                if index == fail_at { "missing\n" } else { &row },
+            );
+        }
+        assert!(
+            call(sample(), Some(&lane)).await.is_err(),
+            "failed status sample {fail_at} was accepted"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("geometry-samples"))
+                .unwrap()
+                .lines()
+                .count(),
+            fail_at
+        );
+    }
+    for index in 1..=4 {
+        fs::remove_file(fixture.root.join(format!("geometry-{index}"))).unwrap();
+    }
+    fs::remove_file(fixture.root.join("geometry-samples")).unwrap();
+    let mut different = status.terminal.clone();
+    different.target.process_start += 1;
+    let changed: Response =
+        serde_json::from_slice(&call(query(different), Some(&lane)).await.unwrap()).unwrap();
+    assert!(matches!(changed, Response::TerminalChanged {}));
+
+    fs::rename(
+        fixture.catalog.join("catalog.sqlite3"),
+        fixture.catalog.join("retained.sqlite3"),
+    )
+    .unwrap();
+    let cached: Response =
+        serde_json::from_slice(&call(sample(), Some(&lane)).await.unwrap()).unwrap();
+    assert!(
+        matches!(cached, Response::TerminalStatus { status: current }
+        if current.terminal == status.terminal && current.observation == ObservationState::Observed)
+    );
+    let mut unbound = status.terminal;
+    unbound.view_id = Uuid::new_v4();
+    assert!(call(query(unbound), Some(&lane)).await.is_err());
+    assert!(call(open, Some(&lane)).await.is_err());
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("marker")).unwrap(),
+        marker
+    );
+    assert!(!fixture.root.join("mutation-attempts").exists());
+}
+
+#[cfg(target_os = "macos")]
+const DELAYED_PROBE_STDIN: &str = r##"#!/usr/bin/env python3
+import os
+from pathlib import Path
+import select
+import subprocess
+import sys
+
+root = Path(__file__).resolve().parent
+binary = (root / "selected-tmux").read_text()
+os.environ.pop("TMUX", None)
+
+if sys.argv[1] == "--probe-worker":
+    data = bytes.fromhex(sys.argv[2])
+    args = sys.argv[3:]
+    pane = args[args.index("-t") + 1]
+    branch = args[-1]
+    assert branch.startswith("load-buffer -b rs-paste-probe-")
+    name = branch.split()[2]
+    args[-1] = f"display-message -p -l -t {pane} rs-probe-entered ; {branch}"
+    fifo = os.open(root / "probe-eof", os.O_RDWR | os.O_NONBLOCK)
+    with subprocess.Popen([binary, *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE) as child:
+        try:
+            assert select.select([child.stdout], [], [], 4)[0], "no real tmux entry witness"
+            assert child.stdout.readline() == b"rs-probe-entered\n"
+            assert 0 < len(data) < 2048
+            child.stdin.write(data)
+            child.stdin.flush()
+            (root / "probe-stdin").write_bytes(data)
+            print(name, flush=True)
+            assert select.select([fifo], [], [], 12)[0], "no explicit EOF release"
+            assert os.read(fifo, 1) == b"E"
+            child.stdin.close()
+            child.wait(timeout=4)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=4)
+            os.close(fifo)
+    (root / "probe-finished").write_text(name)
+    raise SystemExit(0)
+
+args = sys.argv[1:]
+assert args[:3] == ["-N", "-S", str(root / "tmux.sock")]
+if len(args) == 9 and args[-1].startswith("load-buffer -b rs-paste-probe-"):
+    with (root / "probe-load-attempts").open("a") as attempts:
+        attempts.write(args[-1].split()[2] + "\n")
+    if not (root / "probe-entered").exists():
+        sample = sys.stdin.buffer.read(2049)
+        error = (root / "probe-worker-errors").open("wb")
+        worker = subprocess.Popen([sys.executable, __file__, "--probe-worker", sample.hex(), *args],
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=error,
+                                  start_new_session=True)
+        assert select.select([worker.stdout], [], [], 4)[0], "worker did not enter"
+        name = worker.stdout.readline().decode().strip()
+        assert name == args[-1].split()[2], name
+        (root / "probe-entered").write_text(name)
+        # The real tmux stdin job remains live, with EOF owned by the worker.
+        raise SystemExit(1)
+if len(args) >= 9:
+    branch = args[8]
+    if branch.startswith(("send-keys ", "paste-buffer ")) or " ; paste-buffer " in branch:
+        with (root / "probe-pane-effects").open("a") as effects:
+            effects.write(branch + "\n")
+    if branch.startswith("delete-buffer -b rs-paste-probe-") and (root / "probe-finished").exists():
+        with (root / "probe-recovery-attempts").open("a") as effects:
+            effects.write(branch + "\n")
+os.execv(binary, [binary, *args])
+"##;
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn w1_probe_custody_real_stdin_survives_pane_loss_and_later_agent_restart() {
+    use std::{io::Write, process::Command};
+    let fixture = Fixture::new();
+    let tmux = PrivateCreateTmux {
+        binary: find_executable("tmux").expect("selected tmux 3.8 is required"),
+        socket: fixture.root.join("tmux.sock"),
+    };
+    let binary = Command::new(&tmux.binary).arg("-V").output().unwrap();
+    assert_eq!(binary.stdout, b"tmux 3.8\n");
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/tmux.conf");
+    let started = Command::new(&tmux.binary)
+        .arg("-f")
+        .arg(config)
+        .arg("-S")
+        .arg(&tmux.socket)
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            "canary",
+            "--",
+            "/bin/sleep",
+            "75",
+        ])
+        .env_remove("TMUX")
+        .output()
+        .unwrap();
+    assert!(started.status.success(), "{started:?}");
+    let run = |args: &[&str]| tmux.command().args(args).output().unwrap();
+    let ok = |args: &[&str]| {
+        let output = run(args);
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert_eq!(ok(&["display-message", "-p", "#{version}"]), "3.8\n");
+    eprintln!(
+        "selected probe fixture {} actual server 3.8",
+        tmux.binary.display()
+    );
+    fixture.set("selected-tmux", tmux.binary.to_str().unwrap());
+    tests::fixture_program(&fixture.root.join("tmux"), DELAYED_PROBE_STDIN);
+    let fifo = fixture.root.join("probe-eof");
+    assert!(
+        Command::new("/usr/bin/mkfifo")
+            .args(["-m", "600"])
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let open_agent = async || {
+        let job = FixtureServer(tokio::spawn(serve_local(
+            fixture.engine(),
+            Arc::new(AgentLock::acquire(&fixture.root).unwrap()),
+            None,
+        )));
+        fixture.wait_listening(&job).await;
+        job
+    };
+    let local = async |command| request(&fixture.root, &command).await.unwrap();
+    let session_id = Uuid::new_v4();
+    let runtime_id = Uuid::new_v4();
+    let workspace = fixture.root.join("probe workspace");
+    fs::create_dir(&workspace).unwrap();
+    let create = || Request::Create {
+        session_id,
+        runtime_id,
+        cwd: workspace.clone(),
+        argv: vec!["/bin/cat".into()],
+    };
+    let first = open_agent().await;
+    let launched = local(create()).await;
+    let Response::Created { runtime: original } = launched else {
+        panic!("original production diagnostic launch failed: {launched:?}");
+    };
+    assert_eq!(original.session_id, session_id);
+    assert_eq!(original.runtime_id, runtime_id);
+    let value = |path: &str| fs::read_to_string(fixture.root.join(path)).unwrap();
+    let buffer = fs::read_to_string(fixture.root.join("probe-entered")).unwrap_or_else(|error| {
+        let worker_errors = fs::read_to_string(fixture.root.join("probe-worker-errors"));
+        panic!("missing guarded stdin witness: {error}; worker diagnostics: {worker_errors:?}")
+    });
+    let stdin = fs::read(fixture.root.join("probe-stdin")).unwrap();
+    assert!(stdin.ends_with("\n\t☃".as_bytes()));
+    assert_eq!(value("probe-load-attempts"), format!("{buffer}\n"));
+    let generation = ok(&[
+        "display-message",
+        "-p",
+        "#{pid}|#{start_time}|#{@rs_create_generation}",
+    ]);
+    let fields: Vec<_> = generation.trim_end().split('|').collect();
+    let base = format!(
+        "@rs_paste_custody_{}_{}_{}",
+        fields[0],
+        fields[1],
+        fields[2].replace('-', "")
+    );
+    let option = |i| format!("{base}_{i:02}");
+    let read_slot = |i| {
+        ok(&["show-options", "-sqv", &option(i)])
+            .trim_end()
+            .to_owned()
+    };
+    let possible = read_slot(0);
+    let record: Vec<_> = possible.split('~').collect();
+    assert_eq!(&record[2..5], &["possible", "probe", &original.tmux_name]);
+    assert_eq!(record.last(), Some(&buffer.as_str()));
+    let pid = original.pane_pid.unwrap();
+    assert_eq!(record[11], pid.to_string());
+    assert_eq!(
+        record[12],
+        crate::engine::launch_fixture_process_start(pid)
+            .unwrap()
+            .to_string()
+    );
+
+    let probe_canary = format!("rs-paste-probe-{}", Uuid::new_v4().simple());
+    let payload_canary = format!("rs-paste-{}", Uuid::new_v4().simple());
+    ok(&["set-buffer", "-b", &probe_canary, "probe canary"]);
+    ok(&["set-buffer", "-b", &payload_canary, "payload canary"]);
+    let canary_scope = |name: &str| {
+        ok(&["new-session", "-d", "-s", name, "--", "/bin/sleep", "75"]);
+        ok(&[
+            "display-message",
+            "-p",
+            "-t",
+            &format!("={name}:0.0"),
+            "#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}|#{pane_tty}",
+        ])
+    };
+    let probe_runtime = tmux_name(Uuid::new_v4(), Uuid::new_v4());
+    let scope = canary_scope(&probe_runtime);
+    let ids: Vec<_> = scope.trim_end().split('|').collect();
+    let start = crate::engine::launch_fixture_process_start(ids[3].parse().unwrap()).unwrap();
+    let device = fs::symlink_metadata(ids[4]).unwrap();
+    let nonce = Uuid::parse_str(probe_canary.strip_prefix("rs-paste-probe-").unwrap()).unwrap();
+    let probe_record = format!(
+        "v2~{}~possible~probe~{probe_runtime}~{}~{}~{}~{}~{}~{}~{}~{start}~{}~{}~{}~{}~local~{nonce}~{probe_canary}",
+        Uuid::new_v4(),
+        fields[2],
+        fields[0],
+        fields[1],
+        &ids[0][1..],
+        &ids[1][1..],
+        &ids[2][1..],
+        ids[3],
+        ids[4],
+        device.dev(),
+        device.ino(),
+        device.rdev(),
+    );
+    let payload_runtime_id = Uuid::new_v4();
+    let payload_runtime = tmux_name(Uuid::new_v4(), payload_runtime_id);
+    let scope = canary_scope(&payload_runtime);
+    let ids: Vec<_> = scope.trim_end().split('|').collect();
+    let start = crate::engine::launch_fixture_process_start(ids[3].parse().unwrap()).unwrap();
+    let payload_record = format!(
+        "v1~{}~completed~{payload_runtime}~{}~v1~{payload_runtime_id}~{}~{}~{}~{}~{}~{}~{}~{start}~-~{}~{}:{}~l~{}~1~{payload_canary}",
+        Uuid::new_v4(),
+        ids[4],
+        fields[2],
+        fields[0],
+        fields[1],
+        &ids[0][1..],
+        &ids[1][1..],
+        &ids[2][1..],
+        ids[3],
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+    ok(&["set-option", "-so", &option(14), &probe_record]);
+    ok(&["set-option", "-so", &option(15), &payload_record]);
+    assert!(!run(&["save-buffer", "-b", &buffer, "-"]).status.success());
+
+    ok(&["kill-pane", "-t", &original.pane_id]);
+    stop(first).await;
+    fixture.wait_restart_released().await;
+    let restarted = open_agent().await;
+    let launched = local(create()).await;
+    let Response::Created {
+        runtime: replacement,
+    } = launched
+    else {
+        panic!("same-server replacement did not launch: {launched:?}");
+    };
+    assert_eq!(
+        (replacement.session_id, replacement.runtime_id),
+        (session_id, runtime_id)
+    );
+    assert_ne!(replacement.pane_id, original.pane_id);
+    let pane = &replacement.pane_id;
+    assert!(
+        !ok(&["list-panes", "-a", "-F", "#{pane_id}"])
+            .lines()
+            .any(|p| p == original.pane_id)
+    );
+    let replacement_identity = ok(&[
+        "display-message",
+        "-p",
+        "-t",
+        pane,
+        "#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}|#{pane_tty}",
+    ]);
+    let screen = ok(&["capture-pane", "-p", "-t", pane]);
+    assert!(matches!(
+        local(Request::Acquire { runtime_id }).await,
+        Response::ControlRecovering { .. }
+    ));
+    assert_eq!(read_slot(0), possible);
+    assert_eq!(value("probe-load-attempts"), format!("{buffer}\n"));
+    assert!(!run(&["save-buffer", "-b", &buffer, "-"]).status.success());
+
+    OpenOptions::new()
+        .write(true)
+        .custom_flags(nix::libc::O_NONBLOCK)
+        .open(&fifo)
+        .unwrap()
+        .write_all(b"E")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if fs::read_to_string(fixture.root.join("probe-finished"))
+                .ok()
+                .as_deref()
+                == Some(&buffer)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("real tmux stdin did not finish after explicit EOF release");
+    assert_eq!(run(&["save-buffer", "-b", &buffer, "-"]).stdout, stdin);
+    assert_eq!(read_slot(0), possible);
+
+    assert!(matches!(
+        local(Request::Acquire { runtime_id }).await,
+        Response::ControlRecovering { .. }
+    ));
+    assert!(!run(&["save-buffer", "-b", &buffer, "-"]).status.success());
+    let tombstone = read_slot(0);
+    let parts: Vec<_> = tombstone.split('~').collect();
+    assert!(matches!(parts.as_slice(), ["v1", _, "free"]));
+    assert_ne!(parts[1], record[1]);
+    assert!(
+        value("probe-recovery-attempts")
+            .starts_with(&format!("delete-buffer -b {buffer} ; set-option -s "))
+    );
+    assert_eq!(value("probe-recovery-attempts").lines().count(), 1);
+    assert_eq!(
+        ok(&["save-buffer", "-b", &probe_canary, "-"]),
+        "probe canary"
+    );
+    assert_eq!(
+        ok(&["save-buffer", "-b", &payload_canary, "-"]),
+        "payload canary"
+    );
+    assert_eq!(
+        ok(&[
+            "display-message",
+            "-p",
+            "-t",
+            pane,
+            "#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}|#{pane_tty}"
+        ]),
+        replacement_identity
+    );
+    assert_eq!(ok(&["capture-pane", "-p", "-t", pane]), screen);
+    assert_eq!(
+        ok(&["show-options", "-pqv", "-t", pane, "@rs_paste_launch"]),
+        ""
+    );
+    assert_eq!(
+        ok(&["show-options", "-pqv", "-t", pane, "@rs_paste_admission"]),
+        ""
+    );
+    assert!(!fixture.root.join("probe-pane-effects").exists());
+    assert_eq!(value("probe-load-attempts"), format!("{buffer}\n"));
+    assert_eq!(read_slot(14), probe_record);
+    assert_eq!(read_slot(15), payload_record);
+
+    let healthy_session = Uuid::new_v4();
+    let healthy_id = Uuid::new_v4();
+    let launched = local(Request::Create {
+        session_id: healthy_session,
+        runtime_id: healthy_id,
+        cwd: workspace,
+        argv: vec!["/bin/cat".into()],
+    })
+    .await;
+    let Response::Created { runtime: healthy } = launched else {
+        panic!("healthy stock catalog-free probe did not launch: {launched:?}");
+    };
+    let ready = ok(&[
+        "show-options",
+        "-pqv",
+        "-t",
+        &healthy.pane_id,
+        "@rs_paste_admission",
+    ]);
+    assert!(
+        ready.starts_with(&format!("v1~{healthy_id}~")) && ready.contains("~r~"),
+        "{ready}"
+    );
+    let final_slot = read_slot(0);
+    assert_ne!(final_slot, tombstone);
+    assert!(final_slot.starts_with("v1~") && final_slot.ends_with("~free"));
+    assert_eq!(value("probe-load-attempts").lines().count(), 2);
+    assert_eq!(read_slot(14), probe_record);
+    assert_eq!(read_slot(15), payload_record);
+    assert!(!fixture.root.join("probe-pane-effects").exists());
+    stop(restarted).await;
+}
+
+#[tokio::test]
+async fn w1_probe_custody_managed_and_configured_diagnostic_retire_before_ready() {
+    for managed in [true, false] {
+        let fixture = Fixture::new();
+        let (_master, _slave, tty) = observation_pty();
+        fixture.birth_device(&tty);
+        fixture.set("trace-mutations", "");
+        let engine = fixture.engine().with_fixture_sender();
+        let creations = tokio::sync::Mutex::new(());
+        let lane = fixture.lane().await;
+        let dispatch = async |message: Vec<u8>| {
+            dispatch(&message, &engine, &creations, Some(&lane))
+                .await
+                .unwrap()
+        };
+        let key = Uuid::new_v4();
+        let session = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        let runtime = if managed {
+            let registered: ProductEnvelope<ProductResponse> = serde_json::from_slice(
+                &dispatch(
+                    serde_json::to_vec(&ProductEnvelope {
+                        product: ProductRequest::RegisterWorkspace {
+                            locator: fixture.workspace.to_str().unwrap().into(),
+                        },
+                    })
+                    .unwrap(),
+                )
+                .await,
+            )
+            .unwrap();
+            let ProductResponse::WorkspaceRegistered { workspace } = registered.product else {
+                panic!("test workspace not registered");
+            };
+            let message = serde_json::to_vec(&ProductEnvelope {
+                product: create(key, workspace.workspace_id, None),
+            })
+            .unwrap();
+            let reply: ProductEnvelope<ProductResponse> =
+                serde_json::from_slice(&dispatch(message.clone()).await).unwrap();
+            let ProductResponse::Create {
+                state:
+                    CreateState::Confirmed {
+                        outcome,
+                        current: PaneLiveness::Live,
+                        ..
+                    },
+            } = &reply.product
+            else {
+                panic!("managed create failed: {:?}", reply.product);
+            };
+            let replay: ProductEnvelope<ProductResponse> =
+                serde_json::from_slice(&dispatch(message).await).unwrap();
+            assert_eq!(replay.product, reply.product);
+            assert_eq!(fixture.dispatches(), 1);
+            outcome.runtime.clone()
+        } else {
+            fixture.set("names", "");
+            let command = diagnostic_create(&fixture, session, id);
+            let wire = serde_json::to_vec(&command).unwrap();
+            let reply: Response = serde_json::from_slice(&dispatch(wire.clone()).await).unwrap();
+            let Response::Created { runtime } = reply else {
+                panic!("configured diagnostic failed: {reply:?}");
+            };
+            assert_eq!((runtime.session_id, runtime.runtime_id), (session, id));
+            let replay: Response = serde_json::from_slice(&dispatch(wire).await).unwrap();
+            assert!(matches!(replay, Response::Created { runtime: same }
+                if (same.session_id, same.runtime_id, same.pane_id.as_str(), same.pane_pid, same.exited)
+                    == (session, id, runtime.pane_id.as_str(), runtime.pane_pid, false)));
+            assert_eq!(
+                fs::read_to_string(fixture.root.join("diagnostic-dispatched"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+            runtime
+        };
+
+        let record = |name: &str| fs::read_to_string(fixture.root.join(name)).unwrap();
+        let claim = record("last-probe-claim");
+        let parts: Vec<_> = claim.split('~').collect();
+        assert_eq!(&parts[2..5], &["possible", "probe", &runtime.tmux_name]);
+        assert_eq!(
+            parts[17].split(':').next(),
+            Some(if managed { "managed" } else { "diagnostic" })
+        );
+        let free = record(&format!(
+            "custody/{}",
+            record("last-probe-option").trim_end()
+        ));
+        assert!(free.starts_with("v1~") && free.ends_with("~free") && !free.contains(parts[1]));
+        let effects = record("mutation-attempts");
+        let load = effects
+            .find(&format!("load-buffer -b {} -", parts[19]))
+            .unwrap();
+        let retire = effects
+            .find(&format!("delete-buffer -b {} ; set-option -s ", parts[19]))
+            .unwrap();
+        let ready = effects.rfind("@rs_paste_admission v1~").unwrap();
+        assert!(load < retire && retire < ready, "{effects}");
+        assert_eq!(effects.matches("load-buffer -b").count(), 1);
+        assert_eq!(effects.matches("delete-buffer -b").count(), 1);
+        assert_eq!(effects.matches("@rs_paste_admission v1~").count(), 1);
+        assert_eq!(record("buffer-loads"), "load\n");
+        assert!(record("marker").contains("~r~"));
+        assert_eq!(fixture.buffer_snapshot().0.len(), 0);
+        assert!(!fixture.root.join("inputs").exists());
+    }
 }

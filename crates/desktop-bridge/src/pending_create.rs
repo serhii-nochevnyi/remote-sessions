@@ -1214,7 +1214,18 @@ mod tests {
     #[cfg(debug_assertions)]
     #[tokio::test]
     async fn pending_create_committed_reply_dropped_then_bridge_restart_recovers_through_sqlite() {
-        use crate::w1_terminal_tests::write_catalog_birth_fixture;
+        check_committed_reply_dropped(false).await;
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn w1_legacy_provenance_pending_create_projects_original_result_after_reply_loss() {
+        check_committed_reply_dropped(true).await;
+    }
+
+    #[cfg(debug_assertions)]
+    async fn check_committed_reply_dropped(historical: bool) {
+        use crate::w1_terminal_tests::{seed_historical_terminal, write_catalog_birth_fixture};
         use portable_pty::{PtySize, native_pty_system};
 
         let fixture = Fixture::new();
@@ -1246,12 +1257,19 @@ birth_format='#{pid}|#{start_time}|#{@rs_create_generation}|#{session_id}|#{wind
 case "$4" in
   display-message)
     if test "${6-}" = -t; then
-      test "$#" = 8 && test "$5" = -p && test "$7" = '%3' && test "$8" = "$birth_format" || exit 1
+      test "$#" = 8 && test "$5" = -p && test "$7" = '%3' || exit 1
       name=$(cat active)
       nonce=$(cat "$name.nonce")
-      printf '52|101|%s|$1|@2|%%3|%s|%s|0|0|%s:$1:@2:%%3:%s|0|%s|%s|%s\n' \
-        "$token" "$pid" "$name" "$nonce" "$pid" "$(cat tty)" \
-        "$(cat "$name.initializer")" "$(cat "$name.birth")"
+      case "$8" in
+        "$birth_format")
+          printf '52|101|%s|$1|@2|%%3|%s|%s|0|0|%s:$1:@2:%%3:%s|0|%s|%s|%s\n' \
+            "$token" "$pid" "$name" "$nonce" "$pid" "$(cat tty)" \
+            "$(cat "$name.initializer" 2>/dev/null || :)" "$(cat "$name.birth" 2>/dev/null || :)" ;;
+        *'#{session_windows}|#{window_panes}|#{window-size}|#{pane_tty}|'*)
+          printf '52|101|%s|$1|@2|%%3|%s|%s|0|0|%s:$1:@2:%%3:%s|0|1|1|manual|%s|100|30|100|30|||%s|%s|0|0\n' \
+            "$token" "$pid" "$name" "$nonce" "$pid" "$(cat tty)" "$(cat launch)" "$(cat marker)" ;;
+        *) exit 1 ;;
+      esac
       exit 0
     fi
     printf '52|101|%s\n' "$token"
@@ -1262,6 +1280,12 @@ case "$4" in
     case "$6" in *"$token"*) ;; *) exit 1 ;; esac
     printf 'marked\n' >> dispatched
     exec ./spawn-tmux "$@" ;;
+  show-options)
+    test "$#" -eq 14 && test "$5 $6 $7 $8" = "-pq -t %3 @rs_create_initializer"
+    test "${9} ${10} ${11} ${12} ${13} ${14}" = "; show-options -pq -t %3 @rs_create_birth"
+    name=$(cat active)
+    if test -f "$name.initializer"; then printf 'present\n'; fi
+    if test -f "$name.birth"; then printf 'present\n'; fi ;;
   show-environment)
     name=${6#=}
     test "$#" = 14 && test "$7" = RS_CREATE_NONCE
@@ -1327,6 +1351,19 @@ esac
                     assert!(input.contains(&saved.key.to_string()));
                     assert_eq!(saved.submission, Submission::Sent);
                     assert!(response.contains("\"state\":\"confirmed\""));
+                    if historical {
+                        use remote_sessions_host::model::CreateState;
+                        let FixtureEnvelope {
+                            product:
+                                ProductResponse::Create {
+                                    state: CreateState::Confirmed { outcome, .. },
+                                },
+                        } = decode_local_fixture(response.as_bytes()).unwrap()
+                        else {
+                            panic!("original SQLite create did not finish");
+                        };
+                        seed_historical_terminal(&relay_host, &outcome.runtime, (1, 2, 3), 'r');
+                    }
                     key = Some(saved.key);
                     dropped = true;
                 } else {
@@ -1355,7 +1392,7 @@ esac
             CreateDisposition::Unknown { issue: None }
         );
         drop(bridge);
-        let restarted = DesktopBridge::new(Some(native), "/unused/tmux".into());
+        let restarted = DesktopBridge::new(Some(native.clone()), "/unused/tmux".into());
         let status = restarted.create_status(None).await;
         assert_eq!(status.issue, None);
         assert_eq!(status.operations.len(), 1);
@@ -1384,17 +1421,27 @@ esac
             .await;
         assert_eq!(presented.issue, None);
         assert!(presented.operations[0].presented);
-        assert!(restarted.create_status(None).await.operations[0].presented);
+        wait_store_lock_release(&native).await.unwrap();
+        let status = restarted.create_status(None).await;
+        assert_eq!(status.issue, None);
+        assert_eq!(status.operations.len(), 1);
+        assert_eq!(status.operations[0].reference, recovered.reference);
+        assert!(status.operations[0].presented);
 
-        let birth = host.join(format!("{}.birth", runtime.tmux_name));
-        let original = fs::read_to_string(&birth).unwrap();
+        let (record, start_index) = if historical {
+            (host.join("marker"), 9)
+        } else {
+            let birth = host.join(format!("{}.birth", runtime.tmux_name));
+            let index = fs::read_to_string(&birth).unwrap().split('~').count() - 5;
+            (birth, index)
+        };
+        let original = fs::read_to_string(&record).unwrap();
         let start = fs::read_to_string(host.join("pane-start")).unwrap();
         let mut fields: Vec<_> = original.split('~').collect();
-        let start_index = fields.len() - 5;
         assert_eq!(fields[start_index], start);
         let other_start = (start.parse::<u64>().unwrap() + 1).to_string();
         fields[start_index] = &other_start;
-        fs::write(birth, fields.join("~")).unwrap();
+        fs::write(record, fields.join("~")).unwrap();
         let unavailable = restarted.create_status(None).await;
         assert_eq!(unavailable.issue, None);
         assert_eq!(unavailable.operations.len(), 1);
