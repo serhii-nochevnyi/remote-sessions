@@ -1392,7 +1392,7 @@ esac
             CreateDisposition::Unknown { issue: None }
         );
         drop(bridge);
-        let restarted = DesktopBridge::new(Some(native), "/unused/tmux".into());
+        let restarted = DesktopBridge::new(Some(native.clone()), "/unused/tmux".into());
         let status = restarted.create_status(None).await;
         assert_eq!(status.issue, None);
         assert_eq!(status.operations.len(), 1);
@@ -1421,7 +1421,12 @@ esac
             .await;
         assert_eq!(presented.issue, None);
         assert!(presented.operations[0].presented);
-        assert!(restarted.create_status(None).await.operations[0].presented);
+        wait_store_lock_release(&native).await.unwrap();
+        let status = restarted.create_status(None).await;
+        assert_eq!(status.issue, None);
+        assert_eq!(status.operations.len(), 1);
+        assert_eq!(status.operations[0].reference, recovered.reference);
+        assert!(status.operations[0].presented);
 
         let (record, start_index) = if historical {
             (host.join("marker"), 9)
