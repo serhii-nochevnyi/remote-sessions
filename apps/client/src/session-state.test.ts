@@ -8,7 +8,7 @@ import type { CreateStatus, Inventory, LocalCreate, RuntimeInfo, TerminalScope, 
 import type { CreateExposure } from "./presentation-preferences.ts";
 import { acceptMountedRenderer, adoptCurrentTerminal, attachCurrentTerminal, beginTerminalReconnect, cancelTerminalReconnect,
   canRestoreTerminalFocus, closeView, confirmMountedWriter, demoSessions, focusAfterClose, explicitClosedReconnect,
-  explicitTerminalOpen, inventoryOpen, mountedTerminal, mountedTerminalEffect, mountedTerminalEntry, moveView, openView, parseScaffoldStatus,
+  explicitTerminalOpen, inventoryOpen, makeRefusedWriterReconnect, mountedTerminal, mountedTerminalEffect, mountedTerminalEntry, moveView, openView, parseScaffoldStatus,
   refreshTerminalRecord, restoreFullscreenExitFocus, runMountedTerminalStream, tabKey, tabStop, terminalPanel, terminalProofOnly,
   terminalStreamAccess, TerminalAttachmentIdentityError, updateMountedStream, updateTerminalRecord } from "./session-state.ts";
 import type { ActiveTerminalEffect, AttachmentMode, BoundTerminal, MountedTerminal, SessionViews, TerminalBindingState, TerminalRecord } from "./session-state.ts";
@@ -398,6 +398,7 @@ function mountedNativeFixture(t: TestContext, row = nativeRuntime) {
     let proofOnly = false;
     let rendererOpened = false;
     let replacement = false;
+    let keepRenderer = false;
     let confirmation: ReturnType<typeof confirmMountedWriter> | undefined;
     const detachments: Promise<void>[] = [];
     const displayed = new xterm.Terminal({ ...size, allowProposedApi: true, disableStdin: true });
@@ -444,10 +445,11 @@ function mountedNativeFixture(t: TestContext, row = nativeRuntime) {
           detached = pending;
           detachments.push(pending);
         }
-        if (!eof) {
+        if (!eof && !keepRenderer) {
           if (activeEffect === effect) activeEffect = undefined;
           if (!proofOnly) {
-            if (accepted) updateBinding(accepted, replacement ? "changed" : current().mode === "draining" ? "ended" : "retired", accepted);
+            if (accepted) updateBinding(accepted, replacement ? "changed" : current().mode === "draining" ? "ended"
+              : confirmation?.refused ? "view-closed" : "retired", accepted);
             else if (previous && retainedAtEntry) updateBinding(previous, replacement ? "changed" : "view-closed", previous);
           }
           dispose();
@@ -552,10 +554,24 @@ function mountedNativeFixture(t: TestContext, row = nativeRuntime) {
       }
       await Promise.all(detachments);
     }
+    const reconnectRefused = makeRefusedWriterReconnect(scope,
+      expected => activeEffect === effect && accepted === expected ? current(expected) : { mode: "missing" },
+      () => delivery.mayRestore, binding => {
+        if (!updateBinding(binding, "view-closed", binding)) return false;
+        keepRenderer = true;
+        retained = { binding, dispose };
+        scope.retire();
+        const next = beginTerminalReconnect(selected(), binding, selection + 1);
+        assert.ok(next);
+        changeSelection();
+        record = next;
+        return true;
+      }, localClient);
     return {
       binding: bound, scope, displayed, frames, failures, proofOnly,
       confirmation: confirmationState, recovering: recovering.promise,
       update,
+      reconnectRefused: () => reconnectRefused(bound, confirmationState),
       run() { return streaming ??= read(); },
       scheduleLayout: resize.scheduleLayout,
       layoutScheduled: () => layoutScheduled,
@@ -913,51 +929,422 @@ test("catalog impairment keeps the adopted effect, read-only FIFO and historical
   assert.deepEqual(fixture.counts("terminal_confirm_writer"), [writerAssertions(firstView)]);
 });
 
-for (const confirmed of [true, false]) {
-  test(`writer confirmation ${confirmed ? "success" : "failure"} racing catalog impairment grants no writes`, async t => {
+test("writer confirmation success racing catalog impairment waits for a fresh grant sample", async t => {
+  const fixture = mountedNativeFixture(t);
+  await fixture.publish(nativeRuntime);
+  const { mounted, confirmation } = await pendingWriter(fixture);
+  const read = fixture.park("terminal_read");
+  const parked = fixture.park("terminal_read");
+  const next = fixture.park("terminal_read");
+  const eof = fixture.park("terminal_read");
+  const streaming = mounted.run();
+  await read.entered;
+  await fixture.refreshMounted(degradedRuntime);
+  read.resolve(nativeData([65], nativeAttachment(firstView)));
+  await parked.entered;
+  confirmation.resolve(undefined);
+  await mounted.confirmation.settled;
+  assert.equal(mounted.confirmation.confirmed, true);
+  assert.equal(mounted.scope.active, true);
+  assert.equal(mounted.scope.canWrite, false);
+  await attemptMutations(mounted);
+  await fixture.refreshMounted(nativeRuntime);
+  parked.resolve(nativeData([66], nativeAttachment(firstView)));
+  await next.entered;
+  assert.equal(mounted.scope.canWrite, false);
+  next.resolve(nativeData([67], nativeAttachment(firstView)));
+  await eof.entered;
+  assert.equal(mounted.scope.canWrite, true);
+  eof.resolve(nativeClosure({ reason: "eof" }));
+  await streaming;
+  assert.deepEqual(mounted.frames, [[65], [66], [67]]);
+  assert.equal(mounted.scope.canWrite, false);
+  assert.deepEqual(fixture.counts("terminal_confirm_writer"), [writerAssertions(firstView)]);
+  assert.deepEqual(fixture.counts("terminal_attach"), [{ runtimeId }]);
+  assert.equal(fixture.counts("terminal_detach").length, 1);
+  assert.deepEqual(mutatingCommands(fixture), []);
+});
+
+test("explicit reconnect keeps the reader after writer refusal with fresh degraded inventory", async t => {
+  const fixture = mountedNativeFixture(t);
+  await fixture.publish(nativeRuntime);
+  const { mounted, confirmation } = await pendingWriter(fixture);
+  const renderer = mounted.displayed;
+  const first = fixture.park("terminal_read");
+  const parked = fixture.park("terminal_read");
+  const warm = fixture.park("terminal_read");
+  const end = fixture.park("terminal_read");
+  const classification = fixture.park("local_inventory");
+  const status = fixture.park("terminal_status");
+  fixture.nextInventory(degradedRuntime, 12);
+  const streaming = mounted.run();
+  try {
+    await first.entered;
+    first.resolve(nativeData([65]));
+    assert.deepEqual(await parked.entered, { viewId: firstView });
+    confirmation.reject(Error("arbitrary native refusal"));
+    await classification.entered;
+    parked.resolve(nativeData([66]));
+    classification.resolve(inventory(degradedRuntime));
+    assert.deepEqual(await status.entered, { viewId: firstView });
+    status.resolve(nativeAttachment(firstView).status);
+    assert.deepEqual(await warm.entered, { viewId: firstView });
+    assert.equal(mounted.confirmation.refused, true);
+    assert.equal(mounted.confirmation.recovery, undefined);
+    assert.equal(fixture.selected().intent?.runtime.origin, "managed");
+
+    await mounted.reconnectRefused();
+    assert.deepEqual(fixture.counts("terminal_detach"), [], "Reconnect must keep the observed reader registered");
+    assert.deepEqual(fixture.counts("terminal_attach"), [{ runtimeId }]);
+    const rejectedReplies = [
+      Error("inventory unavailable"), { agent_pid: 12, runtimes: [] }, { malformed: true }, inventory(nativeRuntime, 13),
+      inventory({ ...nativeRuntime, workspace_id: fixtureId(24) }), inventory({ ...nativeRuntime, exited: true }),
+    ];
+    for (const reply of rejectedReplies) {
+      const probe = fixture.park("local_inventory");
+      const reconnect = mounted.reconnectRefused();
+      await probe.entered;
+      if (reply instanceof Error) probe.reject(reply);
+      else probe.resolve(reply);
+      assert.equal(await reconnect, false);
+    }
+
+    const probe = fixture.park("local_inventory");
+    const reconnect = mounted.reconnectRefused();
+    await probe.entered;
+    const queries = fixture.counts("local_inventory").length;
+    assert.equal(await mounted.reconnectRefused(), false);
+    assert.equal(fixture.counts("local_inventory").length, queries);
+    const settle = fixture.delivery.begin();
+    probe.resolve(inventory(nativeRuntime));
+    assert.equal(await reconnect, false);
+    settle();
+
+    const heldProbe = fixture.park("local_inventory");
+    const heldReconnect = mounted.reconnectRefused();
+    await heldProbe.entered;
+    fixture.delivery.holdInput(Error("unknown delivery"));
+    heldProbe.resolve(inventory(nativeRuntime));
+    assert.equal(await heldReconnect, false);
+    assert.deepEqual(fixture.counts("terminal_detach"), []);
+    assert.deepEqual(fixture.counts("terminal_attach"), [{ runtimeId }]);
+    await attemptMutations(mounted);
+    assert.deepEqual(mutatingCommands(fixture), []);
+    warm.resolve(nativeData([67], nativeAttachment(firstView), newIncarnation));
+    assert.deepEqual(await end.entered, { viewId: firstView });
+    assert.equal(fixture.binding(), mounted.binding);
+    assert.equal(mounted.scope.viewId, firstView);
+    assert.equal(mounted.displayed, renderer);
+    assert.equal(mounted.disposals(), 0);
+    assert.equal(mounted.scope.canWrite, false);
+    assert.deepEqual(mounted.frames, [[65], [66], [67]]);
+    assert.equal(renderer.buffer.active.getLine(0)?.translateToString(true), "ABC");
+  } finally {
+    confirmation.resolve(undefined);
+    classification.resolve(inventory(degradedRuntime));
+    status.resolve(nativeAttachment(firstView).status);
+    first.resolve(nativeClosure({ reason: "eof" }));
+    parked.resolve(nativeClosure({ reason: "eof" }));
+    warm.resolve(nativeClosure({ reason: "eof" }));
+    end.resolve(nativeClosure({ reason: "eof" }));
+    mounted.scope.retire();
+    await streaming;
+  }
+});
+
+for (const boundary of ["close", "replacement", "a newer attempt"] as const) {
+  test(`late healthy refused reconnect inventory has no effect after ${boundary}`, async t => {
     const fixture = mountedNativeFixture(t);
     await fixture.publish(nativeRuntime);
     const { mounted, confirmation } = await pendingWriter(fixture);
-    const read = fixture.park("terminal_read");
-    const parked = fixture.park("terminal_read");
+    const first = fixture.park("terminal_read");
+    const warm = fixture.park("terminal_read");
+    const status = fixture.park("terminal_status");
+    fixture.nextInventory(degradedRuntime, 12);
     const streaming = mounted.run();
-    await read.entered;
-    await fixture.refreshMounted(degradedRuntime);
-    read.resolve(nativeData([65], nativeAttachment(firstView)));
-    await parked.entered;
-    assert.deepEqual(mounted.frames, [[65]]);
-    if (confirmed) confirmation.resolve(undefined);
-    else confirmation.reject(Error("Terminal inventory binding changed"));
-    await mounted.confirmation.settled;
-    assert.equal(mounted.confirmation.confirmed, confirmed);
-    await attemptMutations(mounted);
-    if (confirmed) {
-      assert.equal(mounted.scope.active, true);
-      assert.equal(mounted.scope.canWrite, false);
-      await fixture.refreshMounted(nativeRuntime);
-      const next = fixture.park("terminal_read");
-      const eof = fixture.park("terminal_read");
-      parked.resolve(nativeData([66], nativeAttachment(firstView)));
-      await next.entered;
-      assert.equal(mounted.scope.canWrite, false);
-      next.resolve(nativeData([67], nativeAttachment(firstView)));
-      await eof.entered;
-      assert.equal(mounted.scope.canWrite, true);
-      eof.resolve(nativeClosure({ reason: "eof" }));
+    await first.entered;
+    confirmation.reject(Error("writer refused"));
+    await status.entered;
+    status.resolve(nativeAttachment(firstView).status);
+    first.resolve(nativeData([65]));
+    assert.deepEqual(await warm.entered, { viewId: firstView });
+    assert.equal(mounted.confirmation.recovery, undefined);
+
+    const probe = fixture.park("local_inventory");
+    const reconnect = mounted.reconnectRefused();
+    await probe.entered;
+    assert.deepEqual(fixture.counts("terminal_detach"), []);
+    if (boundary === "close") {
+      fixture.close();
+      mounted.update();
+    } else if (boundary === "replacement") {
+      await fixture.refreshMounted({ ...nativeRuntime, pane_pid: 43 });
     } else {
-      assert.equal(mounted.scope.active, false);
-      await fixture.refreshMounted(nativeRuntime);
-      parked.resolve(nativeData([66], nativeAttachment(firstView)));
+      warm.resolve(nativeClosure({ reason: "eof" }));
+      await streaming;
+      await fixture.publish(nativeRuntime);
+      assert.equal(fixture.requestReconnect(), true);
+      const next = await connectFixture(fixture, "ordinary", nativeAttachment(observedView));
+      assert.equal(next.scope.viewId, observedView);
+      assert.ok((fixture.record()?.attempt ?? 0) > 0);
     }
+    const effects = [...fixture.calls];
+    const record = fixture.record();
+    probe.resolve(inventory(nativeRuntime));
+    assert.equal(await reconnect, false);
+    warm.resolve(nativeData([90]));
     await streaming;
-    assert.deepEqual(mounted.frames, confirmed ? [[65], [66], [67]] : [[65]]);
-    assert.equal(mounted.scope.canWrite, false);
-    assert.deepEqual(fixture.counts("terminal_confirm_writer"), [writerAssertions(firstView)]);
-    assert.deepEqual(fixture.counts("terminal_attach"), [{ runtimeId }]);
-    assert.equal(fixture.counts("terminal_detach").length, 1);
+    assert.deepEqual(fixture.calls, effects);
+    assert.equal(fixture.record(), record);
+    assert.deepEqual(mounted.frames, [[65]]);
     assert.deepEqual(mutatingCommands(fixture), []);
   });
 }
+
+for (const cachedDegraded of [false, true]) {
+  test(`writer refusal keeps same-view output with ${cachedDegraded ? "cached" : "fresh"} catalog impairment`, async t => {
+    const fixture = mountedNativeFixture(t);
+    await fixture.publish(nativeRuntime);
+    const { mounted, confirmation } = await pendingWriter(fixture);
+    const renderer = mounted.displayed;
+    const first = fixture.park("terminal_read");
+    const parked = fixture.park("terminal_read");
+    const warm = fixture.park("terminal_read");
+    const lateWritable = fixture.park("terminal_read");
+    const afterLate = fixture.park("terminal_read");
+    const streaming = mounted.run();
+    await first.entered;
+    if (cachedDegraded) await fixture.refreshMounted(degradedRuntime);
+    first.resolve(nativeData([65]));
+    assert.deepEqual(await parked.entered, { viewId: firstView });
+    const inventoryRead = fixture.park("local_inventory");
+    const status = fixture.park("terminal_status");
+    if (cachedDegraded) t.mock.timers.enable({ apis: ["setTimeout"] });
+    confirmation.reject(Error("arbitrary native refusal"));
+    await inventoryRead.entered;
+    if (!cachedDegraded) parked.resolve(nativeData([66], nativeAttachment(firstView)));
+    await attemptMutations(mounted);
+    assert.deepEqual(mounted.frames, [[65]]);
+    inventoryRead.resolve(inventory(cachedDegraded ? nativeRuntime : degradedRuntime));
+    assert.deepEqual(await status.entered, { viewId: firstView });
+    assert.deepEqual(mounted.frames, [[65]]);
+    if (cachedDegraded) {
+      assert.equal(fixture.entry(), undefined);
+      assert.equal(await fixture.connect(), undefined);
+    }
+    assert.equal(await mounted.reconnectRefused(), false);
+    status.resolve(nativeAttachment(firstView).status);
+    if (cachedDegraded) {
+      assert.equal((await mounted.confirmation.recovery?.proof)?.observing, true);
+      t.mock.timers.tick(10_000);
+      assert.equal(mounted.scope.active, true);
+      t.mock.timers.reset();
+      parked.resolve(nativeData([66], nativeAttachment(firstView)));
+    }
+    assert.deepEqual(await warm.entered, { viewId: firstView });
+    warm.resolve(nativeData([67]));
+    assert.deepEqual(await lateWritable.entered, { viewId: firstView });
+    await fixture.refreshMounted(nativeRuntime);
+    lateWritable.resolve(nativeData([68], nativeAttachment(firstView), newIncarnation));
+    assert.deepEqual(await afterLate.entered, { viewId: firstView });
+    await attemptMutations(mounted);
+    assert.equal(mounted.confirmation.confirmed, false);
+    assert.equal(mounted.scope.canWrite, false);
+    assert.equal(mounted.scope.viewId, firstView);
+    assert.equal(fixture.binding(), mounted.binding);
+    assert.equal(mounted.displayed, renderer);
+    assert.equal(mounted.disposals(), 0);
+    assert.deepEqual(mounted.frames, [[65], [66], [67], [68]]);
+    assert.equal(renderer.buffer.active.getLine(0)?.translateToString(true), "ABCD");
+    assert.deepEqual(fixture.counts("terminal_attach"), [{ runtimeId }]);
+    assert.deepEqual(fixture.counts("terminal_detach"), []);
+    assert.deepEqual(mutatingCommands(fixture), []);
+
+    const pendingDelivery = fixture.delivery.begin();
+    assert.equal(await mounted.reconnectRefused(), false);
+    pendingDelivery();
+    const freshInventory = fixture.park("local_inventory");
+    const reconnect = mounted.reconnectRefused();
+    await freshInventory.entered;
+    assert.equal(mounted.scope.viewId, firstView);
+    assert.deepEqual(fixture.counts("terminal_detach"), []);
+    assert.deepEqual(fixture.counts("terminal_attach"), [{ runtimeId }]);
+    freshInventory.resolve(inventory(nativeRuntime));
+    assert.equal(await reconnect, true);
+    afterLate.resolve(nativeData([90], nativeAttachment(firstView)));
+    await streaming;
+    assert.deepEqual(mounted.frames, [[65], [66], [67], [68]]);
+    const ready = fixture.park("terminal_attach");
+    const freshConfirmation = fixture.park("terminal_confirm_writer");
+    const restored = fixture.connect("ordinary");
+    assert.deepEqual(await ready.entered, { runtimeId, restoration: {
+      previous: mounted.binding.terminal, agent_pid: 12, session_id: nativeRuntime.session_id,
+      operation_id: nativeRuntime.operation_id,
+    } });
+    ready.resolve(nativeAttachment(observedView));
+    assert.deepEqual(await freshConfirmation.entered, writerAssertions(observedView));
+    const next = await restored;
+    assert.ok(next);
+    assert.notEqual(next.displayed, renderer);
+    assert.equal(mounted.disposals(), 0);
+    const captured = fixture.park("terminal_read");
+    const eligible = fixture.park("terminal_read");
+    const eof = fixture.park("terminal_read");
+    const nextStream = next.run();
+    await captured.entered;
+    freshConfirmation.resolve(undefined);
+    await next.confirmation.settled;
+    captured.resolve(nativeData([69], nativeAttachment(observedView)));
+    await eligible.entered;
+    assert.equal(mounted.disposals(), 1);
+    assert.equal(next.scope.canWrite, false);
+    eligible.resolve(nativeData([70], nativeAttachment(observedView), newIncarnation));
+    await eof.entered;
+    assert.equal(next.scope.canWrite, true);
+    const input = fixture.park("terminal_input");
+    const sent = next.scope.send(Uint8Array.of(71));
+    assert.deepEqual(await input.entered, { viewId: observedView, data: [71], incarnation: newIncarnation });
+    input.resolve(undefined);
+    await sent;
+    eof.resolve(nativeClosure({ reason: "eof" }));
+    await nextStream;
+    assert.deepEqual(next.frames, [[69], [70]]);
+    assert.deepEqual(fixture.counts("terminal_confirm_writer"), [writerAssertions(firstView), writerAssertions(observedView)]);
+    assert.deepEqual(mutatingCommands(fixture).map(call => call.command), ["terminal_input"]);
+  });
+}
+
+for (const boundary of ["missing inventory", "conflicting inventory", "failed status", "wrong status",
+  "close", "replacement", "deadline"] as const) {
+  test(`writer refusal discards parked output on ${boundary} during live proof`, async t => {
+    const fixture = mountedNativeFixture(t);
+    await fixture.publish(nativeRuntime);
+    const { mounted, confirmation } = await pendingWriter(fixture);
+    await fixture.refreshMounted(degradedRuntime);
+    const read = fixture.park("terminal_read");
+    const initial = fixture.park("local_inventory");
+    const status = fixture.park("terminal_status");
+    const stream = mounted.run();
+    await read.entered;
+    if (boundary === "deadline") t.mock.timers.enable({ apis: ["setTimeout"] });
+    confirmation.reject(Error("arbitrary refusal"));
+    await initial.entered;
+    read.resolve(nativeData([90]));
+    if (boundary === "missing inventory") {
+      initial.resolve({ agent_pid: 12, runtimes: [] });
+    } else if (boundary === "conflicting inventory") {
+      initial.resolve(inventory({ ...nativeRuntime, workspace_id: fixtureId(24) }));
+    } else {
+      if (boundary === "deadline") t.mock.timers.tick(9_999);
+      initial.resolve(inventory(degradedRuntime));
+      assert.deepEqual(await status.entered, { viewId: firstView });
+      if (boundary === "close") {
+        fixture.close();
+        mounted.update();
+      }
+      if (boundary === "replacement") await fixture.refreshMounted({ ...nativeRuntime, pane_pid: 43 });
+      if (boundary === "deadline") {
+        await fixture.refreshMounted(nativeRuntime);
+        await fixture.refreshMounted(degradedRuntime);
+        t.mock.timers.tick(1);
+        assert.equal(mounted.scope.active, false);
+      }
+      if (boundary === "failed status") status.reject(Error("native status unavailable"));
+      else if (boundary === "wrong status") {
+        status.resolve(nativeAttachment(firstView, nativeAgent, { ...nativeTarget, process_start: 999 }).status);
+      } else status.resolve(nativeAttachment(firstView).status);
+    }
+    await stream;
+    await attemptMutations(mounted);
+    assert.equal(mounted.scope.active, false);
+    assert.deepEqual(mounted.frames, []);
+    assert.equal(mounted.disposals(), 1);
+    assert.equal(await fixture.connect(), undefined);
+    assert.deepEqual(fixture.counts("terminal_attach"), [{ runtimeId }]);
+    assert.deepEqual(fixture.counts("terminal_detach"), [{ viewId: firstView, failure: undefined }]);
+    assert.deepEqual(mutatingCommands(fixture), []);
+  });
+}
+
+test("refused candidate drains typed EOF when the live status probe cannot prove a reader", async t => {
+  const fixture = mountedNativeFixture(t);
+  await fixture.publish(nativeRuntime);
+  const { mounted, confirmation } = await pendingWriter(fixture);
+  await fixture.refreshMounted(degradedRuntime);
+  const read = fixture.park("terminal_read");
+  const eof = fixture.park("terminal_read");
+  const original = fixture.park("local_inventory");
+  const status = fixture.park("terminal_status");
+  const stream = mounted.run();
+  await read.entered;
+  confirmation.reject(Error("arbitrary refusal"));
+  await original.entered;
+  read.resolve(nativeData([65]));
+  original.resolve(inventory(nativeRuntime));
+  await status.entered;
+  status.reject(Error("view ended"));
+  await eof.entered;
+  const final = fixture.park("local_inventory");
+  eof.resolve(nativeClosure({ reason: "eof" }));
+  await final.entered;
+  assert.deepEqual(mounted.frames, []);
+  final.resolve(inventory({ ...nativeRuntime, pane_pid: null, exited: true }));
+  await stream;
+  assert.deepEqual(mounted.frames, [[65]]);
+  assert.equal(mounted.completed(), 1);
+  assert.equal(mounted.disposals(), 0);
+  assert.deepEqual(fixture.counts("terminal_detach"), [{ viewId: firstView, failure: undefined }]);
+  assert.deepEqual(mutatingCommands(fixture), []);
+});
+
+test("a refused writer settles the already-issued grid on its original renderer", async t => {
+  const fixture = mountedNativeFixture(t);
+  await fixture.publish(nativeRuntime);
+  const { mounted, confirmation } = await pendingWriter(fixture);
+  const renderer = mounted.displayed;
+  const read = fixture.park("terminal_read");
+  const ack = fixture.park("terminal_acknowledge_grid");
+  const warm = fixture.park("terminal_read");
+  const eof = fixture.park("terminal_read");
+  const stream = mounted.run();
+  await read.entered;
+  const dimensions = { cols: 104, rows: 32 };
+  const epoch = { agent: nativeAgent, owner: nativeOwner };
+  const grid = { size: dimensions, sampled_at_us: 1 };
+  const geometry = {
+    status: { ...nativeAttachment(firstView).status, epoch,
+      committed: { size: dimensions, revision: 1, intent: { epoch, id: fixtureId(24) } } },
+    bridge_pty: grid,
+    client: grid,
+  };
+  read.resolve({ ...nativeData([]), geometry });
+  assert.deepEqual(await ack.entered, { viewId: firstView, acknowledgement: {
+    renderer_id: fixtureId(16), epoch, revision: 1, size: dimensions, focused: false,
+  } });
+  const original = fixture.park("local_inventory");
+  const status = fixture.park("terminal_status");
+  confirmation.reject(Error("arbitrary refusal"));
+  await original.entered;
+  original.resolve(inventory(degradedRuntime));
+  assert.deepEqual(await status.entered, { viewId: firstView });
+  status.resolve(geometry.status);
+  assert.equal((await mounted.confirmation.recovery?.proof)?.observing, true);
+  ack.resolve(geometry);
+  assert.deepEqual(await warm.entered, { viewId: firstView });
+  warm.resolve(nativeData([65]));
+  await eof.entered;
+  await attemptMutations(mounted);
+  assert.equal(mounted.displayed, renderer);
+  assert.equal(renderer.buffer.active.getLine(0)?.translateToString(true), "A");
+  assert.deepEqual([renderer.cols, renderer.rows], [dimensions.cols, dimensions.rows]);
+  assert.deepEqual(fixture.counts("terminal_attach"), [{ runtimeId }]);
+  assert.deepEqual(fixture.counts("terminal_detach"), []);
+  assert.deepEqual(mutatingCommands(fixture).map(call => call.command), ["terminal_acknowledge_grid"]);
+  eof.resolve(nativeClosure({ reason: "eof" }));
+  await stream;
+  assert.equal(mounted.completed(), 1);
+  assert.equal(mounted.disposals(), 0);
+});
 
 test("warm observation drops queued mutations and preserves an uncertain predecessor hold", async t => {
   const fixture = mountedNativeFixture(t);
@@ -2057,12 +2444,13 @@ test("the sidebar, saved restore and mounted renderer use the checked production
   assert.match(app, /updateTerminalRecord\(current, currentAttachment\(id, previous, attempt\)/);
   assert.match(app, /<TerminalView key=\{props.mounted.key\}[\s\S]+panels.map\([\s\S]+<section key=\{id\}[\s\S]+hidden=\{id !== activeId\}[\s\S]+<PanelTerminal[\s\S]+previousBinding=\{previousBinding\}[\s\S]+currentAttachment=\{currentAttachment\}/);
   assert.match(view, /const \{ mode, agent \} = mountedTerminalEffect\(mounted, activeEffect.current, delivery.mayRestore\)/);
-  assert.match(view, /activeEffect.current = effect;[\s\S]+effect.binding = binding = accepted;[\s\S]+\[runtimeId, mode, agent, attempt, retry, currentAttachment, delivery, detached, onBinding\]/);
+  assert.match(view, /activeEffect.current = effect;[\s\S]+effect.binding = binding = accepted;[\s\S]+\[runtimeId, mode, agent, attempt, retry, currentAttachment, delivery, detached, onBinding, onReconnectClosed\]/);
   assert.match(view, /updateEligibility.current\?\.\(\)[\s\S]+updateMountedStream\(streamEligibility, confirmation\)/);
   assert.match(view, /inputEligible: \(\) => rendererOpened && attachmentMode === "ordinary" && access\(\) === "attached"/);
   assert.match(view, /if \(view\) detached.current = detach\(view, failure\)/);
   assert.match(view, /const current = \(\) => currentAttachment\(runtimeId, binding \?\? previous, attempt\)[\s\S]+if \(currentIntent\(\)\) setRetry/);
-  assert.match(view, /useEffect\(\(\) => \{\s*const mountedElement[\s\S]+if \(mountedTerminalEntry\(currentAttachment\(runtimeId, previous, attempt\),\s*retainedAtEntry\?\.binding, delivery\.mayRestore\) !== mode\) return;\s*const attachmentMode = mode;/);
+  assert.match(view, /useEffect\(\(\) => \{\s*const mountedElement[\s\S]+const initial = currentAttachment\(runtimeId, previous, attempt\);[\s\S]+if \(mountedTerminalEntry\(initial, retainedAtEntry\?\.binding, delivery\.mayRestore\) !== mode\) return;\s*const attachmentMode = mode;/);
+  assert.match(view, /makeRefusedWriterReconnect\(scope,[\s\S]+onBinding\(accepted, "view-closed", accepted, attempt\)[\s\S]+scope.retire\(\);\s+onReconnectClosed\(runtimeId, accepted, attempt\)[\s\S]+if \(confirmation\?\.refused\) \{\s+if \(binding\) void reconnectRefused\(binding, confirmation\)/);
   assert.match(view, /adoptCurrentTerminal\(runtimeId, previous, attachmentMode,[\s\S]+terminalProofOnly\(current\(\), attachmentMode[\s\S]+onBinding\(accepted, proofOnly \? "proved" : "bound", previous, attempt\)[\s\S]+detached.current, localClient\)/);
   assert.match(view, /if \(proofOnly\) \{\s*scope.retire\(\);\s*return;\s*\}[\s\S]+confirmMountedWriter\(candidate,[\s\S]+await runMountedTerminalStream\(\{[\s\S]+localClient.read\(view\)[\s\S]+protocol.consume\(scope, view, chunk, render\)/);
   assert.match(view, /acceptMountedRenderer\(current\(\), candidate.binding,[\s\S]+onBinding\(candidate.binding, "rendered", candidate.binding, attempt\)[\s\S]+retainedAtEntry\?\.dispose\(\)[\s\S]+openRenderer\(\)[\s\S]+eof\(state\) \{\s+retained = onBinding\(candidate.binding, state/);

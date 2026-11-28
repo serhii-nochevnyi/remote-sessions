@@ -3502,8 +3502,10 @@ async fn w1_legacy_provenance_bridge_restores_finished_held_and_retains_bound_re
     let relay_host = host.0.clone();
     let opens = Arc::new(AtomicU64::new(0));
     let accepted = Arc::new(AtomicU64::new(0));
+    let lists = Arc::new(AtomicU64::new(0));
     let relay_opens = Arc::clone(&opens);
     let relay_accepted = Arc::clone(&accepted);
+    let relay_lists = Arc::clone(&lists);
     let relay = tokio::spawn(async move {
         loop {
             let (mut peer, command) = receive(&listener).await;
@@ -3520,6 +3522,8 @@ async fn w1_legacy_provenance_bridge_restores_finished_held_and_retains_bound_re
                 if matches!(response, Response::TerminalOpened { .. }) {
                     relay_accepted.fetch_add(1, Ordering::Relaxed);
                 }
+            } else if matches!(command, Request::List {}) {
+                relay_lists.fetch_add(1, Ordering::Relaxed);
             }
             respond(&mut peer, response).await;
         }
@@ -3549,12 +3553,43 @@ async fn w1_legacy_provenance_bridge_restores_finished_held_and_retains_bound_re
         read_until_bytes(&bridge, &restored.view_id, b"buffered attachment output").await,
         b"buffered attachment output"
     );
+    let expected = TerminalInventoryBinding::current(
+        &restored.status.terminal,
+        &bridge.inventory().await.unwrap(),
+    )
+    .unwrap();
+    assert!(
+        bridge
+            .views
+            .lock()
+            .unwrap()
+            .writer_candidate(&restored.status.terminal, expected)
+            .is_ok()
+    );
 
     fs::rename(
         host.0.join("catalog/catalog.sqlite3"),
         host.0.join("retained.sqlite3"),
     )
     .unwrap();
+    let impaired = bridge.inventory().await.unwrap();
+    let row = impaired
+        .runtimes
+        .iter()
+        .find(|row| row.runtime_id == original.runtime_id)
+        .unwrap();
+    assert_eq!(row.session_id, original.session_id);
+    assert_eq!(row.pane_id, restored.status.terminal.target.pane);
+    assert_eq!(row.pane_pid, Some(restored.status.terminal.target.pid));
+    assert_eq!((row.operation_id, row.workspace_id), (None, None));
+    let list_before_confirmation = lists.load(Ordering::Relaxed);
+    assert!(
+        bridge
+            .confirm_writer(restored.status.terminal.clone(), expected)
+            .await
+            .is_err()
+    );
+    assert_eq!(lists.load(Ordering::Relaxed), list_before_confirmation + 1);
     let status = bridge.status(&restored.view_id).await.unwrap();
     assert_eq!(status.terminal, restored.status.terminal);
     assert_eq!(status.observation, ObservationState::Observed);
@@ -3660,7 +3695,9 @@ async fn start_catalog_terminal_fixture(
         }
     });
     until(|| server.is_finished() || host.0.join("agent.sock").exists()).await;
-    assert!(!server.is_finished());
+    if server.is_finished() {
+        panic!("catalog fixture exited before Health: {:?}", server.await);
+    }
     let workspace = product_request(
         &host.0,
         &ProductRequest::RegisterWorkspace {

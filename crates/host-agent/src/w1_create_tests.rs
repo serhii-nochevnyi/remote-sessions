@@ -3864,6 +3864,10 @@ async fn check_real_create_reply_loss(replacement: bool) {
         fs::read(fixture.root.join("real-spawns")).unwrap(),
         b"spawned\n"
     );
+    let fifo = fixture.root.join("diagnostic-release");
+    let fifo_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // @security: The FIFO path is a live NUL-terminated string inside the private fixture directory.
+    assert_eq!(unsafe { nix::libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
     let diagnostic = Request::Create {
         session_id: Uuid::new_v4(),
         runtime_id: Uuid::new_v4(),
@@ -3871,8 +3875,11 @@ async fn check_real_create_reply_loss(replacement: bool) {
         argv: vec![
             "/bin/sh".into(),
             "-c".into(),
-            "printf '%s\\n%s' \"$(/bin/pwd)\" \"$2\" > \"$1.tmp\"; /bin/mv \"$1.tmp\" \"$1\""
-                .into(),
+            concat!(
+                "set -e; printf '%s\\n%s' \"$(/bin/pwd)\" \"$2\" > \"$1.tmp\"; /bin/mv \"$1.tmp\" \"$1\"; ",
+                "printf 'entered\\n' > \"$1.entered\"; IFS= read -r release < \"$3\"; test \"$release\" = release",
+            )
+            .into(),
             "fixture".into(),
             fixture
                 .root
@@ -3881,6 +3888,7 @@ async fn check_real_create_reply_loss(replacement: bool) {
                 .unwrap()
                 .into(),
             "literal #{} $name ' \" ; value".into(),
+            fifo.to_str().unwrap().into(),
         ],
     };
     let created = request(&fixture.root, &diagnostic).await.unwrap();
@@ -3893,6 +3901,27 @@ async fn check_real_create_reply_loss(replacement: bool) {
         )
         .as_bytes()
     );
+    assert_eq!(wait("diagnostic-output.entered").await, b"entered\n");
+    // @invariant: A writer opens only when the original shell is waiting for release.
+    let mut release = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match OpenOptions::new()
+                .write(true)
+                .custom_flags(nix::libc::O_NONBLOCK)
+                .open(&fifo)
+            {
+                Ok(writer) => break writer,
+                Err(error) if error.raw_os_error() == Some(nix::libc::ENXIO) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("could not open diagnostic release gate: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("diagnostic shell did not wait for release");
+    std::io::Write::write_all(&mut release, b"release\n").unwrap();
+    drop(release);
     stop(job).await;
 }
 

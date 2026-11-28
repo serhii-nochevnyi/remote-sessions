@@ -4625,6 +4625,18 @@ impl Engine {
         predecessors_closed
     }
 
+    fn discard_live_rejected_paste(&self, binding: &PasteBinding) {
+        let mut owners = self.owners();
+        let now = self.now();
+        // @security: Under the runtime lane, discard only the live consumed binding without advancing high-water.
+        if owners.epoch(binding.terminal.target.runtime_id, binding.token, now)
+            == Some(binding.epoch)
+            && owners.paste_live(binding, now)
+        {
+            owners.discard_rejected_stage(binding, now);
+        }
+    }
+
     async fn paste_stage(
         &self,
         binding: PasteBinding,
@@ -4645,6 +4657,7 @@ impl Engine {
                     .await
                     .is_err() =>
             {
+                self.discard_live_rejected_paste(&binding);
                 return PasteResult::Unavailable {};
             }
             Ok(read) if lane.holds_pane(&read) => Some(PasteResult::Unknown {}),
@@ -4723,9 +4736,11 @@ impl Engine {
         };
         let mut lane = lock.lock().await;
         let Ok(read) = self.scoped_geometry(&binding.terminal).await else {
+            self.discard_live_rejected_paste(&binding);
             return PasteResult::Stale {};
         };
         if read.epoch != Some(binding.epoch) {
+            self.discard_live_rejected_paste(&binding);
             return PasteResult::Stale {};
         }
         if self
@@ -4733,6 +4748,7 @@ impl Engine {
             .await
             .is_err()
         {
+            self.discard_live_rejected_paste(&binding);
             return PasteResult::Unavailable {};
         }
         let Some(data) = self.owners().take_stage(&binding) else {

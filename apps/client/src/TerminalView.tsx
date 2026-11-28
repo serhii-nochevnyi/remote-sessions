@@ -6,7 +6,7 @@ import { bindTerminalPaste, bindTerminalProtocol } from "./terminal-protocol";
 import { localClient, TerminalViewScope } from "./local-client";
 import type { GeometryEvent, TerminalDelivery, TerminalSize, TerminalStatus, TerminalStreamFailure } from "./local-client";
 import { acceptMountedRenderer, adoptCurrentTerminal, confirmMountedWriter, desiredTerminalMode, explicitClosedReconnect,
-  mountedTerminalEffect, mountedTerminalEntry, runMountedTerminalStream, TerminalAttachmentIdentityError, terminalProofOnly, terminalStreamAccess,
+  makeRefusedWriterReconnect, mountedTerminalEffect, mountedTerminalEntry, runMountedTerminalStream, TerminalAttachmentIdentityError, terminalProofOnly, terminalStreamAccess,
   updateMountedStream } from "./session-state";
 import type { ActiveTerminalEffect, BoundTerminal, MountedTerminal, TerminalBindingState } from "./session-state";
 import { GeometryBoundaryError, mountedResize, OrderedGeometry, sameTerminal } from "./terminal-geometry";
@@ -55,7 +55,8 @@ export function TerminalView({ runtimeId, label, fontSize, mounted, previousBind
   const reconnectDelay = useRef(500);
   const previousRef = useRef(previousBinding);
   const activeEffect = useRef<ActiveTerminalEffect | undefined>(undefined);
-  const updateEligibility = useRef<((reconnect?: boolean) => void) | null>(null);
+  const updateEligibility = useRef<(() => void) | null>(null);
+  const reconnectCurrent = useRef<(() => boolean) | null>(null);
   const retainedRenderer = useRef<{ binding: BoundTerminal; dispose: () => void } | null>(null);
   const [status, setStatus] = useState("Підключення…");
   const [retry, setRetry] = useState(0);
@@ -84,9 +85,9 @@ export function TerminalView({ runtimeId, label, fontSize, mounted, previousBind
     if (!mountedElement || !mode || agent === undefined) return;
     const previous = previousRef.current;
     const retainedAtEntry = retainedRenderer.current;
-    const reopening = retainedAtEntry !== null;
-    if (mountedTerminalEntry(currentAttachment(runtimeId, previous, attempt),
-      retainedAtEntry?.binding, delivery.mayRestore) !== mode) return;
+    const initial = currentAttachment(runtimeId, previous, attempt);
+    const reopening = retainedAtEntry !== null || initial.reconnectFrom !== undefined;
+    if (mountedTerminalEntry(initial, retainedAtEntry?.binding, delivery.mayRestore) !== mode) return;
     const attachmentMode = mode;
     const effect: ActiveTerminalEffect = { mode: attachmentMode, agent };
     activeEffect.current = effect;
@@ -221,13 +222,20 @@ export function TerminalView({ runtimeId, label, fontSize, mounted, previousBind
         const draining = current().mode === "draining";
         if (!retained) {
           if (!proofOnly) {
-            if (binding) onBinding(binding, identityChanged ? "changed" : draining ? "ended" : "retired", binding, attempt);
-            else if (previous && (identityChanged || reopening)) onBinding(previous, identityChanged ? "changed" : "view-closed", previous, attempt);
+            if (binding) {
+              // @invariant: A retired refused candidate waits for deliberate restoration even after remount.
+              const state = identityChanged ? "changed" : draining ? "ended"
+                : confirmation?.refused ? "view-closed" : "retired";
+              onBinding(binding, state, binding, attempt);
+            } else if (previous && (identityChanged || reopening)) {
+              onBinding(previous, identityChanged ? "changed" : "view-closed", previous, attempt);
+            }
           }
           activeEffect.current = undefined;
         }
         container.removeAttribute("data-terminal-attached");
         updateEligibility.current = null;
+        reconnectCurrent.current = null;
         routing?.close();
         resize.close();
         protocol.pauseInput();
@@ -240,7 +248,7 @@ export function TerminalView({ runtimeId, label, fontSize, mounted, previousBind
       },
       reconnect(error) {
         setStatus(`Перепідключення… ${String(error)}`);
-        if ((reopening && !binding) || identityChanged || !currentIntent()) return;
+        if (confirmation?.refused || (reopening && !binding) || identityChanged || !currentIntent()) return;
         reconnect = setTimeout(() => {
           if (currentIntent()) setRetry(value => value + 1);
         }, reconnectDelay.current);
@@ -250,12 +258,27 @@ export function TerminalView({ runtimeId, label, fontSize, mounted, previousBind
     const protocol = bindTerminalProtocol(terminal, bytes => { void scope.send(bytes); });
     if (!reopening && attachmentMode === "ordinary") openRenderer();
     const streamEligibility = { scope, access, revokeMutations, identityChanged() { identityChanged = true; } };
-    updateEligibility.current = (reconnect = false) => {
-      if (reconnect) {
-        stale = true;
-        scope.setInputEligible(false);
+    const reconnectRefused = makeRefusedWriterReconnect(scope,
+      expected => !stale && activeEffect.current === effect && binding === expected ? current() : { mode: "missing" },
+      () => delivery.mayRestore, accepted => {
+        retained = onBinding(accepted, "view-closed", accepted, attempt);
+        if (!retained) return false;
         scope.retire();
-      } else if (binding) {
+        onReconnectClosed(runtimeId, accepted, attempt);
+        return true;
+      }, localClient);
+    reconnectCurrent.current = () => {
+      if (confirmation?.refused) {
+        if (binding) void reconnectRefused(binding, confirmation);
+        return false;
+      }
+      stale = true;
+      scope.setInputEligible(false);
+      scope.retire();
+      return true;
+    };
+    updateEligibility.current = () => {
+      if (binding) {
         const access = updateMountedStream(streamEligibility, confirmation);
         if (access === "draining" || access === "observing") report();
       } else if (desiredTerminalMode(currentIntent(), attachmentMode, delivery.mayRestore) !== attachmentMode) {
@@ -374,7 +397,7 @@ export function TerminalView({ runtimeId, label, fontSize, mounted, previousBind
       if (!retained) disposeRenderer();
       activeEffect.current = undefined;
     };
-  }, [runtimeId, mode, agent, attempt, retry, currentAttachment, delivery, detached, onBinding]);
+  }, [runtimeId, mode, agent, attempt, retry, currentAttachment, delivery, detached, onBinding, onReconnectClosed]);
   const displayStatus = mounted.mode === "completed" ? "Процес завершився · режим перегляду"
     : mounted.mode === "view-closed" && !intent ? "Потік термінала закрито · режим перегляду"
     : intent || (observation && mode) || outputOnly ? status : "Очікуємо підтвердження термінала…";
@@ -389,7 +412,7 @@ export function TerminalView({ runtimeId, label, fontSize, mounted, previousBind
     }
     if (!current.intent || current.intent.reconnect) return;
     element.current?.focus();
-    updateEligibility.current?.(true);
+    if (reconnectCurrent.current && !reconnectCurrent.current()) return;
     setRetry(value => value + 1);
   }}>Перепідключити</button></div>
     <div className="terminal-view"><div className="live-terminal" ref={element} role="region" aria-label={label} tabIndex={0} /></div></>;

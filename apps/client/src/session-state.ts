@@ -411,7 +411,8 @@ export function acceptMountedRenderer(
   commit: () => boolean,
 ) {
   if (terminalStreamAccess(mounted, binding, mode, mayRestore) === "stale" || retained !== currentRetained) return false;
-  return !retained || (mounted.reconnectFrom === retained && commit());
+  if (retained && mounted.reconnectFrom !== retained) return false;
+  return !mounted.reconnectFrom || commit();
 }
 
 export class TerminalAttachmentIdentityError extends Error {
@@ -525,15 +526,18 @@ const terminalDrainFrames = 17;
 interface ConfirmationRecovery {
   readonly error: unknown;
   readonly deadline: number;
-  readonly original: Promise<RuntimeInfo | undefined>;
+  readonly proof: Promise<{ readonly observing: boolean; readonly original: RuntimeInfo | undefined } | undefined>;
+  continueEofDeadline(): void;
 }
 
 interface MountedConfirmation {
   readonly pending: boolean;
   readonly confirmed: boolean;
   readonly armed: boolean;
+  readonly refused: boolean;
   readonly recovery: ConfirmationRecovery | undefined;
   readonly settled: Promise<void>;
+  resumeObservation(): void;
   updateEligibility(access: StreamAccess): void;
   stop(): void;
 }
@@ -548,6 +552,40 @@ function corroborateTerminalDrain(binding: BoundTerminal, inventory: Inventory |
       (row.pane_pid === target.pid || (row.exited && row.pane_pid === null))) return row;
 }
 
+export function makeRefusedWriterReconnect(
+  scope: TerminalViewScope,
+  current: (binding: BoundTerminal) => MountedTerminal,
+  mayRestore: () => boolean,
+  reconnect: (binding: BoundTerminal) => boolean,
+  client: Pick<typeof localClient, "inventory">,
+) {
+  let probing = false;
+  return async (binding: BoundTerminal, confirmation: MountedConfirmation): Promise<boolean> => {
+    const { terminal, identity } = binding;
+    const currentIntent = () => {
+      if (!scope.owns(terminal.view_id) || !confirmation.refused || confirmation.recovery || !mayRestore()) return;
+      const intent = current(binding).intent;
+      if (intent?.mode === "live" && !intent.reconnect && sameInventoryIdentity(intent.identity, identity) &&
+          matchesPane(intent.runtime, terminal) && inventoryMatches(intent.runtime, identity) &&
+          intent.runtime.workspace_id === identity.workspaceId && intent.runtime.operation_id === identity.operationId) return intent;
+    };
+    if (probing) return false;
+    const intent = currentIntent();
+    if (!intent) return false;
+    probing = true;
+    try {
+      // @security: Retiring a refused reader requires fresh native inventory for its exact live binding.
+      const fresh = await client.inventory().catch(() => null);
+      const latest = currentIntent();
+      if (!latest || !sameRuntime(latest.runtime, intent.runtime) || fresh?.agent_pid !== identity.agentPid) return false;
+      const row = fresh.runtimes.find(runtime => runtime.runtime_id === terminal.target.runtime_id);
+      return row !== undefined && sameRuntime(row, latest.runtime) && reconnect(binding);
+    } finally {
+      probing = false;
+    }
+  };
+}
+
 export function confirmMountedWriter(
   candidate: { readonly binding: BoundTerminal; readonly runtime: RuntimeInfo },
   mode: AttachmentMode,
@@ -555,10 +593,11 @@ export function confirmMountedWriter(
   mayRestore: () => boolean,
   stream: Pick<MountedStream, "scope" | "access" | "revokeMutations" | "identityChanged">,
   recovering: () => void,
-  client: Pick<typeof localClient, "confirmWriter" | "inventory">,
+  client: Pick<typeof localClient, "confirmWriter" | "inventory" | "terminalStatus">,
 ): MountedConfirmation {
   const { scope } = stream;
-  const { binding: { terminal, identity }, runtime } = candidate;
+  const { binding, runtime } = candidate;
+  const { terminal, identity } = binding;
   const canConfirm = () => {
     const intent = current().intent;
     return mode === "ordinary" && scope.owns(terminal.view_id) && stream.access() === "attached" &&
@@ -569,6 +608,7 @@ export function confirmMountedWriter(
   let pending = canConfirm();
   let confirmed = false;
   let armed = false;
+  let refused = false;
   let recovery: ConfirmationRecovery | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   function updateEligibility(access: StreamAccess) {
@@ -588,17 +628,53 @@ export function confirmMountedWriter(
     } catch (error) {
       if (!scope.owns(terminal.view_id) || updateMountedStream(stream) === "stale") return;
       const deadline = performance.now() + terminalDrainTimeout;
+      // @security: This candidate stays disarmed even if inventory enrichment or a writable sample returns.
+      refused = true;
       scope.setInputEligible(false);
       stream.revokeMutations();
-      const original = client.inventory().catch(() => null).then(inventory => {
-        if (!scope.owns(terminal.view_id) || updateMountedStream(stream) === "stale") return;
-        const row = corroborateTerminalDrain(candidate.binding, inventory);
-        if (row === "changed") stream.identityChanged();
-        if (row && row !== "changed") return row;
+      const hasMountedObservation = () => current().observation === binding;
+      const wasObserving = hasMountedObservation();
+      const active = () => {
+        if (!scope.owns(terminal.view_id) || updateMountedStream(stream) === "stale") return false;
+        if (performance.now() < deadline) return true;
         scope.retire({ error });
-      });
-      recovery = { error, deadline, original };
-      timer = setTimeout(() => { scope.retire({ error }); }, terminalDrainTimeout);
+        return false;
+      };
+      const armDeadline = () => {
+        timer = setTimeout(() => { scope.retire({ error }); }, Math.max(0, Math.ceil(deadline - performance.now())));
+      };
+      async function classify() {
+        const inventory = await client.inventory().catch(() => null);
+        if (!active()) return;
+        const row = inventory?.runtimes.find(row => row.runtime_id === terminal.target.runtime_id);
+        const original = corroborateTerminalDrain(binding, inventory);
+        if (original === "changed" || (row && !row.exited && !matchesPane(row, terminal))) {
+          stream.identityChanged();
+        } else {
+          const degraded = row?.origin === "unverified" && identity.operationId !== null && identity.workspaceId !== null;
+          const canObserve = stream.access() !== "draining" &&
+            (inventory === null || Boolean(row && !row.exited && (degraded || original))) &&
+            (degraded || wasObserving || hasMountedObservation());
+          if (canObserve) {
+            const status = await client.terminalStatus(terminal.view_id).catch(() => null);
+            if (!active()) return;
+            if (status && !sameTerminal(terminal, status.terminal)) {
+              stream.identityChanged();
+              scope.retire({ error });
+              return;
+            }
+            if (status && stream.access() !== "draining") {
+              clearTimeout(timer);
+              return { observing: true, original };
+            }
+          }
+          // @contract: A failed live status probe still permits the separately corroborated EOF path.
+          if (original) return { observing: false, original };
+        }
+        scope.retire({ error });
+      }
+      armDeadline();
+      recovery = { error, deadline, proof: classify(), continueEofDeadline: armDeadline };
       recovering();
       return;
     } finally {
@@ -615,8 +691,13 @@ export function confirmMountedWriter(
     get pending() { return pending; },
     get confirmed() { return confirmed; },
     get armed() { return armed; },
+    get refused() { return refused; },
     get recovery() { return recovery; },
     settled,
+    resumeObservation() {
+      clearTimeout(timer);
+      recovery = undefined;
+    },
     updateEligibility,
     stop() { clearTimeout(timer); },
   };
@@ -742,8 +823,23 @@ export async function runMountedTerminalStream(stream: MountedStream) {
       if (performance.now() >= recovery.deadline) throw recovery.error;
       return true;
     };
-    const original = await recovery.original;
-    if (!withinBudget() || !original) return;
+    const proof = await recovery.proof;
+    if (!permitted(recovery) || !proof) return;
+    if (head) validateScope(head);
+    if (head?.closure && head.closure.reason !== "eof") {
+      stream.closed();
+      scope.acceptClosure(view, head.closure);
+      return;
+    }
+    if (proof.observing && !head?.closure && !head?.closed && stream.access() !== "draining") {
+      confirmation.resumeObservation();
+      return !head || (await render(readOnly(head))).rendered;
+    }
+    if (!withinBudget()) return;
+    // @contract: An EOF racing live proof keeps the original absolute deadline.
+    if (proof.observing) recovery.continueEofDeadline();
+    const { original } = proof;
+    if (!original) throw recovery.error;
     let chunk = head;
     while (withinBudget()) {
       chunk ??= await stream.read(view);
@@ -778,14 +874,20 @@ export async function runMountedTerminalStream(stream: MountedStream) {
 
   try {
     while (active()) {
-      if (confirmation.recovery) return await recover(confirmation.recovery);
+      if (confirmation.recovery) {
+        if (!await recover(confirmation.recovery)) return;
+        continue;
+      }
       const checkEligibility = scope.captureReadEligibility();
       const wasArmed = confirmation.armed;
       const chunk = await stream.read(view);
       if (!active()) return;
       if (confirmation.pending && chunk.closure?.reason === "eof") await confirmation.settled;
       if (!active()) return;
-      if (confirmation.recovery) return await recover(confirmation.recovery, chunk);
+      if (confirmation.recovery) {
+        if (!await recover(confirmation.recovery, chunk)) return;
+        continue;
+      }
       const access = stream.access();
       if (chunk.closure) {
         if (chunk.closure.reason === "eof") finish(access === "draining");
@@ -800,7 +902,10 @@ export async function runMountedTerminalStream(stream: MountedStream) {
         ? readOnly(chunk) : chunk;
       const { rendered, submitted } = await render(sample);
       if (!active()) return;
-      if (confirmation.recovery) return await recover(confirmation.recovery, submitted ? undefined : chunk);
+      if (confirmation.recovery) {
+        if (!await recover(confirmation.recovery, submitted ? undefined : chunk)) return;
+        continue;
+      }
       if (!rendered) return;
     }
   } finally {
