@@ -22,6 +22,7 @@ FOLLOW_UP = "https://github.com/serhii-nochevnyi/remote-sessions/issues/10"
 INSPECTED_REVISION = "086365f61368678fb780cfa1e7f4befa9d606276"
 SCOPED_ARGV = "python3 -m unittest discover -s tests/integration -p test_w1_evidence.py".split()
 REVIEWED_CASE_TEXT_SHA256 = "57455de156e47e9eeecab18de079801947213a10c06af3971a93790155eb08df"
+REVIEWED_NARRATIVE_SHA256 = "04e8799d683f1449e52857ff54a6d9a3b64ab00a28d0b93f7bbf7923d4dcd66f"
 
 PARENT_GATES = frozenset("R1 R2 R3 R4 R5 R6 R7".split())
 PREPARATION_CASES = frozenset("""
@@ -310,6 +311,10 @@ def validate_evidence(root, data, markdown):
     require_reviewed_case_text(REPORT, (
         (case_id, reason, witness) for case_id, (_, reason, _, witness) in markdown_cases.items()
     ))
+    require(
+        hashlib.sha256(narrative.encode("utf-8")).hexdigest() == REVIEWED_NARRATIVE_SHA256,
+        f"{REPORT}: held report narrative differs from the reviewed baseline; baseline review required",
+    )
 
 
 def validate_public_docs(root):
@@ -504,6 +509,25 @@ class W1EvidenceTest(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, diagnostic):
                     validate_evidence(root, data, markdown)
         print(self.id(), flush=True)
+
+    def test_rejects_unreviewed_markdown_narrative(self):
+        root = self.report_fixture()
+        case_lines = [line for line in self.markdown.splitlines() if line.startswith("| `R")]
+        self.assertEqual(len(case_lines), 105)
+        for sentence in (
+            "Both provider programs finished the installed run successfully.",
+            "For each actual provider there was not a single submitted model query.",
+            "Additional details belong in the follow-up.",
+        ):
+            with self.subTest(sentence=sentence):
+                (root / REPORT).write_text(f"{self.markdown}\n{sentence}\n", encoding="utf-8")
+                data, markdown = load_report(root)
+                self.assertEqual((root / EVIDENCE).read_bytes(), (ROOT / EVIDENCE).read_bytes())
+                self.assertEqual(data, self.data)
+                fixture_case_lines = [line for line in markdown.splitlines() if line.startswith("| `R")]
+                self.assertEqual(fixture_case_lines, case_lines)
+                with self.assertRaisesRegex(AssertionError, "held report narrative differs from the reviewed baseline"):
+                    validate_evidence(root, data, markdown)
 
     def test_rejects_markdown_case_status_and_prompt_changes(self):
         for new_value in ("PASS | changed | Unknown", "UNRUN | changed | 0"):
