@@ -226,12 +226,25 @@ def inventory_shape(rows):
 
 
 def resize_shape(value):
-    variant(value, 'result', {
+    result = variant(value, 'result', {
+        'busy': {'terminal': TERMINAL, 'size': SIZE},
         'committed': {'admission': INTENT, 'status': TERMINAL_STATUS},
         'rejected': {'terminal': TERMINAL, 'intent': INTENT},
         'uncertain': {'terminal': TERMINAL, 'intent': INTENT},
     })
+    if result == 'busy' and not (2 <= value['size']['cols'] <= 500 and 2 <= value['size']['rows'] <= 200):
+        raise ValueError('Unsupported IPC resize size')
     return True
+
+
+def terminal_identity(terminal):
+    target = terminal['target']
+    return {
+        **terminal,
+        'view_id': UUID(terminal['view_id']),
+        'agent_epoch': UUID(terminal['agent_epoch']),
+        'target': {**target, 'runtime_id': UUID(target['runtime_id']), 'generation': UUID(target['generation'])},
+    }
 
 
 def launch_outcome_shape(value):
@@ -378,6 +391,11 @@ def validate_reply(message, reply):
     result = variant(reply, 'result', {name: REPLIES[name] for name in (*names, 'error')})
     if result == 'health' and not desktop_pid(reply['agent_pid']):
         raise ValueError('Invalid desktop inventory agent PID')
+    if result == 'resize' and reply['resize']['result'] == 'busy':
+        resize = reply['resize']
+        if (resize['size'] != message['size']
+                or terminal_identity(resize['terminal']) != terminal_identity(message['terminal'])):
+            raise ValueError('Mismatched IPC resize Busy reply')
     if result == 'paste':
         variant(reply['paste'], 'result', PASTE_REPLIES[op])
     return result
