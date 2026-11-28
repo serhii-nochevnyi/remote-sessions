@@ -1176,7 +1176,7 @@ impl Engine {
         self
     }
 
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(test)]
     pub(crate) fn with_creation_fixture(
         mut self,
         launch_program: Option<PathBuf>,
