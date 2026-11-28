@@ -35,7 +35,10 @@ test("guarded bundle rejects desktop modules and external assets", async () => {
 
     write("entry.tsx", `import { demoSessions } from ${JSON.stringify(desktopModule)};
       document.body.dataset.fixture = demoSessions[0].id;`);
-    await assert.rejects(bundle, /Module is outside the fixture and its locked packages: .*session-state\.ts/);
+    await assert.rejects(
+      bundle,
+      /^(?:Error: )?Module is outside the fixture and its locked packages: (?:.*\/)?apps\/client\/src\/[^/?\r\n].*$/m,
+    );
     write("entry.tsx", entry);
 
     write("index.html", html.replace("./marker.svg", "//example.invalid/remote.svg"));
