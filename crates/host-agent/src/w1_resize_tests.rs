@@ -372,7 +372,8 @@ elif command == "display-message":
             row[5] = "%1"
         cols, rows = read(key("grid", pane)).split()
         print("|".join(row), cols, rows, cols, rows,
-              read(key("epoch", pane)), read(key("intent", pane)), read(key("launch", pane)),
+              read("readback-epoch") or read(key("epoch", pane)),
+              read(key("intent", pane)), read(key("launch", pane)),
               read(key("marker", pane)), int(bool(read("input-off"))),
               int(not read("unsupported")), sep="|")
 elif command == "save-buffer":
@@ -763,6 +764,342 @@ async fn configured_test_catalog(root: &Path) -> (PathBuf, CatalogLane) {
     .await
     .unwrap();
     (path, lane)
+}
+
+#[derive(Clone, Copy)]
+enum PasteRefusal {
+    Continuation,
+    Commit,
+    Scope,
+    Epoch,
+}
+
+async fn paste_ipc(root: &Path, request: Request) -> PasteResult {
+    match crate::request(root, &request).await.unwrap() {
+        Response::Paste { paste } => paste,
+        reply => panic!("expected a scoped paste response, got {reply:?}"),
+    }
+}
+
+async fn paste_while_catalog_busy(
+    root: &Path,
+    catalog: &CatalogLane,
+    requests: impl IntoIterator<Item = Request>,
+) {
+    use std::{future::poll_fn, task::Poll};
+
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let (release, parked) = std::sync::mpsc::channel();
+    let mut active = std::pin::pin!(catalog.run(move |_, _| {
+        entered.send(()).unwrap();
+        parked
+            .recv_timeout(SEND_WATCHDOG)
+            .map_err(|_| ProductIssue::WorkspaceCheckTimedOut)
+    }));
+    assert!(
+        poll_fn(|cx| Poll::Ready(active.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    tokio::time::timeout(SEND_WATCHDOG, waiting)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // @contract: A parked worker and four enqueued reads make authorization fail through the real lane.
+    let read = || {
+        catalog.run(|db, _| {
+            db.diagnostic(Uuid::nil(), Uuid::nil())
+                .map(|row| row.is_none())
+        })
+    };
+    let mut queued: Vec<_> = (0..4).map(|_| Box::pin(read())).collect();
+    for read in &mut queued {
+        assert!(
+            poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+    }
+    assert_eq!(read().await, Err(ProductIssue::CatalogBusy));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        for request in requests {
+            assert_eq!(paste_ipc(root, request).await, PasteResult::Unavailable {});
+        }
+    })
+    .await
+    .expect("paste reply must arrive while the catalog worker is parked");
+    assert_eq!(read().await, Err(ProductIssue::CatalogBusy));
+    release.send(()).unwrap();
+    active.await.unwrap();
+    for read in queued {
+        assert!(read.await.unwrap());
+    }
+    assert!(read().await.unwrap());
+}
+
+async fn configured_paste_refusal(refusal: PasteRefusal) {
+    let Fixture {
+        engine,
+        terminal,
+        temp,
+        pty: _pty,
+    } = Fixture::new();
+    let root = temp.path();
+    let (_, catalog) = configured_test_catalog(root).await;
+    fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
+    let guard = Arc::new(crate::AgentLock::acquire(root).unwrap());
+    let socket = guard.socket.clone();
+    let mut agent = tokio::task::JoinSet::new();
+    agent.spawn(crate::serve_local(
+        Arc::into_inner(engine).unwrap(),
+        guard,
+        Some(catalog.clone()),
+    ));
+    let request = async |message| crate::request(root, &message).await.unwrap();
+    let health = || request(Request::Health {});
+    let initial_health = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::select! {
+            reply = async {
+                while !socket.exists() {
+                    tokio::task::yield_now().await;
+                }
+                health().await
+            } => reply,
+            done = agent.join_next() => panic!("paste fixture exited before Health: {done:?}"),
+        }
+    })
+    .await
+    .expect("private paste fixture Health timed out");
+    let Response::Health {
+        agent_pid,
+        remote_execution_enabled: false,
+    } = initial_health
+    else {
+        panic!("expected local-only Health: {initial_health:?}");
+    };
+    let runtime_id = terminal.target.runtime_id;
+    let Response::TerminalOpened { status } = request(Request::OpenTerminal {
+        runtime_id,
+        view_id: terminal.view_id,
+    })
+    .await
+    else {
+        panic!("expected the configured legacy view");
+    };
+    assert_eq!(status.terminal, terminal);
+    let started = Instant::now();
+    let Response::TerminalControl { token, epoch } = request(Request::AcquireTerminal {
+        terminal: terminal.clone(),
+    })
+    .await
+    else {
+        panic!("expected one healthy configured writer grant");
+    };
+    assert_eq!(epoch.agent, terminal.agent_epoch);
+    let old = PasteBinding {
+        terminal: terminal.clone(),
+        token,
+        epoch,
+        incarnation: Uuid::new_v4(),
+        operation: 2,
+        sequence: 0,
+    };
+    let stage = |binding: &PasteBinding, offset, data: &[u8]| Request::PasteStage {
+        binding: binding.clone(),
+        offset,
+        data: data.to_vec(),
+    };
+    let commit = |binding: &PasteBinding, bytes| Request::PasteCommit {
+        binding: binding.clone(),
+        bytes,
+    };
+    let file = |name| fs::read(root.join(name)).unwrap();
+    let epoch_before = file("epoch");
+    let marker_before = file("marker");
+    let grid_before = file("grid");
+    let intent_before = file("intent");
+    let last_write = file("last-write");
+    let unchanged = || {
+        for (name, before) in [
+            ("epoch", &epoch_before),
+            ("marker", &marker_before),
+            ("grid", &grid_before),
+            ("intent", &intent_before),
+            ("last-write", &last_write),
+        ] {
+            assert_eq!(&file(name), before, "{name}");
+        }
+        for name in [
+            "paste-load-attempts",
+            "paste-loads",
+            "submissions",
+            "effects",
+            "pane0-bytes",
+        ] {
+            assert!(!root.join(name).exists(), "{name}");
+        }
+    };
+    let old_bytes = b"discard this";
+    assert_eq!(
+        paste_ipc(root, stage(&old, 0, old_bytes)).await,
+        PasteResult::Staged {}
+    );
+    let control = match refusal {
+        PasteRefusal::Continuation | PasteRefusal::Commit => {
+            let rejected = match refusal {
+                PasteRefusal::Continuation => stage(&old, old_bytes.len(), b" continuation"),
+                _ => commit(&old, old_bytes.len()),
+            };
+            paste_while_catalog_busy(root, &catalog, [rejected]).await;
+            None
+        }
+        PasteRefusal::Scope => Some(("scope", "changed".to_owned())),
+        PasteRefusal::Epoch => Some((
+            "readback-epoch",
+            epoch_text(Some(ResizeEpoch {
+                owner: Uuid::new_v4(),
+                ..epoch
+            })),
+        )),
+    };
+    if let Some((name, value)) = &control {
+        fs::write(root.join(name), value).unwrap();
+        assert_eq!(
+            paste_ipc(root, commit(&old, old_bytes.len())).await,
+            PasteResult::Stale {}
+        );
+        fs::remove_file(root.join(name)).unwrap();
+    }
+    // @contract: Rejection precedes offset zero so a surviving stage cannot conceal a failed invalidation.
+    assert_eq!(
+        paste_ipc(root, commit(&old, old_bytes.len())).await,
+        PasteResult::Stale {}
+    );
+    for offset in [0, old_bytes.len()] {
+        assert_eq!(
+            paste_ipc(root, stage(&old, offset, old_bytes)).await,
+            PasteResult::Stale {}
+        );
+    }
+    unchanged();
+
+    let fresh = PasteBinding {
+        operation: old.operation + 1,
+        ..old.clone()
+    };
+    let prefix = "fresh ☃".as_bytes();
+    let tail = b"\nnew gesture";
+    assert_eq!(
+        paste_ipc(root, stage(&fresh, 0, prefix)).await,
+        PasteResult::Staged {}
+    );
+    let higher = PasteBinding {
+        operation: fresh.operation + 1,
+        ..fresh.clone()
+    };
+    let wrong_sequence = PasteBinding {
+        sequence: fresh.sequence + 1,
+        ..fresh.clone()
+    };
+    let wrong_view = PasteBinding {
+        terminal: TerminalView {
+            view_id: Uuid::new_v4(),
+            ..terminal.clone()
+        },
+        ..fresh.clone()
+    };
+    let canaries = [&old, &higher, &wrong_sequence, &wrong_view];
+    if let Some((name, value)) = &control {
+        fs::write(root.join(name), value).unwrap();
+        for binding in canaries {
+            assert_eq!(
+                paste_ipc(root, commit(binding, prefix.len())).await,
+                PasteResult::Stale {}
+            );
+        }
+        fs::remove_file(root.join(name)).unwrap();
+    } else {
+        let requests = canaries.into_iter().map(|binding| match refusal {
+            PasteRefusal::Continuation => stage(binding, prefix.len(), tail),
+            _ => commit(binding, prefix.len()),
+        });
+        paste_while_catalog_busy(root, &catalog, requests).await;
+    }
+    unchanged();
+    assert_eq!(
+        paste_ipc(root, stage(&fresh, prefix.len(), tail)).await,
+        PasteResult::Staged {}
+    );
+    let payload = [prefix, tail.as_slice()].concat();
+    let PasteResult::Committed { receipt } = paste_ipc(root, commit(&fresh, payload.len())).await
+    else {
+        panic!("unrelated fresh stage did not survive on the original grant");
+    };
+    assert_eq!(
+        paste_ipc(
+            root,
+            Request::PasteAck {
+                binding: fresh.clone(),
+                receipt
+            }
+        )
+        .await,
+        PasteResult::Acknowledged { writable: true }
+    );
+    assert_eq!(
+        paste_ipc(root, commit(&fresh, payload.len())).await,
+        PasteResult::Stale {}
+    );
+    assert_eq!(
+        paste_ipc(root, commit(&old, old_bytes.len())).await,
+        PasteResult::Stale {}
+    );
+    assert_eq!(file("paste-load-attempts"), b"%0\n");
+    assert_eq!(file("paste-loads"), b"%0\n");
+    assert_eq!(file("submissions"), b"1");
+    assert_eq!(file("effects"), b"1");
+    assert_eq!(file("pane0-bytes"), payload);
+    assert_eq!(file("epoch"), epoch_before);
+    assert_eq!(file("grid"), grid_before);
+    assert_eq!(file("intent"), intent_before);
+    assert!(String::from_utf8(file("marker")).unwrap().contains("~r~"));
+    assert!(matches!(health().await, Response::Health {
+        agent_pid: current, remote_execution_enabled: false
+    } if current == agent_pid));
+    let Response::TerminalStatus {
+        status: final_status,
+    } = request(Request::TerminalStatus { terminal }).await
+    else {
+        panic!("expected the same view after recovery");
+    };
+    assert_eq!(final_status.terminal, status.terminal);
+    assert_eq!(final_status.epoch, Some(epoch));
+    assert_eq!(final_status.committed, status.committed);
+    assert_eq!(final_status.provider.unwrap().size, ORIGINAL);
+    assert!(started.elapsed() < INPUT_LEASE_TTL);
+    agent.abort_all();
+    assert!(agent.join_next().await.unwrap().unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn w1_terminal_paste_busy_continuation_consumes_stage() {
+    configured_paste_refusal(PasteRefusal::Continuation).await;
+}
+
+#[tokio::test]
+async fn w1_terminal_paste_busy_commit_consumes_stage() {
+    configured_paste_refusal(PasteRefusal::Commit).await;
+}
+
+#[tokio::test]
+async fn w1_terminal_paste_early_scope_refusal_consumes_stage() {
+    configured_paste_refusal(PasteRefusal::Scope).await;
+}
+
+#[tokio::test]
+async fn w1_terminal_paste_early_epoch_refusal_consumes_stage() {
+    configured_paste_refusal(PasteRefusal::Epoch).await;
 }
 
 #[tokio::test]
