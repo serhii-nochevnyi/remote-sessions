@@ -81,7 +81,6 @@ def main():
         call('release',token=second)
         current = lab.call('list')['runtimes'][0]
         assert current['pane_pid'] == runtime['pane_pid']
-        # Actual same bridge used by Tauri; acquire/read/input/detach/reconnect.
         result = run_native_probe(lab, runtime['runtime_id'])
         assert 'PASS' in result.stdout
         wait_for(lambda: received.read_text().count('Native bridge — Україна') == 3)
