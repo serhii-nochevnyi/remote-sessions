@@ -383,7 +383,7 @@ export function mountedTerminalEffect(
     mode: desiredTerminalMode(mounted.intent, active?.mode, mayRestore),
     agent: mounted.intent.identity.agentPid,
   };
-  if (mounted.outputOnly || (active?.mode === "ordinary" && active.binding &&
+  if (mounted.outputOnly || (active?.binding &&
       mounted.observation === active.binding)) return { mode: active?.mode, agent: active?.agent };
   return { mode: undefined, agent: undefined };
 }
@@ -631,7 +631,7 @@ export function terminalStreamAccess(
   mayRestore: boolean,
 ): StreamAccess {
   if (mounted.mode === "draining" && mounted.outputOnly === binding) return "draining";
-  if (mounted.observation === binding && attached === "ordinary") return "observing";
+  if (mounted.observation === binding) return "observing";
   if (mounted.intent && (!mounted.outputOnly || mounted.reconnectFrom === mounted.outputOnly) &&
       sameInventoryIdentity(mounted.intent.identity, binding.identity) &&
       matchesPane(mounted.intent.runtime, binding.terminal) &&

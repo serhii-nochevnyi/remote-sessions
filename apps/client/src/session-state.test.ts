@@ -1593,6 +1593,62 @@ async function closeLiveTerminalView(fixture: MountedFixture, holdDelivery = fal
   return mounted;
 }
 
+test("catalog impairment keeps an adopted observer readable under an input hold", async t => {
+  const fixture = mountedNativeFixture(t);
+  await fixture.publish(nativeRuntime);
+  const original = await closeLiveTerminalView(fixture, true);
+  assert.equal(fixture.delivery.held, true);
+  assert.equal(fixture.requestReconnect(), true);
+  const mounted = await connectFixture(fixture, "observer", nativeAttachment(observedView));
+  const renderer = mounted.displayed;
+  const effect = fixture.effect();
+  const mutations = mutatingCommands(fixture);
+  const first = fixture.park("terminal_read");
+  const impaired = fixture.park("terminal_read");
+  const restored = fixture.park("terminal_read");
+  const end = fixture.park("terminal_read");
+  const stream = mounted.run();
+  const sample = nativeAttachment(observedView);
+  assert.deepEqual(await first.entered, { viewId: observedView });
+  first.resolve(nativeData([65], sample));
+  assert.deepEqual(await impaired.entered, { viewId: observedView });
+  assert.equal(mounted.rendererOpened(), true);
+  assert.equal(fixture.binding(), mounted.binding);
+  assert.equal(original.disposals(), 1);
+
+  const observing = await fixture.refreshMounted(degradedRuntime);
+  assert.equal(observing.mode, "observe");
+  assert.equal(observing.observation, mounted.binding);
+  assert.deepEqual(fixture.effect(), effect);
+  assert.equal(fixture.entry(), undefined);
+  assert.equal(await fixture.connect(), undefined);
+  assert.equal(fixture.requestReconnect(), false);
+  assert.equal(mounted.update(), "observing");
+  await attemptMutations(mounted);
+  impaired.resolve(nativeData([66], sample));
+  assert.deepEqual(await restored.entered, { viewId: observedView });
+  assert.equal(renderer.buffer.active.getLine(0)?.translateToString(true), "AB");
+
+  await fixture.refreshMounted(nativeRuntime);
+  assert.deepEqual(fixture.effect(), effect);
+  restored.resolve(nativeData([67], sample));
+  assert.deepEqual(await end.entered, { viewId: observedView });
+  assert.equal(renderer.buffer.active.getLine(0)?.translateToString(true), "ABC");
+  assert.deepEqual(mounted.frames, [[65], [66], [67]]);
+  assert.equal(mounted.displayed, renderer);
+  assert.equal(mounted.disposals(), 0);
+  assert.equal(mounted.scope.viewId, observedView);
+  assert.equal(fixture.delivery.held, true);
+  assert.equal(mounted.scope.canWrite, false);
+  await attemptMutations(mounted);
+  assert.deepEqual(mutatingCommands(fixture), mutations);
+  assert.deepEqual(fixture.counts("terminal_confirm_writer"), [writerAssertions(firstView)]);
+  assert.deepEqual(fixture.counts("terminal_attach"), [{ runtimeId }, { runtimeId, observer: true }]);
+  assert.deepEqual(fixture.counts("terminal_detach"), [{ viewId: firstView, failure: undefined }]);
+  end.resolve(nativeClosure({ reason: "detached" }));
+  await stream;
+});
+
 const reconnectRoutes = ["Reconnect button", "same sidebar row with create status", "same sidebar row with inventory origin"] as const;
 type ReconnectRoute = typeof reconnectRoutes[number];
 
