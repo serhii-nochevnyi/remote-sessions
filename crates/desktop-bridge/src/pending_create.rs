@@ -1385,6 +1385,34 @@ esac
         assert_eq!(presented.issue, None);
         assert!(presented.operations[0].presented);
         assert!(restarted.create_status(None).await.operations[0].presented);
+
+        let birth = host.join(format!("{}.birth", runtime.tmux_name));
+        let original = fs::read_to_string(&birth).unwrap();
+        let start = fs::read_to_string(host.join("pane-start")).unwrap();
+        let mut fields: Vec<_> = original.split('~').collect();
+        let start_index = fields.len() - 5;
+        assert_eq!(fields[start_index], start);
+        let other_start = (start.parse::<u64>().unwrap() + 1).to_string();
+        fields[start_index] = &other_start;
+        fs::write(birth, fields.join("~")).unwrap();
+        let unavailable = restarted.create_status(None).await;
+        assert_eq!(unavailable.issue, None);
+        assert_eq!(unavailable.operations.len(), 1);
+        let unavailable = &unavailable.operations[0];
+        assert_eq!(unavailable.reference, recovered.reference);
+        assert!(unavailable.presented);
+        assert!(matches!(
+            &unavailable.disposition,
+            CreateDisposition::Launched { runtime: saved, current: PaneLiveness::Unavailable, .. }
+            if saved == runtime
+        ));
+        let raw = restarted.inventory().await.unwrap().runtimes;
+        assert_eq!(raw.len(), 1);
+        assert_eq!(
+            (raw[0].session_id, raw[0].runtime_id),
+            (runtime.session_id, runtime.runtime_id)
+        );
+        assert_eq!((raw[0].workspace_id, raw[0].operation_id), (None, None));
         assert_eq!(
             fs::read_to_string(host.join("dispatched")).unwrap(),
             "marked\n"

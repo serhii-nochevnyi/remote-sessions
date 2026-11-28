@@ -145,6 +145,7 @@ impl Fixture {
             server,
             name: name.clone(),
             nonce: String::new(),
+            diagnostic: None,
             tty: tty.clone(),
             epoch: None,
             committed: CommittedGeometry {
@@ -239,6 +240,15 @@ def check(guard, pane, write_input=False):
         "@rs_paste_admission": read(key("marker", pane)),
         "@rs_paste_launch": read(key("launch", pane)),
     }
+    if "#{==:#{after-kill-session},}" in guard:
+        expected.update({
+            "window_index": row[8], "pane_index": row[9], "@rs_create_nonce": row[10],
+            "pane_dead": row[11], "session_windows": row[12], "window_panes": row[13],
+            "window-size": row[14], "after-if-shell": "", "after-set-option": "",
+            "after-resize-window": "", "after-display-message": "", "after-kill-session": "",
+            "command-error": "",
+        })
+        return not read("scope") and allows(guard, expected)
     slots = re.findall(r"#\{[!=]=:#\{(@rs_paste_custody_[^}]+)\},", guard)
     if slots or "#{==:#{after-if-shell},}" in guard:
         if slots:
@@ -638,6 +648,7 @@ path.chmod(0o700)
             },
             name: name.clone(),
             nonce: String::new(),
+            diagnostic: None,
             tty: tty.into(),
             epoch: None,
             committed: CommittedGeometry {
@@ -719,6 +730,232 @@ path.chmod(0o700)
             response => panic!("Expected a scoped status, got {response:?}"),
         }
     }
+}
+
+async fn configured_test_catalog(root: &Path) -> (PathBuf, CatalogLane) {
+    let path = root.canonicalize().unwrap().join("catalog");
+    crate::catalog::provision(&path).unwrap();
+    let directory = path.clone();
+    let lane = CatalogLane::start_fixture(
+        move || Ok(directory),
+        crate::product_launch::ServiceProfiles::new(None),
+        None,
+    )
+    .await
+    .unwrap();
+    (path, lane)
+}
+
+#[tokio::test]
+async fn w1_configured_legacy_writer_and_stop_make_no_attempts_after_catalog_fault() {
+    let fixture = Fixture::new();
+    let engine = &fixture.engine;
+    let terminal = fixture.terminal.clone();
+    let root = fixture.temp.path();
+    let runtime_id = terminal.target.runtime_id;
+    let (path, catalog) = configured_test_catalog(root).await;
+    let send = async |message| engine.handle(message, Some(&catalog)).await;
+    let Response::Control { token } = send(Request::Acquire { runtime_id }).await.unwrap() else {
+        panic!("stamped legacy CLI writer was ineligible");
+    };
+    assert!(matches!(
+        send(Request::Release { runtime_id, token }).await.unwrap(),
+        Response::Accepted {}
+    ));
+    let acquire = || Request::AcquireTerminal {
+        terminal: terminal.clone(),
+    };
+    let Response::TerminalControl { token, epoch } = send(acquire()).await.unwrap() else {
+        panic!("stamped legacy view writer was ineligible");
+    };
+    let binding = PasteBinding {
+        terminal: terminal.clone(),
+        token,
+        epoch,
+        incarnation: Uuid::new_v4(),
+        operation: 1,
+        sequence: 0,
+    };
+    let stage = |offset| Request::PasteStage {
+        binding: binding.clone(),
+        offset,
+        data: vec![b'a'],
+    };
+    assert!(matches!(
+        send(stage(0)).await.unwrap(),
+        Response::Paste {
+            paste: PasteResult::Staged {}
+        }
+    ));
+
+    let read = engine.scoped_geometry(&terminal).await.unwrap();
+    let last_write = fs::read(root.join("last-write")).unwrap();
+    fs::rename(path.join("catalog.sqlite3"), path.join("retained.sqlite3")).unwrap();
+    for mutation in [
+        Request::Acquire { runtime_id },
+        acquire(),
+        Request::Input {
+            runtime_id,
+            token,
+            sequence: 0,
+            data: b"x".to_vec(),
+            paste: false,
+        },
+        Request::ResizeTerminal {
+            terminal: terminal.clone(),
+            token,
+            sequence: 0,
+            size: DESIRED,
+        },
+        Request::Stop {
+            runtime_id,
+            expected_pane_id: terminal.target.pane.clone(),
+        },
+    ] {
+        let denied = send(mutation).await.unwrap_err();
+        assert!(denied.to_string().contains("CatalogMissing"), "{denied:#}");
+    }
+    for paste in [stage(1), Request::PasteCommit { binding, bytes: 1 }] {
+        assert!(matches!(
+            send(paste).await.unwrap(),
+            Response::Paste {
+                paste: PasteResult::Unavailable {}
+            }
+        ));
+    }
+    assert!(
+        send(Request::Renew { runtime_id, token })
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("CatalogMissing")
+    );
+    assert_eq!(fs::read(root.join("last-write")).unwrap(), last_write);
+    assert_eq!(engine.scoped_geometry(&terminal).await.unwrap(), read);
+    assert!(
+        engine
+            .read_custody(read.server)
+            .await
+            .unwrap()
+            .iter()
+            .all(Option::is_none)
+    );
+    for name in [
+        "effects",
+        "deletions",
+        "submissions",
+        "paste-loads",
+        "removed-0",
+        "pane0-bytes",
+    ] {
+        assert!(!root.join(name).exists(), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn w1_paste_catalog_fault_at_send_preserves_armed_custody() {
+    let fixture = Fixture::new();
+    let engine = &fixture.engine;
+    *engine.paste_test.now.lock().unwrap() = Some(Instant::now());
+    let root = fixture.temp.path();
+    let (path, lane) = configured_test_catalog(root).await;
+    let terminal = fixture.terminal.clone();
+    let response = engine
+        .handle(
+            Request::AcquireTerminal {
+                terminal: terminal.clone(),
+            },
+            Some(&lane),
+        )
+        .await
+        .unwrap();
+    let Response::TerminalControl { token, epoch } = response else {
+        panic!("healthy configured legacy writer refused: {response:?}");
+    };
+    let binding = PasteBinding {
+        terminal: terminal.clone(),
+        token,
+        epoch,
+        incarnation: Uuid::new_v4(),
+        operation: 1,
+        sequence: 0,
+    };
+    let payload = "catalog fault fixture\n☃".as_bytes();
+    assert_eq!(
+        engine
+            .paste_stage(binding.clone(), 0, payload.to_vec(), Some(&lane))
+            .await,
+        PasteResult::Staged {}
+    );
+    let barrier = Arc::new(PasteBarrier::default());
+    *engine.paste_test.admission.lock().unwrap() = Some(barrier.clone());
+    let commit = tokio::spawn({
+        let engine = engine.clone();
+        let binding = binding.clone();
+        let lane = lane.clone();
+        async move {
+            engine
+                .paste_commit(binding, payload.len(), Some(&lane))
+                .await
+        }
+    });
+    tokio::time::timeout(SEND_WATCHDOG, barrier.reached.notified())
+        .await
+        .unwrap();
+    let read = engine.scoped_geometry(&terminal).await.unwrap();
+    let buffer = PasteBuffer::from_marker(&read).unwrap();
+    assert_eq!(read.paste_marker, buffer.marker(&read, 'a'));
+    let prior = engine.read_custody(read.server).await.unwrap();
+    assert!(
+        prior[0]
+            .as_ref()
+            .unwrap()
+            .active
+            .as_ref()
+            .unwrap()
+            .completed
+    );
+    assert_eq!(fs::read(root.join(&buffer.name)).unwrap(), payload);
+    let last_write = fs::read(root.join("last-write")).unwrap();
+    fs::rename(path.join("catalog.sqlite3"), path.join("retained.sqlite3")).unwrap();
+    barrier.proceed.notify_one();
+    assert_eq!(commit.await.unwrap(), PasteResult::Unknown {});
+    assert_eq!(fs::read(root.join(&buffer.name)).unwrap(), payload);
+    assert_eq!(fs::read(root.join("last-write")).unwrap(), last_write);
+    let after = engine.read_custody(read.server).await.unwrap();
+    for (old, new) in prior.iter().zip(&after) {
+        assert_eq!(
+            old.as_ref().map(|slot| &slot.value),
+            new.as_ref().map(|slot| &slot.value)
+        );
+    }
+    assert_eq!(engine.scoped_geometry(&terminal).await.unwrap(), read);
+    for name in ["effects", "deletions", "submissions"] {
+        assert!(!root.join(name).exists(), "{name}");
+    }
+    let status = engine
+        .handle(
+            Request::TerminalStatus {
+                terminal: terminal.clone(),
+            },
+            Some(&lane),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(status, Response::TerminalStatus { status } if status.terminal == terminal && status.observation == ObservationState::Observed)
+    );
+    let stopped = engine
+        .handle(
+            Request::Stop {
+                runtime_id: terminal.target.runtime_id,
+                expected_pane_id: terminal.target.pane.clone(),
+            },
+            Some(&lane),
+        )
+        .await;
+    assert!(stopped.is_err());
+    assert_eq!(fs::read(root.join("last-write")).unwrap(), last_write);
 }
 
 #[tokio::test]
@@ -2559,10 +2796,27 @@ os.execvp(cli[0], [*cli, *args])
                 PASTE_OPTION,
             ])
             .await;
-        engine
-            .stamp_paste(&runtime, legacy.server, &identity, Some(nonce))
-            .await
-            .unwrap();
+        let mut stamped = engine.geometry(runtime.runtime_id, pane).await.unwrap();
+        let launch = Uuid::new_v4().to_string();
+        stamped.paste_launch = launch.clone();
+        let marker = stamped.ready_marker(None);
+        fixture
+            .tmux(&[
+                "set-option",
+                "-po",
+                "-t",
+                pane,
+                PASTE_LAUNCH_OPTION,
+                &launch,
+                ";",
+                "set-option",
+                "-po",
+                "-t",
+                pane,
+                PASTE_OPTION,
+                &marker,
+            ])
+            .await;
         let ready = engine.geometry(runtime.runtime_id, pane).await.unwrap();
         let ready = engine
             .rotate_epoch(
