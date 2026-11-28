@@ -485,7 +485,12 @@ const CUSTODY_END: &str = "rs-custody-snapshot";
 const PANE_OPTION: &str = "@rs_create_nonce";
 const INITIALIZER_OPTION: &str = "@rs_create_initializer";
 const BIRTH_OPTION: &str = "@rs_create_birth";
-const BIRTH_FORMAT: &str = "#{@rs_create_initializer}|#{@rs_create_birth}";
+const BIRTH_FORMAT: &str = concat!(
+    "#{pid}|#{start_time}|#{@rs_create_generation}|",
+    "#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}|",
+    "#{session_name}|#{window_index}|#{pane_index}|#{@rs_create_nonce}|#{pane_dead}|",
+    "#{pane_tty}|#{@rs_create_initializer}|#{@rs_create_birth}"
+);
 const BIRTH_RETRY: Duration = Duration::from_millis(25);
 const BIRTH_READ_BUDGET: Duration = Duration::from_millis(300);
 const RECEIPT_FORMAT: &str = "#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}";
@@ -638,6 +643,28 @@ impl LaunchBirth {
 struct Observation {
     identity: PaneIdentity,
     runtime: Runtime,
+}
+
+struct OriginalBirth {
+    initializer: String,
+    record: String,
+    ticket: Uuid,
+    start: u64,
+    tty: PathBuf,
+    device: TtyIdentity,
+    used: bool,
+}
+
+#[derive(PartialEq, Eq)]
+struct BirthSample {
+    tty: PathBuf,
+    initializer: String,
+    record: String,
+}
+
+enum GenerationSample {
+    Stamped(ServerGeneration),
+    Unstamped { pid: u32, start: u64 },
 }
 
 struct PaneEvidence {
@@ -1379,14 +1406,40 @@ impl Engine {
         Ok(runtimes)
     }
 
-    async fn generation(&self) -> Result<ServerGeneration> {
+    async fn sample_generation(&self) -> Result<GenerationSample> {
         let output = self
             .command(&["display-message", "-p", GENERATION_FORMAT])
             .await?;
         let (pid, start, token) =
             server_fields(output.trim_end()).context("invalid tmux generation")?;
-        if !token.is_empty() {
-            return generation(output.trim_end()).context("invalid tmux generation token");
+        if token.is_empty() {
+            return Ok(GenerationSample::Unstamped { pid, start });
+        }
+        generation(output.trim_end())
+            .map(GenerationSample::Stamped)
+            .context("invalid tmux generation token")
+    }
+
+    async fn generation(&self) -> Result<ServerGeneration> {
+        match self.sample_generation().await? {
+            GenerationSample::Stamped(server) => Ok(server),
+            GenerationSample::Unstamped { .. } => anyhow::bail!("tmux generation unavailable"),
+        }
+    }
+
+    async fn initialize_generation(
+        &self,
+        catalog: Option<&CatalogLane>,
+    ) -> Result<ServerGeneration> {
+        let (pid, start) = match self.sample_generation().await? {
+            GenerationSample::Stamped(server) => return Ok(server),
+            GenerationSample::Unstamped { pid, start } => (pid, start),
+        };
+        if let Some(catalog) = catalog {
+            catalog
+                .run(|db, _| db.operation(Uuid::nil()).map(drop))
+                .await
+                .map_err(|issue| anyhow::anyhow!("Terminal generation unavailable: {issue:?}"))?;
         }
         let token = Uuid::new_v4();
         // @invariant: The tmux server checks its identity and the empty token before setting the token.
@@ -1394,10 +1447,7 @@ impl Engine {
         let guard = format!("#{{&&:{guard},#{{==:#{{{GENERATION_OPTION}}},}}}}");
         let set = format!("set-option -s {GENERATION_OPTION} {token}");
         self.command(&["if-shell", "-F", &guard, &set]).await?;
-        let output = self
-            .command(&["display-message", "-p", GENERATION_FORMAT])
-            .await?;
-        let captured = generation(output.trim_end()).context("tmux generation unavailable")?;
+        let captured = self.generation().await?;
         ensure!(
             (captured.pid, captured.start, captured.token) == (pid, start, token),
             "tmux generation changed"
@@ -1649,7 +1699,7 @@ impl Engine {
             }
             Err(issue) => return CreateState::Failed { issue },
         };
-        let Ok(generation) = self.generation().await else {
+        let Ok(generation) = self.initialize_generation(Some(catalog)).await else {
             return unknown(unavailable());
         };
         let session_id = Uuid::new_v4();
@@ -1781,7 +1831,15 @@ impl Engine {
             }
             OperationStage::Finished(StoredOutcome::Launched { identity, outcome }) => {
                 let current = match self.observe(&operation).await {
-                    Ok(observed) if observed.identity == *identity => liveness(&observed.runtime),
+                    Ok(observed) if observed.identity == *identity => {
+                        if observed.runtime.exited {
+                            PaneLiveness::Exited
+                        } else if self.prove_live_birth(&operation, identity).await.is_ok() {
+                            PaneLiveness::Live
+                        } else {
+                            PaneLiveness::Unavailable
+                        }
+                    }
                     _ => PaneLiveness::Unavailable,
                 };
                 let setup_issue = if current == PaneLiveness::Exited {
@@ -1811,7 +1869,20 @@ impl Engine {
             return unknown(None);
         };
         if !observed.runtime.exited {
-            let _ = self.initialize_managed_writer(operation, &observed).await;
+            let Ok(birth) = self.prove_live_birth(operation, &observed.identity).await else {
+                return unknown(None);
+            };
+            if !birth.used {
+                let _ = self
+                    .initialize_managed_writer(operation, &observed.identity, &birth)
+                    .await;
+                let Ok(after) = self.prove_live_birth(operation, &observed.identity).await else {
+                    return unknown(None);
+                };
+                if after.record != birth.record {
+                    return unknown(None);
+                }
+            }
         }
         let setup_issue = if observed.runtime.exited {
             read_setup_fault(state, operation.nonce)
@@ -2151,8 +2222,11 @@ impl Engine {
         })
     }
 
-    async fn geometry_for_runtime(&self, runtime: &Runtime) -> Result<GeometryReadback> {
-        let server = self.generation().await?;
+    async fn geometry_for_runtime(
+        &self,
+        runtime: &Runtime,
+        server: ServerGeneration,
+    ) -> Result<GeometryReadback> {
         let read = self.geometry(runtime.runtime_id, &runtime.pane_id).await?;
         ensure!(
             !runtime.exited
@@ -2507,20 +2581,111 @@ impl Engine {
         Ok(before.status(terminal, provider))
     }
 
-    async fn initialize_managed_writer(
+    async fn sample_live_birth(
         &self,
         operation: &Operation,
-        observed: &Observation,
-    ) -> Result<()> {
-        let identity = &observed.identity;
-        let pane = &identity.pane;
-        let read = self.geometry(operation.runtime_id, pane).await?;
+        identity: &PaneIdentity,
+    ) -> Result<BirthSample> {
+        let output = self
+            .geometry_command(&["display-message", "-p", "-t", &identity.pane, BIRTH_FORMAT])
+            .await?;
+        let row = output
+            .strip_suffix('\n')
+            .context("Missing launch birth sample")?;
+        let fields: Vec<_> = row.split('|').collect();
+        let stamp = format!(
+            "{}:{}:{}:{}:{}",
+            operation.nonce, identity.session, identity.window, identity.pane, identity.pid
+        );
+        ensure!(
+            fields.len() == 15
+                && !row.contains('\n')
+                && generation(&fields[..3].join("|")) == Some(operation.generation)
+                && pane_identity(&fields[3..7]).as_ref() == Some(identity)
+                && fields[7] == operation.target
+                && fields[8..10] == ["0", "0"]
+                && fields[10] == stamp
+                && fields[11] == "0"
+                && valid_pane_tty(fields[12]),
+            "Managed launch target changed"
+        );
+        Ok(BirthSample {
+            tty: fields[12].into(),
+            initializer: fields[13].into(),
+            record: fields[14].into(),
+        })
+    }
+
+    async fn prove_live_birth(
+        &self,
+        operation: &Operation,
+        identity: &PaneIdentity,
+    ) -> Result<OriginalBirth> {
+        ensure!(
+            operation.target == tmux_name(operation.session_id, operation.runtime_id),
+            "Invalid managed launch target"
+        );
         let prefix = birth_prefix(
             operation.generation,
             operation.id,
             operation.runtime_id,
             operation.nonce,
         );
+        let (sample, ticket) = tokio::time::timeout(BIRTH_READ_BUDGET, async {
+            loop {
+                let sample = self.sample_live_birth(operation, identity).await?;
+                let tail = sample
+                    .initializer
+                    .strip_prefix(&prefix)
+                    .context("Missing launch initializer")?;
+                let (ticket, _) = tail.split_once('~').context("Invalid launch initializer")?;
+                let ticket = parse_uuid(ticket)?;
+                ensure!(
+                    ticket.get_version_num() == 4
+                        && sample.initializer == initializer(&prefix, ticket, identity),
+                    "Launch initializer changed"
+                );
+                if !sample.record.is_empty() {
+                    break Ok::<_, anyhow::Error>((sample, ticket));
+                }
+                tokio::time::sleep(BIRTH_RETRY).await;
+            }
+        })
+        .await
+        .context("Launch birth evidence unavailable")??;
+        let start = self.observed_process_start(identity.pid)?;
+        let device = tty_identity(&fs::symlink_metadata(&sample.tty)?)?;
+        let record = birth_text(&sample.initializer, start, &sample.tty, device);
+        let (witness, used) = sample
+            .record
+            .strip_prefix("used~")
+            .map_or((sample.record.as_str(), false), |record| (record, true));
+        ensure!(witness == record, "Managed process birth changed");
+        ensure!(
+            self.sample_live_birth(operation, identity).await? == sample
+                && self.observed_process_start(identity.pid)? == start
+                && tty_identity(&fs::symlink_metadata(&sample.tty)?)? == device,
+            "Managed process changed during birth proof"
+        );
+        Ok(OriginalBirth {
+            initializer: sample.initializer,
+            record,
+            ticket,
+            start,
+            tty: sample.tty,
+            device,
+            used,
+        })
+    }
+
+    async fn initialize_managed_writer(
+        &self,
+        operation: &Operation,
+        identity: &PaneIdentity,
+        birth: &OriginalBirth,
+    ) -> Result<()> {
+        let pane = &identity.pane;
+        let read = self.geometry(operation.runtime_id, pane).await?;
         let stamp = format!(
             "{}:{}:{}:{pane}:{}",
             operation.nonce, identity.session, identity.window, identity.pid
@@ -2534,6 +2699,8 @@ impl Engine {
                 && read.target.window == identity.window
                 && read.target.pane == *pane
                 && read.target.pid == identity.pid
+                && read.target.process_start == birth.start
+                && read.tty == birth.tty
                 && read.nonce == stamp
                 && read.epoch.is_none()
                 && read.paste_launch.is_empty()
@@ -2541,36 +2708,7 @@ impl Engine {
             "Managed writer initialization is unavailable"
         );
         let (_, device) = sample_tty(&read.tty)?;
-        let (init, birth, ticket) = tokio::time::timeout(BIRTH_READ_BUDGET, async {
-            loop {
-                let row = self
-                    .geometry_command(&["display-message", "-p", "-t", pane, BIRTH_FORMAT])
-                    .await?;
-                let (init, birth) = row
-                    .strip_suffix('\n')
-                    .and_then(|row| row.split_once('|'))
-                    .context("Invalid launch birth evidence")?;
-                let tail = init
-                    .strip_prefix(&prefix)
-                    .context("Missing launch initializer")?;
-                let (ticket, _) = tail.split_once('~').context("Invalid launch initializer")?;
-                let ticket = parse_uuid(ticket)?;
-                ensure!(
-                    ticket.get_version_num() == 4 && init == initializer(&prefix, ticket, identity),
-                    "Launch initializer changed"
-                );
-                if !birth.is_empty() {
-                    ensure!(
-                        birth == birth_text(init, read.target.process_start, &read.tty, device),
-                        "Managed process birth changed or was consumed"
-                    );
-                    break Ok::<_, anyhow::Error>((init.to_owned(), birth.to_owned(), ticket));
-                }
-                tokio::time::sleep(BIRTH_RETRY).await;
-            }
-        })
-        .await
-        .context("Launch birth evidence unavailable")??;
+        ensure!(device == birth.device, "Managed terminal device changed");
         self.prove_paste_buffer_io(&read).await?;
         let fresh = self.geometry(operation.runtime_id, pane).await?;
         ensure!(
@@ -2581,12 +2719,12 @@ impl Engine {
         let guard = format_all([
             self.paste_guard(&fresh),
             format_equal("pane_input_off", 0),
-            format_equal(INITIALIZER_OPTION, &init),
-            format_equal(BIRTH_OPTION, &birth),
+            format_equal(INITIALIZER_OPTION, &birth.initializer),
+            format_equal(BIRTH_OPTION, &birth.record),
             format_equal("after-if-shell", ""),
         ]);
-        let used = format!("used~{birth}");
-        let launch = birth_launch_id(ticket);
+        let used = format!("used~{}", birth.record);
+        let launch = birth_launch_id(birth.ticket);
         let mut stamped = fresh;
         stamped.paste_launch = format!("{launch}~{used}");
         let ready = stamped.ready_marker(None);
@@ -3666,8 +3804,9 @@ impl Engine {
         let read_scope = async || match &terminal {
             Some(terminal) => self.scoped_geometry(terminal).await,
             None => {
-                self.geometry_for_runtime(&self.find(runtime_id).await?)
-                    .await
+                let runtime = self.find(runtime_id).await?;
+                let server = self.initialize_generation(catalog).await?;
+                self.geometry_for_runtime(&runtime, server).await
             }
         };
         let (lock, first_read) = match self.existing_lane(runtime_id) {
@@ -3719,7 +3858,7 @@ impl Engine {
         {
             if terminal.is_some() {
                 let current = self
-                    .geometry_for_runtime(&self.find(runtime_id).await?)
+                    .geometry_for_runtime(&self.find(runtime_id).await?, read.server)
                     .await?;
                 ensure!(
                     current.same_pane(&read),
@@ -4015,7 +4154,7 @@ impl Engine {
         );
         let lock = self.lane(runtime_id);
         let mut lane = lock.lock().await;
-        let server = self.generation().await?;
+        let server = self.initialize_generation(catalog).await?;
         let runtime = self.find(runtime_id).await?;
         let pane = &runtime.pane_id;
         ensure!(pane == expected_pane_id, "runtime precondition failed");
@@ -4023,7 +4162,7 @@ impl Engine {
         let checked = if runtime.exited {
             let read = self.retained_geometry(&runtime, server, catalog).await?;
             Some(self.prepare_paste_stop(&mut lane, read, &snapshot).await?)
-        } else if let Ok(read) = self.geometry_for_runtime(&runtime).await {
+        } else if let Ok(read) = self.geometry_for_runtime(&runtime, server).await {
             ensure!(read.server == server, "Stop target server changed");
             self.observe_terminal(&read.identity(), catalog).await?;
             Some(self.prepare_paste_stop(&mut lane, read, &snapshot).await?)
@@ -4120,7 +4259,7 @@ impl Engine {
                 let mut lane = lock.lock().await;
                 let (targets, admitted) = match catalog {
                     Some(catalog) => {
-                        let server = self.generation().await?;
+                        let server = self.initialize_generation(Some(catalog)).await?;
                         let targets =
                             self.creation_targets(catalog, server)
                                 .await
@@ -4153,7 +4292,7 @@ impl Engine {
                 let name = tmux_name(session_id, runtime_id);
                 let server = match admitted {
                     Some(server) => server,
-                    None => self.generation().await?,
+                    None => self.initialize_generation(None).await?,
                 };
                 let cwd = cwd.to_str().context("cwd must be UTF8")?;
                 let label = Path::new(&argv[0])
@@ -4219,7 +4358,7 @@ impl Engine {
                     }
                     let _ = self.stamp_paste(&runtime, server, &identity, None).await;
                     if lane.has_paste_hold()
-                        && let Ok(current) = self.geometry_for_runtime(&runtime).await
+                        && let Ok(current) = self.geometry_for_runtime(&runtime, server).await
                         && current.server == server
                         && current.target.session == identity.session
                         && current.target.window == identity.window
@@ -4259,9 +4398,11 @@ impl Engine {
                 view_id,
             } => {
                 ensure!(!view_id.is_nil(), "Invalid terminal view");
-                let read = self
-                    .geometry_for_runtime(&self.find(runtime_id).await?)
-                    .await?;
+                let runtime = self.find(runtime_id).await?;
+                let server = self.initialize_generation(catalog).await.with_context(|| {
+                    format!("Terminal observation unavailable for runtime {runtime_id}")
+                })?;
+                let read = self.geometry_for_runtime(&runtime, server).await?;
                 self.observe_terminal(&read.identity(), catalog).await?;
                 let terminal = TerminalView {
                     target: read.target.clone(),

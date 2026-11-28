@@ -1214,6 +1214,9 @@ mod tests {
     #[cfg(debug_assertions)]
     #[tokio::test]
     async fn pending_create_committed_reply_dropped_then_bridge_restart_recovers_through_sqlite() {
+        use crate::w1_terminal_tests::write_catalog_birth_fixture;
+        use portable_pty::{PtySize, native_pty_system};
+
         let fixture = Fixture::new();
         let host = fixture.directory("host");
         let native = fixture.directory("native");
@@ -1223,28 +1226,51 @@ mod tests {
         fs::write(&provider, "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
         let generation = Uuid::new_v4();
-        let command = r#"#!/bin/sh
+        fs::write(host.join("generation"), generation.to_string()).unwrap();
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows: 30,
+                cols: 100,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let tty = pty.master.tty_name().unwrap();
+        write_catalog_birth_fixture(&host, &tty, "$1~@2~%3");
+        let command = r##"#!/bin/sh
 set -eu
 cd "$(dirname "$3")"
-token=GENERATION
+token=$(cat generation)
+pid=$(cat pane-pid)
+birth_format='#{pid}|#{start_time}|#{@rs_create_generation}|#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}|#{session_name}|#{window_index}|#{pane_index}|#{@rs_create_nonce}|#{pane_dead}|#{pane_tty}|#{@rs_create_initializer}|#{@rs_create_birth}'
 case "$4" in
   display-message)
+    if test "${6-}" = -t; then
+      test "$#" = 8 && test "$5" = -p && test "$7" = '%3' && test "$8" = "$birth_format" || exit 1
+      name=$(cat active)
+      nonce=$(cat "$name.nonce")
+      printf '52|101|%s|$1|@2|%%3|%s|%s|0|0|%s:$1:@2:%%3:%s|0|%s|%s|%s\n' \
+        "$token" "$pid" "$name" "$nonce" "$pid" "$(cat tty)" \
+        "$(cat "$name.initializer")" "$(cat "$name.birth")"
+      exit 0
+    fi
     printf '52|101|%s\n' "$token"
-    if test "$#" -gt 6 && test -f name; then cat name; fi ;;
+    if test "$#" -gt 6 && test -f names; then cat names; fi ;;
   if-shell)
     branch=$7
     case "$branch" in 'new-session '*) ;; *) exit 1 ;; esac
     case "$6" in *"$token"*) ;; *) exit 1 ;; esac
     printf 'marked\n' >> dispatched
-    printf '%s\n' "$branch" | awk '{for(i=1;i<NF;i++) if ($i=="-s") {print $(i+1); exit}}' > name
-    printf '%s\n' "$branch" | awk '{for(i=1;i<=NF;i++) if ($i~/^RS_CREATE_NONCE=/) {sub(/^RS_CREATE_NONCE=/,"",$i); print $i; exit}}' > nonce
-    printf '$1|@2|%%3|501\n' ;;
+    exec ./spawn-tmux "$@" ;;
   show-environment)
-    nonce=$(cat nonce)
-    printf 'RS_CREATE_NONCE=%s\n52|101|%s|$1|@2|%%3|501|%s|0|0|%s:$1:@2:%%3:501|0|100|30\n' "$nonce" "$token" "$(cat name)" "$nonce" ;;
-  list-sessions) if test -f name; then cat name; fi ;;
+    name=${6#=}
+    test "$#" = 14 && test "$7" = RS_CREATE_NONCE
+    nonce=$(cat "$name.nonce")
+    printf 'RS_CREATE_NONCE=%s\n52|101|%s|$1|@2|%%3|%s|%s|0|0|%s:$1:@2:%%3:%s|0|100|30\n' \
+      "$nonce" "$token" "$pid" "$name" "$nonce" "$pid" ;;
+  list-sessions) if test -f names; then cat names; fi ;;
   list-panes)
-    printf '%s\t%%3\t501\t0\t100\t30\tcodex' "$(cat name)"
+    printf '%s\t%%3\t%s\t0\t100\t30\tcodex' "$(cat active)" "$pid"
     case "$7" in
       *'#{pid}|#{start_time}|#{?#{m/r:^[0-9a-f-]*$,#{@rs_create_generation}},#{@rs_create_generation},invalid}|#{session_id}|#{window_id}'*)
         printf '\t52|101|%s|$1|@2' "$token" ;;
@@ -1252,7 +1278,7 @@ case "$4" in
     printf '\n' ;;
   *) exit 1 ;;
 esac
-"#.replace("GENERATION", &generation.to_string());
+"##;
         fs::write(&tmux, command).unwrap();
         fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
         let host_run = host.clone();
@@ -1344,6 +1370,7 @@ esac
             panic!("expected the committed launch")
         };
         assert_eq!(runtime.pane_id, "%3");
+        assert_eq!(runtime.pane_pid, Some(std::process::id()));
         let inventory = restarted.inventory().await.unwrap();
         assert_eq!(inventory.runtimes, vec![runtime.clone()]);
         let (one, two) = tokio::join!(

@@ -3081,6 +3081,7 @@ set -eu
 cd "$(dirname "$3")"
 token=$(cat generation)
 pid=$(cat pane-pid)
+birth_format='#{pid}|#{start_time}|#{@rs_create_generation}|#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}|#{session_name}|#{window_index}|#{pane_index}|#{@rs_create_nonce}|#{pane_dead}|#{pane_tty}|#{@rs_create_initializer}|#{@rs_create_birth}'
 sender=0
 if test -f paste-tmux; then
   test "$1" = -N && test "$2" = -S && test "$3" = "$PWD/tmux.sock" && test -S "$3"
@@ -3091,10 +3092,23 @@ read_option() {
 }
 case "$4" in
   display-message)
-    if test "$#" = 8 && test "$6" = -t; then
+    if test "$#" = 8 && test "$5" = -p && test "$6" = -t; then
       test "$7" = '%0'
       name=$(cat active)
       device=$(cat tty)
+      case "$8" in
+        "$birth_format")
+          nonce=$(cat "$name.nonce")
+          printf '52|101|%s|$0|@0|%%0|%s|%s|0|0|%s:$0:@0:%%0:%s|0|%s|%s|%s\n' \
+            "$token" "$pid" "$name" "$nonce" "$pid" "$device" \
+            "$(read_option "$name.initializer")" "$(read_option "$name.birth")"
+          exit 0 ;;
+        '#{@rs_create_initializer}|#{@rs_create_birth}')
+          printf '%s|%s\n' "$(read_option "$name.initializer")" "$(read_option "$name.birth")"
+          exit 0 ;;
+        *'#{session_windows}|#{window_panes}|#{window-size}|#{pane_tty}|'*) ;;
+        *) exit 1 ;;
+      esac
       if test -f samples; then
         sample=$(awk 'END {print NR + 1}' samples)
         name=$(cat "sample-$sample")
@@ -3103,10 +3117,6 @@ case "$4" in
         if test -f missing-device && test "$sample" = 1; then device=/dev/pts/999999999; fi
       fi
       nonce=$(cat "$name.nonce")
-      if test "$8" = '#{@rs_create_initializer}|#{@rs_create_birth}'; then
-        printf '%s|%s\n' "$(read_option "$name.initializer")" "$(read_option "$name.birth")"
-        exit 0
-      fi
       launch=$(read_option launch)
       case "$launch" in ??????????????8*) launch="$launch~$(read_option "$name.birth")" ;; esac
       printf '52|101|%s|$0|@0|%%0|%s|%s|0|0|%s:$0:@0:%%0:%s|0|1|1|manual|%s|100|30|100|30|%s||%s|%s|0|%s\n' \
@@ -3120,15 +3130,7 @@ case "$4" in
     case "${7-}" in
       'new-session '*)
         if test "$sender" = 1; then exec ./paste-tmux "$@"; fi
-        for predicate in "#{==:#{pid},52}" "#{==:#{start_time},101}" "#{==:#{@rs_create_generation},$token}"; do
-          case "$6" in *"$predicate"*) ;; *) exit 1 ;; esac
-        done
-        name=$(printf '%s\n' "$7" | awk '{for(i=1;i<NF;i++) if ($i=="-s") {print $(i+1); exit}}')
-        nonce=$(printf '%s\n' "$7" | awk '{for(i=1;i<=NF;i++) if ($i~/^RS_CREATE_NONCE=/) {sub(/^RS_CREATE_NONCE=/,"",$i); print $i; exit}}')
-        test -n "$name" && test -n "$nonce"
-        printf '%s\n' "$nonce" > "$name.nonce"
-        printf '%s\n' "$name" >> names
-        printf '$0|@0|%%0|%s\n' "$pid" ;;
+        exec ./spawn-tmux "$@" ;;
       'show-options -sq -F '*)
         test "$sender" = 1
         exec ./paste-tmux "$@" ;;
@@ -3256,7 +3258,8 @@ elif command == "if-shell" and args[0] == "-F" and args[1] != "-t":
                      "#{session_id}:#{window_id}:#{pane_id}:#{pane_pid}'")
     assert label == f"set-option -p -t ={name}:0.0 @rs_command codex"
     assert not Path(name + ".nonce").exists() and not Path(name + ".birth").exists()
-    init = prefix + f"$0~@0~%0~{pid}"
+    session, window, pane = read("pane-scope").split("~")
+    init = prefix + f"{session}~{window}~{pane}~{pid}"
     tty = read("tty")
     device = Path(tty).stat()
     witness = f"{init}~{read('pane-start')}~{tty}~{device.st_dev}~{device.st_ino}~{device.st_rdev}"
@@ -3266,7 +3269,7 @@ elif command == "if-shell" and args[0] == "-F" and args[1] != "-t":
     write("active", name)
     with Path("names").open("a") as names:
         names.write(name + "\n")
-    print(f"$0|@0|%0|{pid}")
+    print(f"{session}|{window}|{pane}|{pid}")
 else:
     assert command == "if-shell"
     flag, target, pane, guard, branch, *otherwise = args
@@ -3395,6 +3398,19 @@ async fn w1_terminal_eof_real_host_replacement_discards_fifo() {
 }
 
 #[cfg(debug_assertions)]
+pub(super) fn write_catalog_birth_fixture(directory: &Path, tty: &Path, scope: &str) {
+    let spawn = directory.join("spawn-tmux");
+    fs::write(&spawn, PASTE_HOST_MUTATIONS).unwrap();
+    fs::set_permissions(&spawn, fs::Permissions::from_mode(0o700)).unwrap();
+    let pid = std::process::id();
+    let start = remote_sessions_host::engine::launch_fixture_process_start(pid).unwrap();
+    fs::write(directory.join("pane-pid"), pid.to_string()).unwrap();
+    fs::write(directory.join("pane-start"), start.to_string()).unwrap();
+    fs::write(directory.join("pane-scope"), scope).unwrap();
+    fs::write(directory.join("tty"), tty.to_str().unwrap()).unwrap();
+}
+
+#[cfg(debug_assertions)]
 async fn start_catalog_terminal_fixture(
     host: &AgentFixture,
     generation: Uuid,
@@ -3409,15 +3425,7 @@ async fn start_catalog_terminal_fixture(
     fs::write(&codex, "#!/bin/sh\nexit 0\n").unwrap();
     fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(host.0.join("generation"), generation.to_string()).unwrap();
-    fs::write(host.0.join("pane-pid"), std::process::id().to_string()).unwrap();
-    fs::write(
-        host.0.join("pane-start"),
-        remote_sessions_host::engine::launch_fixture_process_start(std::process::id())
-            .unwrap()
-            .to_string(),
-    )
-    .unwrap();
-    fs::write(host.0.join("tty"), tty.to_str().unwrap()).unwrap();
+    write_catalog_birth_fixture(&host.0, tty, "$0~@0~%0");
     let project = host.0.join("project");
     fs::create_dir(&project).unwrap();
     let server = tokio::spawn({
