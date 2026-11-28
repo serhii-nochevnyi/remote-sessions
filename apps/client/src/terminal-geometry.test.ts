@@ -31,6 +31,7 @@ const initial = () => parseTerminalStatus({
 });
 const committedReply = (status = fixtureStatus()) =>
   ({ result: "committed", admission: status.committed.intent, status });
+const busyReply = (size: TerminalSize) => ({ result: "busy", terminal, size });
 const committed = (revision: number, size: TerminalSize) =>
   parseResizeResult(committedReply(fixtureStatus(revision, size)));
 
@@ -98,6 +99,11 @@ test("production status and resize reply decoders reject each malformed scope an
     ["admission", undefined], ["admission.id", uuid(25)], ["admission.epoch.agent", uuid(26)],
   ] as const) assert.throws(() => parseResizeResult(mutate(reply, path, field)), path);
   assert.throws(() => parseResizeResult(mutate(uncertain, "intent.epoch.agent", uuid(42))));
+  const busy = busyReply(sizes[0]);
+  assert.deepEqual(parseResizeResult(busy), busy);
+  assert.throws(() => parseResizeResult(mutate(busy, "terminal.view_id", undefined)));
+  assert.throws(() => parseResizeResult(mutate(busy, "size.rows", 201)));
+  assert.throws(() => parseResizeResult({ ...busy, intent: uncertain.intent }));
 });
 
 test("status and geometry events preserve historical intents after ownership changes", () => {
@@ -237,6 +243,7 @@ function mountedResizeFixture(t: TestContext) {
   let layoutQueued = false;
   let bound = terminal;
   let proposed = Promise.resolve();
+  let expectingTimeout = false;
   const resize = mountedResize({
     owns: target => sameTerminal(bound, target) && scope.owns(target.view_id),
     canWrite: () => scope.canWrite,
@@ -251,7 +258,11 @@ function mountedResizeFixture(t: TestContext) {
     inputFailure: error => assert.fail(String(error)),
     grantRejected() { if (resize.grantRejected()) protocol.pauseInput(); },
     retire() { resize.close(); ordered.close(); protocol.dispose(); },
-    reconnect: error => assert.fail(String(error)),
+    reconnect(error) {
+      if (!expectingTimeout) assert.fail(String(error));
+      assert.equal(String(error), "Error: Потік перервано");
+      expectingTimeout = false;
+    },
   });
   const protocol = bindTerminalProtocol(display.xtermTerminal, data => { void scope.send(data); });
   assert.ok(scope.bind(terminal.view_id));
@@ -277,14 +288,24 @@ function mountedResizeFixture(t: TestContext) {
     pendingLayout: () => layoutQueued,
     lastProposal: () => proposed,
     replaceBinding() { bound = { ...terminal, target: { ...terminal.target, pane: "%3" } }; },
+    geometryTimeout() {
+      const chunk = parseChunk({ ...bytes([]), closed: true, status: null, geometry: null,
+        closure: { reason: "geometry_timeout" } });
+      assert.ok(chunk.closure);
+      expectingTimeout = true;
+      scope.acceptClosure(terminal.view_id, chunk.closure);
+      assert.equal(expectingTimeout, false);
+    },
     measure(size: TerminalSize) {
       assert.equal(layoutQueued, true);
       layoutQueued = false;
       return resize.offer(size);
     },
-    async sample(status: TerminalStatus | null, incarnation?: string, geometry: GeometryEvent | null = null) {
+    async sample(status: TerminalStatus | null, incarnation?: string, geometry: GeometryEvent | null = null,
+      pasteCompletion?: { incarnation: string; operation: number }) {
       const chunk = parseChunk({ ...bytes([]), status, geometry, writable: incarnation !== undefined,
-        ...(incarnation ? { paste_incarnation: incarnation } : {}) });
+        ...(incarnation ? { paste_incarnation: incarnation } : {}),
+        ...(pasteCompletion ? { paste_completion: pasteCompletion } : {}) });
       assert.ok(await protocol.consume(scope, terminal.view_id, chunk, () => ordered.consume(chunk, sink)));
       resize.observe(chunk);
       proposed = resize.propose();
@@ -300,6 +321,114 @@ function mountedResizeFixture(t: TestContext) {
     },
   };
 }
+
+test("a stopped viewport burst settles its latest size after definite contention", { timeout: 2000 }, async t => {
+  const fixture = mountedResizeFixture(t);
+  const incarnation = uuid(51);
+  const call = (size: TerminalSize) => ({ viewId: terminal.view_id, epoch, size, incarnation });
+  await fixture.sample(initial(), incarnation);
+  const first = fixture.measure(sizes[0]);
+  fixture.resize.scheduleLayout();
+  await fixture.measure(sizes[1]);
+  fixture.resize.scheduleLayout();
+  await fixture.measure(sizes[2]);
+  assert.deepEqual(fixture.calls.map(item => item.args), [call(sizes[0])]);
+  fixture.calls[0]!.reply.resolve(busyReply(sizes[0]));
+  await first;
+  await fixture.sample(null, incarnation);
+  assert.deepEqual(fixture.calls.map(item => item.args), [call(sizes[0])]);
+  assert.deepEqual(fixture.reports, []);
+
+  await fixture.sample(initial(), incarnation);
+  assert.deepEqual(fixture.calls.map(item => item.args), [call(sizes[0]), call(sizes[2])]);
+  fixture.calls[1]!.reply.resolve(busyReply(sizes[2]));
+  await fixture.lastProposal();
+  await fixture.resize.propose();
+  assert.equal(fixture.calls.length, 2);
+  assert.equal(fixture.ordered.applied, 0);
+
+  await fixture.sample(initial(), incarnation);
+  assert.deepEqual(fixture.calls.map(item => item.args), [call(sizes[0]), call(sizes[2]), call(sizes[2])]);
+  fixture.calls[2]!.reply.resolve(committedReply(fixtureStatus(1, sizes[2])));
+  await fixture.lastProposal();
+  assert.deepEqual(fixture.reports, [false]);
+  assert.deepEqual(fixture.grids, []);
+  const event = parseGeometryEvent(fixtureEvent(1, sizes[2]));
+  const applying = fixture.sample(null, incarnation, event);
+  assert.equal(fixture.ordered.applied, 0);
+  assert.deepEqual(fixture.acknowledgements[0]?.args, { viewId: terminal.view_id, acknowledgement: {
+    renderer_id: uuid(30), epoch, revision: 1, size: sizes[2], focused: false,
+  } });
+  fixture.acknowledgements[0]!.reply.resolve(event);
+  await applying;
+  assert.equal(fixture.ordered.applied, 1);
+  assert.deepEqual(fixture.grids, [sizes[2]]);
+  assert.equal(fixture.calls.length, 3);
+});
+
+test("pending paste suspends contention recovery until the stream restores authority", { timeout: 2000 }, async t => {
+  const fixture = mountedResizeFixture(t);
+  const incarnation = uuid(52);
+  await fixture.sample(initial(), incarnation);
+  const first = fixture.measure(sizes[0]);
+  fixture.calls[0]!.reply.resolve(busyReply(sizes[0]));
+  await first;
+  await fixture.sample(initial(), undefined, null, { incarnation, operation: 1 });
+  assert.equal(fixture.scope.canWrite, false);
+  assert.equal(fixture.pendingLayout(), false);
+  assert.equal(fixture.calls.length, 1);
+  await fixture.sample(initial(), incarnation);
+  const fresh = fixture.measure(sizes[2]);
+  assert.deepEqual(fixture.calls[1]?.args, { viewId: terminal.view_id, epoch, size: sizes[2], incarnation });
+  fixture.calls[1]!.reply.resolve(committedReply(fixtureStatus(1, sizes[2])));
+  await fresh;
+  assert.equal(fixture.calls.length, 2);
+  assert.deepEqual(fixture.reports, [false]);
+});
+
+test("only a scoped busy result can reopen resize on an unchanged grid", { timeout: 2000 }, async t => {
+  for (const mismatch of ["transport", "size", "view"] as const) {
+    await t.test(mismatch, async sub => {
+      const fixture = mountedResizeFixture(sub);
+      const incarnation = uuid(54);
+      await fixture.sample(initial(), incarnation);
+      const first = fixture.measure(sizes[0]);
+      fixture.resize.scheduleLayout();
+      await fixture.measure(sizes[2]);
+      const reply = fixture.calls[0]!.reply;
+      if (mismatch === "transport") reply.reject(Error("Terminal mutation in progress"));
+      else reply.resolve(mismatch === "size" ? busyReply(sizes[1]) : {
+        ...busyReply(sizes[0]), terminal: { ...terminal, view_id: uuid(55) },
+      });
+      await first;
+      await fixture.sample(initial(), incarnation);
+      assert.equal(fixture.pendingLayout(), false);
+      fixture.resize.scheduleLayout();
+      await fixture.measure(sizes[2]);
+      assert.equal(fixture.calls.length, 1);
+      assert.equal(fixture.ordered.applied, 0);
+      assert.deepEqual(fixture.grids, []);
+    });
+  }
+});
+
+test("the mounted view drops contention work when the original grid deadline closes it", { timeout: 2000 }, async t => {
+  const fixture = mountedResizeFixture(t);
+  const incarnation = uuid(53);
+  await fixture.sample(initial(), incarnation);
+  const first = fixture.measure(sizes[0]);
+  fixture.resize.scheduleLayout();
+  await fixture.measure(sizes[2]);
+  fixture.geometryTimeout();
+  fixture.calls[0]!.reply.resolve(busyReply(sizes[0]));
+  await first;
+  await fixture.resize.propose();
+  assert.equal(fixture.scope.active, false);
+  assert.equal(fixture.pendingLayout(), false);
+  assert.equal(fixture.calls.length, 1);
+  assert.deepEqual(fixture.reports, []);
+  assert.deepEqual(fixture.acknowledgements, []);
+});
 
 async function exerciseResizeGrantGap(t: TestContext, replyFirst: boolean, nextEpoch: typeof epoch, latest: TerminalSize) {
   const fixture = mountedResizeFixture(t);

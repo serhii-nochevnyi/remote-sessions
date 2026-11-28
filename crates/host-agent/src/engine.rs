@@ -3828,7 +3828,12 @@ impl Engine {
             .get(&runtime_id)
             .cloned()
             .context("Resize authority unavailable")?;
-        let mut lane = lane.try_lock().context("Terminal mutation in progress")?;
+        let Ok(mut lane) = lane.try_lock() else {
+            ensure!(expected_epoch.is_none(), "Terminal mutation in progress");
+            return Ok(Response::Resize {
+                resize: ResizeResult::Busy { terminal, size },
+            });
+        };
         let read = self.scoped_geometry(&terminal).await?;
         let epoch = read.epoch.context("Engine epoch unavailable")?;
         ensure!(

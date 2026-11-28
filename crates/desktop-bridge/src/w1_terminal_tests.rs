@@ -2219,6 +2219,300 @@ esac
 }
 
 #[tokio::test]
+async fn w1_resize_settles_original_reply_across_same_view_token_handoff() {
+    for grid_first in [false, true] {
+        let mut fixture = GeometryFixture::new().await;
+        let key = fixture.key();
+        fixture
+            .bridge
+            .detach(&fixture.owner.terminal.view_id.to_string());
+        release_fixture_writer(&fixture.listener, &fixture.owner, fixture.token).await;
+        let (token, epoch, capture) =
+            grant_fixture_writer(&fixture.listener, &fixture.bridge, &fixture.view).await;
+        let mut old = std::pin::pin!(fixture.bridge.resize(&key, GRID_A, epoch, capture));
+        let (mut peer, request) = tokio::select! {
+            result = old.as_mut() => panic!("old resize completed before its reply: {result:?}"),
+            request = receive(&fixture.listener) => request,
+        };
+        assert!(
+            matches!(request, Request::ResizeTerminal { terminal, token: sent, sequence: 0, size: GRID_A }
+            if terminal == fixture.view.terminal && sent == token)
+        );
+        let admission = ResizeIntent {
+            epoch,
+            id: Uuid::new_v4(),
+        };
+        fixture.status.epoch = Some(epoch);
+        fixture.status.committed = CommittedGeometry {
+            revision: 1,
+            size: GRID_A,
+            intent: Some(admission),
+        };
+        let historical = ResizeResult::Committed {
+            admission,
+            status: fixture.status.clone(),
+        };
+
+        let refreshing = refresh_fixture_control(&fixture.view);
+        let (mut renewal, request) = receive(&fixture.listener).await;
+        assert!(matches!(request, Request::Renew { runtime_id, token: sent }
+            if runtime_id == fixture.view.terminal.target.runtime_id && sent == token));
+        respond(
+            &mut renewal,
+            Response::Error {
+                message: "expired original writer".into(),
+            },
+        )
+        .await;
+        release_fixture_writer(&fixture.listener, &fixture.view, token).await;
+        refreshing.await.unwrap();
+        assert!(fixture.view.control.lock().await.lease.is_none());
+        let successor = Uuid::new_v4();
+        assert_ne!(successor, token);
+        let next_epoch = ResizeEpoch {
+            owner: Uuid::new_v4(),
+            ..epoch
+        };
+        let refreshing = refresh_fixture_control(&fixture.view);
+        let mut acquiring = acquire_fixture_writer(&fixture.listener, &fixture.view).await;
+        respond(
+            &mut acquiring,
+            Response::TerminalControl {
+                token: successor,
+                epoch: next_epoch,
+            },
+        )
+        .await;
+        refreshing.await.unwrap();
+        fixture.status.epoch = Some(next_epoch);
+
+        let sample = async || {
+            let control = fixture.view.control.lock().await;
+            let lease = control.lease.as_ref().unwrap();
+            assert_eq!((lease.token, lease.epoch), (successor, next_epoch));
+            assert_eq!(
+                (
+                    lease.input_sequence,
+                    lease.resize_sequence,
+                    lease.paste_high_water
+                ),
+                (0, 0, 0)
+            );
+            assert!(lease.pending_paste.is_none() && lease.staged_paste.is_none());
+            assert!(lease.writable(Instant::now()));
+            (
+                lease.deadline,
+                lease.incarnation,
+                lease.paste_wire_incarnation,
+            )
+        };
+        let before = sample().await;
+        assert_ne!(before.1, capture);
+        let event_before = if grid_first {
+            Some(fixture.issue_first().await)
+        } else {
+            None
+        };
+        let drain = fixture.view.output.lock().await.drain_started;
+        assert_eq!(drain, grid_first.then_some(fixture.start));
+        assert_eq!(fixture.view.output.lock().await.applied_revision, 0);
+        respond(
+            &mut peer,
+            Response::Resize {
+                resize: historical.clone(),
+            },
+        )
+        .await;
+        assert_eq!(old.await.unwrap(), historical);
+        assert_eq!(sample().await, before);
+        assert_eq!(fixture.view.output.lock().await.drain_started, drain);
+        assert_eq!(fixture.view.output.lock().await.applied_revision, 0);
+        assert_eq!(fixture.redraws(), 0);
+
+        let event = match event_before {
+            Some(event) => event,
+            None => fixture.issue_first().await,
+        };
+        assert_eq!(event.status.epoch, Some(next_epoch));
+        assert_eq!(event.status.committed.intent, Some(admission));
+        assert_eq!(event.status.committed.size, GRID_A);
+        let ack = fixture.acknowledgement(&event);
+        let (reply, ()) = tokio::join!(
+            fixture
+                .bridge
+                .acknowledge_grid_with_clock(&key, ack, || fixture.start + DRAIN_TIMEOUT / 2),
+            fixture.reply_status(fixture.status.clone()),
+        );
+        assert_eq!(reply.unwrap().status, fixture.status);
+        assert_eq!(fixture.view.output.lock().await.applied_revision, 1);
+        assert_eq!(fixture.redraws(), 1);
+        assert_eq!(sample().await, before);
+        fixture.bridge.detach(&key);
+        release_fixture_writer(&fixture.listener, &fixture.view, successor).await;
+        fixture.writer.finish();
+        fixture._owner_reader.finish();
+        until(|| allocation_counts(&fixture.bridge) == (0, 0)).await;
+    }
+}
+
+#[tokio::test]
+async fn w1_resize_native_and_host_busy_keep_the_sequence_for_fresh_scope() {
+    let fixture = AgentFixture::new();
+    let listener = UnixListener::bind(fixture.0.join("agent.sock")).unwrap();
+    let bridge = DesktopBridge::new(Some(fixture.0.clone()), "/unused/tmux".into());
+    let (view, reader, _) = controlled_view(&bridge, &target(), Uuid::new_v4(), 0);
+    let id = view.terminal.view_id.to_string();
+    let (token, epoch, incarnation) = grant_fixture_writer(&listener, &bridge, &view).await;
+    let mut old = std::pin::pin!(bridge.resize(&id, GRID_A, epoch, incarnation));
+    let (mut peer, request) = tokio::select! {
+        result = old.as_mut() => panic!("first resize completed before IPC: {result:?}"),
+        request = receive(&listener) => request,
+    };
+    assert!(
+        matches!(request, Request::ResizeTerminal { terminal, token: sent, sequence: 0, size: GRID_A }
+        if terminal == view.terminal && sent == token)
+    );
+    assert_eq!(
+        bridge
+            .resize(&id, GRID_B, epoch, incarnation)
+            .await
+            .unwrap(),
+        ResizeResult::Busy {
+            terminal: view.terminal.clone(),
+            size: GRID_B
+        },
+    );
+    let refused = ResizeResult::Busy {
+        terminal: view.terminal.clone(),
+        size: GRID_A,
+    };
+    respond(
+        &mut peer,
+        Response::Resize {
+            resize: refused.clone(),
+        },
+    )
+    .await;
+    assert_eq!(old.await.unwrap(), refused);
+    assert_no_fixture_request(&listener).await;
+
+    let admission = ResizeIntent {
+        epoch,
+        id: Uuid::new_v4(),
+    };
+    let mut status = view.output.lock().await.status.clone();
+    status.committed = CommittedGeometry {
+        size: GRID_B,
+        revision: 1,
+        intent: Some(admission),
+    };
+    let committed = ResizeResult::Committed { admission, status };
+    let reply = async {
+        let (mut peer, request) = receive(&listener).await;
+        assert!(
+            matches!(request, Request::ResizeTerminal { terminal, token: sent, sequence: 0, size: GRID_B }
+            if terminal == view.terminal && sent == token)
+        );
+        respond(
+            &mut peer,
+            Response::Resize {
+                resize: committed.clone(),
+            },
+        )
+        .await;
+    };
+    let (result, ()) = tokio::join!(bridge.resize(&id, GRID_B, epoch, incarnation), reply);
+    assert_eq!(result.unwrap(), committed);
+    let control = view.control.lock().await;
+    let lease = control.lease.as_ref().unwrap();
+    assert_eq!(
+        (
+            lease.token,
+            lease.epoch,
+            lease.incarnation,
+            lease.resize_sequence
+        ),
+        (token, epoch, incarnation, 1)
+    );
+    drop(control);
+    assert_no_fixture_request(&listener).await;
+    bridge.detach(&id);
+    release_fixture_writer(&listener, &view, token).await;
+    reader.finish();
+    until(|| allocation_counts(&bridge) == (0, 0)).await;
+}
+
+#[tokio::test]
+async fn w1_resize_cannot_settle_a_retired_source_with_a_live_replacement() {
+    let fixture = AgentFixture::new();
+    let listener = UnixListener::bind(fixture.0.join("agent.sock")).unwrap();
+    let bridge = DesktopBridge::new(Some(fixture.0.clone()), "/unused/tmux".into());
+    let agent = Uuid::new_v4();
+    let (view, reader, _) = controlled_view(&bridge, &target(), agent, 0);
+    let id = view.terminal.view_id.to_string();
+    let (token, epoch, capture) = grant_fixture_writer(&listener, &bridge, &view).await;
+    let mut status = view.output.lock().await.status.clone();
+    let admission = ResizeIntent {
+        epoch,
+        id: Uuid::new_v4(),
+    };
+    status.committed = CommittedGeometry {
+        size: GRID_A,
+        revision: 1,
+        intent: Some(admission),
+    };
+    let mut old = std::pin::pin!(bridge.resize(&id, GRID_A, epoch, capture));
+    let (mut peer, request) = tokio::select! {
+        result = old.as_mut() => panic!("old resize completed before IPC: {result:?}"),
+        request = receive(&listener) => request,
+    };
+    assert!(
+        matches!(request, Request::ResizeTerminal { terminal, token: sent, sequence: 0, size: GRID_A }
+        if terminal == view.terminal && sent == token)
+    );
+
+    bridge.detach(&id);
+    release_fixture_writer(&listener, &view, token).await;
+    let replacement = TerminalTarget {
+        pane: "%9".into(),
+        ..view.terminal.target.clone()
+    };
+    let (fresh, fresh_reader, _) = controlled_view(&bridge, &replacement, agent, 0);
+    let (successor, fresh_epoch, fresh_capture) =
+        grant_fixture_writer(&listener, &bridge, &fresh).await;
+    let fresh_id = fresh.terminal.view_id.to_string();
+    assert_ne!(fresh_id, id);
+    assert_ne!(fresh_epoch, epoch);
+    let original = fresh.output.lock().await.status.clone();
+    respond(
+        &mut peer,
+        Response::Resize {
+            resize: ResizeResult::Committed { admission, status },
+        },
+    )
+    .await;
+    assert_eq!(old.await.unwrap_err().to_string(), "View detached");
+    assert_eq!(fresh.output.lock().await.status, original);
+    let control = fresh.control.lock().await;
+    let lease = control.lease.as_ref().unwrap();
+    assert_eq!(
+        (
+            lease.token,
+            lease.epoch,
+            lease.incarnation,
+            lease.resize_sequence
+        ),
+        (successor, fresh_epoch, fresh_capture, 0)
+    );
+    drop(control);
+    reader.finish();
+    bridge.detach(&fresh_id);
+    release_fixture_writer(&listener, &fresh, successor).await;
+    fresh_reader.finish();
+    until(|| allocation_counts(&bridge) == (0, 0)).await;
+}
+
+#[tokio::test]
 async fn w1_resize_superseding_ack() {
     let mut fixture = GeometryFixture::new().await;
     let key = fixture.key();
@@ -4540,6 +4834,16 @@ async fn w1_terminal_pending_paste_denies_ordinary_input_and_keeps_its_receipt()
     assert_eq!(
         (completion.incarnation, completion.operation),
         (incarnation, operation)
+    );
+    assert_eq!(
+        bridge
+            .resize(&id, GRID_A, epoch, incarnation)
+            .await
+            .unwrap(),
+        ResizeResult::Busy {
+            terminal: view.terminal.clone(),
+            size: GRID_A
+        }
     );
     assert_eq!(
         bridge

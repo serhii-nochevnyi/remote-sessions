@@ -164,6 +164,7 @@ from pathlib import Path
 import json
 import re
 import shlex
+import socket
 import subprocess
 import sys
 import time
@@ -340,6 +341,12 @@ elif command == "display-message":
             print(value)
             print(value)
             sys.exit()
+        if (root / "park-resize-lane").exists():
+            (root / "park-resize-lane").unlink()
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as gate:
+                gate.connect(str(root / "resize-lane.sock"))
+                gate.sendall(b"P")
+                assert gate.recv(1) == b"R"
         append("geometry-targets", (pane + "\n").encode())
         row = pane_row(pane)
         if row is None:
@@ -440,6 +447,7 @@ elif command == "if-shell":
         if read("custody-write") == "lost" or (len(nodes) == 2 and read("lose-cleanup-reply")):
             sys.exit(1)
     elif branch.startswith("resize-window"):
+        append("resize-dispatches", b"1")
         if mode == "stale":
             sys.exit()
         if mode == "lost-before":
@@ -555,14 +563,25 @@ else:
             "987|123456|{generation}|$0|@0|%0|{pid}|{name}|0|0||0|1|1|manual|{}",
             tty.display()
         );
-        fs::write(
-            &tmux,
-            script
-                .replace("PREFIX", &prefix)
-                .replace("GENERATION", &generation.to_string()),
-        )
-        .unwrap();
-        fs::set_permissions(tmux, fs::Permissions::from_mode(0o700)).unwrap();
+        let script = script
+            .replace("PREFIX", &prefix)
+            .replace("GENERATION", &generation.to_string());
+        let status = std::process::Command::new("python3")
+            .args([
+                "-c",
+                r#"from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+path.write_text(sys.argv[2], encoding="utf-8")
+path.chmod(0o700)
+"#,
+            ])
+            .arg(&tmux)
+            .arg(script)
+            .status()
+            .unwrap();
+        assert!(status.success(), "Fixture script creation failed: {status}");
         Self {
             engine,
             terminal,
@@ -1630,6 +1649,117 @@ async fn w1_resize_private_fixture_socket() {
     let _ = agent.await;
     server.abort();
     let _ = server.await;
+}
+
+#[tokio::test]
+async fn w1_resize_private_contention_refuses_before_admission_and_keeps_original_grant() {
+    let f = Fixture::new();
+    let root = f.temp.path();
+    let directory = root.join("agent");
+    fs::create_dir(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let guard = Arc::new(crate::AgentLock::acquire(&directory).unwrap());
+    let socket = guard.socket.clone();
+    let gate = tokio::net::UnixListener::bind(root.join("resize-lane.sock")).unwrap();
+    let engine = Arc::into_inner(f.engine).unwrap();
+    *engine.paste_test.now.lock().unwrap() = Some(Instant::now());
+    let mut agent = tokio::task::JoinSet::new();
+    agent.spawn(crate::serve_local(engine, guard, None));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !socket.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let terminal = f.terminal;
+    let runtime_id = terminal.target.runtime_id;
+    let send = async |request| crate::request(&directory, &request).await.unwrap();
+    let Response::TerminalControl { token, epoch } = send(Request::AcquireTerminal {
+        terminal: terminal.clone(),
+    })
+    .await
+    else {
+        panic!("expected the original writer grant");
+    };
+    let resize = |sequence, size| Request::ResizeTerminal {
+        terminal: terminal.clone(),
+        token,
+        sequence,
+        size,
+    };
+    let dispatches = root.join("resize-dispatches");
+    let latest = TerminalSize {
+        cols: 142,
+        rows: 46,
+    };
+    for (request, size) in [
+        (Request::Renew { runtime_id, token }, DESIRED),
+        (
+            Request::Input {
+                runtime_id,
+                token,
+                sequence: 0,
+                data: b"x".to_vec(),
+                paste: false,
+            },
+            latest,
+        ),
+    ] {
+        fs::write(root.join("park-resize-lane"), "1").unwrap();
+        let mut writer = std::pin::pin!(send(request));
+        let mut parked = tokio::select! {
+            result = writer.as_mut() => panic!("writer finished before parking: {result:?}"),
+            accepted = tokio::time::timeout(Duration::from_secs(3), gate.accept()) => accepted.unwrap().unwrap().0,
+        };
+        let mut entered = [0];
+        tokio::io::AsyncReadExt::read_exact(&mut parked, &mut entered)
+            .await
+            .unwrap();
+        assert_eq!(&entered, b"P");
+        let last_write = fs::read(root.join("last-write")).unwrap();
+        let Response::Resize { resize: refused } = send(resize(0, size)).await else {
+            panic!("expected a scoped zero-admission response while the lane is parked");
+        };
+        assert_eq!(
+            refused,
+            ResizeResult::Busy {
+                terminal: terminal.clone(),
+                size
+            }
+        );
+        assert!(!dispatches.exists());
+        assert_eq!(fs::read(root.join("last-write")).unwrap(), last_write);
+        assert_eq!(fs::read_to_string(root.join("grid")).unwrap(), "100 30");
+        assert_eq!(fs::read_to_string(root.join("intent")).unwrap(), "");
+        parked.write_all(b"R").await.unwrap();
+        assert!(matches!(writer.await, Response::Accepted {}));
+    }
+    assert_eq!(fs::read(root.join("pane0-bytes")).unwrap(), b"x");
+    let Response::Resize {
+        resize: ResizeResult::Committed { admission, status },
+    } = send(resize(0, latest)).await
+    else {
+        panic!("the latest size must commit at the unconsumed original sequence");
+    };
+    assert_eq!(status.terminal, terminal);
+    assert_eq!(status.epoch, Some(epoch));
+    assert_eq!(admission.epoch, epoch);
+    assert_eq!(
+        status.committed,
+        CommittedGeometry {
+            size: latest,
+            revision: 1,
+            intent: Some(admission)
+        }
+    );
+    assert_eq!(fs::read(&dispatches).unwrap(), b"1");
+    assert!(matches!(
+        send(resize(0, DESIRED)).await,
+        Response::Error { .. }
+    ));
+    assert_eq!(fs::read(dispatches).unwrap(), b"1");
+    agent.shutdown().await;
 }
 
 #[cfg(debug_assertions)]

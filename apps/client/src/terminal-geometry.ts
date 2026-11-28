@@ -39,9 +39,10 @@ export class ResizeProposals {
   private sending: Proposal | undefined;
   private committedFence = 0;
   private blockedAt: number | undefined;
+  private waitingForStatus = false;
   private closed = false;
 
-  observe(status: TerminalStatus, writable: boolean, applied: number, incarnation?: string): boolean {
+  observe(status: TerminalStatus, writable: boolean, applied: number, incarnation?: string, refreshed = false): boolean {
     if (this.closed) return false;
     if (this.current && !sameTerminal(this.current.terminal, status.terminal)) {
       this.close();
@@ -60,6 +61,7 @@ export class ResizeProposals {
       this.grant = { epoch, incarnation };
       return true;
     }
+    if (refreshed) this.waitingForStatus = false;
     if (this.blockedAt === undefined || applied <= this.blockedAt) return false;
     this.blockedAt = undefined;
     return true;
@@ -72,7 +74,7 @@ export class ResizeProposals {
   take(current = this.current): Proposal | undefined {
     const size = this.queued;
     const grant = this.grant;
-    if (this.sending || !grant || this.blockedAt !== undefined || !current || current !== this.current || !size ||
+    if (this.sending || !grant || this.waitingForStatus || this.blockedAt !== undefined || !current || current !== this.current || !size ||
       this.applied < Math.max(this.committedFence, current.committed.revision)) return;
     this.queued = undefined;
     if (sameSize(size, current.committed.size)) return;
@@ -99,9 +101,14 @@ export class ResizeProposals {
       }
     }
     if (!sameGrant) return false;
+    if (result?.result === "busy" && sameTerminal(result.terminal, proposal.terminal) && sameSize(result.size, proposal.size)) {
+      this.queued ??= proposal.size;
+      this.waitingForStatus = true;
+      return false;
+    }
     this.queued = undefined;
     this.blockedAt = this.applied;
-    return !result || (result.result !== "committed" &&
+    return !result || ((result.result === "uncertain" || result.result === "rejected") &&
       sameTerminal(result.terminal, proposal.terminal) && epochKey(result.intent.epoch) === owner);
   }
 
@@ -109,6 +116,7 @@ export class ResizeProposals {
     this.grant = undefined;
     this.queued = undefined;
     this.blockedAt = undefined;
+    this.waitingForStatus = false;
   }
 
   close() {
@@ -193,7 +201,9 @@ export function mountedResize(callbacks: {
       } else if (chunk.writable) {
         incarnation = chunk.paste_incarnation;
       }
-      const changed = proposals.observe(ordered.status, writable && incarnation !== undefined, ordered.applied, incarnation);
+      const changed = proposals.observe(
+        ordered.status, writable && incarnation !== undefined, ordered.applied, incarnation, chunk.status != null,
+      );
       if (changed) scheduleLayout();
       return changed;
     },

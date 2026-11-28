@@ -628,10 +628,16 @@ mod desktop {
         let incarnation = incarnation
             .parse()
             .map_err(|_| "Некоректна прив’язка зміни розміру".to_owned())?;
-        bridge
+        let result = bridge
             .resize(&view_id, size, epoch, incarnation)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        if let ResizeResult::Busy { terminal, .. } = &result
+            && terminal.agent_epoch != epoch.agent
+        {
+            return Err("Resize authority changed".to_owned());
+        }
+        Ok(result)
     }
     #[tauri::command]
     pub async fn terminal_acknowledge_grid(

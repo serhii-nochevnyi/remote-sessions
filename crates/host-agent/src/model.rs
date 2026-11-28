@@ -210,6 +210,10 @@ pub struct TerminalStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResizeResult {
+    Busy {
+        terminal: TerminalView,
+        size: TerminalSize,
+    },
     Committed {
         admission: ResizeIntent,
         status: TerminalStatus,
