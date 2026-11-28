@@ -24,6 +24,7 @@ from uuid import UUID, uuid4
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'scripts'))
 
+import desktop_input
 import desktop_lab
 import runtime_lab
 import w1_recovery
@@ -636,6 +637,137 @@ class ManifestTests(unittest.TestCase):
             (lab.host, '--state-dir', self.state, '--tmux', self.tmux, 'health'),
             (self.tmux, '-N', '-S', self.state / 'tmux.sock', 'show-options', '-s', 'exit-empty'),
         ])
+
+    def prepare_desktop_smoke(self):
+        self.prepare_start()
+        self.state.mkdir(mode=0o700)
+        selected = self.state.parent / 'toolchain' / 'bin' / 'tmux'
+        selected.parent.mkdir(parents=True)
+        selected.touch()
+        self.tmux = str(selected)
+        for replacement in (
+            patch.object(runtime_lab.shutil, 'which', return_value=self.tmux),
+            patch.object(runtime_lab.tempfile, 'mkdtemp', return_value=str(self.state)),
+        ):
+            replacement.start()
+            self.addCleanup(replacement.stop)
+
+    def desktop_smoke_process(self, argv, **_):
+        socket_argv = [self.tmux, '-N', '-S', str(self.state / 'tmux.sock')]
+        if argv == [self.tmux, '-V']:
+            stdout = 'tmux 3.8\n'
+        elif argv == [*socket_argv, 'show-options', '-s', 'exit-empty']:
+            stdout = 'exit-empty off\n'
+        elif argv == [*socket_argv, 'display-message', '-p', '#{version}']:
+            stdout = '3.8\n'
+        elif argv == [str(self.state.parent / 'target/debug/host-agent'), '--state-dir',
+                      str(self.state), '--tmux', self.tmux, 'health']:
+            stdout = '{"agent_pid": 123}'
+        elif argv[0] == 'launchctl' and argv[1] in ('bootstrap', 'bootout', 'print'):
+            stdout = ''
+        elif argv == [str(ROOT / 'target/debug/examples/probe'), str(self.state),
+                      self.lab_id, self.tmux]:
+            stdout = 'PASS\n'
+        else:
+            self.fail(f'Unexpected desktop smoke command {argv}')
+        return subprocess.CompletedProcess(argv, 0, stdout, '')
+
+    def test_desktop_smoke_uses_selected_binary_for_server_agent_and_probe(self):
+        self.prepare_desktop_smoke()
+        with patch.object(runtime_lab.subprocess, 'run', side_effect=self.desktop_smoke_process) as process:
+            with runtime_lab.Lab(writable_smoke=True) as lab:
+                self.assertIsNone(lab.catalog)
+                self.assertEqual(lab.tmux, self.tmux)
+                self.assertEqual(plistlib.loads((lab.state / 'tmux.plist').read_bytes())['ProgramArguments'],
+                                 [self.tmux, '-D', '-S', str(lab.state / 'tmux.sock'),
+                                  '-f', str(lab.state / 'tmux.conf')])
+                self.assertEqual(plistlib.loads((lab.state / 'agent.plist').read_bytes())['ProgramArguments'],
+                                 [str(lab.service_host), '--state-dir', str(lab.state),
+                                  '--tmux', self.tmux, 'serve'])
+                token = str(uuid4())
+                self.assertEqual(desktop_input.writer_token(lab, {'result': 'control', 'token': token}), token)
+                self.assertEqual(desktop_input.run_native_probe(lab, self.lab_id).stdout, 'PASS\n')
+                commands = [entry.args[0] for entry in process.call_args_list]
+                self.assertEqual(commands[0], [self.tmux, '-V'])
+                self.assertEqual(commands[1:-1], [
+                    ['launchctl', 'bootstrap', lab.domain, str(lab.state / 'tmux.plist')],
+                    ['launchctl', 'bootstrap', lab.domain, str(lab.state / 'agent.plist')],
+                    [self.tmux, '-N', '-S', str(lab.state / 'tmux.sock'), 'show-options', '-s', 'exit-empty'],
+                    [self.tmux, '-N', '-S', str(lab.state / 'tmux.sock'), 'display-message', '-p', '#{version}'],
+                    [str(lab.host), '--state-dir', str(lab.state), '--tmux', self.tmux, 'health'],
+                ])
+                self.assertEqual(commands[-1], [str(ROOT / 'target/debug/examples/probe'), str(lab.state),
+                                                self.lab_id, self.tmux])
+
+    def test_desktop_smoke_rejects_wrong_binary_before_startup(self):
+        self.prepare_desktop_smoke()
+        query = [self.tmux, '-V']
+        unsupported = subprocess.CompletedProcess(query, 0, 'tmux 3.8a\n', '')
+        with patch.object(runtime_lab.subprocess, 'run', return_value=unsupported) as process:
+            with self.assertRaisesRegex(RuntimeError, "requires 'tmux 3.8'") as error:
+                desktop_input.main()
+        for detail in (self.tmux, "Observed 'tmux 3.8a'", 'first on PATH'):
+            self.assertIn(detail, str(error.exception))
+        self.assertEqual([entry.args[0] for entry in process.call_args_list], [query])
+        self.assertEqual(list(self.state.iterdir()), [])
+
+    def test_desktop_smoke_rejects_wrong_server_before_writable_requests(self):
+        self.prepare_desktop_smoke()
+        socket_path = str(self.state / 'tmux.sock')
+        query = [self.tmux, '-N', '-S', socket_path, 'display-message', '-p', '#{version}']
+
+        def serve_wrong_version(argv, **kwargs):
+            if argv == query:
+                return subprocess.CompletedProcess(argv, 0, '3.8a\n', '')
+            return self.desktop_smoke_process(argv, **kwargs)
+
+        with (patch.object(runtime_lab.subprocess, 'run', side_effect=serve_wrong_version) as process,
+              patch.object(desktop_input.socket, 'socket') as connection):
+            with self.assertRaisesRegex(RuntimeError, "requires '3.8'") as error:
+                desktop_input.main()
+        for detail in (self.tmux, socket_path, "Observed '3.8a'", 'rerun make check-desktop'):
+            self.assertIn(detail, str(error.exception))
+        connection.assert_not_called()
+        self.assertIn(query, [entry.args[0] for entry in process.call_args_list])
+        self.assertFalse(self.state.exists())
+
+    def test_desktop_smoke_reports_typed_read_only_without_reading_token(self):
+        self.prepare_desktop_smoke()
+
+        class ReadOnlyReply(dict):
+            def __getitem__(self, field):
+                if field == 'token':
+                    raise AssertionError('Read-only response has no writer token')
+                return super().__getitem__(field)
+
+            def get(self, field, default=None):
+                if field == 'token':
+                    raise AssertionError('Read-only response has no writer token')
+                return super().get(field, default)
+
+        with patch.object(runtime_lab.subprocess, 'run', side_effect=self.desktop_smoke_process):
+            with runtime_lab.Lab(writable_smoke=True) as lab:
+                socket_path = str(lab.state / 'tmux.sock')
+                query = [self.tmux, '-N', '-S', socket_path, 'display-message', '-p', '#{version}']
+                binary = self.desktop_smoke_process([self.tmux, '-V'])
+                unsupported = subprocess.CompletedProcess(query, 0, '3.9\n', '')
+                for admission, result, observed in (
+                    ('prior_send_unknown', self.desktop_smoke_process(query), 'Expected and observed'),
+                    ('unavailable', unsupported, "Observed '3.9'"),
+                ):
+                    with (self.subTest(admission=admission),
+                          patch.object(runtime_lab.subprocess, 'run', side_effect=[binary, result]) as process):
+                        response = ReadOnlyReply(result='control_recovering', paste_admission=admission)
+                        with self.assertRaisesRegex(RuntimeError, 'read-only') as error:
+                            desktop_input.writer_token(lab, response)
+                        for detail in (admission, self.tmux, socket_path, '3.8', observed,
+                                       'rerun' if admission == 'unavailable' else 'without replay'):
+                            self.assertIn(detail, str(error.exception))
+                        self.assertEqual([entry.args[0] for entry in process.call_args_list],
+                                         [[self.tmux, '-V'], query])
+                malformed = ReadOnlyReply(result='control_recovering')
+                with self.assertRaisesRegex(RuntimeError, 'Invalid desktop smoke read-only acquisition response'):
+                    desktop_input.writer_token(lab, malformed)
 
     def test_fixture_and_pressure_callers_preserve_recoverable_startup(self):
         for caller in ('fixture', 'pressure'):
